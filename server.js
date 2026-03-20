@@ -4,7 +4,12 @@ const { Pool } = require("pg");
 
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  allowedHeaders: ["Content-Type"]
+}));
+
 app.use(express.json({ limit: "10mb" }));
 
 const pool = new Pool({
@@ -83,11 +88,19 @@ async function initDB() {
         id SERIAL PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
-        is_admin BOOLEAN NOT NULL DEFAULT FALSE,
-        roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": true}'::jsonb,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
+    `);
+
+    await pool.query(`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
+    `);
+
+    await pool.query(`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": true}'::jsonb;
     `);
 
     await pool.query(`
@@ -313,10 +326,6 @@ app.get("/jobs", async (req, res) => {
     });
   }
 });
-
-// -----------------------------
-// PHASE 1 RECORD CRUD
-// -----------------------------
 
 app.get("/records", async (req, res) => {
   try {
