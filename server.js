@@ -6,10 +6,9 @@ const app = express();
 
 app.use(cors({
   origin: "*",
-  methods: ["GET", "POST", "PUT", "DELETE"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type"]
 }));
-
 app.use(express.json({ limit: "10mb" }));
 
 const pool = new Pool({
@@ -26,35 +25,45 @@ function isObject(value) {
   return value && typeof value === "object" && !Array.isArray(value);
 }
 
+function normalizeRoles(roles) {
+  if (!isObject(roles)) return { camera: true, vac: true };
+  return {
+    camera: roles.camera !== false,
+    vac: roles.vac !== false,
+  };
+}
+
 function normalizeUser(userRow) {
   if (!userRow) return null;
   return {
     id: userRow.id,
     username: userRow.username,
     isAdmin: !!userRow.is_admin,
-    roles: isObject(userRow.roles) ? userRow.roles : { camera: true, vac: true },
+    roles: normalizeRoles(userRow.roles),
+    mustChangePassword: !!userRow.must_change_password,
   };
 }
 
 function normalizeRecordInput(body = {}) {
   const data = isObject(body.data) ? body.data : {};
-  const client = cleanString(body.client || data.client);
-  const city = cleanString(body.city || data.city);
-  const date = cleanString(body.date || data.date);
-  const jobsite = cleanString(body.jobsite || body.jobsiteLabel || data.jobsite || data.jobsiteLabel);
-  const psr = cleanString(body.psr || data.psr);
-  const system = cleanString(body.system || data.system);
-  const dia = cleanString(body.dia || data.dia);
-  const material = cleanString(body.material || data.material);
-  const footage = cleanString(body.footage || body.length || data.footage || data.length);
-  const notes = cleanString(body.notes || data.notes);
-  const status = cleanString(body.status || data.status);
+  const client = cleanString(body.client ?? data.client);
+  const city = cleanString(body.city ?? data.city);
+  const date = cleanString(body.date ?? body.record_date ?? data.date ?? data.record_date);
+  const jobsite = cleanString(body.jobsite ?? body.jobsiteLabel ?? data.jobsite ?? data.jobsiteLabel);
+  const psr = cleanString(body.psr ?? data.psr);
+  const system = cleanString(body.system ?? data.system);
+  const dia = cleanString(body.dia ?? data.dia);
+  const material = cleanString(body.material ?? data.material);
+  const footage = cleanString(body.footage ?? body.length ?? data.footage ?? data.length);
+  const notes = cleanString(body.notes ?? data.notes);
+  const status = cleanString(body.status ?? data.status);
 
   const mergedData = {
     ...data,
     client,
     city,
     date,
+    record_date: date,
     jobsite,
     psr,
     system,
@@ -82,9 +91,10 @@ function normalizeRecordInput(body = {}) {
 }
 
 function normalizePricingInput(body = {}) {
-  const dia = cleanString(body.dia);
-  const rate = Number(body.rate);
-  return { dia, rate };
+  return {
+    dia: cleanString(body.dia),
+    rate: Number(body.rate),
+  };
 }
 
 async function initDB() {
@@ -94,6 +104,9 @@ async function initDB() {
         id SERIAL PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
+        is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+        roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": true}'::jsonb,
+        must_change_password BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
@@ -103,10 +116,13 @@ async function initDB() {
       ALTER TABLE users
       ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
     `);
-
     await pool.query(`
       ALTER TABLE users
       ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": true}'::jsonb;
+    `);
+    await pool.query(`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT TRUE;
     `);
 
     await pool.query(`
@@ -140,30 +156,11 @@ async function initDB() {
       );
     `);
 
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_planner_records_record_date
-      ON planner_records (record_date);
-    `);
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_planner_records_client
-      ON planner_records (client);
-    `);
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_planner_records_city
-      ON planner_records (city);
-    `);
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_planner_records_jobsite
-      ON planner_records (jobsite);
-    `);
-
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_planner_records_status
-      ON planner_records (status);
-    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_planner_records_record_date ON planner_records (record_date);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_planner_records_client ON planner_records (client);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_planner_records_city ON planner_records (city);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_planner_records_jobsite ON planner_records (jobsite);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_planner_records_status ON planner_records (status);`);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS pricing_rates (
@@ -182,11 +179,11 @@ async function initDB() {
 
 initDB();
 
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.send("Horizon Backend Running");
 });
 
-app.get("/health", (req, res) => {
+app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
@@ -196,14 +193,11 @@ app.post("/login", async (req, res) => {
 
   try {
     if (!username || !password) {
-      return res.json({
-        success: false,
-        error: "Username and password are required",
-      });
+      return res.json({ success: false, error: "Username and password are required" });
     }
 
     const result = await pool.query(
-      `SELECT id, username, password, is_admin, roles
+      `SELECT id, username, password, is_admin, roles, must_change_password
        FROM users
        WHERE username = $1 AND password = $2
        LIMIT 1`,
@@ -211,46 +205,32 @@ app.post("/login", async (req, res) => {
     );
 
     if (!result.rows.length) {
-      return res.json({
-        success: false,
-        error: "Invalid username or password",
-      });
+      return res.json({ success: false, error: "Invalid username or password" });
     }
 
-    return res.json({
-      success: true,
-      user: normalizeUser(result.rows[0]),
-    });
+    return res.json({ success: true, user: normalizeUser(result.rows[0]) });
   } catch (err) {
     console.error("LOGIN ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.post("/create-user", async (req, res) => {
   const username = cleanString(req.body?.username);
-  const password = cleanString(req.body?.password);
+  const password = cleanString(req.body?.password || "1234");
   const isAdmin = !!req.body?.isAdmin;
-  const roles = isObject(req.body?.roles)
-    ? req.body.roles
-    : { camera: true, vac: true };
+  const roles = normalizeRoles(req.body?.roles);
 
   try {
-    if (!username || !password) {
-      return res.json({
-        success: false,
-        error: "Username and password are required",
-      });
+    if (!username) {
+      return res.json({ success: false, error: "Username is required" });
     }
 
     const inserted = await pool.query(
-      `INSERT INTO users (username, password, is_admin, roles)
-       VALUES ($1, $2, $3, $4::jsonb)
-       RETURNING id, username, is_admin, roles`,
-      [username, password, isAdmin, JSON.stringify(roles)]
+      `INSERT INTO users (username, password, is_admin, roles, must_change_password, updated_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5, CURRENT_TIMESTAMP)
+       RETURNING id, username, is_admin, roles, must_change_password`,
+      [username, password, isAdmin, JSON.stringify(roles), true]
     );
 
     return res.json({
@@ -260,39 +240,111 @@ app.post("/create-user", async (req, res) => {
     });
   } catch (err) {
     console.error("CREATE USER ERROR:", err);
-
     if (err.code === "23505") {
-      return res.json({
-        success: false,
-        error: "That username already exists",
-      });
+      return res.json({ success: false, error: "That username already exists" });
     }
-
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-app.get("/users", async (req, res) => {
+app.get("/users", async (_req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, username, is_admin, roles, created_at, updated_at
+      `SELECT id, username, is_admin, roles, must_change_password, created_at, updated_at
        FROM users
        ORDER BY username ASC`
     );
-
-    return res.json({
-      success: true,
-      users: result.rows.map(normalizeUser),
-    });
+    return res.json({ success: true, users: result.rows.map(normalizeUser) });
   } catch (err) {
     console.error("GET USERS ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.put("/users/:id", async (req, res) => {
+  const id = Number(req.params.id);
+  const username = cleanString(req.body?.username);
+  const isAdmin = !!req.body?.isAdmin;
+  const roles = normalizeRoles(req.body?.roles);
+
+  try {
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ success: false, error: "Invalid user id" });
+    }
+
+    const result = await pool.query(
+      `UPDATE users
+       SET username = COALESCE(NULLIF($1, ''), username),
+           is_admin = $2,
+           roles = $3::jsonb,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $4
+       RETURNING id, username, is_admin, roles, must_change_password`,
+      [username, isAdmin, JSON.stringify(roles), id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ success: false, error: "User not found" });
+    }
+
+    return res.json({ success: true, user: normalizeUser(result.rows[0]) });
+  } catch (err) {
+    console.error("UPDATE USER ERROR:", err);
+    if (err.code === "23505") {
+      return res.json({ success: false, error: "That username already exists" });
+    }
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/change-password", async (req, res) => {
+  const userId = Number(req.body?.userId);
+  const username = cleanString(req.body?.username);
+  const currentPassword = cleanString(req.body?.currentPassword);
+  const newPassword = cleanString(req.body?.newPassword);
+
+  try {
+    if (!newPassword) {
+      return res.status(400).json({ success: false, error: "New password is required" });
+    }
+
+    let userResult;
+    if (Number.isInteger(userId) && userId > 0) {
+      userResult = await pool.query(
+        `SELECT id, username, password FROM users WHERE id = $1 LIMIT 1`,
+        [userId]
+      );
+    } else if (username) {
+      userResult = await pool.query(
+        `SELECT id, username, password FROM users WHERE username = $1 LIMIT 1`,
+        [username]
+      );
+    } else {
+      return res.status(400).json({ success: false, error: "User is required" });
+    }
+
+    if (!userResult.rows.length) {
+      return res.status(404).json({ success: false, error: "User not found" });
+    }
+
+    const user = userResult.rows[0];
+    if (currentPassword && currentPassword !== user.password) {
+      return res.status(400).json({ success: false, error: "Current password is incorrect" });
+    }
+
+    await pool.query(
+      `UPDATE users
+       SET password = $1,
+           must_change_password = FALSE,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2`,
+      [newPassword, user.id]
+    );
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("CHANGE PASSWORD ERROR:", err);
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -302,10 +354,7 @@ app.post("/save-job", async (req, res) => {
 
   try {
     if (!name) {
-      return res.json({
-        success: false,
-        error: "Job name is required",
-      });
+      return res.json({ success: false, error: "Job name is required" });
     }
 
     await pool.query(
@@ -313,70 +362,35 @@ app.post("/save-job", async (req, res) => {
       [name, JSON.stringify(data)]
     );
 
-    return res.json({
-      success: true,
-      message: "Job saved successfully",
-    });
+    return res.json({ success: true, message: "Job saved successfully" });
   } catch (err) {
     console.error("SAVE JOB ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-app.get("/jobs", async (req, res) => {
+app.get("/jobs", async (_req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT * FROM jobs ORDER BY id DESC"
-    );
-
+    const result = await pool.query("SELECT * FROM jobs ORDER BY id DESC");
     return res.json(result.rows);
   } catch (err) {
     console.error("LOAD JOBS ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-app.get("/records", async (req, res) => {
+app.get("/records", async (_req, res) => {
   try {
     const result = await pool.query(
-      `SELECT
-         id,
-         client,
-         city,
-         record_date,
-         jobsite,
-         psr,
-         system,
-         dia,
-         material,
-         footage,
-         notes,
-         status,
-         data,
-         created_by,
-         updated_by,
-         created_at,
-         updated_at
+      `SELECT id, client, city, record_date, jobsite, psr, system, dia, material, footage,
+              notes, status, data, created_by, updated_by, created_at, updated_at
        FROM planner_records
        ORDER BY id DESC`
     );
-
-    return res.json({
-      success: true,
-      records: result.rows,
-    });
+    return res.json({ success: true, records: result.rows });
   } catch (err) {
     console.error("GET RECORDS ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -385,31 +399,12 @@ app.get("/records/:id", async (req, res) => {
 
   try {
     if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({
-        success: false,
-        error: "Invalid record id",
-      });
+      return res.status(400).json({ success: false, error: "Invalid record id" });
     }
 
     const result = await pool.query(
-      `SELECT
-         id,
-         client,
-         city,
-         record_date,
-         jobsite,
-         psr,
-         system,
-         dia,
-         material,
-         footage,
-         notes,
-         status,
-         data,
-         created_by,
-         updated_by,
-         created_at,
-         updated_at
+      `SELECT id, client, city, record_date, jobsite, psr, system, dia, material, footage,
+              notes, status, data, created_by, updated_by, created_at, updated_at
        FROM planner_records
        WHERE id = $1
        LIMIT 1`,
@@ -417,147 +412,74 @@ app.get("/records/:id", async (req, res) => {
     );
 
     if (!result.rows.length) {
-      return res.status(404).json({
-        success: false,
-        error: "Record not found",
-      });
+      return res.status(404).json({ success: false, error: "Record not found" });
     }
 
-    return res.json({
-      success: true,
-      record: result.rows[0],
-    });
+    return res.json({ success: true, record: result.rows[0] });
   } catch (err) {
     console.error("GET RECORD ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-app.post("/records", async (req, res) => {
+async function createOrUpdateRecord(req, res, mode) {
   const normalized = normalizeRecordInput(req.body || {});
-  const username = cleanString(req.body?.username || req.body?.savedBy || req.body?.createdBy);
+  const username = cleanString(req.body?.username || req.body?.savedBy || req.body?.createdBy || req.body?.updatedBy);
 
   try {
-    const inserted = await pool.query(
-      `INSERT INTO planner_records (
-         client,
-         city,
-         record_date,
-         jobsite,
-         psr,
-         system,
-         dia,
-         material,
-         footage,
-         notes,
-         status,
-         data,
-         created_by,
-         updated_by
-       )
-       VALUES (
-         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $13
-       )
-       RETURNING
-         id,
-         client,
-         city,
-         record_date,
-         jobsite,
-         psr,
-         system,
-         dia,
-         material,
-         footage,
-         notes,
-         status,
-         data,
-         created_by,
-         updated_by,
-         created_at,
-         updated_at`,
-      [
-        normalized.client,
-        normalized.city,
-        normalized.date,
-        normalized.jobsite,
-        normalized.psr,
-        normalized.system,
-        normalized.dia,
-        normalized.material,
-        normalized.footage,
-        normalized.notes,
-        normalized.status,
-        JSON.stringify(normalized.data),
-        username,
-      ]
-    );
+    if (mode === "create") {
+      const inserted = await pool.query(
+        `INSERT INTO planner_records (
+           client, city, record_date, jobsite, psr, system, dia, material, footage,
+           notes, status, data, created_by, updated_by
+         )
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$13)
+         RETURNING id, client, city, record_date, jobsite, psr, system, dia, material,
+                   footage, notes, status, data, created_by, updated_by, created_at, updated_at`,
+        [
+          normalized.client,
+          normalized.city,
+          normalized.date,
+          normalized.jobsite,
+          normalized.psr,
+          normalized.system,
+          normalized.dia,
+          normalized.material,
+          normalized.footage,
+          normalized.notes,
+          normalized.status,
+          JSON.stringify(normalized.data),
+          username,
+        ]
+      );
 
-    return res.json({
-      success: true,
-      record: inserted.rows[0],
-    });
-  } catch (err) {
-    console.error("CREATE RECORD ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
-  }
-});
+      return res.json({ success: true, record: inserted.rows[0] });
+    }
 
-app.put("/records/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  const normalized = normalizeRecordInput(req.body || {});
-  const username = cleanString(req.body?.username || req.body?.savedBy || req.body?.updatedBy);
-
-  try {
+    const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({
-        success: false,
-        error: "Invalid record id",
-      });
+      return res.status(400).json({ success: false, error: "Invalid record id" });
     }
 
     const updated = await pool.query(
       `UPDATE planner_records
-       SET
-         client = $1,
-         city = $2,
-         record_date = $3,
-         jobsite = $4,
-         psr = $5,
-         system = $6,
-         dia = $7,
-         material = $8,
-         footage = $9,
-         notes = $10,
-         status = $11,
-         data = $12::jsonb,
-         updated_by = $13,
-         updated_at = CURRENT_TIMESTAMP
+       SET client = $1,
+           city = $2,
+           record_date = $3,
+           jobsite = $4,
+           psr = $5,
+           system = $6,
+           dia = $7,
+           material = $8,
+           footage = $9,
+           notes = $10,
+           status = $11,
+           data = $12::jsonb,
+           updated_by = $13,
+           updated_at = CURRENT_TIMESTAMP
        WHERE id = $14
-       RETURNING
-         id,
-         client,
-         city,
-         record_date,
-         jobsite,
-         psr,
-         system,
-         dia,
-         material,
-         footage,
-         notes,
-         status,
-         data,
-         created_by,
-         updated_by,
-         created_at,
-         updated_at`,
+       RETURNING id, client, city, record_date, jobsite, psr, system, dia, material,
+                 footage, notes, status, data, created_by, updated_by, created_at, updated_at`,
       [
         normalized.client,
         normalized.city,
@@ -577,255 +499,155 @@ app.put("/records/:id", async (req, res) => {
     );
 
     if (!updated.rows.length) {
-      return res.status(404).json({
-        success: false,
-        error: "Record not found",
-      });
+      return res.status(404).json({ success: false, error: "Record not found" });
     }
 
-    return res.json({
-      success: true,
-      record: updated.rows[0],
-    });
+    return res.json({ success: true, record: updated.rows[0] });
   } catch (err) {
-    console.error("UPDATE RECORD ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    console.error(mode === "create" ? "CREATE RECORD ERROR:" : "UPDATE RECORD ERROR:", err);
+    return res.status(500).json({ success: false, error: err.message });
   }
-});
+}
+
+app.post("/records", (req, res) => createOrUpdateRecord(req, res, "create"));
+app.put("/records/:id", (req, res) => createOrUpdateRecord(req, res, "update"));
+app.patch("/records/:id", (req, res) => createOrUpdateRecord(req, res, "update"));
 
 app.delete("/records/:id", async (req, res) => {
   const id = Number(req.params.id);
 
   try {
     if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({
-        success: false,
-        error: "Invalid record id",
-      });
+      return res.status(400).json({ success: false, error: "Invalid record id" });
     }
 
     const deleted = await pool.query(
-      `DELETE FROM planner_records
-       WHERE id = $1
-       RETURNING id`,
+      `DELETE FROM planner_records WHERE id = $1 RETURNING id`,
       [id]
     );
 
     if (!deleted.rows.length) {
-      return res.status(404).json({
-        success: false,
-        error: "Record not found",
-      });
+      return res.status(404).json({ success: false, error: "Record not found" });
     }
 
-    return res.json({
-      success: true,
-      deletedId: deleted.rows[0].id,
-    });
+    return res.json({ success: true, deletedId: deleted.rows[0].id });
   } catch (err) {
     console.error("DELETE RECORD ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-/* =========================
-   PRICING ROUTES
-   ========================= */
+/* Pricing */
 
-app.get("/pricing-rates", async (req, res) => {
+app.get("/pricing-rates", async (_req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, dia, rate, updated_at
-       FROM pricing_rates
-       ORDER BY
-         CASE
-           WHEN regexp_replace(dia, '[^0-9]', '', 'g') = '' THEN 999999
-           ELSE CAST(regexp_replace(dia, '[^0-9]', '', 'g') AS INTEGER)
-         END ASC,
-         dia ASC`
+      `SELECT id, dia, rate, updated_at FROM pricing_rates ORDER BY dia ASC`
     );
-
-    return res.json({
-      success: true,
-      rates: result.rows,
-    });
+    return res.json({ success: true, rates: result.rows });
   } catch (err) {
     console.error("GET PRICING RATES ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.get("/pricing-rates/:dia", async (req, res) => {
   const dia = cleanString(req.params.dia);
-
   try {
-    if (!dia) {
-      return res.status(400).json({
-        success: false,
-        error: "DIA is required",
-      });
-    }
-
     const result = await pool.query(
-      `SELECT id, dia, rate, updated_at
-       FROM pricing_rates
-       WHERE dia = $1
-       LIMIT 1`,
+      `SELECT id, dia, rate, updated_at FROM pricing_rates WHERE dia = $1 LIMIT 1`,
       [dia]
     );
 
     if (!result.rows.length) {
-      return res.status(404).json({
-        success: false,
-        error: "Pricing rate not found",
-      });
+      return res.status(404).json({ success: false, error: "Rate not found" });
     }
 
-    return res.json({
-      success: true,
-      rate: result.rows[0],
-    });
+    return res.json({ success: true, rate: result.rows[0] });
   } catch (err) {
     console.error("GET PRICING RATE ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.post("/pricing-rates", async (req, res) => {
   const { dia, rate } = normalizePricingInput(req.body || {});
-
   try {
     if (!dia || Number.isNaN(rate)) {
-      return res.status(400).json({
-        success: false,
-        error: "Valid dia and rate are required",
-      });
+      return res.status(400).json({ success: false, error: "Valid dia and rate are required" });
     }
 
     const result = await pool.query(
       `INSERT INTO pricing_rates (dia, rate, updated_at)
        VALUES ($1, $2, CURRENT_TIMESTAMP)
        ON CONFLICT (dia)
-       DO UPDATE SET
-         rate = EXCLUDED.rate,
-         updated_at = CURRENT_TIMESTAMP
+       DO UPDATE SET rate = EXCLUDED.rate, updated_at = CURRENT_TIMESTAMP
        RETURNING id, dia, rate, updated_at`,
       [dia, rate]
     );
 
-    return res.json({
-      success: true,
-      rate: result.rows[0],
-    });
+    return res.json({ success: true, rate: result.rows[0] });
   } catch (err) {
     console.error("CREATE PRICING RATE ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.put("/pricing-rates/:dia", async (req, res) => {
   const dia = cleanString(req.params.dia);
   const rate = Number(req.body?.rate);
-
   try {
     if (!dia || Number.isNaN(rate)) {
-      return res.status(400).json({
-        success: false,
-        error: "Valid dia and rate are required",
-      });
+      return res.status(400).json({ success: false, error: "Valid dia and rate are required" });
     }
 
     const result = await pool.query(
       `INSERT INTO pricing_rates (dia, rate, updated_at)
        VALUES ($1, $2, CURRENT_TIMESTAMP)
        ON CONFLICT (dia)
-       DO UPDATE SET
-         rate = EXCLUDED.rate,
-         updated_at = CURRENT_TIMESTAMP
+       DO UPDATE SET rate = EXCLUDED.rate, updated_at = CURRENT_TIMESTAMP
        RETURNING id, dia, rate, updated_at`,
       [dia, rate]
     );
 
-    return res.json({
-      success: true,
-      rate: result.rows[0],
-    });
+    return res.json({ success: true, rate: result.rows[0] });
   } catch (err) {
     console.error("UPDATE PRICING RATE ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.post("/pricing-rates/bulk", async (req, res) => {
   const rates = Array.isArray(req.body?.rates) ? req.body.rates : null;
-
   if (!rates) {
-    return res.status(400).json({
-      success: false,
-      error: "rates must be an array",
-    });
+    return res.status(400).json({ success: false, error: "rates must be an array" });
   }
 
   const client = await pool.connect();
-
   try {
     await client.query("BEGIN");
-
     const saved = [];
-
     for (const item of rates) {
       const dia = cleanString(item?.dia);
       const rate = Number(item?.rate);
-
       if (!dia || Number.isNaN(rate)) continue;
 
       const result = await client.query(
         `INSERT INTO pricing_rates (dia, rate, updated_at)
          VALUES ($1, $2, CURRENT_TIMESTAMP)
          ON CONFLICT (dia)
-         DO UPDATE SET
-           rate = EXCLUDED.rate,
-           updated_at = CURRENT_TIMESTAMP
+         DO UPDATE SET rate = EXCLUDED.rate, updated_at = CURRENT_TIMESTAMP
          RETURNING id, dia, rate, updated_at`,
         [dia, rate]
       );
-
-      if (result.rows[0]) {
-        saved.push(result.rows[0]);
-      }
+      if (result.rows[0]) saved.push(result.rows[0]);
     }
-
     await client.query("COMMIT");
-
-    return res.json({
-      success: true,
-      rates: saved,
-    });
+    return res.json({ success: true, rates: saved });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("BULK PRICING RATE ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
   } finally {
     client.release();
   }
@@ -833,43 +655,24 @@ app.post("/pricing-rates/bulk", async (req, res) => {
 
 app.delete("/pricing-rates/:dia", async (req, res) => {
   const dia = cleanString(req.params.dia);
-
   try {
-    if (!dia) {
-      return res.status(400).json({
-        success: false,
-        error: "DIA is required",
-      });
-    }
-
-    const result = await pool.query(
-      `DELETE FROM pricing_rates
-       WHERE dia = $1
-       RETURNING id, dia`,
+    const deleted = await pool.query(
+      `DELETE FROM pricing_rates WHERE dia = $1 RETURNING id, dia`,
       [dia]
     );
 
-    if (!result.rows.length) {
-      return res.status(404).json({
-        success: false,
-        error: "Pricing rate not found",
-      });
+    if (!deleted.rows.length) {
+      return res.status(404).json({ success: false, error: "Rate not found" });
     }
 
-    return res.json({
-      success: true,
-      deleted: result.rows[0],
-    });
+    return res.json({ success: true, deletedDia: deleted.rows[0].dia });
   } catch (err) {
     console.error("DELETE PRICING RATE ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log("Server running on port " + PORT);
+  console.log(`Server listening on ${PORT}`);
 });
