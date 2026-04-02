@@ -138,7 +138,7 @@ async function ensureSchema() {
     CREATE TABLE IF NOT EXISTS users (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       username TEXT NOT NULL UNIQUE,
-      display_name TEXT NOT NULL,
+      display_name TEXT,
       password TEXT NOT NULL,
       is_admin BOOLEAN NOT NULL DEFAULT false,
       roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": false}'::jsonb,
@@ -146,6 +146,55 @@ async function ensureSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS display_name TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": false}'::jsonb
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    UPDATE users
+    SET display_name = username
+    WHERE display_name IS NULL OR btrim(display_name) = ''
+  `);
+
+  await pool.query(`
+    UPDATE users
+    SET roles = '{"camera": true, "vac": false}'::jsonb
+    WHERE roles IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE users
+    SET must_change_password = false
+    WHERE must_change_password IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE users
+    SET updated_at = NOW()
+    WHERE updated_at IS NULL
   `);
 
   await pool.query(`
