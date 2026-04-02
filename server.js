@@ -610,6 +610,7 @@ app.get('/records', requireAuth, async (req, res) => {
        FROM planner_records
        ORDER BY updated_at DESC, created_at DESC`
     );
+
     const rows = result.rows.map((row) => ({
       id: row.id,
       record_date: row.record_date,
@@ -623,6 +624,7 @@ app.get('/records', requireAuth, async (req, res) => {
       created_at: row.created_at,
       updated_at: row.updated_at
     }));
+
     res.json({ success: true, records: rows });
   } catch (error) {
     console.error('GET RECORDS ERROR:', error);
@@ -654,10 +656,6 @@ app.post('/records', requireAuth, async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
-
-
-
-
 
 app.put('/records/:id', requireAuth, async (req, res) => {
   try {
@@ -698,26 +696,17 @@ app.put('/records/:id', requireAuth, async (req, res) => {
   }
 });
 
-
-
-
-    if (!result.rows.length) {
-      return res.status(404).json({ success: false, error: 'Record not found' });
-    }
-
-    res.json({ success: true, record: result.rows[0] });
-  catch (error) {
-    console.error('UPDATE RECORD ERROR:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 app.delete('/records/:id', requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query('DELETE FROM planner_records WHERE id = $1 RETURNING id', [req.params.id]);
+    const result = await pool.query(
+      'DELETE FROM planner_records WHERE id = $1 RETURNING id',
+      [req.params.id]
+    );
+
     if (!result.rows.length) {
       return res.status(404).json({ success: false, error: 'Record not found' });
     }
+
     res.json({ success: true, deletedId: result.rows[0].id });
   } catch (error) {
     console.error('DELETE RECORD ERROR:', error);
