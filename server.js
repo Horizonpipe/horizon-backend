@@ -1,1612 +1,773 @@
-
-const express = require("express");
-const cors = require("cors");
-const session = require("express-session");
-const connectPgSimple = require("connect-pg-simple");
-const multer = require("multer");
-const bcrypt = require("bcryptjs");
-const initSqlJs = require("sql.js");
-const XLSX = require("xlsx");
-const { createWorker } = require("tesseract.js");
-const { Pool } = require("pg");
-const path = require("path");
+const express = require('express');
+const cors = require('cors');
+const session = require('express-session');
+const PgSession = require('connect-pg-simple')(session);
+const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const multer = require('multer');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const path = require('path');
+const initSqlJs = require('sql.js');
+const { createWorker } = require('tesseract.js');
+const crypto = require('crypto');
 
 const app = express();
-app.set("trust proxy", 1);
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
-});
-
-const PgSession = connectPgSimple(session);
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: Number(process.env.MAX_UPLOAD_MB || 20) * 1024 * 1024,
-    files: Number(process.env.MAX_UPLOAD_FILES || 20),
-  },
-});
-
-const ALLOWED_ORIGINS = String(process.env.CORS_ORIGINS || "")
-  .split(",")
+const PORT = Number(process.env.PORT || 3000);
+const DATABASE_URL = process.env.DATABASE_URL;
+const SESSION_SECRET = process.env.SESSION_SECRET || 'change-me';
+const FRONTEND_ORIGINS = (process.env.CORS_ORIGINS || 'https://horizon-frontend.onrender.com,http://localhost:3000,http://127.0.0.1:3000')
+  .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+const SESSION_TTL_MS = 15 * 60 * 1000;
+
+if (!DATABASE_URL) {
+  console.error('DATABASE_URL is required.');
+  process.exit(1);
+}
+
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
+});
 
 app.use(cors({
   origin(origin, callback) {
-    if (!origin) return callback(null, true);
-    if (!ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error("Origin not allowed"));
+    if (!origin || FRONTEND_ORIGINS.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS blocked origin: ${origin}`));
   },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true
 }));
-app.use(express.json({ limit: "15mb" }));
-app.use(express.urlencoded({ extended: true, limit: "15mb" }));
 
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+app.use('/uploads', express.static(UPLOAD_DIR));
+app.set('trust proxy', 1);
 app.use(session({
-  store: new PgSession({
-    pool,
-    tableName: "user_sessions",
-    createTableIfMissing: true,
-  }),
-  secret: process.env.SESSION_SECRET || "change-this-secret",
-  name: "horizon.sid",
+  store: new PgSession({ pool, tableName: 'user_sessions', createTableIfMissing: true }),
+  secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
   rolling: true,
   cookie: {
-    maxAge: 15 * 60 * 1000,
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
-  },
+    sameSite: 'none',
+    secure: true,
+    maxAge: SESSION_TTL_MS
+  }
 }));
 
-function cleanString(value) {
-  if (value === null || value === undefined) return "";
-  return String(value).trim();
-}
-
-function isObject(value) {
-  return value && typeof value === "object" && !Array.isArray(value);
-}
-
-function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function normalizeRoles(roles) {
-  if (!isObject(roles)) return { camera: true, vac: true };
-  return {
-    camera: roles.camera !== false,
-    vac: roles.vac !== false,
-  };
-}
-
-function normalizeUser(userRow) {
-  if (!userRow) return null;
-  return {
-    id: userRow.id,
-    username: userRow.username,
-    isAdmin: !!userRow.is_admin,
-    roles: normalizeRoles(userRow.roles),
-    mustChangePassword: !!userRow.must_change_password,
-  };
-}
-
-function sessionUser(req) {
-  return normalizeUser(req.session?.user || null);
-}
-
-function isMikeUser(user) {
-  return cleanString(user?.username).toLowerCase() === "mike strickland";
-}
-
-function requireAuth(req, res, next) {
-  const user = sessionUser(req);
-  if (!user) return res.status(401).json({ success: false, error: "Authentication required" });
-  req.currentUser = user;
-  next();
-}
-
-function requireAdmin(req, res, next) {
-  const user = sessionUser(req);
-  if (!user) return res.status(401).json({ success: false, error: "Authentication required" });
-  if (!user.isAdmin) return res.status(403).json({ success: false, error: "Admin access required" });
-  req.currentUser = user;
-  next();
-}
-
-function requireMike(req, res, next) {
-  const user = sessionUser(req);
-  if (!user) return res.status(401).json({ success: false, error: "Authentication required" });
-  if (!isMikeUser(user)) return res.status(403).json({ success: false, error: "Mike-only importer access" });
-  req.currentUser = user;
-  next();
-}
-
-function isBcryptHash(value) {
-  return /^\$2[aby]\$\d+\$/.test(String(value || ""));
-}
-
-async function verifyPasswordAndUpgrade(userRow, password) {
-  const stored = cleanString(userRow?.password);
-  if (!stored) return false;
-  let ok = false;
-  if (isBcryptHash(stored)) {
-    ok = await bcrypt.compare(password, stored);
-  } else {
-    ok = stored === password;
-    if (ok) {
-      const hash = await bcrypt.hash(password, 10);
-      await pool.query(
-        `UPDATE users SET password = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-        [hash, userRow.id]
-      );
-      userRow.password = hash;
-    }
+const storage = multer.diskStorage({
+  destination: async (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: async (req, file, cb) => {
+    const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+    cb(null, `${Date.now()}_${crypto.randomUUID()}_${safe}`);
   }
-  return ok;
+});
+const upload = multer({ storage, limits: { fileSize: 40 * 1024 * 1024 } });
+
+function uid() { return crypto.randomUUID(); }
+function nowIso() { return new Date().toISOString(); }
+function safeJsonParse(value, fallback) {
+  try { return typeof value === 'string' ? JSON.parse(value) : (value ?? fallback); }
+  catch { return fallback; }
 }
-
-function normalizeRecordInput(body = {}) {
-  const data = isObject(body.data) ? body.data : {};
-  const client = cleanString(body.client ?? data.client);
-  const city = cleanString(body.city ?? data.city);
-  const date = cleanString(body.date ?? body.record_date ?? data.date ?? data.record_date);
-  const jobsite = cleanString(body.jobsite ?? body.jobsiteLabel ?? data.jobsite ?? data.jobsiteLabel);
-  const psr = cleanString(body.psr ?? data.psr);
-  const system = cleanString(body.system ?? data.system);
-  const dia = cleanString(body.dia ?? data.dia);
-  const material = cleanString(body.material ?? data.material);
-  const footage = cleanString(body.footage ?? body.length ?? data.footage ?? data.length);
-  const notes = cleanString(body.notes ?? data.notes);
-  const status = cleanString(body.status ?? data.status);
-
-  const mergedData = {
-    ...data,
-    client,
-    city,
-    date,
-    record_date: date,
-    jobsite,
-    psr,
-    system,
-    dia,
-    material,
-    footage,
-    notes,
-    status,
-  };
-
-  return {
-    client,
-    city,
-    date,
-    jobsite,
-    psr,
-    system,
-    dia,
-    material,
-    footage,
-    notes,
-    status,
-    data: mergedData,
-  };
+function normalizeStatus(value) {
+  const v = String(value || '').trim().toLowerCase();
+  if (['complete','video complete'].includes(v)) return 'complete';
+  if (['failed','video failed'].includes(v)) return 'failed';
+  if (['rerun','rerun queue','rerun queued','needs rerun'].includes(v)) return 'rerun';
+  if (['revideoed','rerun-videoed','rerun videoed'].includes(v)) return 'rerun-videoed';
+  if (['rerun-failed','rerun failed'].includes(v)) return 'rerun-failed';
+  if (['ni','not installed','could not locate','could-not-locate'].includes(v)) return 'could-not-locate';
+  if (['jetted'].includes(v)) return 'jetted';
+  return 'neutral';
 }
-
-function normalizePricingInput(body = {}) {
-  return {
-    dia: cleanString(body.dia),
-    rate: Number(body.rate),
-  };
-}
-
-function normalizeFileMeta(row) {
+function publicUser(row) {
   return {
     id: row.id,
-    label: cleanString(row.label),
-    fileName: cleanString(row.file_name),
-    contentType: cleanString(row.content_type),
-    byteSize: Number(row.byte_size || 0),
-    externalUrl: cleanString(row.external_url),
-    createdAt: row.created_at,
-    downloadUrl: cleanString(row.external_url) || `/files/${row.id}/download`,
+    username: row.username,
+    is_admin: !!row.is_admin,
+    can_camera: !!row.can_camera,
+    can_vac: !!row.can_vac,
+    must_change_password: !!row.must_change_password
   };
 }
-
-async function initDB() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        is_admin BOOLEAN NOT NULL DEFAULT FALSE,
-        roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": true}'::jsonb,
-        must_change_password BOOLEAN NOT NULL DEFAULT TRUE,
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS jobs (
-        id SERIAL PRIMARY KEY,
-        name TEXT,
-        data JSONB,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS planner_records (
-        id SERIAL PRIMARY KEY,
-        client TEXT DEFAULT '',
-        city TEXT DEFAULT '',
-        record_date TEXT DEFAULT '',
-        jobsite TEXT DEFAULT '',
-        psr TEXT DEFAULT '',
-        system TEXT DEFAULT '',
-        dia TEXT DEFAULT '',
-        material TEXT DEFAULT '',
-        footage TEXT DEFAULT '',
-        notes TEXT DEFAULT '',
-        status TEXT DEFAULT '',
-        data JSONB NOT NULL DEFAULT '{}'::jsonb,
-        created_by TEXT DEFAULT '',
-        updated_by TEXT DEFAULT '',
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_planner_records_record_date ON planner_records (record_date);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_planner_records_client ON planner_records (client);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_planner_records_city ON planner_records (city);`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_planner_records_jobsite ON planner_records (jobsite);`);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS pricing_rates (
-        id SERIAL PRIMARY KEY,
-        dia TEXT UNIQUE NOT NULL,
-        rate NUMERIC(10,2) NOT NULL DEFAULT 0,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS daily_reports (
-        id SERIAL PRIMARY KEY,
-        report_date TEXT NOT NULL,
-        notes TEXT DEFAULT '',
-        created_by TEXT DEFAULT '',
-        updated_by TEXT DEFAULT '',
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS jobsite_assets (
-        id SERIAL PRIMARY KEY,
-        jobsite TEXT NOT NULL,
-        site_contact TEXT DEFAULT '',
-        notes TEXT DEFAULT '',
-        external_url TEXT DEFAULT '',
-        created_by TEXT DEFAULT '',
-        updated_by TEXT DEFAULT '',
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS uploaded_files (
-        id SERIAL PRIMARY KEY,
-        owner_type TEXT NOT NULL,
-        owner_id BIGINT NOT NULL,
-        label TEXT DEFAULT '',
-        file_name TEXT DEFAULT '',
-        content_type TEXT DEFAULT '',
-        byte_size BIGINT NOT NULL DEFAULT 0,
-        file_data BYTEA,
-        external_url TEXT DEFAULT '',
-        created_by TEXT DEFAULT '',
-        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_uploaded_files_owner ON uploaded_files (owner_type, owner_id);`);
-
-    const countResult = await pool.query(`SELECT COUNT(*)::int AS count FROM users`);
-    if (!countResult.rows[0]?.count) {
-      const seeds = [
-        { username: "Tyler Clark", isAdmin: true, roles: { camera: true, vac: true } },
-        { username: "Nick Krull", isAdmin: true, roles: { camera: true, vac: true } },
-        { username: "Mike Strickland", isAdmin: true, roles: { camera: true, vac: true } },
-      ];
-      for (const seed of seeds) {
-        await pool.query(
-          `INSERT INTO users (username, password, is_admin, roles, must_change_password, updated_at)
-           VALUES ($1, $2, $3, $4::jsonb, TRUE, CURRENT_TIMESTAMP)`,
-          [seed.username, await bcrypt.hash("1234", 10), seed.isAdmin, JSON.stringify(seed.roles)]
-        );
-      }
-    }
-
-    console.log("Database initialized");
-  } catch (error) {
-    console.error("DATABASE INIT ERROR:", error);
-    throw error;
-  }
+function requireAuth(req, res, next) {
+  if (!req.session.user) return res.status(401).json({ error: 'Authentication required.' });
+  next();
 }
-
-const MATERIAL_LABELS = {
-  PE: "Polyethylene",
-  PVC: "Polyvinyl Chloride",
-  PP: "Polypropylene",
-  RCP: "Reinforced Concrete Pipe",
-  DIP: "Ductile Iron Pipe",
-  VCP: "Vitrified Clay Pipe",
-  STL: "Steel Pipe",
-};
-
-const SHAPE_LABELS = {
-  C: "Circular",
-  O: "Oval",
-  R: "Rectangular",
-  E: "Egg",
-  A: "Arch",
-  U: "U-Shape",
-};
-
-function inferStructureType(ref) {
-  const token = cleanString(ref).toUpperCase();
-  if (token.startsWith("CB")) return "CATCH BASIN";
-  if (token.startsWith("ME")) return "MITERED END";
-  return "MANHOLE";
+function requireAdmin(req, res, next) {
+  if (!req.session.user) return res.status(401).json({ error: 'Authentication required.' });
+  if (!req.session.user.is_admin) return res.status(403).json({ error: 'Admin access required.' });
+  next();
 }
-
-function parseDiaFromShape(shapeCode, size1, size2, unit) {
-  if (!size1 && !size2) return "";
-  const suffix = cleanString(unit) || "inch";
-  if (size1 && size2) return `${size1}/${size2}${suffix}`;
-  return `${size1}${suffix}`;
+function requireMike(req, res, next) {
+  if (!req.session.user) return res.status(401).json({ error: 'Authentication required.' });
+  const username = String(req.session.user.username || '').trim().toLowerCase();
+  if (!['mike strickland', 'mik'].includes(username)) return res.status(403).json({ error: 'Mike Strickland access only.' });
+  next();
 }
-
-function normalizeImportedMaterial(materialCode) {
-  const code = cleanString(materialCode).toUpperCase();
-  return MATERIAL_LABELS[code] || cleanString(materialCode);
+function allowSegmentWrite(req, res, next) {
+  if (!req.session.user) return res.status(401).json({ error: 'Authentication required.' });
+  const user = req.session.user;
+  if (user.is_admin || user.can_camera || user.can_vac) return next();
+  return res.status(403).json({ error: 'Segment edit access required.' });
 }
-
-function normalizeImportedShape(shapeCode, size1, size2, unit) {
-  const code = cleanString(shapeCode).toUpperCase();
-  const label = SHAPE_LABELS[code] || cleanString(shapeCode);
-  const dia = parseDiaFromShape(shapeCode, size1, size2, unit);
+function formatUploadFile(req, file) {
+  const base = `${req.protocol}://${req.get('host')}`;
   return {
-    code,
-    label,
-    dia,
-    raw: [label, dia].filter(Boolean).join(" ").trim(),
+    name: file.originalname,
+    original_name: file.originalname,
+    filename: file.filename,
+    mime: file.mimetype,
+    size: file.size,
+    url: `${base}/uploads/${file.filename}`,
+    uploaded_at: nowIso()
   };
 }
 
-async function parseWinCanDb3Buffer(buffer, sourceName = "upload.db3") {
-  const SQL = await initSqlJs();
-  const db = new SQL.Database(new Uint8Array(buffer));
-  const result = db.exec(`
-    SELECT
-      p.PRJ_Key AS project_name,
-      s.OBJ_Key AS psr,
-      COALESCE(si.INS_InspectedLength, s.OBJ_Length, s.OBJ_RealLength, s.OBJ_CMPLength) AS footage,
-      COALESCE(si.INS_StartDate, p.PRJ_Date, '') AS inspection_date,
-      TRIM(REPLACE(COALESCE(s.OBJ_City, ''), ',', '')) AS city,
-      TRIM(COALESCE(s.OBJ_Street, '')) AS street,
-      TRIM(COALESCE(fn.OBJ_Key, '')) AS upstream,
-      TRIM(COALESCE(tn.OBJ_Key, '')) AS downstream,
-      TRIM(COALESCE(s.OBJ_Material, '')) AS material_code,
-      TRIM(COALESCE(s.OBJ_Shape, '')) AS shape_code,
-      s.OBJ_Size1 AS size1,
-      s.OBJ_Size2 AS size2,
-      TRIM(COALESCE(s.OBJ_Unit, '')) AS unit
-    FROM SECTION s
-    LEFT JOIN PROJECT p ON p.PRJ_PK = s.OBJ_Project_FK
-    LEFT JOIN NODE fn ON fn.OBJ_Node_REF = s.OBJ_FromNode_REF
-    LEFT JOIN NODE tn ON tn.OBJ_Node_REF = s.OBJ_ToNode_REF
-    LEFT JOIN (
-      SELECT INS_Section_FK, MAX(INS_PK) AS latest_pk
-      FROM SECINSP
-      GROUP BY INS_Section_FK
-    ) latest ON latest.INS_Section_FK = s.OBJ_PK
-    LEFT JOIN SECINSP si ON si.INS_PK = latest.latest_pk
-    ORDER BY s.OBJ_Key
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_users (
+      id TEXT PRIMARY KEY,
+      username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
+      is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+      can_camera BOOLEAN NOT NULL DEFAULT TRUE,
+      can_vac BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS jobsites (
+      id TEXT PRIMARY KEY,
+      client TEXT NOT NULL,
+      city TEXT NOT NULL,
+      street TEXT DEFAULT '',
+      jobsite TEXT NOT NULL,
+      record_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      contact_name TEXT DEFAULT '',
+      contact_phone TEXT DEFAULT '',
+      contact_email TEXT DEFAULT '',
+      contact_notes TEXT DEFAULT '',
+      drive_url TEXT DEFAULT '',
+      create_storm BOOLEAN NOT NULL DEFAULT TRUE,
+      create_sanitary BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobsites_lookup ON jobsites (LOWER(client), LOWER(city), LOWER(jobsite));
+
+    CREATE TABLE IF NOT EXISTS segments (
+      id TEXT PRIMARY KEY,
+      jobsite_id TEXT NOT NULL REFERENCES jobsites(id) ON DELETE CASCADE,
+      system_type TEXT NOT NULL,
+      reference TEXT NOT NULL,
+      upstream TEXT DEFAULT '',
+      downstream TEXT DEFAULT '',
+      dia TEXT DEFAULT '',
+      material TEXT DEFAULT '',
+      length NUMERIC(12,3) DEFAULT 0,
+      footage NUMERIC(12,3) DEFAULT 0,
+      latest_status TEXT NOT NULL DEFAULT 'neutral',
+      versions JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(jobsite_id, system_type, reference)
+    );
+
+    CREATE TABLE IF NOT EXISTS pricing_rates (
+      dia TEXT PRIMARY KEY,
+      rate NUMERIC(12,2) NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS daily_reports (
+      id TEXT PRIMARY KEY,
+      report_date DATE NOT NULL,
+      title TEXT DEFAULT '',
+      notes TEXT DEFAULT '',
+      created_by TEXT NOT NULL,
+      files JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS jobsite_assets (
+      id TEXT PRIMARY KEY,
+      client TEXT NOT NULL,
+      city TEXT NOT NULL,
+      street TEXT DEFAULT '',
+      jobsite TEXT NOT NULL,
+      contact_name TEXT DEFAULT '',
+      contact_phone TEXT DEFAULT '',
+      contact_email TEXT DEFAULT '',
+      drive_url TEXT DEFAULT '',
+      notes TEXT DEFAULT '',
+      files JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
-  if (!result.length) {
-    return { rows: [], stats: { sourceType: "db3", sourceName, projectName: "", count: 0 } };
+
+  const existingCount = await pool.query('SELECT COUNT(*)::int AS count FROM app_users');
+  if (existingCount.rows[0].count === 0) {
+    const defaults = [
+      { username: 'Tyler Clark', password: '1234', is_admin: true, can_camera: true, can_vac: true },
+      { username: 'Nick Krull', password: '1234', is_admin: true, can_camera: true, can_vac: true },
+      { username: 'Mike Strickland', password: '1234', is_admin: true, can_camera: true, can_vac: true }
+    ];
+    for (const item of defaults) {
+      const hash = await bcrypt.hash(item.password, 10);
+      await pool.query(`
+        INSERT INTO app_users (id, username, password_hash, must_change_password, is_admin, can_camera, can_vac)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+      `, [uid(), item.username, hash, true, item.is_admin, item.can_camera, item.can_vac]);
+    }
   }
+}
 
-  const columns = result[0].columns;
-  const rows = result[0].values.map((valueRow) => {
-    const row = {};
-    columns.forEach((column, index) => { row[column] = valueRow[index]; });
-    const shape = normalizeImportedShape(row.shape_code, row.size1, row.size2, row.unit);
-    const footageValue = Number(row.footage);
-    const psr = cleanString(row.psr) || [cleanString(row.upstream), cleanString(row.downstream)].filter(Boolean).join("-");
-    return {
-      sourceType: "db3",
-      sourceName,
-      projectName: cleanString(row.project_name),
-      psr,
-      footage: Number.isFinite(footageValue) ? Number(footageValue.toFixed(3)) : "",
-      city: cleanString(row.city),
-      street: cleanString(row.street),
-      upstream: cleanString(row.upstream),
-      downstream: cleanString(row.downstream),
-      material: normalizeImportedMaterial(row.material_code),
-      materialCode: cleanString(row.material_code),
-      shape: shape.label,
-      shapeCode: shape.code,
-      shapeRaw: shape.raw,
-      dia: shape.dia,
-      inspectionDate: cleanString(row.inspection_date).slice(0, 10),
-      confidence: 0.99,
+async function findUserByUsername(username) {
+  const result = await pool.query('SELECT * FROM app_users WHERE LOWER(username)=LOWER($1) LIMIT 1', [username]);
+  return result.rows[0] || null;
+}
+
+async function hydrateRecords() {
+  const jobsResult = await pool.query('SELECT * FROM jobsites ORDER BY LOWER(client), LOWER(city), LOWER(jobsite), record_date DESC');
+  const segmentsResult = await pool.query('SELECT * FROM segments ORDER BY LOWER(reference)');
+  const segmentMap = new Map();
+  for (const row of segmentsResult.rows) {
+    const segment = {
+      id: row.id,
+      reference: row.reference,
+      upstream: row.upstream || '',
+      downstream: row.downstream || '',
+      dia: row.dia || '',
+      material: row.material || '',
+      length: row.length == null ? '' : String(row.length),
+      footage: row.footage == null ? '' : String(row.footage),
+      status: normalizeStatus(row.latest_status),
+      selectedVersionId: null,
+      versions: safeJsonParse(row.versions, []).map((v) => ({
+        id: v.id || uid(),
+        createdAt: v.createdAt || v.created_at || row.updated_at,
+        savedBy: v.savedBy || v.saved_by || 'System',
+        status: normalizeStatus(v.status),
+        notes: v.notes || '',
+        failureReason: v.failureReason || v.failure_reason || '',
+        recordedDate: String(v.recordedDate || v.recorded_date || '').slice(0, 10),
+        displayStatus: v.displayStatus || v.display_status || ''
+      }))
     };
-  }).filter((row) => row.psr);
+    segment.selectedVersionId = segment.versions[segment.versions.length - 1]?.id || null;
+    if (!segmentMap.has(row.jobsite_id)) segmentMap.set(row.jobsite_id, { storm: [], sanitary: [] });
+    const systems = segmentMap.get(row.jobsite_id);
+    if (!systems[row.system_type]) systems[row.system_type] = [];
+    systems[row.system_type].push(segment);
+  }
+  return jobsResult.rows.map((job) => ({
+    id: job.id,
+    client: job.client,
+    city: job.city,
+    street: job.street || '',
+    jobsite: job.jobsite,
+    record_date: String(job.record_date || '').slice(0, 10),
+    contact_name: job.contact_name || '',
+    contact_phone: job.contact_phone || '',
+    contact_email: job.contact_email || '',
+    contact_notes: job.contact_notes || '',
+    drive_url: job.drive_url || '',
+    createStorm: !!job.create_storm,
+    createSanitary: !!job.create_sanitary,
+    systems: segmentMap.get(job.id) || { storm: [], sanitary: [] }
+  }));
+}
 
+async function ensureTargetJobsite({ client, city, jobsite, street = '' }) {
+  const existing = await pool.query(
+    'SELECT * FROM jobsites WHERE LOWER(client)=LOWER($1) AND LOWER(city)=LOWER($2) AND LOWER(jobsite)=LOWER($3) LIMIT 1',
+    [client, city, jobsite]
+  );
+  if (existing.rows[0]) return existing.rows[0];
+  const id = uid();
+  const result = await pool.query(`
+    INSERT INTO jobsites (id, client, city, street, jobsite, record_date, create_storm, create_sanitary)
+    VALUES ($1,$2,$3,$4,$5,CURRENT_DATE,TRUE,TRUE)
+    RETURNING *
+  `, [id, client, city, street || '', jobsite]);
+  return result.rows[0];
+}
+
+async function segmentExists(jobsiteId, systemType, reference) {
+  const result = await pool.query(
+    'SELECT id FROM segments WHERE jobsite_id=$1 AND system_type=$2 AND LOWER(reference)=LOWER($3) LIMIT 1',
+    [jobsiteId, systemType, reference]
+  );
+  return !!result.rows[0];
+}
+
+function buildVersion({ status, notes = '', failureReason = '', recordedDate = '', savedBy = 'System' }) {
   return {
-    rows,
-    stats: {
-      sourceType: "db3",
-      sourceName,
-      projectName: cleanString(rows[0]?.projectName),
-      count: rows.length,
-    },
+    id: uid(),
+    createdAt: nowIso(),
+    savedBy,
+    status: normalizeStatus(status),
+    displayStatus: normalizeStatus(status),
+    notes,
+    failureReason,
+    recordedDate: String(recordedDate || nowIso().slice(0, 10)).slice(0, 10)
   };
 }
 
-function groupWordsByLine(words) {
-  const lines = [];
-  const sorted = (words || []).filter(Boolean).sort((a, b) => (a.bbox.y0 - b.bbox.y0) || (a.bbox.x0 - b.bbox.x0));
-  for (const word of sorted) {
-    const centerY = (word.bbox.y0 + word.bbox.y1) / 2;
-    const existing = lines.find((line) => Math.abs(line.centerY - centerY) < 12);
-    if (existing) {
-      existing.words.push(word);
-      existing.centerY = (existing.centerY * (existing.words.length - 1) + centerY) / existing.words.length;
-    } else {
-      lines.push({ centerY, words: [word] });
-    }
-  }
-  return lines
-    .map((line) => ({
-      centerY: line.centerY,
-      words: line.words.sort((a, b) => a.bbox.x0 - b.bbox.x0),
-    }))
-    .sort((a, b) => a.centerY - b.centerY);
+async function writeSegment(jobsiteId, payload, saveBy) {
+  const versions = Array.isArray(payload.versions) && payload.versions.length
+    ? payload.versions
+    : [buildVersion({ status: payload.status || 'neutral', notes: payload.notes || '', failureReason: payload.failureReason || '', recordedDate: payload.recordedDate || '', savedBy: saveBy || 'System' })];
+  const latest = versions[versions.length - 1];
+  return pool.query(`
+    INSERT INTO segments (id, jobsite_id, system_type, reference, upstream, downstream, dia, material, length, footage, latest_status, versions)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb)
+    ON CONFLICT (jobsite_id, system_type, reference)
+    DO UPDATE SET upstream=EXCLUDED.upstream, downstream=EXCLUDED.downstream, dia=EXCLUDED.dia, material=EXCLUDED.material,
+      length=EXCLUDED.length, footage=EXCLUDED.footage, latest_status=EXCLUDED.latest_status, versions=EXCLUDED.versions,
+      updated_at=NOW()
+  `, [
+    payload.id || uid(),
+    jobsiteId,
+    payload.system || payload.system_type || 'storm',
+    payload.reference,
+    payload.upstream || '',
+    payload.downstream || '',
+    payload.dia || '',
+    payload.material || '',
+    Number(payload.length || payload.footage || 0),
+    Number(payload.footage || payload.length || 0),
+    normalizeStatus(latest.status || payload.status || 'neutral'),
+    JSON.stringify(versions)
+  ]);
 }
 
-function headerColumnRanges(headerWords) {
-  const buckets = [];
-  const headerText = headerWords.map((w) => cleanString(w.text)).join(" ");
-  const aliases = [
-    { key: "psr", patterns: [/pipe/i, /segment/i, /refer/i] },
-    { key: "footage", patterns: [/total/i, /length/i] },
-    { key: "city", patterns: [/city/i] },
-    { key: "street", patterns: [/street/i] },
-    { key: "upstream", patterns: [/upstream/i] },
-    { key: "downstream", patterns: [/downstream/i] },
-    { key: "material", patterns: [/material/i] },
-    { key: "shape", patterns: [/shape/i] },
-  ];
-
-  if (!headerText) return buckets;
-
-  const lineText = headerWords.map((word) => ({
-    text: cleanString(word.text),
-    x0: word.bbox.x0,
-    x1: word.bbox.x1,
-  }));
-
-  for (const alias of aliases) {
-    const matching = lineText.filter((item) => alias.patterns.some((pattern) => pattern.test(item.text)));
-    if (!matching.length) continue;
-    buckets.push({
-      key: alias.key,
-      x0: Math.min(...matching.map((item) => item.x0)) - 12,
-      x1: Math.max(...matching.map((item) => item.x1)) + 22,
+async function parseDb3(filePath) {
+  const SQL = await initSqlJs({ locateFile: (file) => require.resolve(`sql.js/dist/${file}`) });
+  const buffer = await fsp.readFile(filePath);
+  const db = new SQL.Database(buffer);
+  const tables = new Set(db.exec("SELECT name FROM sqlite_master WHERE type='table'")[0]?.values?.map((row) => row[0]) || []);
+  if (!tables.has('SECTION')) throw new Error('SECTION table not found in DB3 file.');
+  const query = `
+    SELECT
+      s.OBJ_Key AS reference,
+      COALESCE(si.INS_InspectedLength, s.OBJ_Length, 0) AS length,
+      COALESCE(s.OBJ_City, '') AS city,
+      COALESCE(s.OBJ_Street, '') AS street,
+      COALESCE(s.OBJ_FromNode_REF, '') AS upstream,
+      COALESCE(s.OBJ_ToNode_REF, '') AS downstream,
+      COALESCE(s.OBJ_Material, '') AS material,
+      COALESCE(s.OBJ_Shape, '') AS shape,
+      COALESCE(s.OBJ_Size1, '') AS size1,
+      COALESCE(s.OBJ_Size2, '') AS size2
+    FROM SECTION s
+    LEFT JOIN SECINSP si ON si.OBJ_ID = s.OBJ_ID
+  `;
+  const result = db.exec(query);
+  const rows = [];
+  if (!result[0]) return rows;
+  const columns = result[0].columns;
+  for (const values of result[0].values) {
+    const row = Object.fromEntries(columns.map((column, index) => [column, values[index]]));
+    const shape = normalizeShape(row.shape, row.size1, row.size2);
+    rows.push({
+      reference: String(row.reference || '').trim(),
+      length: Number(row.length || 0).toFixed(3),
+      city: String(row.city || '').trim(),
+      street: String(row.street || '').trim(),
+      upstream: String(row.upstream || '').trim(),
+      downstream: String(row.downstream || '').trim(),
+      material: normalizeMaterial(row.material),
+      shape: shape.shape,
+      dia: shape.dia,
+      duplicate: false
     });
   }
-
-  return buckets.sort((a, b) => a.x0 - b.x0);
+  return rows.filter((row) => row.reference);
 }
 
-function wordsToColumns(words, ranges) {
-  const values = {};
-  for (const range of ranges) values[range.key] = [];
-  for (const word of words) {
-    const centerX = (word.bbox.x0 + word.bbox.x1) / 2;
-    const range = ranges.find((item) => centerX >= item.x0 && centerX <= item.x1)
-      || ranges.find((item) => centerX < item.x1)
-      || ranges[ranges.length - 1];
-    if (range) values[range.key].push(cleanString(word.text));
-  }
-  Object.keys(values).forEach((key) => {
-    values[key] = values[key].join(" ").replace(/\s+/g, " ").trim();
-  });
-  return values;
+function normalizeMaterial(raw) {
+  const v = String(raw || '').trim();
+  const map = {
+    PE: 'Polyethylene',
+    PVC: 'Polyvinyl Chloride',
+    PP: 'Polypropylene',
+    RCP: 'Reinforced Concrete Pipe',
+    VCP: 'Vitrified Clay Pipe'
+  };
+  return map[v] || v;
 }
 
-function parseShapeString(value) {
-  const raw = cleanString(value);
-  if (!raw) return { shape: "", dia: "", raw: "" };
-  const diaMatch = raw.match(/(\d+\s*\/\s*\d+|\d+(?:\.\d+)?)\s*(?:inch|in\b|")/i);
-  const dia = diaMatch ? diaMatch[1].replace(/\s+/g, "") + "inch" : "";
-  const shape = raw.replace(diaMatch ? diaMatch[0] : "", "").trim();
-  return { shape, dia, raw };
+function normalizeShape(shape, size1, size2) {
+  const s = String(shape || '').trim().toUpperCase();
+  const a = String(size1 || '').trim();
+  const b = String(size2 || '').trim();
+  if (!s && !a && !b) return { shape: '', dia: '' };
+  if (b && Number(b) > 0) return { shape: s === 'O' ? 'Oval' : 'Shape', dia: `${a}/${b}` };
+  const label = s === 'C' ? 'Circular' : s === 'O' ? 'Oval' : s;
+  return { shape: label, dia: a };
 }
 
-async function parseWinCanScreenshotBuffer(buffer, sourceName = "screenshot.png") {
-  const worker = await createWorker("eng");
+async function parseImageFile(filePath) {
+  const worker = await createWorker('eng');
   try {
-    const recognition = await worker.recognize(buffer);
-    const words = (recognition?.data?.words || [])
-      .filter((word) => cleanString(word.text) && Number(word.confidence || word.conf || 0) >= 20)
-      .map((word) => ({
-        text: word.text,
-        confidence: Number(word.confidence || word.conf || 0),
-        bbox: word.bbox,
-      }));
-
-    const lines = groupWordsByLine(words);
-    const headerLine = lines.find((line) => {
-      const text = line.words.map((word) => cleanString(word.text)).join(" ");
-      return /pipe/i.test(text) && /segment/i.test(text) && /length/i.test(text);
-    });
-
-    if (!headerLine) {
-      return { rows: [], stats: { sourceType: "screenshot", sourceName, count: 0, warning: "Could not detect WinCan table headers." } };
+    const out = await worker.recognize(filePath);
+    const text = out.data.text || '';
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const rows = [];
+    const rowPattern = /^([A-Z0-9-]+)\s+([0-9]+(?:\.[0-9]+)?)\s+(.+)$/i;
+    for (const line of lines) {
+      const match = line.match(rowPattern);
+      if (!match) continue;
+      rows.push({
+        reference: match[1].trim(),
+        length: Number(match[2]).toFixed(3),
+        city: '',
+        street: '',
+        upstream: '',
+        downstream: '',
+        material: '',
+        shape: '',
+        dia: '',
+        duplicate: false,
+        raw_line: line
+      });
     }
-
-    const ranges = headerColumnRanges(headerLine.words);
-    const rows = lines
-      .filter((line) => line.centerY > headerLine.centerY + 10)
-      .map((line) => {
-        const mapped = wordsToColumns(line.words, ranges);
-        const shape = parseShapeString(mapped.shape);
-        const psr = cleanString(mapped.psr);
-        if (!psr || /pipe segment/i.test(psr)) return null;
-        const footageValue = Number(String(mapped.footage || "").replace(/[^\d.]/g, ""));
-        return {
-          sourceType: "screenshot",
-          sourceName,
-          projectName: "",
-          psr,
-          footage: Number.isFinite(footageValue) ? Number(footageValue.toFixed(3)) : "",
-          city: cleanString(mapped.city),
-          street: cleanString(mapped.street),
-          upstream: cleanString(mapped.upstream),
-          downstream: cleanString(mapped.downstream),
-          material: cleanString(mapped.material),
-          materialCode: cleanString(mapped.material),
-          shape: cleanString(shape.shape),
-          shapeCode: "",
-          shapeRaw: cleanString(mapped.shape),
-          dia: cleanString(shape.dia),
-          inspectionDate: "",
-          confidence: Number((line.words.reduce((sum, word) => sum + Number(word.confidence || 0), 0) / Math.max(line.words.length, 1) / 100).toFixed(2)),
-        };
-      })
-      .filter(Boolean);
-
-    return {
-      rows,
-      stats: {
-        sourceType: "screenshot",
-        sourceName,
-        count: rows.length,
-      },
-    };
+    return rows;
   } finally {
     await worker.terminate();
   }
 }
 
-function parseSpreadsheetBuffer(buffer, sourceName = "import.xlsx") {
-  const workbook = XLSX.read(buffer, { type: "buffer" });
-  const firstSheetName = workbook.SheetNames[0];
-  const rows = XLSX.utils.sheet_to_json(workbook.Sheets[firstSheetName], { defval: "" });
-  const normalizedRows = rows.map((row) => {
-    const psr = cleanString(row["Pipe Segment Reference"] || row["PSR"] || row["Pipe Segment Refer"]);
-    const shapeCell = cleanString(row["Shape"] || "");
-    const shape = parseShapeString(shapeCell);
-    const footageValue = Number(row["Total Length [ft]"] || row["Total Length"] || row["Length"] || "");
-    return {
-      sourceType: "spreadsheet",
-      sourceName,
-      projectName: cleanString(row["Project"] || row["Project Name"]),
-      psr,
-      footage: Number.isFinite(footageValue) ? Number(footageValue.toFixed(3)) : "",
-      city: cleanString(row["City"]),
-      street: cleanString(row["Street"]),
-      upstream: cleanString(row["Upstream MH"] || row["Upstream M"]),
-      downstream: cleanString(row["Downstream MH"] || row["Downstream M"]),
-      material: cleanString(row["Material"]),
-      materialCode: cleanString(row["Material"]),
-      shape: cleanString(shape.shape),
-      shapeCode: "",
-      shapeRaw: shapeCell,
-      dia: cleanString(shape.dia),
-      inspectionDate: cleanString(row["Date"] || row["Inspection Date"]).slice(0, 10),
-      confidence: 0.95,
-    };
-  }).filter((row) => row.psr);
-  return {
-    rows: normalizedRows,
-    stats: {
-      sourceType: "spreadsheet",
-      sourceName,
-      count: normalizedRows.length,
-    },
-  };
-}
-
-async function parseUploadedImportFile(file) {
-  const ext = path.extname(cleanString(file.originalname)).toLowerCase();
-  if (ext === ".db3" || ext === ".sqlite" || ext === ".sqlite3") {
-    return parseWinCanDb3Buffer(file.buffer, file.originalname);
-  }
-  if (ext === ".xlsx" || ext === ".xls" || ext === ".csv") {
-    return parseSpreadsheetBuffer(file.buffer, file.originalname);
-  }
-  if ((file.mimetype || "").startsWith("image/")) {
-    return parseWinCanScreenshotBuffer(file.buffer, file.originalname);
-  }
-  throw new Error(`Unsupported importer file type for ${file.originalname}`);
-}
-
-function buildImportedVersion(row, userName) {
-  return {
-    id: `import-${Math.random().toString(36).slice(2)}-${Date.now()}`,
-    createdAt: new Date().toISOString(),
-    savedBy: userName,
-    savedById: null,
-    mode: "import",
-    flags: {
-      videoComplete: false,
-      videoFailed: false,
-      rerun: false,
-      rerunVideoed: false,
-      rerunFailed: false,
-      couldNotLocate: false,
-      jetted: false,
-    },
-    failureReason: "",
-    recordedDate: cleanString(row.inspectionDate) || todayISO(),
-    notes: `Imported from ${row.sourceType.toUpperCase()} (${row.sourceName})`,
-    status: "neutral",
-    displayStatus: "Unmarked",
-  };
-}
-
-function normalizeImportRows(rows) {
-  return (Array.isArray(rows) ? rows : []).map((row) => ({
-    sourceType: cleanString(row.sourceType || "db3"),
-    sourceName: cleanString(row.sourceName || ""),
-    projectName: cleanString(row.projectName || ""),
-    psr: cleanString(row.psr),
-    footage: cleanString(row.footage),
-    city: cleanString(row.city),
-    street: cleanString(row.street),
-    upstream: cleanString(row.upstream),
-    downstream: cleanString(row.downstream),
-    material: cleanString(row.material),
-    materialCode: cleanString(row.materialCode),
-    shape: cleanString(row.shape),
-    shapeCode: cleanString(row.shapeCode),
-    shapeRaw: cleanString(row.shapeRaw),
-    dia: cleanString(row.dia),
-    inspectionDate: cleanString(row.inspectionDate).slice(0, 10),
-    confidence: Number(row.confidence || 0),
-  })).filter((row) => row.psr);
-}
-
-function groupImportedRows(rows, options = {}) {
-  const mode = cleanString(options.groupMode || "street").toLowerCase();
-  const system = cleanString(options.system || "storm").toLowerCase() === "sanitary" ? "sanitary" : "storm";
-  const defaultClient = cleanString(options.client);
-  const defaultJobsite = cleanString(options.singleJobsite);
-  const defaultDate = cleanString(options.recordDate) || todayISO();
-  const groups = new Map();
-
-  for (const row of rows) {
-    const client = defaultClient || row.projectName || "WinCan Import";
-    const city = row.city || cleanString(options.city);
-    const jobsite = mode === "single"
-      ? (defaultJobsite || row.street || row.projectName || "Imported Job")
-      : (row.street || defaultJobsite || row.projectName || "Imported Job");
-    const recordDate = row.inspectionDate || defaultDate;
-    const key = [client, city, jobsite, recordDate, system].join("|");
-
-    if (!groups.has(key)) {
-      groups.set(key, {
-        client,
-        city,
-        jobsite,
-        date: recordDate,
-        system,
-        rows: [],
-      });
-    }
-    groups.get(key).rows.push(row);
-  }
-
-  return Array.from(groups.values());
-}
-
-async function fetchExistingRecord(client, group) {
-  const result = await client.query(
-    `SELECT id, client, city, record_date, jobsite, data
-     FROM planner_records
-     WHERE client = $1 AND city = $2 AND jobsite = $3 AND record_date = $4
-     ORDER BY id DESC
-     LIMIT 1`,
-    [group.client, group.city, group.jobsite, group.date]
-  );
-  return result.rows[0] || null;
-}
-
-function ensureRecordDataShape(recordRow, group) {
-  let data = recordRow?.data;
-  if (!isObject(data)) {
-    data = {};
-  }
-  if (typeof data === "string") {
-    try { data = JSON.parse(data); } catch (_error) { data = {}; }
-  }
-  const systems = isObject(data.systems) ? data.systems : {};
-  return {
-    date: cleanString(data.date || recordRow?.record_date || group.date),
-    client: cleanString(data.client || recordRow?.client || group.client),
-    city: cleanString(data.city || recordRow?.city || group.city),
-    jobsite: cleanString(data.jobsite || recordRow?.jobsite || group.jobsite),
-    createStorm: systems.storm !== null,
-    createSanitary: systems.sanitary !== null,
-    systems: {
-      storm: Array.isArray(systems.storm) ? systems.storm : [],
-      sanitary: Array.isArray(systems.sanitary) ? systems.sanitary : [],
-    },
-  };
-}
-
-function importedSegmentFromRow(row, userName) {
-  const version = buildImportedVersion(row, userName);
-  return {
-    id: `seg-${Math.random().toString(36).slice(2)}-${Date.now()}`,
-    reference: row.psr,
-    selectedVersionId: version.id,
-    versions: [version],
-    endpoints: {
-      startType: inferStructureType(row.upstream),
-      startRef: row.upstream,
-      endType: inferStructureType(row.downstream),
-      endRef: row.downstream,
-    },
-    dia: row.dia,
-    material: row.material,
-    footage: row.footage,
-    length: row.footage,
-  };
-}
-
-async function commitImportedRows(rows, options, user) {
-  const groups = groupImportedRows(rows, options);
-  const client = await pool.connect();
-  const createdIds = [];
-  try {
-    await client.query("BEGIN");
-
-    for (const group of groups) {
-      const existing = await fetchExistingRecord(client, group);
-      const recordData = ensureRecordDataShape(existing, group);
-      const targetList = recordData.systems[group.system] || [];
-      const existingRefs = new Set(targetList.map((segment) => cleanString(segment.reference).toLowerCase()));
-      let importedCount = 0;
-
-      for (const row of group.rows) {
-        if (existingRefs.has(row.psr.toLowerCase())) continue;
-        targetList.push(importedSegmentFromRow(row, user.username));
-        existingRefs.add(row.psr.toLowerCase());
-        importedCount += 1;
-      }
-
-      recordData.systems[group.system] = targetList;
-      recordData.createStorm = recordData.systems.storm !== null;
-      recordData.createSanitary = recordData.systems.sanitary !== null;
-
-      const normalized = normalizeRecordInput({
-        client: group.client,
-        city: group.city,
-        date: group.date,
-        jobsite: group.jobsite,
-        status: "",
-        data: recordData,
-      });
-
-      if (existing) {
-        await client.query(
-          `UPDATE planner_records
-           SET client = $1,
-               city = $2,
-               record_date = $3,
-               jobsite = $4,
-               data = $5::jsonb,
-               updated_by = $6,
-               updated_at = CURRENT_TIMESTAMP
-           WHERE id = $7`,
-          [
-            normalized.client,
-            normalized.city,
-            normalized.date,
-            normalized.jobsite,
-            JSON.stringify(normalized.data),
-            user.username,
-            existing.id,
-          ]
-        );
-        createdIds.push(existing.id);
-      } else {
-        const inserted = await client.query(
-          `INSERT INTO planner_records (
-            client, city, record_date, jobsite, psr, system, dia, material, footage,
-            notes, status, data, created_by, updated_by
-          )
-          VALUES ($1,$2,$3,$4,'','','','','','','',$5::jsonb,$6,$6)
-          RETURNING id`,
-          [
-            normalized.client,
-            normalized.city,
-            normalized.date,
-            normalized.jobsite,
-            JSON.stringify(normalized.data),
-            user.username,
-          ]
-        );
-        createdIds.push(inserted.rows[0].id);
-      }
-    }
-
-    await client.query("COMMIT");
-    return { createdIds, groupCount: groups.length };
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
-async function addFilesForOwner(ownerType, ownerId, files, createdBy, externalUrls = []) {
-  const inserted = [];
-  for (const file of files || []) {
-    const row = await pool.query(
-      `INSERT INTO uploaded_files (
-        owner_type, owner_id, label, file_name, content_type, byte_size, file_data, external_url, created_by
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-      RETURNING id, label, file_name, content_type, byte_size, external_url, created_at`,
-      [
-        ownerType,
-        ownerId,
-        cleanString(file.originalname),
-        cleanString(file.originalname),
-        cleanString(file.mimetype),
-        Number(file.size || file.buffer?.length || 0),
-        file.buffer,
-        "",
-        createdBy,
-      ]
-    );
-    inserted.push(normalizeFileMeta(row.rows[0]));
-  }
-  for (const url of externalUrls) {
-    const cleanUrl = cleanString(url);
-    if (!cleanUrl) continue;
-    const row = await pool.query(
-      `INSERT INTO uploaded_files (
-        owner_type, owner_id, label, file_name, content_type, byte_size, file_data, external_url, created_by
-      )
-      VALUES ($1,$2,$3,'','',0,NULL,$4,$5)
-      RETURNING id, label, file_name, content_type, byte_size, external_url, created_at`,
-      [ownerType, ownerId, cleanUrl, cleanUrl, createdBy]
-    );
-    inserted.push(normalizeFileMeta(row.rows[0]));
-  }
-  return inserted;
-}
-
-async function mapFilesByOwner(ownerType, ownerIds) {
-  if (!ownerIds.length) return new Map();
-  const result = await pool.query(
-    `SELECT id, owner_id, label, file_name, content_type, byte_size, external_url, created_at
-     FROM uploaded_files
-     WHERE owner_type = $1 AND owner_id = ANY($2::bigint[])
-     ORDER BY created_at DESC`,
-    [ownerType, ownerIds]
-  );
-  const map = new Map();
-  for (const row of result.rows) {
-    if (!map.has(row.owner_id)) map.set(row.owner_id, []);
-    map.get(row.owner_id).push(normalizeFileMeta(row));
-  }
-  return map;
-}
-
-function parseExternalUrls(value) {
-  if (Array.isArray(value)) return value.map(cleanString).filter(Boolean);
-  const raw = cleanString(value);
-  if (!raw) return [];
-  if (raw.startsWith("[")) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parsed.map(cleanString).filter(Boolean);
-    } catch (_error) {}
-  }
-  return raw.split(/\r?\n|,/).map(cleanString).filter(Boolean);
-}
-
-app.get("/", (_req, res) => {
-  res.send("Horizon Backend Running");
+app.get('/health', async (req, res) => {
+  res.json({ ok: true, now: nowIso() });
 });
 
-app.get("/health", (_req, res) => {
+app.get('/session', async (req, res) => {
+  if (!req.session.user) return res.status(200).json({ authenticated: false });
+  res.json({ authenticated: true, user: req.session.user });
+});
+
+app.post('/session/logout', requireAuth, async (req, res) => {
+  req.session.destroy(() => {
+    res.clearCookie('connect.sid');
+    res.json({ ok: true });
+  });
+});
+
+app.post('/login', async (req, res) => {
+  const username = String(req.body.username || '').trim();
+  const password = String(req.body.password || '');
+  if (!username || !password) return res.status(400).json({ error: 'Username and password are required.' });
+  const user = await findUserByUsername(username);
+  if (!user) return res.status(401).json({ error: 'Invalid username or password.' });
+  const ok = await bcrypt.compare(password, user.password_hash);
+  if (!ok) return res.status(401).json({ error: 'Invalid username or password.' });
+  req.session.cookie.maxAge = SESSION_TTL_MS;
+  req.session.user = publicUser(user);
+  res.json({ ok: true, user: req.session.user });
+});
+
+app.post('/change-password', requireAuth, async (req, res) => {
+  const targetUsername = String(req.body.username || req.session.user.username || '').trim();
+  const newPassword = String(req.body.newPassword || '').trim();
+  if (!newPassword || newPassword.length < 4) return res.status(400).json({ error: 'New password must be at least 4 characters.' });
+  if (!req.session.user.is_admin && targetUsername.toLowerCase() !== String(req.session.user.username || '').toLowerCase()) {
+    return res.status(403).json({ error: 'You can only change your own password.' });
+  }
+  const hash = await bcrypt.hash(newPassword, 10);
+  await pool.query('UPDATE app_users SET password_hash=$1, must_change_password=FALSE, updated_at=NOW() WHERE LOWER(username)=LOWER($2)', [hash, targetUsername]);
+  if (targetUsername.toLowerCase() === String(req.session.user.username || '').toLowerCase()) {
+    const updated = await findUserByUsername(targetUsername);
+    req.session.user = publicUser(updated);
+  }
   res.json({ ok: true });
 });
 
-app.get("/auth/usernames", async (_req, res) => {
-  try {
-    const result = await pool.query(`SELECT username FROM users ORDER BY username ASC`);
-    return res.json({ success: true, usernames: result.rows.map((row) => row.username) });
-  } catch (error) {
-    console.error("USERNAME LIST ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
+app.get('/users', async (req, res) => {
+  const result = await pool.query('SELECT id, username, is_admin, can_camera, can_vac, must_change_password FROM app_users ORDER BY LOWER(username)');
+  res.json({ users: result.rows });
 });
 
-app.get("/session", (req, res) => {
-  const user = sessionUser(req);
-  return res.json({ success: true, authenticated: !!user, user });
+app.post('/create-user', requireAdmin, async (req, res) => {
+  const username = String(req.body.username || '').trim();
+  const password = String(req.body.password || '1234');
+  if (!username) return res.status(400).json({ error: 'Username is required.' });
+  const existing = await findUserByUsername(username);
+  if (existing) return res.status(409).json({ error: 'That username already exists.' });
+  const hash = await bcrypt.hash(password, 10);
+  const row = await pool.query(`
+    INSERT INTO app_users (id, username, password_hash, must_change_password, is_admin, can_camera, can_vac)
+    VALUES ($1,$2,$3,$4,$5,$6,$7)
+    RETURNING id, username, is_admin, can_camera, can_vac, must_change_password
+  `, [uid(), username, hash, password === '1234', !!req.body.is_admin, !!req.body.can_camera, !!req.body.can_vac]);
+  res.status(201).json({ user: row.rows[0] });
 });
 
-async function loginHandler(req, res) {
-  const username = cleanString(req.body?.username);
-  const password = cleanString(req.body?.password);
-  try {
-    if (!username || !password) {
-      return res.status(400).json({ success: false, error: "Username and password are required" });
-    }
-    const result = await pool.query(
-      `SELECT id, username, password, is_admin, roles, must_change_password
-       FROM users
-       WHERE LOWER(username) = LOWER($1)
-       LIMIT 1`,
-      [username]
-    );
-    if (!result.rows.length) {
-      return res.status(401).json({ success: false, error: "Invalid username or password" });
-    }
-    const userRow = result.rows[0];
-    const verified = await verifyPasswordAndUpgrade(userRow, password);
-    if (!verified) {
-      return res.status(401).json({ success: false, error: "Invalid username or password" });
-    }
-    const user = normalizeUser(userRow);
-    req.session.user = user;
-    return res.json({ success: true, user });
-  } catch (error) {
-    console.error("LOGIN ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-}
-
-app.post("/login", loginHandler);
-app.post("/session/login", loginHandler);
-
-app.post("/session/logout", requireAuth, (req, res) => {
-  req.session.destroy((error) => {
-    if (error) return res.status(500).json({ success: false, error: "Could not sign out" });
-    res.clearCookie("horizon.sid");
-    return res.json({ success: true });
-  });
+app.put('/users/:id', requireAdmin, async (req, res) => {
+  const row = await pool.query(`
+    UPDATE app_users SET is_admin=$1, can_camera=$2, can_vac=$3, updated_at=NOW()
+    WHERE id=$4 RETURNING id, username, is_admin, can_camera, can_vac, must_change_password
+  `, [!!req.body.is_admin, !!req.body.can_camera, !!req.body.can_vac, req.params.id]);
+  if (!row.rows[0]) return res.status(404).json({ error: 'User not found.' });
+  res.json({ user: row.rows[0] });
 });
 
-app.post("/change-password", requireAuth, async (req, res) => {
-  const currentPassword = cleanString(req.body?.currentPassword);
-  const newPassword = cleanString(req.body?.newPassword);
-  try {
-    if (!newPassword || newPassword.length < 4) {
-      return res.status(400).json({ success: false, error: "Use at least 4 characters for the new password" });
-    }
-    const result = await pool.query(
-      `SELECT id, username, password FROM users WHERE id = $1 LIMIT 1`,
-      [req.currentUser.id]
-    );
-    if (!result.rows.length) {
-      return res.status(404).json({ success: false, error: "User not found" });
-    }
-    const verified = await verifyPasswordAndUpgrade(result.rows[0], currentPassword);
-    if (!verified) {
-      return res.status(400).json({ success: false, error: "Current password is incorrect" });
-    }
-    const hash = await bcrypt.hash(newPassword, 10);
-    await pool.query(
-      `UPDATE users
-       SET password = $1, must_change_password = FALSE, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2`,
-      [hash, req.currentUser.id]
-    );
-    req.session.user = { ...req.currentUser, mustChangePassword: false };
-    return res.json({ success: true, user: req.session.user });
-  } catch (error) {
-    console.error("CHANGE PASSWORD ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
+app.get('/records', requireAuth, async (req, res) => {
+  const records = await hydrateRecords();
+  res.json({ records });
 });
 
-app.post("/users/:id/reset-password", requireAdmin, async (req, res) => {
-  const id = Number(req.params.id);
-  const nextPassword = cleanString(req.body?.password || "1234");
-  try {
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({ success: false, error: "Invalid user id" });
-    }
-    const hash = await bcrypt.hash(nextPassword, 10);
-    const result = await pool.query(
-      `UPDATE users
-       SET password = $1, must_change_password = TRUE, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2
-       RETURNING id, username, is_admin, roles, must_change_password`,
-      [hash, id]
-    );
-    if (!result.rows.length) {
-      return res.status(404).json({ success: false, error: "User not found" });
-    }
-    return res.json({ success: true, user: normalizeUser(result.rows[0]) });
-  } catch (error) {
-    console.error("RESET PASSWORD ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
+app.post('/records', requireAdmin, async (req, res) => {
+  const id = uid();
+  const client = String(req.body.client || '').trim();
+  const city = String(req.body.city || '').trim();
+  const jobsite = String(req.body.jobsite || '').trim();
+  if (!client || !city || !jobsite) return res.status(400).json({ error: 'Client, city, and jobsite are required.' });
+  const recordDate = String(req.body.record_date || req.body.date || '').slice(0, 10) || nowIso().slice(0, 10);
+  await pool.query(`
+    INSERT INTO jobsites (id, client, city, street, jobsite, record_date, create_storm, create_sanitary)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+  `, [id, client, city, String(req.body.street || ''), jobsite, recordDate, !!req.body.createStorm, !!req.body.createSanitary]);
+  res.status(201).json({ ok: true, id });
 });
 
-app.get("/users", requireAdmin, async (_req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, username, is_admin, roles, must_change_password, created_at, updated_at
-       FROM users
-       ORDER BY username ASC`
-    );
-    return res.json({ success: true, users: result.rows.map(normalizeUser) });
-  } catch (error) {
-    console.error("GET USERS ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
+app.delete('/records/:id', requireAdmin, async (req, res) => {
+  await pool.query('DELETE FROM jobsites WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
 });
 
-async function createUserHandler(req, res) {
-  const username = cleanString(req.body?.username);
-  const password = cleanString(req.body?.password || "1234");
-  const isAdmin = !!req.body?.isAdmin;
-  const roles = normalizeRoles(req.body?.roles);
-  try {
-    if (!username) {
-      return res.status(400).json({ success: false, error: "Username is required" });
-    }
-    const hash = await bcrypt.hash(password, 10);
-    const inserted = await pool.query(
-      `INSERT INTO users (username, password, is_admin, roles, must_change_password, updated_at)
-       VALUES ($1, $2, $3, $4::jsonb, TRUE, CURRENT_TIMESTAMP)
-       RETURNING id, username, is_admin, roles, must_change_password`,
-      [username, hash, isAdmin, JSON.stringify(roles)]
-    );
-    return res.json({ success: true, user: normalizeUser(inserted.rows[0]) });
-  } catch (error) {
-    console.error("CREATE USER ERROR:", error);
-    if (error.code === "23505") {
-      return res.status(409).json({ success: false, error: "That username already exists" });
-    }
-    return res.status(500).json({ success: false, error: error.message });
-  }
-}
-
-app.post("/users", requireAdmin, createUserHandler);
-app.post("/create-user", requireAdmin, createUserHandler);
-
-app.put("/users/:id", requireAdmin, async (req, res) => {
-  const id = Number(req.params.id);
-  const username = cleanString(req.body?.username);
-  const isAdmin = !!req.body?.isAdmin;
-  const roles = normalizeRoles(req.body?.roles);
-  try {
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({ success: false, error: "Invalid user id" });
-    }
-    const result = await pool.query(
-      `UPDATE users
-       SET username = COALESCE(NULLIF($1, ''), username),
-           is_admin = $2,
-           roles = $3::jsonb,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $4
-       RETURNING id, username, is_admin, roles, must_change_password`,
-      [username, isAdmin, JSON.stringify(roles), id]
-    );
-    if (!result.rows.length) {
-      return res.status(404).json({ success: false, error: "User not found" });
-    }
-    return res.json({ success: true, user: normalizeUser(result.rows[0]) });
-  } catch (error) {
-    console.error("UPDATE USER ERROR:", error);
-    if (error.code === "23505") {
-      return res.status(409).json({ success: false, error: "That username already exists" });
-    }
-    return res.status(500).json({ success: false, error: error.message });
-  }
+app.delete('/clients/:client', requireAdmin, async (req, res) => {
+  await pool.query('DELETE FROM jobsites WHERE LOWER(client)=LOWER($1)', [req.params.client]);
+  res.json({ ok: true });
 });
 
-app.post("/save-job", requireAuth, async (req, res) => {
-  const name = cleanString(req.body?.name);
-  const data = isObject(req.body?.data) ? req.body.data : {};
-  try {
-    if (!name) return res.status(400).json({ success: false, error: "Job name is required" });
-    await pool.query(`INSERT INTO jobs (name, data) VALUES ($1, $2::jsonb)`, [name, JSON.stringify(data)]);
-    return res.json({ success: true });
-  } catch (error) {
-    console.error("SAVE JOB ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
+app.post('/records/:id/segments', allowSegmentWrite, async (req, res) => {
+  const recordId = req.params.id;
+  const record = await pool.query('SELECT * FROM jobsites WHERE id=$1', [recordId]);
+  if (!record.rows[0]) return res.status(404).json({ error: 'Jobsite not found.' });
+  if (!req.body.reference) return res.status(400).json({ error: 'Segment reference is required.' });
+  await writeSegment(recordId, { ...req.body, id: uid() }, req.session.user.username);
+  res.status(201).json({ ok: true });
 });
 
-app.get("/jobs", requireAuth, async (_req, res) => {
-  try {
-    const result = await pool.query(`SELECT * FROM jobs ORDER BY id DESC`);
-    return res.json({ success: true, jobs: result.rows });
-  } catch (error) {
-    console.error("GET JOBS ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
+app.post('/records/:id/segments/bulk', requireAdmin, async (req, res) => {
+  const recordId = req.params.id;
+  const list = Array.isArray(req.body.segments) ? req.body.segments : [];
+  for (const segment of list) {
+    if (!segment.reference) continue;
+    await writeSegment(recordId, { ...segment, id: uid() }, req.session.user.username);
   }
+  res.json({ ok: true, count: list.length });
 });
 
-app.get("/records", requireAuth, async (_req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, client, city, record_date, jobsite, psr, system, dia, material, footage,
-              notes, status, data, created_by, updated_by, created_at, updated_at
-       FROM planner_records
-       ORDER BY updated_at DESC, id DESC`
-    );
-    return res.json({ success: true, records: result.rows });
-  } catch (error) {
-    console.error("GET RECORDS ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
+app.put('/records/:recordId/segments/:segmentId', allowSegmentWrite, async (req, res) => {
+  const row = await pool.query('SELECT * FROM segments WHERE id=$1 AND jobsite_id=$2', [req.params.segmentId, req.params.recordId]);
+  if (!row.rows[0]) return res.status(404).json({ error: 'Segment not found.' });
+  const segment = row.rows[0];
+  const recordPatch = req.body.recordPatch || {};
+  const segmentPatch = req.body.segmentPatch || {};
+  const versionPatch = req.body.versionPatch || {};
+  if (Object.keys(recordPatch).length) {
+    const record = await pool.query(`
+      UPDATE jobsites SET jobsite=COALESCE(NULLIF($1,''), jobsite), updated_at=NOW() WHERE id=$2
+    `, [recordPatch.jobsite || '', req.params.recordId]);
   }
-});
-
-app.get("/records/:id", requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  try {
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({ success: false, error: "Invalid record id" });
-    }
-    const result = await pool.query(
-      `SELECT id, client, city, record_date, jobsite, psr, system, dia, material, footage,
-              notes, status, data, created_by, updated_by, created_at, updated_at
-       FROM planner_records
-       WHERE id = $1
-       LIMIT 1`,
-      [id]
-    );
-    if (!result.rows.length) {
-      return res.status(404).json({ success: false, error: "Record not found" });
-    }
-    return res.json({ success: true, record: result.rows[0] });
-  } catch (error) {
-    console.error("GET RECORD ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-async function createOrUpdateRecord(req, res, mode) {
-  const normalized = normalizeRecordInput(req.body || {});
-  const username = req.currentUser?.username || cleanString(req.body?.username || req.body?.savedBy || req.body?.createdBy || req.body?.updatedBy);
-  try {
-    if (mode === "create") {
-      const inserted = await pool.query(
-        `INSERT INTO planner_records (
-          client, city, record_date, jobsite, psr, system, dia, material, footage,
-          notes, status, data, created_by, updated_by
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$13)
-        RETURNING id, client, city, record_date, jobsite, psr, system, dia, material, footage,
-                  notes, status, data, created_by, updated_by, created_at, updated_at`,
-        [
-          normalized.client,
-          normalized.city,
-          normalized.date,
-          normalized.jobsite,
-          normalized.psr,
-          normalized.system,
-          normalized.dia,
-          normalized.material,
-          normalized.footage,
-          normalized.notes,
-          normalized.status,
-          JSON.stringify(normalized.data),
-          username,
-        ]
-      );
-      return res.json({ success: true, record: inserted.rows[0] });
-    }
-
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({ success: false, error: "Invalid record id" });
-    }
-    const updated = await pool.query(
-      `UPDATE planner_records
-       SET client = $1,
-           city = $2,
-           record_date = $3,
-           jobsite = $4,
-           psr = $5,
-           system = $6,
-           dia = $7,
-           material = $8,
-           footage = $9,
-           notes = $10,
-           status = $11,
-           data = $12::jsonb,
-           updated_by = $13,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $14
-       RETURNING id, client, city, record_date, jobsite, psr, system, dia, material, footage,
-                 notes, status, data, created_by, updated_by, created_at, updated_at`,
-      [
-        normalized.client,
-        normalized.city,
-        normalized.date,
-        normalized.jobsite,
-        normalized.psr,
-        normalized.system,
-        normalized.dia,
-        normalized.material,
-        normalized.footage,
-        normalized.notes,
-        normalized.status,
-        JSON.stringify(normalized.data),
-        username,
-        id,
-      ]
-    );
-    if (!updated.rows.length) {
-      return res.status(404).json({ success: false, error: "Record not found" });
-    }
-    return res.json({ success: true, record: updated.rows[0] });
-  } catch (error) {
-    console.error(mode === "create" ? "CREATE RECORD ERROR:" : "UPDATE RECORD ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-}
-
-app.post("/records", requireAuth, (req, res) => createOrUpdateRecord(req, res, "create"));
-app.put("/records/:id", requireAuth, (req, res) => createOrUpdateRecord(req, res, "update"));
-app.patch("/records/:id", requireAuth, (req, res) => createOrUpdateRecord(req, res, "update"));
-
-app.delete("/records/:id", requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  try {
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({ success: false, error: "Invalid record id" });
-    }
-    const deleted = await pool.query(`DELETE FROM planner_records WHERE id = $1 RETURNING id`, [id]);
-    if (!deleted.rows.length) {
-      return res.status(404).json({ success: false, error: "Record not found" });
-    }
-    return res.json({ success: true, deletedId: deleted.rows[0].id });
-  } catch (error) {
-    console.error("DELETE RECORD ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get("/pricing-rates", requireAuth, async (_req, res) => {
-  try {
-    const result = await pool.query(`SELECT id, dia, rate, updated_at FROM pricing_rates ORDER BY dia ASC`);
-    return res.json({ success: true, rates: result.rows });
-  } catch (error) {
-    console.error("GET PRICING RATES ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.put("/pricing-rates/:dia", requireAdmin, async (req, res) => {
-  const dia = cleanString(req.params.dia);
-  const rate = Number(req.body?.rate);
-  try {
-    if (!dia || Number.isNaN(rate)) {
-      return res.status(400).json({ success: false, error: "Valid dia and rate are required" });
-    }
-    const result = await pool.query(
-      `INSERT INTO pricing_rates (dia, rate, updated_at)
-       VALUES ($1, $2, CURRENT_TIMESTAMP)
-       ON CONFLICT (dia)
-       DO UPDATE SET rate = EXCLUDED.rate, updated_at = CURRENT_TIMESTAMP
-       RETURNING id, dia, rate, updated_at`,
-      [dia, rate]
-    );
-    return res.json({ success: true, rate: result.rows[0] });
-  } catch (error) {
-    console.error("SAVE PRICING RATE ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.delete("/pricing-rates/:dia", requireAdmin, async (req, res) => {
-  const dia = cleanString(req.params.dia);
-  try {
-    const deleted = await pool.query(`DELETE FROM pricing_rates WHERE dia = $1 RETURNING id, dia`, [dia]);
-    if (!deleted.rows.length) {
-      return res.status(404).json({ success: false, error: "Rate not found" });
-    }
-    return res.json({ success: true, deletedDia: deleted.rows[0].dia });
-  } catch (error) {
-    console.error("DELETE PRICING RATE ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get("/daily-reports", requireAuth, async (_req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, report_date, notes, created_by, updated_by, created_at, updated_at
-       FROM daily_reports
-       ORDER BY report_date DESC, created_at DESC`
-    );
-    const ids = result.rows.map((row) => row.id);
-    const filesMap = await mapFilesByOwner("daily_report", ids);
-    const reports = result.rows.map((row) => ({
-      id: row.id,
-      reportDate: row.report_date,
-      notes: row.notes || "",
-      createdBy: row.created_by || "",
-      updatedBy: row.updated_by || "",
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      attachments: filesMap.get(row.id) || [],
-    }));
-    return res.json({ success: true, reports });
-  } catch (error) {
-    console.error("GET DAILY REPORTS ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.post("/daily-reports", requireAdmin, upload.array("files", 8), async (req, res) => {
-  const reportDate = cleanString(req.body?.reportDate || req.body?.date) || todayISO();
-  const notes = cleanString(req.body?.notes);
-  try {
-    const inserted = await pool.query(
-      `INSERT INTO daily_reports (report_date, notes, created_by, updated_by)
-       VALUES ($1, $2, $3, $3)
-       RETURNING id, report_date, notes, created_by, updated_by, created_at, updated_at`,
-      [reportDate, notes, req.currentUser.username]
-    );
-    const report = inserted.rows[0];
-    const attachments = await addFilesForOwner(
-      "daily_report",
-      report.id,
-      req.files,
-      req.currentUser.username,
-      parseExternalUrls(req.body?.externalUrls)
-    );
-    return res.json({
-      success: true,
-      report: {
-        id: report.id,
-        reportDate: report.report_date,
-        notes: report.notes || "",
-        createdBy: report.created_by || "",
-        updatedBy: report.updated_by || "",
-        createdAt: report.created_at,
-        updatedAt: report.updated_at,
-        attachments,
-      },
-    });
-  } catch (error) {
-    console.error("CREATE DAILY REPORT ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.delete("/daily-reports/:id", requireAdmin, async (req, res) => {
-  const id = Number(req.params.id);
-  try {
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({ success: false, error: "Invalid report id" });
-    }
-    await pool.query(`DELETE FROM uploaded_files WHERE owner_type = 'daily_report' AND owner_id = $1`, [id]);
-    const deleted = await pool.query(`DELETE FROM daily_reports WHERE id = $1 RETURNING id`, [id]);
-    if (!deleted.rows.length) {
-      return res.status(404).json({ success: false, error: "Report not found" });
-    }
-    return res.json({ success: true, deletedId: deleted.rows[0].id });
-  } catch (error) {
-    console.error("DELETE DAILY REPORT ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get("/jobsite-assets", requireAuth, async (req, res) => {
-  const search = cleanString(req.query?.search).toLowerCase();
-  try {
-    const result = await pool.query(
-      `SELECT id, jobsite, site_contact, notes, external_url, created_by, updated_by, created_at, updated_at
-       FROM jobsite_assets
-       ORDER BY updated_at DESC, id DESC`
-    );
-    const ids = result.rows.map((row) => row.id);
-    const filesMap = await mapFilesByOwner("jobsite_asset", ids);
-    const assets = result.rows
-      .map((row) => ({
-        id: row.id,
-        jobsite: row.jobsite || "",
-        siteContact: row.site_contact || "",
-        notes: row.notes || "",
-        externalUrl: row.external_url || "",
-        createdBy: row.created_by || "",
-        updatedBy: row.updated_by || "",
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-        attachments: filesMap.get(row.id) || [],
-      }))
-      .filter((row) => {
-        if (!search) return true;
-        const hay = `${row.jobsite} ${row.siteContact} ${row.notes}`.toLowerCase();
-        return hay.includes(search);
-      });
-    return res.json({ success: true, assets });
-  } catch (error) {
-    console.error("GET JOBSITE ASSETS ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.post("/jobsite-assets", requireAuth, upload.array("files", 12), async (req, res) => {
-  const jobsite = cleanString(req.body?.jobsite);
-  const siteContact = cleanString(req.body?.siteContact);
-  const notes = cleanString(req.body?.notes);
-  const externalUrl = cleanString(req.body?.externalUrl);
-  try {
-    if (!jobsite) return res.status(400).json({ success: false, error: "Jobsite is required" });
-    const inserted = await pool.query(
-      `INSERT INTO jobsite_assets (jobsite, site_contact, notes, external_url, created_by, updated_by)
-       VALUES ($1, $2, $3, $4, $5, $5)
-       RETURNING id, jobsite, site_contact, notes, external_url, created_by, updated_by, created_at, updated_at`,
-      [jobsite, siteContact, notes, externalUrl, req.currentUser.username]
-    );
-    const asset = inserted.rows[0];
-    const attachments = await addFilesForOwner(
-      "jobsite_asset",
-      asset.id,
-      req.files,
-      req.currentUser.username,
-      parseExternalUrls(req.body?.externalUrls)
-    );
-    return res.json({
-      success: true,
-      asset: {
-        id: asset.id,
-        jobsite: asset.jobsite || "",
-        siteContact: asset.site_contact || "",
-        notes: asset.notes || "",
-        externalUrl: asset.external_url || "",
-        createdBy: asset.created_by || "",
-        updatedBy: asset.updated_by || "",
-        createdAt: asset.created_at,
-        updatedAt: asset.updated_at,
-        attachments,
-      },
-    });
-  } catch (error) {
-    console.error("CREATE JOBSITE ASSET ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.delete("/jobsite-assets/:id", requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  try {
-    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ success: false, error: "Invalid asset id" });
-    await pool.query(`DELETE FROM uploaded_files WHERE owner_type = 'jobsite_asset' AND owner_id = $1`, [id]);
-    const deleted = await pool.query(`DELETE FROM jobsite_assets WHERE id = $1 RETURNING id`, [id]);
-    if (!deleted.rows.length) return res.status(404).json({ success: false, error: "Asset not found" });
-    return res.json({ success: true, deletedId: deleted.rows[0].id });
-  } catch (error) {
-    console.error("DELETE JOBSITE ASSET ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get("/files/:id/download", requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  try {
-    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ success: false, error: "Invalid file id" });
-    const result = await pool.query(
-      `SELECT id, file_name, content_type, file_data, external_url
-       FROM uploaded_files
-       WHERE id = $1
-       LIMIT 1`,
-      [id]
-    );
-    if (!result.rows.length) return res.status(404).json({ success: false, error: "File not found" });
-    const file = result.rows[0];
-    if (cleanString(file.external_url)) return res.redirect(file.external_url);
-    res.setHeader("Content-Type", cleanString(file.content_type) || "application/octet-stream");
-    res.setHeader("Content-Disposition", `attachment; filename="${cleanString(file.file_name) || `file-${id}`}"`);
-    return res.send(file.file_data);
-  } catch (error) {
-    console.error("FILE DOWNLOAD ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.post("/imports/wincan/preview", requireMike, upload.array("files", 20), async (req, res) => {
-  try {
-    if (!req.files?.length) {
-      return res.status(400).json({ success: false, error: "Upload at least one DB3, image, or spreadsheet file" });
-    }
-    const parsed = [];
-    for (const file of req.files) {
-      parsed.push(await parseUploadedImportFile(file));
-    }
-    const rows = parsed.flatMap((item) => item.rows);
-    const stats = {
-      totalRows: rows.length,
-      files: parsed.map((item) => item.stats),
+  const versions = safeJsonParse(segment.versions, []);
+  if (Object.keys(versionPatch).length) {
+    const latest = versions[versions.length - 1] || buildVersion({ status: segment.latest_status, savedBy: req.session.user.username });
+    const nextVersion = {
+      ...latest,
+      id: uid(),
+      createdAt: nowIso(),
+      savedBy: req.body.saveBy || req.session.user.username,
+      status: normalizeStatus(versionPatch.status || latest.status),
+      notes: versionPatch.notes ?? latest.notes ?? '',
+      failureReason: versionPatch.failureReason ?? latest.failureReason ?? '',
+      recordedDate: String(versionPatch.recordedDate || latest.recordedDate || nowIso().slice(0, 10)).slice(0, 10)
     };
-    return res.json({ success: true, preview: { rows, stats } });
-  } catch (error) {
-    console.error("WINCAN PREVIEW ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
+    versions.push(nextVersion);
   }
+  await pool.query(`
+    UPDATE segments SET
+      reference=COALESCE(NULLIF($1,''), reference),
+      upstream=COALESCE($2, upstream),
+      downstream=COALESCE($3, downstream),
+      dia=COALESCE($4, dia),
+      material=COALESCE($5, material),
+      length=COALESCE($6, length),
+      footage=COALESCE($7, footage),
+      latest_status=$8,
+      versions=$9::jsonb,
+      updated_at=NOW()
+    WHERE id=$10 AND jobsite_id=$11
+  `, [
+    segmentPatch.reference ?? '',
+    segmentPatch.upstream ?? segment.upstream,
+    segmentPatch.downstream ?? segment.downstream,
+    segmentPatch.dia ?? segment.dia,
+    segmentPatch.material ?? segment.material,
+    segmentPatch.length === '' ? 0 : (segmentPatch.length ?? segment.length),
+    segmentPatch.footage === '' ? (segmentPatch.length === '' ? 0 : segmentPatch.length ?? segment.footage) : (segmentPatch.footage ?? segment.footage),
+    normalizeStatus((versions[versions.length - 1] || {}).status || segment.latest_status),
+    JSON.stringify(versions),
+    req.params.segmentId,
+    req.params.recordId
+  ]);
+  res.json({ ok: true });
 });
 
-app.post("/imports/wincan/commit", requireMike, async (req, res) => {
-  try {
-    const rows = normalizeImportRows(req.body?.rows);
-    const options = isObject(req.body?.options) ? req.body.options : {};
-    if (!rows.length) {
-      return res.status(400).json({ success: false, error: "No preview rows supplied for import" });
-    }
-    const result = await commitImportedRows(rows, options, req.currentUser);
-    return res.json({ success: true, ...result });
-  } catch (error) {
-    console.error("WINCAN COMMIT ERROR:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
+app.delete('/records/:recordId/segments/:segmentId', requireAdmin, async (req, res) => {
+  await pool.query('DELETE FROM segments WHERE id=$1 AND jobsite_id=$2', [req.params.segmentId, req.params.recordId]);
+  res.json({ ok: true });
 });
 
-initDB()
-  .then(() => {
-    const PORT = process.env.PORT || 10000;
-    app.listen(PORT, () => {
-      console.log(`Server listening on ${PORT}`);
-    });
-  })
-  .catch((error) => {
-    console.error("Startup failed:", error);
-    process.exit(1);
+app.post('/records/:recordId/segments/:segmentId/move', requireAdmin, async (req, res) => {
+  const source = await pool.query('SELECT * FROM segments WHERE id=$1 AND jobsite_id=$2', [req.params.segmentId, req.params.recordId]);
+  if (!source.rows[0]) return res.status(404).json({ error: 'Segment not found.' });
+  const targetClient = String(req.body.targetClient || '').trim();
+  const targetCity = String(req.body.targetCity || '').trim();
+  const targetJobsite = String(req.body.targetJobsite || '').trim();
+  const targetSystem = String(req.body.targetSystem || 'storm').trim();
+  if (!targetClient || !targetCity || !targetJobsite) return res.status(400).json({ error: 'Target client, city, and jobsite are required.' });
+  const target = await ensureTargetJobsite({ client: targetClient, city: targetCity, jobsite: targetJobsite, street: '' });
+  const dup = await segmentExists(target.id, targetSystem, source.rows[0].reference);
+  if (dup) return res.status(409).json({ error: 'That target already has this segment reference.' });
+  await pool.query('UPDATE segments SET jobsite_id=$1, system_type=$2, updated_at=NOW() WHERE id=$3', [target.id, targetSystem, req.params.segmentId]);
+  res.json({ ok: true });
+});
+
+app.get('/pricing-rates', requireAuth, async (req, res) => {
+  const result = await pool.query('SELECT dia, rate FROM pricing_rates ORDER BY dia');
+  res.json({ rates: result.rows });
+});
+
+app.put('/pricing-rates/:dia', requireAdmin, async (req, res) => {
+  const dia = String(req.params.dia || '').trim();
+  const rate = Number(req.body.rate || 0);
+  if (!dia) return res.status(400).json({ error: 'DIA is required.' });
+  await pool.query(`
+    INSERT INTO pricing_rates (dia, rate, updated_at) VALUES ($1,$2,NOW())
+    ON CONFLICT (dia) DO UPDATE SET rate=EXCLUDED.rate, updated_at=NOW()
+  `, [dia, rate]);
+  res.json({ ok: true });
+});
+
+app.delete('/pricing-rates/:dia', requireAdmin, async (req, res) => {
+  await pool.query('DELETE FROM pricing_rates WHERE dia=$1', [req.params.dia]);
+  res.json({ ok: true });
+});
+
+app.get('/daily-reports', requireAuth, async (req, res) => {
+  const result = await pool.query('SELECT * FROM daily_reports ORDER BY report_date DESC, created_at DESC');
+  res.json({ reports: result.rows.map((row) => ({ ...row, files: safeJsonParse(row.files, []) })) });
+});
+
+app.post('/daily-reports', requireAdmin, upload.array('files', 12), async (req, res) => {
+  const files = (req.files || []).map((file) => formatUploadFile(req, file));
+  const row = await pool.query(`
+    INSERT INTO daily_reports (id, report_date, title, notes, created_by, files)
+    VALUES ($1,$2,$3,$4,$5,$6::jsonb)
+    RETURNING *
+  `, [uid(), String(req.body.report_date || '').slice(0, 10) || nowIso().slice(0, 10), req.body.title || '', req.body.notes || '', req.session.user.username, JSON.stringify(files)]);
+  res.status(201).json({ report: { ...row.rows[0], files } });
+});
+
+app.delete('/daily-reports/:id', requireAdmin, async (req, res) => {
+  await pool.query('DELETE FROM daily_reports WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+});
+
+app.get('/jobsite-assets', requireAuth, async (req, res) => {
+  const result = await pool.query('SELECT * FROM jobsite_assets ORDER BY LOWER(client), LOWER(city), LOWER(jobsite), created_at DESC');
+  res.json({ assets: result.rows.map((row) => ({ ...row, files: safeJsonParse(row.files, []) })) });
+});
+
+app.post('/jobsite-assets', requireAdmin, upload.array('files', 20), async (req, res) => {
+  const files = (req.files || []).map((file) => formatUploadFile(req, file));
+  const row = await pool.query(`
+    INSERT INTO jobsite_assets (id, client, city, street, jobsite, contact_name, contact_phone, contact_email, drive_url, notes, files)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)
+    RETURNING *
+  `, [uid(), req.body.assetClient || '', req.body.assetCity || '', '', req.body.assetJobsite || '', req.body.assetContactName || '', req.body.assetContactPhone || '', req.body.assetContactEmail || '', req.body.assetDriveUrl || '', req.body.assetNotes || '', JSON.stringify(files)]);
+  res.status(201).json({ asset: { ...row.rows[0], files } });
+});
+
+app.delete('/jobsite-assets/:id', requireAdmin, async (req, res) => {
+  await pool.query('DELETE FROM jobsite_assets WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+});
+
+app.post('/imports/wincan/preview', requireMike, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Import file is required.' });
+  const ext = path.extname(req.file.originalname).toLowerCase();
+  const sourceKind = ['.db3', '.sqlite', '.db'].includes(ext) ? 'DB3' : 'SCREENSHOT';
+  let rows = [];
+  if (sourceKind === 'DB3') rows = await parseDb3(req.file.path);
+  else rows = await parseImageFile(req.file.path);
+
+  const target = await ensureTargetJobsite({
+    client: String(req.body.targetClient || 'Imported Client').trim(),
+    city: String(req.body.targetCity || 'Imported City').trim(),
+    jobsite: String(req.body.targetJobsite || 'Imported Jobsite').trim(),
+    street: rows[0]?.street || ''
   });
+  const system = String(req.body.targetSystem || 'storm').trim();
+  for (const row of rows) {
+    row.duplicate = await segmentExists(target.id, system, row.reference);
+  }
+  res.json({ rows, sourceKind });
+});
+
+app.post('/imports/wincan/commit', requireMike, async (req, res) => {
+  const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
+  if (!rows.length) return res.status(400).json({ error: 'Nothing to import.' });
+  const target = await ensureTargetJobsite({
+    client: String(req.body.targetClient || '').trim(),
+    city: String(req.body.targetCity || '').trim(),
+    jobsite: String(req.body.targetJobsite || '').trim(),
+    street: rows[0]?.street || ''
+  });
+  const system = String(req.body.targetSystem || 'storm').trim();
+  let count = 0;
+  for (const row of rows) {
+    if (!row.reference) continue;
+    if (await segmentExists(target.id, system, row.reference)) continue;
+    await writeSegment(target.id, {
+      id: uid(),
+      system,
+      reference: row.reference,
+      upstream: row.upstream || '',
+      downstream: row.downstream || '',
+      dia: row.dia || '',
+      material: row.material || '',
+      length: Number(row.length || 0),
+      footage: Number(row.length || 0),
+      versions: [buildVersion({ status: 'neutral', notes: `Imported from ${req.body.targetClient || 'WinCan'} preview.`, recordedDate: nowIso().slice(0, 10), savedBy: req.session.user.username })]
+    }, req.session.user.username);
+    count += 1;
+  }
+  res.json({ ok: true, imported: count });
+});
+
+app.use((error, req, res, next) => {
+  console.error(error);
+  res.status(500).json({ error: error.message || 'Server error.' });
+});
+
+initDb().then(() => {
+  app.listen(PORT, () => console.log(`Horizon backend listening on ${PORT}`));
+}).catch((error) => {
+  console.error('Failed to initialize backend:', error);
+  process.exit(1);
+});
