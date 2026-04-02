@@ -210,29 +210,36 @@ async function issueSession(userId) {
   await pool.query(
     `INSERT INTO auth_sessions (token, user_id, expires_at)
      VALUES ($1, $2, NOW() + ($3 || ' minutes')::interval)`,
-    [token, userId, SESSION_TTL_MINUTES]
+    [token, String(userId), SESSION_TTL_MINUTES]
   );
   return token;
 }
 
 async function readSession(token) {
   if (!token) return null;
+
   await pool.query(`DELETE FROM auth_sessions WHERE expires_at < NOW()`);
+
   const result = await pool.query(
-    `SELECT s.token, s.user_id, s.expires_at, u.id, u.username, u.display_name, u.password,
+    `SELECT s.token, s.user_id, s.expires_at,
+            u.id, u.username, u.display_name, u.password,
             u.is_admin, u.roles, u.must_change_password
      FROM auth_sessions s
-     JOIN users u ON u.id = s.user_id
+     JOIN users u ON CAST(u.id AS text) = s.user_id
      WHERE s.token = $1
      LIMIT 1`,
     [token]
   );
+
   if (!result.rows.length) return null;
+
   const row = result.rows[0];
+
   if (new Date(row.expires_at).getTime() < Date.now()) {
     await pool.query('DELETE FROM auth_sessions WHERE token = $1', [token]);
     return null;
   }
+
   await pool.query(
     `UPDATE auth_sessions
      SET expires_at = NOW() + ($2 || ' minutes')::interval,
@@ -240,6 +247,7 @@ async function readSession(token) {
      WHERE token = $1`,
     [token, SESSION_TTL_MINUTES]
   );
+
   return normalizeUser(row);
 }
 
@@ -393,10 +401,12 @@ async function ensureSchema() {
   await pool.query(`UPDATE users SET roles = '{"camera": true, "vac": false}'::jsonb WHERE roles IS NULL`);
   await pool.query(`UPDATE users SET must_change_password = false WHERE must_change_password IS NULL`);
 
+  await pool.query(`DROP TABLE IF EXISTS auth_sessions`);
+
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS auth_sessions (
+    CREATE TABLE auth_sessions (
       token TEXT PRIMARY KEY,
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL,
       expires_at TIMESTAMPTZ NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
