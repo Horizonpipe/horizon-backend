@@ -212,6 +212,105 @@ async function ensureSchema() {
     )
   `);
 
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS record_date DATE NOT NULL DEFAULT CURRENT_DATE
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS client TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS city TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS street TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS jobsite TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS saved_by TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS data JSONB NOT NULL DEFAULT '{}'::jsonb
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET client = ''
+    WHERE client IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET city = ''
+    WHERE city IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET street = ''
+    WHERE street IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET jobsite = ''
+    WHERE jobsite IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET status = ''
+    WHERE status IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET saved_by = ''
+    WHERE saved_by IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET data = '{}'::jsonb
+    WHERE data IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET updated_at = NOW()
+    WHERE updated_at IS NULL
+  `);
+  
+
     await pool.query(`
     ALTER TABLE planner_records
     ADD COLUMN IF NOT EXISTS record_date DATE NOT NULL DEFAULT CURRENT_DATE
@@ -604,18 +703,19 @@ app.put('/users/:id', requireAdmin, async (req, res) => {
 app.get('/records', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, record_date, client, city, jobsite, status, saved_by, data, created_at, updated_at
+      `SELECT id, record_date, client, city, street, jobsite, status, saved_by, data, created_at, updated_at
        FROM planner_records
        ORDER BY updated_at DESC, created_at DESC`
     );
     const rows = result.rows.map((row) => ({
       id: row.id,
-      date: row.record_date,
+      record_date: row.record_date,
       client: row.client,
       city: row.city,
+      street: row.street,
       jobsite: row.jobsite,
       status: row.status,
-      savedBy: row.saved_by,
+      saved_by: row.saved_by,
       data: row.data,
       created_at: row.created_at,
       updated_at: row.updated_at
@@ -629,19 +729,20 @@ app.get('/records', requireAuth, async (req, res) => {
 
 app.post('/records', requireAuth, async (req, res) => {
   try {
-    const date = cleanString(req.body?.date || req.body?.record_date || new Date().toISOString().slice(0, 10));
+    const recordDate = cleanString(req.body?.record_date || req.body?.date || new Date().toISOString().slice(0, 10));
     const client = cleanString(req.body?.client);
     const city = cleanString(req.body?.city);
+    const street = cleanString(req.body?.street);
     const jobsite = cleanString(req.body?.jobsite);
     const status = cleanString(req.body?.status);
-    const savedBy = cleanString(req.body?.savedBy || req.user.name);
+    const savedBy = cleanString(req.body?.saved_by || req.body?.savedBy || req.user.username);
     const data = parseJsonObject(req.body?.data, {});
 
     const result = await pool.query(
-      `INSERT INTO planner_records (record_date, client, city, jobsite, status, saved_by, data)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-       RETURNING id, record_date, client, city, jobsite, status, saved_by, data, created_at, updated_at`,
-      [date, client, city, jobsite, status, savedBy, JSON.stringify(data)]
+      `INSERT INTO planner_records (record_date, client, city, street, jobsite, status, saved_by, data)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+       RETURNING id, record_date, client, city, street, jobsite, status, saved_by, data, created_at, updated_at`,
+      [recordDate, client, city, street, jobsite, status, savedBy, JSON.stringify(data)]
     );
 
     res.status(201).json({ success: true, record: result.rows[0] });
@@ -651,15 +752,20 @@ app.post('/records', requireAuth, async (req, res) => {
   }
 });
 
+
+
+
+
 app.put('/records/:id', requireAuth, async (req, res) => {
   try {
     const id = req.params.id;
-    const date = cleanString(req.body?.date || req.body?.record_date || new Date().toISOString().slice(0, 10));
+    const recordDate = cleanString(req.body?.record_date || req.body?.date || new Date().toISOString().slice(0, 10));
     const client = cleanString(req.body?.client);
     const city = cleanString(req.body?.city);
+    const street = cleanString(req.body?.street);
     const jobsite = cleanString(req.body?.jobsite);
     const status = cleanString(req.body?.status);
-    const savedBy = cleanString(req.body?.savedBy || req.user.name);
+    const savedBy = cleanString(req.body?.saved_by || req.body?.savedBy || req.user.username);
     const data = parseJsonObject(req.body?.data, {});
 
     const result = await pool.query(
@@ -667,15 +773,30 @@ app.put('/records/:id', requireAuth, async (req, res) => {
        SET record_date = $1,
            client = $2,
            city = $3,
-           jobsite = $4,
-           status = $5,
-           saved_by = $6,
-           data = $7::jsonb,
+           street = $4,
+           jobsite = $5,
+           status = $6,
+           saved_by = $7,
+           data = $8::jsonb,
            updated_at = NOW()
-       WHERE id = $8
-       RETURNING id, record_date, client, city, jobsite, status, saved_by, data, created_at, updated_at`,
-      [date, client, city, jobsite, status, savedBy, JSON.stringify(data), id]
+       WHERE id = $9
+       RETURNING id, record_date, client, city, street, jobsite, status, saved_by, data, created_at, updated_at`,
+      [recordDate, client, city, street, jobsite, status, savedBy, JSON.stringify(data), id]
     );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ success: false, error: 'Record not found' });
+    }
+
+    res.json({ success: true, record: result.rows[0] });
+  } catch (error) {
+    console.error('UPDATE RECORD ERROR:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+
 
     if (!result.rows.length) {
       return res.status(404).json({ success: false, error: 'Record not found' });
