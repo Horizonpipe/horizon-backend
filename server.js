@@ -803,7 +803,7 @@ app.put('/records/:id', requireAuth, async (req, res) => {
     }
 
     res.json({ success: true, record: result.rows[0] });
-  } catch (error) {
+  catch (error) {
     console.error('UPDATE RECORD ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
   }
