@@ -437,7 +437,7 @@ async function parseDb3(buffer) {
   stmt.free();
   db.close();
   return rows;
-}
+
 
 async function ensureSchema() {
   await pool.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
