@@ -212,7 +212,6 @@ function normalizeRecordRow(row) {
   };
 }
 
-
 function serializeRecordData(record) {
   return {
     systems: {
@@ -415,30 +414,6 @@ async function parseDb3(buffer) {
   return rows;
 }
 
-  const stmt = db.prepare(query);
-  const rows = [];
-  while (stmt.step()) {
-    const row = stmt.getAsObject();
-    const dia = row.size2
-      ? `${String(row.size1).replace(/\.0+$/, '')}/${String(row.size2).replace(/\.0+$/, '')}`
-      : String(row.size1 || '').replace(/\.0+$/, '');
-    rows.push({
-      reference: cleanString(row.reference),
-      length: Number(row.length || 0).toFixed(3),
-      city: cleanString(row.city),
-      street: cleanString(row.street),
-      upstream: cleanString(row.upstream),
-      downstream: cleanString(row.downstream),
-      material: materialLabel(row.material_code),
-      shape: shapeLabel(row.shape_code, row.size1, row.size2),
-      dia
-    });
-  }
-  stmt.free();
-  db.close();
-  return rows;
-
-
 async function ensureSchema() {
   await pool.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
 
@@ -469,7 +444,6 @@ async function ensureSchema() {
   await pool.query(`UPDATE users SET must_change_password = false WHERE must_change_password IS NULL`);
 
   await pool.query(`DROP TABLE IF EXISTS auth_sessions`);
-
   await pool.query(`
     CREATE TABLE auth_sessions (
       token TEXT PRIMARY KEY,
@@ -859,8 +833,8 @@ app.post('/records', requireAuth, async (req, res) => {
       status: '',
       saved_by: req.user.displayName || req.user.username,
       systems: {
-        storm: req.body?.createStorm === false ? [] : [],
-        sanitary: req.body?.createSanitary ? [] : []
+        storm: [],
+        sanitary: []
       }
     };
 
@@ -1356,13 +1330,12 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
       duplicate: existingRefs.has(String(row.reference || '').toLowerCase())
     }));
 
-    res.json({ success: true, sourceKind: 'DB3', rows: previres.json({
-  success: true,
-  sourceKind: 'DB3',
-  defaultJobsite: cleanString(previewRows[0]?.project || 'NOT SET'),
-  rows: previewRows
-});
-  ewRows });
+    res.json({
+      success: true,
+      sourceKind: 'DB3',
+      defaultJobsite: cleanString(previewRows[0]?.project || 'NOT SET'),
+      rows: previewRows
+    });
   } catch (error) {
     console.error('IMPORT PREVIEW ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -1374,8 +1347,8 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
     const targetClient = cleanString(req.body?.targetClient);
     const targetCity = cleanString(req.body?.targetCity);
-   const inferredProject = cleanString(rows[0]?.project || 'NOT SET');
-const targetJobsite = normalizeJobsiteName(req.body?.targetJobsite || inferredProject || 'NOT SET');
+    const inferredProject = cleanString(rows[0]?.project || 'NOT SET');
+    const targetJobsite = normalizeJobsiteName(req.body?.targetJobsite || inferredProject || 'NOT SET');
     const targetSystem = cleanString(req.body?.targetSystem || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
     if (!targetClient || !targetCity || !targetJobsite) {
       return res.status(400).json({ success: false, error: 'Target client, city, and jobsite are required' });
