@@ -212,6 +212,104 @@ async function ensureSchema() {
     )
   `);
 
+    await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS record_date DATE NOT NULL DEFAULT CURRENT_DATE
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS client TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS city TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS street TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS jobsite TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS saved_by TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS data JSONB NOT NULL DEFAULT '{}'::jsonb
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    ALTER TABLE planner_records
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET client = ''
+    WHERE client IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET city = ''
+    WHERE city IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET street = ''
+    WHERE street IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET jobsite = ''
+    WHERE jobsite IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET status = ''
+    WHERE status IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET saved_by = ''
+    WHERE saved_by IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET data = '{}'::jsonb
+    WHERE data IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE planner_records
+    SET updated_at = NOW()
+    WHERE updated_at IS NULL
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pricing_rates (
       dia TEXT PRIMARY KEY,
