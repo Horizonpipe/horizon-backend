@@ -348,6 +348,131 @@ async function ensureSchema() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+    await pool.query(`
+    ALTER TABLE jobsite_assets
+    ADD COLUMN IF NOT EXISTS client TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobsite_assets
+    ADD COLUMN IF NOT EXISTS city TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobsite_assets
+    ADD COLUMN IF NOT EXISTS jobsite TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobsite_assets
+    ADD COLUMN IF NOT EXISTS contact_name TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobsite_assets
+    ADD COLUMN IF NOT EXISTS contact_phone TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobsite_assets
+    ADD COLUMN IF NOT EXISTS contact_email TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobsite_assets
+    ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobsite_assets
+    ADD COLUMN IF NOT EXISTS drive_url TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobsite_assets
+    ADD COLUMN IF NOT EXISTS files JSONB NOT NULL DEFAULT '[]'::jsonb
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobsite_assets
+    ADD COLUMN IF NOT EXISTS created_by TEXT NOT NULL DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobsite_assets
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobsite_assets
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    UPDATE jobsite_assets
+    SET client = ''
+    WHERE client IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE jobsite_assets
+    SET city = ''
+    WHERE city IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE jobsite_assets
+    SET jobsite = ''
+    WHERE jobsite IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE jobsite_assets
+    SET contact_name = ''
+    WHERE contact_name IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE jobsite_assets
+    SET contact_phone = ''
+    WHERE contact_phone IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE jobsite_assets
+    SET contact_email = ''
+    WHERE contact_email IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE jobsite_assets
+    SET notes = ''
+    WHERE notes IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE jobsite_assets
+    SET drive_url = ''
+    WHERE drive_url IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE jobsite_assets
+    SET files = '[]'::jsonb
+    WHERE files IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE jobsite_assets
+    SET created_by = ''
+    WHERE created_by IS NULL
+  `);
+
+  await pool.query(`
+    UPDATE jobsite_assets
+    SET updated_at = NOW()
+    WHERE updated_at IS NULL
+  `);
 
   const countResult = await pool.query('SELECT COUNT(*)::int AS count FROM users');
   if (countResult.rows[0].count === 0) {
