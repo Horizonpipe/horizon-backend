@@ -174,13 +174,37 @@ function normalizeJobsiteName(jobsite, street = '') {
 function normalizeRecordRow(row) {
   const data = parseJsonObject(row.data, {});
   const systems = normalizeSystems(data.systems, row.saved_by || 'System');
+
+  const rawJobsite = cleanString(row.jobsite || data.jobsite);
+  const rawStreet = cleanString(row.street || data.street);
+
+  const segmentStreets = [
+    ...(systems.storm || []),
+    ...(systems.sanitary || [])
+  ].map((segment) => cleanString(segment.street)).filter(Boolean);
+
+  const looksLikeStreetOnly =
+    rawJobsite &&
+    segmentStreets.some((street) => street.toLowerCase() === rawJobsite.toLowerCase());
+
+  const fallbackStreet = looksLikeStreetOnly ? rawJobsite : rawStreet;
+
+  ['storm', 'sanitary'].forEach((system) => {
+    systems[system] = (systems[system] || []).map((segment) => ({
+      ...segment,
+      street: cleanString(segment.street || fallbackStreet)
+    }));
+  });
+
   return {
     id: row.id,
     record_date: String(row.record_date || '').slice(0, 10),
     client: cleanString(row.client || data.client),
     city: cleanString(row.city || data.city),
-    street: cleanString(row.street || data.street),
-    jobsite: normalizeJobsiteName(row.jobsite || data.jobsite, row.street || data.street),
+    street: fallbackStreet,
+    jobsite: looksLikeStreetOnly
+      ? 'NOT SET'
+      : normalizeJobsiteName(rawJobsite, rawStreet),
     status: cleanString(row.status || data.status),
     saved_by: cleanString(row.saved_by || data.saved_by),
     systems,
@@ -188,6 +212,7 @@ function normalizeRecordRow(row) {
     updated_at: row.updated_at
   };
 }
+
 
 function serializeRecordData(record) {
   return {
@@ -325,6 +350,21 @@ async function parseDb3(buffer) {
   const SQL = await sqlJsPromise;
   const db = new SQL.Database(new Uint8Array(buffer));
 
+  let projectName = '';
+  try {
+    const projectStmt = db.prepare(`
+      SELECT COALESCE(MAX(PRJ_Key), '') AS project_name
+      FROM PROJECT
+    `);
+    if (projectStmt.step()) {
+      const row = projectStmt.getAsObject();
+      projectName = cleanString(row.project_name);
+    }
+    projectStmt.free();
+  } catch (error) {
+    projectName = '';
+  }
+
   const query = `
     SELECT
       s.OBJ_Key AS reference,
@@ -347,6 +387,34 @@ async function parseDb3(buffer) {
     LEFT JOIN NODE n2 ON n2.OBJ_PK = s.OBJ_ToNode_REF
     ORDER BY s.OBJ_Key
   `;
+
+  const stmt = db.prepare(query);
+  const rows = [];
+
+  while (stmt.step()) {
+    const row = stmt.getAsObject();
+    const dia = row.size2
+      ? `${String(row.size1).replace(/\.0+$/, '')}/${String(row.size2).replace(/\.0+$/, '')}`
+      : String(row.size1 || '').replace(/\.0+$/, '');
+
+    rows.push({
+      project: projectName || 'NOT SET',
+      reference: cleanString(row.reference),
+      length: Number(row.length || 0).toFixed(3),
+      city: cleanString(row.city),
+      street: cleanString(row.street),
+      upstream: cleanString(row.upstream),
+      downstream: cleanString(row.downstream),
+      material: materialLabel(row.material_code),
+      shape: shapeLabel(row.shape_code, row.size1, row.size2),
+      dia
+    });
+  }
+
+  stmt.free();
+  db.close();
+  return rows;
+}
 
   const stmt = db.prepare(query);
   const rows = [];
@@ -1289,7 +1357,13 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
       duplicate: existingRefs.has(String(row.reference || '').toLowerCase())
     }));
 
-    res.json({ success: true, sourceKind: 'DB3', rows: previewRows });
+    res.json({ success: true, sourceKind: 'DB3', rows: previres.json({
+  success: true,
+  sourceKind: 'DB3',
+  defaultJobsite: cleanString(previewRows[0]?.project || 'NOT SET'),
+  rows: previewRows
+});
+  ewRows });
   } catch (error) {
     console.error('IMPORT PREVIEW ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -1301,7 +1375,8 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
     const targetClient = cleanString(req.body?.targetClient);
     const targetCity = cleanString(req.body?.targetCity);
-    const targetJobsite = normalizeJobsiteName(req.body?.targetJobsite || 'NOT SET');
+   const inferredProject = cleanString(rows[0]?.project || 'NOT SET');
+const targetJobsite = normalizeJobsiteName(req.body?.targetJobsite || inferredProject || 'NOT SET');
     const targetSystem = cleanString(req.body?.targetSystem || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
     if (!targetClient || !targetCity || !targetJobsite) {
       return res.status(400).json({ success: false, error: 'Target client, city, and jobsite are required' });
