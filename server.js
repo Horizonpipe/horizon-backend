@@ -9,6 +9,7 @@ const { Pool } = require('pg');
 const { ensureOutlookSchema, registerOutlookRoutes } = require('./outlook');
 
 const app = express();
+app.use(express.json());
 const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL;
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
@@ -34,6 +35,41 @@ const upload = multer({
 const sqlJsPromise = initSqlJs();
 
 app.set('trust proxy', 1);
+function currentToken(req) {
+  const auth = req.headers.authorization || '';
+  if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
+  if (req.headers['x-session-token']) return String(req.headers['x-session-token']).trim();
+  return '';
+}
+
+app.post('/auto-import-plugin/push', async (req, res) => {
+  try {
+    const token = currentToken(req);
+
+    if (token !== 'horizon-auto-import-001') {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const body = req.body || {};
+    const source = String(body.source || '').trim();
+    const rows = Array.isArray(body.rows) ? body.rows : [];
+
+    return res.json({
+      success: true,
+      message: rows.length
+        ? 'Auto import payload received.'
+        : 'Auto import test received.',
+      received: {
+        source,
+        rowCount: rows.length
+      }
+    });
+
+  } catch (error) {
+    console.error('auto-import-plugin/push failed:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
 
 const corsOptions = {
   origin(origin, callback) {
