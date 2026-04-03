@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 
 const DEFAULT_SCOPES = 'offline_access openid profile email Mail.Read Mail.ReadWrite Mail.Send User.Read';
+const ALLOWED_FOLDERS = new Set(['inbox', 'sentitems', 'archive', 'deleteditems']);
 
 function configured() {
   return !!(process.env.OUTLOOK_CLIENT_ID && process.env.OUTLOOK_CLIENT_SECRET && process.env.OUTLOOK_REDIRECT_URI);
@@ -20,6 +21,11 @@ function authSecret() {
 
 function clean(value) {
   return String(value || '').trim();
+}
+
+function normalizeFolder(value) {
+  const folder = clean(value).toLowerCase();
+  return ALLOWED_FOLDERS.has(folder) ? folder : 'inbox';
 }
 
 function base64url(value) {
@@ -116,6 +122,67 @@ async function graphRequest(accessToken, path, options = {}) {
   return fetchJson(`https://graph.microsoft.com/v1.0${path}`, { ...options, headers });
 }
 
+function parseRecipients(value) {
+  return clean(value)
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((address) => ({ emailAddress: { address } }));
+}
+
+function addressList(items) {
+  return (items || []).map((item) => clean(item?.emailAddress?.address)).filter(Boolean);
+}
+
+function addressDisplay(items) {
+  return (items || [])
+    .map((item) => clean(item?.emailAddress?.name || item?.emailAddress?.address))
+    .filter(Boolean)
+    .join(', ');
+}
+
+function normalizeMessageSummary(item) {
+  return {
+    id: item.id,
+    subject: item.subject || '',
+    preview: item.bodyPreview || '',
+    from: clean(item.from?.emailAddress?.name || item.from?.emailAddress?.address),
+    fromAddress: clean(item.from?.emailAddress?.address),
+    to: addressDisplay(item.toRecipients),
+    toAddresses: addressList(item.toRecipients),
+    receivedAt: item.receivedDateTime ? new Date(item.receivedDateTime).toLocaleString() : '',
+    isRead: !!item.isRead,
+    hasAttachments: !!item.hasAttachments,
+    importance: clean(item.importance || 'normal').toLowerCase()
+  };
+}
+
+function normalizeMessageDetail(item) {
+  return {
+    id: item.id,
+    subject: item.subject || '',
+    from: clean(item.from?.emailAddress?.name || item.from?.emailAddress?.address),
+    fromAddress: clean(item.from?.emailAddress?.address),
+    to: addressDisplay(item.toRecipients),
+    toAddresses: addressList(item.toRecipients),
+    cc: addressDisplay(item.ccRecipients),
+    ccAddresses: addressList(item.ccRecipients),
+    bcc: addressDisplay(item.bccRecipients),
+    bccAddresses: addressList(item.bccRecipients),
+    receivedAt: item.receivedDateTime ? new Date(item.receivedDateTime).toLocaleString() : '',
+    isRead: !!item.isRead,
+    hasAttachments: !!item.hasAttachments,
+    importance: clean(item.importance || 'normal').toLowerCase(),
+    bodyHtml: item.body?.contentType === 'html' ? item.body.content : '',
+    bodyText: item.body?.contentType === 'text' ? item.body.content : item.bodyPreview || ''
+  };
+}
+
+async function resolveFolderId(accessToken, folderName) {
+  const folder = await graphRequest(accessToken, `/me/mailFolders/${encodeURIComponent(normalizeFolder(folderName))}?$select=id`);
+  return clean(folder?.id);
+}
+
 async function ensureOutlookSchema(pool) {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_outlook_tokens (
@@ -202,6 +269,7 @@ function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
   const prefixes = ['/outlook', '/api/outlook'];
   const mountGet = (path, ...handlers) => prefixes.forEach((prefix) => app.get(`${prefix}${path}`, ...handlers));
   const mountPost = (path, ...handlers) => prefixes.forEach((prefix) => app.post(`${prefix}${path}`, ...handlers));
+  const mountPatch = (path, ...handlers) => prefixes.forEach((prefix) => app.patch(`${prefix}${path}`, ...handlers));
   const mountDelete = (path, ...handlers) => prefixes.forEach((prefix) => app.delete(`${prefix}${path}`, ...handlers));
 
   mountGet('/status', requireAuth, async (req, res) => {
@@ -261,16 +329,10 @@ function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
       if (!configured()) return res.status(400).json({ success: false, error: 'Outlook integration is not configured' });
       const token = await getValidAccessToken(pool, req.user.id);
       if (!token) return res.status(401).json({ success: false, error: 'Outlook is not connected for this user' });
-      const data = await graphRequest(token, `/me/mailFolders/inbox/messages?$top=25&$orderby=receivedDateTime desc&$select=id,subject,receivedDateTime,bodyPreview,from,toRecipients`);
-      const messages = Array.isArray(data.value) ? data.value.map((item) => ({
-        id: item.id,
-        subject: item.subject || '',
-        preview: item.bodyPreview || '',
-        from: clean(item.from?.emailAddress?.name || item.from?.emailAddress?.address),
-        to: (item.toRecipients || []).map((r) => clean(r.emailAddress?.address || r.emailAddress?.name)).filter(Boolean).join(', '),
-        receivedAt: item.receivedDateTime ? new Date(item.receivedDateTime).toLocaleString() : ''
-      })) : [];
-      res.json({ success: true, messages });
+      const folder = normalizeFolder(req.query.folder);
+      const data = await graphRequest(token, `/me/mailFolders/${encodeURIComponent(folder)}/messages?$top=50&$orderby=receivedDateTime desc&$select=id,subject,receivedDateTime,bodyPreview,from,toRecipients,isRead,hasAttachments,importance`);
+      const messages = Array.isArray(data.value) ? data.value.map(normalizeMessageSummary) : [];
+      res.json({ success: true, folder, messages });
     } catch (error) {
       console.error('OUTLOOK MESSAGES ERROR:', error);
       res.status(500).json({ success: false, error: error.message });
@@ -281,23 +343,55 @@ function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
     try {
       const token = await getValidAccessToken(pool, req.user.id);
       if (!token) return res.status(401).json({ success: false, error: 'Outlook is not connected for this user' });
-      const item = await graphRequest(token, `/me/messages/${encodeURIComponent(req.params.id)}?$select=id,subject,receivedDateTime,body,bodyPreview,from,toRecipients,ccRecipients,bccRecipients`);
-      res.json({
-        success: true,
-        message: {
-          id: item.id,
-          subject: item.subject || '',
-          from: clean(item.from?.emailAddress?.name || item.from?.emailAddress?.address),
-          to: (item.toRecipients || []).map((r) => clean(r.emailAddress?.address || r.emailAddress?.name)).filter(Boolean).join(', '),
-          cc: (item.ccRecipients || []).map((r) => clean(r.emailAddress?.address || r.emailAddress?.name)).filter(Boolean).join(', '),
-          bcc: (item.bccRecipients || []).map((r) => clean(r.emailAddress?.address || r.emailAddress?.name)).filter(Boolean).join(', '),
-          receivedAt: item.receivedDateTime ? new Date(item.receivedDateTime).toLocaleString() : '',
-          bodyHtml: item.body?.contentType === 'html' ? item.body.content : '',
-          bodyText: item.body?.contentType === 'text' ? item.body.content : item.bodyPreview || ''
-        }
-      });
+      const item = await graphRequest(token, `/me/messages/${encodeURIComponent(req.params.id)}?$select=id,subject,receivedDateTime,body,bodyPreview,from,toRecipients,ccRecipients,bccRecipients,isRead,hasAttachments,importance`);
+      res.json({ success: true, message: normalizeMessageDetail(item) });
     } catch (error) {
       console.error('OUTLOOK MESSAGE ERROR:', error);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  mountPatch('/messages/:id/read', requireAuth, async (req, res) => {
+    try {
+      const token = await getValidAccessToken(pool, req.user.id);
+      if (!token) return res.status(401).json({ success: false, error: 'Outlook is not connected for this user' });
+      await graphRequest(token, `/me/messages/${encodeURIComponent(req.params.id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ isRead: !!req.body?.isRead })
+      });
+      res.json({ success: true, isRead: !!req.body?.isRead });
+    } catch (error) {
+      console.error('OUTLOOK READ STATE ERROR:', error);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  mountPost('/messages/:id/move', requireAuth, async (req, res) => {
+    try {
+      const token = await getValidAccessToken(pool, req.user.id);
+      if (!token) return res.status(401).json({ success: false, error: 'Outlook is not connected for this user' });
+      const destination = normalizeFolder(req.body?.destination);
+      const destinationId = await resolveFolderId(token, destination);
+      if (!destinationId) return res.status(400).json({ success: false, error: 'Destination folder not found' });
+      await graphRequest(token, `/me/messages/${encodeURIComponent(req.params.id)}/move`, {
+        method: 'POST',
+        body: JSON.stringify({ destinationId })
+      });
+      res.json({ success: true, destination });
+    } catch (error) {
+      console.error('OUTLOOK MOVE ERROR:', error);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  mountDelete('/messages/:id', requireAuth, async (req, res) => {
+    try {
+      const token = await getValidAccessToken(pool, req.user.id);
+      if (!token) return res.status(401).json({ success: false, error: 'Outlook is not connected for this user' });
+      await graphRequest(token, `/me/messages/${encodeURIComponent(req.params.id)}`, { method: 'DELETE' });
+      res.json({ success: true });
+    } catch (error) {
+      console.error('OUTLOOK DELETE ERROR:', error);
       res.status(500).json({ success: false, error: error.message });
     }
   });
@@ -310,7 +404,6 @@ function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
       const subject = clean(req.body?.subject);
       const body = String(req.body?.body || '');
       if (!to || !subject) return res.status(400).json({ success: false, error: 'To and subject are required' });
-      const parseRecipients = (value) => clean(value).split(',').map((item) => item.trim()).filter(Boolean).map((address) => ({ emailAddress: { address } }));
       await graphRequest(token, '/me/sendMail', {
         method: 'POST',
         body: JSON.stringify({
