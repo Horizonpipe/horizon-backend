@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const initSqlJs = require('sql.js');
 const { Pool } = require('pg');
+const { ensureOutlookSchema, registerOutlookRoutes } = require('./outlook');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -58,21 +59,27 @@ function cleanString(value) {
   return String(value || '').trim();
 }
 
+function upperCleanString(value) {
+  return cleanString(value).toUpperCase();
+}
+
 function normalizeRoles(value) {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     return {
       camera: value.camera !== false,
-      vac: value.vac !== false
+      vac: value.vac !== false,
+      simpleVac: !!(value.simpleVac ?? value.simple_vac ?? false),
+      email: !!value.email
     };
   }
   if (typeof value === 'string') {
     try {
       return normalizeRoles(JSON.parse(value));
     } catch (error) {
-      return { camera: true, vac: true };
+      return { camera: true, vac: true, simpleVac: false, email: false };
     }
   }
-  return { camera: true, vac: true };
+  return { camera: true, vac: true, simpleVac: false, email: false };
 }
 
 function normalizeUser(row) {
@@ -141,14 +148,14 @@ function normalizeSegment(raw = {}, userName = 'System') {
     : [defaultVersion(userName, { status: raw.status || 'neutral' })];
   return {
     id: raw.id || crypto.randomUUID(),
-    reference: cleanString(raw.reference),
-    upstream: cleanString(raw.upstream),
-    downstream: cleanString(raw.downstream),
-    dia: cleanString(raw.dia),
-    material: cleanString(raw.material),
+    reference: upperCleanString(raw.reference),
+    upstream: upperCleanString(raw.upstream),
+    downstream: upperCleanString(raw.downstream),
+    dia: upperCleanString(raw.dia),
+    material: upperCleanString(raw.material),
     length: cleanString(raw.length ?? raw.footage),
     footage: cleanString(raw.footage ?? raw.length),
-    street: cleanString(raw.street),
+    street: upperCleanString(raw.street),
     system: cleanString(raw.system),
     versions,
     selectedVersionId: raw.selectedVersionId || versions[versions.length - 1].id
@@ -164,8 +171,8 @@ function normalizeSystems(value, userName = 'System') {
 }
 
 function normalizeJobsiteName(jobsite, street = '') {
-  const j = cleanString(jobsite);
-  const s = cleanString(street);
+  const j = upperCleanString(jobsite);
+  const s = upperCleanString(street);
   if (!j) return 'NOT SET';
   if (s && j.toLowerCase() === s.toLowerCase()) return 'NOT SET';
   return j;
@@ -199,9 +206,9 @@ function normalizeRecordRow(row) {
   return {
     id: String(row.id),
     record_date: String(row.record_date || '').slice(0, 10),
-    client: cleanString(row.client || data.client),
-    city: cleanString(row.city || data.city),
-    street: fallbackStreet,
+    client: upperCleanString(row.client || data.client),
+    city: upperCleanString(row.city || data.city),
+    street: upperCleanString(fallbackStreet),
     jobsite: looksLikeStreetOnly ? 'NOT SET' : normalizeJobsiteName(rawJobsite, rawStreet),
     status: cleanString(row.status || data.status),
     saved_by: cleanString(row.saved_by || data.saved_by),
@@ -412,7 +419,7 @@ async function ensureSchema() {
       display_name TEXT,
       password TEXT NOT NULL,
       is_admin BOOLEAN NOT NULL DEFAULT false,
-      roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": false}'::jsonb,
+      roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": false, "simpleVac": false, "email": false}'::jsonb,
       must_change_password BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -421,14 +428,15 @@ async function ensureSchema() {
 
   const userAlters = [
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": false}'::jsonb`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": false, "simpleVac": false, "email": false}'::jsonb`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
   ];
   for (const query of userAlters) await pool.query(query);
   await pool.query(`UPDATE users SET display_name = username WHERE display_name IS NULL OR btrim(display_name) = ''`);
-  await pool.query(`UPDATE users SET roles = '{"camera": true, "vac": false}'::jsonb WHERE roles IS NULL`);
+  await pool.query(`UPDATE users SET roles = '{"camera": true, "vac": false, "simpleVac": false, "email": false}'::jsonb WHERE roles IS NULL`);
+  await pool.query(`UPDATE users SET roles = '{"camera": true, "vac": false, "simpleVac": false, "email": false}'::jsonb || COALESCE(roles, '{}'::jsonb)`);
   await pool.query(`UPDATE users SET must_change_password = false WHERE must_change_password IS NULL`);
 
   await pool.query(`DROP TABLE IF EXISTS auth_sessions`);
@@ -541,12 +549,14 @@ async function ensureSchema() {
   ];
   for (const query of assetAlters) await pool.query(query);
 
+  await ensureOutlookSchema(pool);
+
   const countResult = await pool.query('SELECT COUNT(*)::int AS count FROM users');
   if (countResult.rows[0].count === 0) {
     const defaults = [
-      { username: 'mik', displayName: 'Mike Strickland', isAdmin: true, roles: { camera: true, vac: true } },
-      { username: 'nick', displayName: 'Nick Krull', isAdmin: true, roles: { camera: true, vac: true } },
-      { username: 'tyler', displayName: 'Tyler Clark', isAdmin: true, roles: { camera: true, vac: true } }
+      { username: 'mik', displayName: 'Mike Strickland', isAdmin: true, roles: { camera: true, vac: true, simpleVac: false, email: true } },
+      { username: 'nick', displayName: 'Nick Krull', isAdmin: true, roles: { camera: true, vac: true, simpleVac: false, email: true } },
+      { username: 'tyler', displayName: 'Tyler Clark', isAdmin: true, roles: { camera: true, vac: true, simpleVac: false, email: true } }
     ];
     for (const user of defaults) {
       const hash = await bcrypt.hash('1234', 10);
@@ -568,6 +578,25 @@ app.get('/health', async (req, res) => {
     await pool.query('SELECT 1');
     res.json({ success: true });
   } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/sync-state', requireAuth, async (req, res) => {
+  try {
+    const [records, pricing, reports, assets, users, emails] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM planner_records`),
+      pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM pricing_rates`),
+      pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM daily_reports`),
+      pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM jobsite_assets`),
+      pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM users`),
+      pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM user_outlook_tokens`)
+    ]);
+    const payload = { records: records.rows[0], pricing: pricing.rows[0], reports: reports.rows[0], assets: assets.rows[0], users: users.rows[0], emails: emails.rows[0] };
+    const signature = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+    res.json({ success: true, signature, state: payload });
+  } catch (error) {
+    console.error('SYNC STATE ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -813,9 +842,9 @@ app.post('/records', requireAuth, async (req, res) => {
   try {
     const record = {
       record_date: cleanString(req.body?.record_date || req.body?.date || new Date().toISOString().slice(0, 10)),
-      client: cleanString(req.body?.client),
-      city: cleanString(req.body?.city),
-      street: cleanString(req.body?.street),
+      client: upperCleanString(req.body?.client),
+      city: upperCleanString(req.body?.city),
+      street: upperCleanString(req.body?.street),
       jobsite: normalizeJobsiteName(req.body?.jobsite, req.body?.street),
       status: '',
       saved_by: req.user.displayName || req.user.username,
@@ -889,9 +918,9 @@ app.put('/records/:id', requireAuth, async (req, res) => {
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
 
     record.record_date = cleanString(req.body?.record_date || req.body?.date || record.record_date);
-    record.client = cleanString(req.body?.client || record.client);
-    record.city = cleanString(req.body?.city || record.city);
-    record.street = cleanString(req.body?.street || record.street);
+    record.client = upperCleanString(req.body?.client || record.client);
+    record.city = upperCleanString(req.body?.city || record.city);
+    record.street = upperCleanString(req.body?.street || record.street);
     record.jobsite = normalizeJobsiteName(req.body?.jobsite || record.jobsite, req.body?.street || record.street);
     record.status = cleanString(req.body?.status || record.status);
     record.saved_by = cleanString(req.body?.saved_by || req.body?.savedBy || req.user.displayName || req.user.username);
@@ -919,10 +948,10 @@ app.delete('/records/:id', requireAuth, requireAdmin, async (req, res) => {
 
 app.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const client = cleanString(req.body?.client);
-    const city = cleanString(req.body?.city || 'NOT SET');
+    const client = upperCleanString(req.body?.client);
+    const city = upperCleanString(req.body?.city || 'NOT SET');
     const jobsite = normalizeJobsiteName(req.body?.jobsite || 'NOT SET');
-    const street = cleanString(req.body?.street || '');
+    const street = upperCleanString(req.body?.street || '');
     if (!client) return res.status(400).json({ success: false, error: 'Client name is required' });
 
     const result = await pool.query(
@@ -950,7 +979,7 @@ app.post('/clients', requireAuth, requireAdmin, async (req, res) => {
 
 app.delete('/clients/:client', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const client = cleanString(req.params.client);
+    const client = upperCleanString(req.params.client);
     await pool.query('DELETE FROM jobsite_assets WHERE client = $1', [client]);
     const result = await pool.query('DELETE FROM planner_records WHERE client = $1 RETURNING id', [client]);
     res.json({ success: true, deletedCount: result.rowCount });
@@ -967,6 +996,12 @@ app.post('/records/:id/segments', requireAuth, async (req, res) => {
     const system = cleanString(req.body?.system || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
     const segment = normalizeSegment({
       ...req.body,
+      reference: upperCleanString(req.body?.reference),
+      upstream: upperCleanString(req.body?.upstream),
+      downstream: upperCleanString(req.body?.downstream),
+      dia: upperCleanString(req.body?.dia),
+      material: upperCleanString(req.body?.material),
+      street: upperCleanString(req.body?.street || record.street),
       system,
       id: crypto.randomUUID(),
       versions: [
@@ -1047,20 +1082,30 @@ app.put('/records/:id/segments/:segmentId', requireAuth, async (req, res) => {
     const recordPatch = parseJsonObject(req.body?.recordPatch, {});
     const segmentPatch = parseJsonObject(req.body?.segmentPatch, {});
     const versionPatch = parseJsonObject(req.body?.versionPatch, {});
+    if (recordPatch.client !== undefined) recordPatch.client = upperCleanString(recordPatch.client);
+    if (recordPatch.city !== undefined) recordPatch.city = upperCleanString(recordPatch.city);
+    if (recordPatch.street !== undefined) recordPatch.street = upperCleanString(recordPatch.street);
+    if (recordPatch.jobsite !== undefined) recordPatch.jobsite = upperCleanString(recordPatch.jobsite);
+    if (segmentPatch.reference !== undefined) segmentPatch.reference = upperCleanString(segmentPatch.reference);
+    if (segmentPatch.upstream !== undefined) segmentPatch.upstream = upperCleanString(segmentPatch.upstream);
+    if (segmentPatch.downstream !== undefined) segmentPatch.downstream = upperCleanString(segmentPatch.downstream);
+    if (segmentPatch.dia !== undefined) segmentPatch.dia = upperCleanString(segmentPatch.dia);
+    if (segmentPatch.material !== undefined) segmentPatch.material = upperCleanString(segmentPatch.material);
+    if (segmentPatch.street !== undefined) segmentPatch.street = upperCleanString(segmentPatch.street);
     record.jobsite = normalizeJobsiteName(recordPatch.jobsite || record.jobsite, record.street);
-    record.client = cleanString(recordPatch.client || record.client);
-    record.city = cleanString(recordPatch.city || record.city);
-    record.street = cleanString(recordPatch.street || record.street);
+    record.client = upperCleanString(recordPatch.client || record.client);
+    record.city = upperCleanString(recordPatch.city || record.city);
+    record.street = upperCleanString(recordPatch.street || record.street);
 
     Object.assign(found, {
-      reference: cleanString(segmentPatch.reference || found.reference),
-      upstream: cleanString(segmentPatch.upstream || found.upstream),
-      downstream: cleanString(segmentPatch.downstream || found.downstream),
-      dia: cleanString(segmentPatch.dia !== undefined ? segmentPatch.dia : found.dia),
-      material: cleanString(segmentPatch.material !== undefined ? segmentPatch.material : found.material),
+      reference: upperCleanString(segmentPatch.reference || found.reference),
+      upstream: upperCleanString(segmentPatch.upstream || found.upstream),
+      downstream: upperCleanString(segmentPatch.downstream || found.downstream),
+      dia: upperCleanString(segmentPatch.dia !== undefined ? segmentPatch.dia : found.dia),
+      material: upperCleanString(segmentPatch.material !== undefined ? segmentPatch.material : found.material),
       length: cleanString(segmentPatch.length !== undefined ? segmentPatch.length : found.length),
       footage: cleanString(segmentPatch.footage !== undefined ? segmentPatch.footage : (segmentPatch.length !== undefined ? segmentPatch.length : found.footage)),
-      street: cleanString(segmentPatch.street !== undefined ? segmentPatch.street : found.street)
+      street: upperCleanString(segmentPatch.street !== undefined ? segmentPatch.street : found.street)
     });
 
     if (Object.keys(versionPatch).length) {
@@ -1192,7 +1237,7 @@ app.get('/pricing-rates', requireAuth, async (req, res) => {
 
 app.put('/pricing-rates/:dia', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const dia = cleanString(req.params.dia || req.body?.dia);
+    const dia = upperCleanString(req.params.dia || req.body?.dia);
     const rate = Number(req.body?.rate);
     if (!dia) return res.status(400).json({ success: false, error: 'DIA is required' });
     if (!Number.isFinite(rate)) return res.status(400).json({ success: false, error: 'Rate must be numeric' });
@@ -1257,6 +1302,34 @@ app.post('/daily-reports', requireAuth, requireAdmin, upload.array('files'), asy
   }
 });
 
+app.put('/daily-reports/:id', requireAuth, requireAdmin, upload.array('files'), async (req, res) => {
+  try {
+    const existingResult = await pool.query('SELECT * FROM daily_reports WHERE id = $1 LIMIT 1', [req.params.id]);
+    if (!existingResult.rows.length) return res.status(404).json({ success: false, error: 'Daily report not found' });
+    const current = existingResult.rows[0];
+    const currentFiles = Array.isArray(current.files) ? current.files : parseJsonObject(current.files, []);
+    const keepIds = new Set([].concat(req.body?.keepFileIds || []).filter(Boolean));
+    const keptFiles = keepIds.size ? currentFiles.filter((file) => keepIds.has(file.id)) : currentFiles;
+    const addedFiles = (req.files || []).map(fileToStoredJson);
+    const nextFiles = [...keptFiles, ...addedFiles];
+    const result = await pool.query(
+      `UPDATE daily_reports
+       SET title = $1,
+           report_date = $2,
+           notes = $3,
+           files = $4::jsonb,
+           updated_at = NOW()
+       WHERE id = $5
+       RETURNING *`,
+      [cleanString(req.body?.title), cleanString(req.body?.report_date || current.report_date), cleanString(req.body?.notes), JSON.stringify(nextFiles), req.params.id]
+    );
+    res.json({ success: true, report: result.rows[0] });
+  } catch (error) {
+    console.error('UPDATE DAILY REPORT ERROR:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.delete('/daily-reports/:id', requireAuth, requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM daily_reports WHERE id = $1', [req.params.id]);
@@ -1287,8 +1360,8 @@ app.post('/jobsite-assets', requireAuth, requireAdmin, upload.array('files'), as
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
        RETURNING *`,
       [
-        cleanString(req.body?.assetClient || req.body?.client),
-        cleanString(req.body?.assetCity || req.body?.city),
+        upperCleanString(req.body?.assetClient || req.body?.client),
+        upperCleanString(req.body?.assetCity || req.body?.city),
         normalizeJobsiteName(req.body?.assetJobsite || req.body?.jobsite),
         cleanString(req.body?.assetContactName || req.body?.contactName),
         cleanString(req.body?.assetContactPhone || req.body?.contactPhone),
@@ -1442,6 +1515,8 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+registerOutlookRoutes(app, { pool, requireAuth, currentToken, corsOrigins: CORS_ORIGINS });
 
 app.use((error, req, res, next) => {
   if (error && /CORS blocked/.test(error.message || '')) {
