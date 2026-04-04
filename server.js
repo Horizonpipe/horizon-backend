@@ -42,35 +42,6 @@ function currentToken(req) {
   return '';
 }
 
-app.post('/auto-import-plugin/push', async (req, res) => {
-  try {
-    const token = currentToken(req);
-
-    if (token !== 'horizon-auto-import-001') {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const body = req.body || {};
-    const source = String(body.source || '').trim();
-    const rows = Array.isArray(body.rows) ? body.rows : [];
-
-    return res.json({
-      success: true,
-      message: rows.length
-        ? 'Auto import payload received.'
-        : 'Auto import test received.',
-      received: {
-        source,
-        rowCount: rows.length
-      }
-    });
-
-  } catch (error) {
-    console.error('auto-import-plugin/push failed:', error);
-    return res.status(500).json({ error: 'Server error' });
-  }
-});
-
 const corsOptions = {
   origin(origin, callback) {
     if (!origin) {
@@ -716,6 +687,29 @@ app.post('/login', async (req, res) => {
 
 app.get('/session', requireAuth, async (req, res) => {
   res.json({ success: true, user: req.user });
+});
+
+/** WinCan / desktop EXE pushes rows using the same session token as the web planner (not a static API key). */
+app.post('/auto-import-plugin/push', requireAuth, requireMike, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const source = String(body.source || '').trim();
+    const rows = Array.isArray(body.rows) ? body.rows : [];
+
+    return res.json({
+      success: true,
+      message: rows.length
+        ? 'Auto import payload received.'
+        : 'Auto import test received.',
+      received: {
+        source,
+        rowCount: rows.length
+      }
+    });
+  } catch (error) {
+    console.error('auto-import-plugin/push failed:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
 });
 
 app.post('/logout', requireAuth, async (req, res) => {
