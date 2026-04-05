@@ -122,17 +122,36 @@ function normalizeRoles(value) {
       camera: value.camera !== false,
       vac: value.vac !== false,
       simpleVac: !!(value.simpleVac ?? value.simple_vac ?? false),
-      email: !!value.email
+      email: !!value.email,
+      psrPlanner: value.psrPlanner !== false && value.viewPsr !== false,
+      pricingView: !!value.pricingView,
+      footageView: !!value.footageView
     };
   }
   if (typeof value === 'string') {
     try {
       return normalizeRoles(JSON.parse(value));
     } catch (error) {
-      return { camera: true, vac: true, simpleVac: false, email: false };
+      return {
+        camera: true,
+        vac: true,
+        simpleVac: false,
+        email: false,
+        psrPlanner: true,
+        pricingView: false,
+        footageView: false
+      };
     }
   }
-  return { camera: true, vac: true, simpleVac: false, email: false };
+  return {
+    camera: true,
+    vac: true,
+    simpleVac: false,
+    email: false,
+    psrPlanner: true,
+    pricingView: false,
+    footageView: false
+  };
 }
 
 /** Shared prefix for per-user portal uploads in Wasabi (`clients/portal-users/jobs/{userId}/…`). */
@@ -624,9 +643,48 @@ async function ensureSchema() {
   const countResult = await pool.query('SELECT COUNT(*)::int AS count FROM users');
   if (countResult.rows[0].count === 0) {
     const defaults = [
-      { username: 'mik', displayName: 'Mike Strickland', isAdmin: true, roles: { camera: true, vac: true, simpleVac: false, email: true } },
-      { username: 'nick', displayName: 'Nick Krull', isAdmin: true, roles: { camera: true, vac: true, simpleVac: false, email: true } },
-      { username: 'tyler', displayName: 'Tyler Clark', isAdmin: true, roles: { camera: true, vac: true, simpleVac: false, email: true } }
+      {
+        username: 'mik',
+        displayName: 'Mike Strickland',
+        isAdmin: true,
+        roles: {
+          camera: true,
+          vac: true,
+          simpleVac: false,
+          email: true,
+          psrPlanner: true,
+          pricingView: true,
+          footageView: true
+        }
+      },
+      {
+        username: 'nick',
+        displayName: 'Nick Krull',
+        isAdmin: true,
+        roles: {
+          camera: true,
+          vac: true,
+          simpleVac: false,
+          email: true,
+          psrPlanner: true,
+          pricingView: true,
+          footageView: true
+        }
+      },
+      {
+        username: 'tyler',
+        displayName: 'Tyler Clark',
+        isAdmin: true,
+        roles: {
+          camera: true,
+          vac: true,
+          simpleVac: false,
+          email: true,
+          psrPlanner: true,
+          pricingView: true,
+          footageView: true
+        }
+      }
     ];
     for (const user of defaults) {
       const hash = await bcrypt.hash('1234', 10);
