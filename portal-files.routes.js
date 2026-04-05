@@ -27,6 +27,7 @@ const {
   PutObjectCommand
 } = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
+const { NodeHttpHandler } = require('@smithy/node-http-handler');
 
 const CATEGORIES = new Set(['videos', 'db3', 'pdf', 'photos']);
 const FOLDER_MARKER = '.hp-folder';
@@ -62,8 +63,11 @@ const portalBatchUpload = multer({
   limits: { fileSize: 25 * 1024 * 1024 * 1024, files: 100 }
 });
 
-/** Faster multipart uploads to S3-compatible storage (Wasabi). */
-const S3_UPLOAD_PARALLEL = { queueSize: 8, partSize: 8 * 1024 * 1024 };
+/**
+ * Multipart upload to Wasabi (S3 API): parallel part uploads over multiple connections.
+ * queueSize = concurrent UploadPart calls; partSize must be ≥5MB (S3 rules, except last part).
+ */
+const S3_UPLOAD_PARALLEL = { queueSize: 10, partSize: 16 * 1024 * 1024 };
 
 /**
  * @param {import('@aws-sdk/client-s3').S3Client} s3Client
@@ -130,7 +134,12 @@ function createWasabiClient() {
     region,
     endpoint,
     credentials: { accessKeyId, secretAccessKey },
-    forcePathStyle: true
+    forcePathStyle: true,
+    requestHandler: new NodeHttpHandler({
+      connectionTimeout: 30000,
+      socketTimeout: 0,
+      maxSockets: 50
+    })
   });
 }
 
