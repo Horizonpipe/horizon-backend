@@ -1051,9 +1051,67 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
     });
   });
 
+  /**
+   * Browsers send a burst of Range GETs while scrubbing video. Each request used to run several SQL
+   * checks plus HeadObject — enough to starve the pg pool (default max 10) and look like a backend crash.
+   */
+  const PORTAL_DL_AUTH_TTL_MS = 60 * 1000;
+  const PORTAL_DL_AUTH_DENY_TTL_MS = 12 * 1000;
+  const PORTAL_DL_META_TTL_MS = 5 * 60 * 1000;
+  const portalDlAuthCache = new Map();
+  const portalDlObjectMetaCache = new Map();
+
+  function portalDlAuthCacheKey(user, fileId) {
+    if (user && user.isAdmin) return `admin::${fileId}`;
+    const uid = user && user.id != null ? `id:${user.id}` : '';
+    const un = user && user.username ? `u:${user.username}` : '';
+    return `${uid || un || 'anon'}::${fileId}`;
+  }
+
+  function trimPortalDlMap(map, maxEntries = 3000) {
+    if (map.size <= maxEntries) return;
+    const n = Math.floor(map.size / 2);
+    let k = 0;
+    for (const key of map.keys()) {
+      map.delete(key);
+      if (++k >= n) break;
+    }
+  }
+
+  function invalidatePortalDlCachesForFile(fileId, objectKey) {
+    portalDlObjectMetaCache.delete(`${bucket}::${objectKey}`);
+    const suffix = `::${fileId}`;
+    for (const key of portalDlAuthCache.keys()) {
+      if (key.endsWith(suffix)) portalDlAuthCache.delete(key);
+    }
+  }
+
+  async function resolvePortalDownloadObjectMeta(objectKey) {
+    const mk = `${bucket}::${objectKey}`;
+    const now = Date.now();
+    const hit = portalDlObjectMetaCache.get(mk);
+    if (hit && hit.exp > now) return hit;
+    const meta = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: objectKey }));
+    const total = Number(meta.ContentLength);
+    if (!Number.isFinite(total) || total < 0) {
+      throw new Error('Missing object size');
+    }
+    const s3Type = (meta.ContentType || '').split(';')[0].trim().toLowerCase();
+    const entry = {
+      total,
+      s3Type,
+      rawContentType: meta.ContentType || '',
+      exp: now + PORTAL_DL_META_TTL_MS
+    };
+    portalDlObjectMetaCache.set(mk, entry);
+    trimPortalDlMap(portalDlObjectMetaCache);
+    return entry;
+  }
+
   async function handlePortalFileDownload(req, res) {
     try {
-      const Key = idToKey(req.params.id);
+      const fileId = req.params.id;
+      const Key = idToKey(fileId);
       if (!Key.startsWith('clients/')) {
         return res.status(400).json({ error: 'Invalid id' });
       }
@@ -1061,28 +1119,52 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         return res.status(400).json({ error: 'Not a downloadable file' });
       }
       const parsed = parseJobFromObjectKey(Key);
-      if (!parsed || !(await assertPortalJobAccess(pool, req.user, parsed.clientId, parsed.jobId))) {
+      if (!parsed) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefDl = jobPrefix(parsed.clientId, parsed.jobId);
       const relPathDl = Key.slice(prefDl.length);
-      if (!(await assertPortalPathRel(pool, req.user, parsed.clientId, parsed.jobId, relPathDl))) {
+      const now = Date.now();
+      const authK = portalDlAuthCacheKey(req.user, fileId);
+      const authHit = portalDlAuthCache.get(authK);
+      let pathOk = false;
+      if (authHit && authHit.exp > now) {
+        pathOk = authHit.allowed;
+      } else {
+        // Single check: includes job access (avoid duplicate assertPortalJobAccess vs older handler).
+        pathOk = await assertPortalPathRel(pool, req.user, parsed.clientId, parsed.jobId, relPathDl);
+        portalDlAuthCache.set(authK, {
+          allowed: pathOk,
+          exp: now + (pathOk ? PORTAL_DL_AUTH_TTL_MS : PORTAL_DL_AUTH_DENY_TTL_MS)
+        });
+        trimPortalDlMap(portalDlAuthCache);
+      }
+      if (!pathOk) {
         return res.status(403).json({ error: 'Forbidden' });
       }
 
       const filename = path.basename(Key);
       const fromKey = contentTypeFromFilename(filename);
-      const meta = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key }));
-      const total = Number(meta.ContentLength);
-      if (!Number.isFinite(total) || total < 0) {
-        return res.status(500).json({ error: 'Missing object size' });
+      let om;
+      try {
+        om = await resolvePortalDownloadObjectMeta(Key);
+      } catch (headErr) {
+        const hn = headErr && typeof headErr === 'object' && 'name' in headErr ? headErr.name : '';
+        if (
+          hn === 'NoSuchKey' ||
+          (headErr instanceof Error && headErr.message && headErr.message.includes('NoSuchKey'))
+        ) {
+          return res.status(404).json({ error: 'Not found' });
+        }
+        throw headErr;
       }
+      const total = om.total;
 
-      const s3Type = (meta.ContentType || '').split(';')[0].trim().toLowerCase();
+      const s3Type = om.s3Type;
       const useGuess =
         fromKey &&
         (!s3Type || s3Type === 'application/octet-stream' || s3Type === 'binary/octet-stream');
-      const contentType = useGuess ? fromKey : meta.ContentType || 'application/octet-stream';
+      const contentType = useGuess ? fromKey : om.rawContentType || 'application/octet-stream';
       const inline =
         /^video\//i.test(contentType) ||
         contentType === 'application/pdf' ||
@@ -1190,6 +1272,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key }));
+      invalidatePortalDlCachesForFile(req.params.id, Key);
       return res.status(204).send();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
