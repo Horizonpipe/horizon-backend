@@ -24,10 +24,42 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
+/** Managed Postgres (Render, Neon, Supabase, etc.) often closes idle connections; recycle clients before that. */
+const PG_POOL_MAX = Math.max(2, Math.min(50, Number(process.env.PG_POOL_MAX || 10)));
+const PG_IDLE_TIMEOUT_MS = Math.max(
+  5000,
+  Math.min(120000, Number(process.env.PG_IDLE_TIMEOUT_MS || 25000))
+);
+const PG_CONNECT_TIMEOUT_MS = Math.max(
+  3000,
+  Math.min(60000, Number(process.env.PG_CONNECT_TIMEOUT_MS || 20000))
+);
+
+const databaseUrlLooksLocal =
+  /(^|@)(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(DATABASE_URL) ||
+  /sslmode=disable/i.test(DATABASE_URL);
+const sslDisabledByEnv =
+  process.env.DATABASE_SSL === '0' || /^false$/i.test(String(process.env.DATABASE_SSL || ''));
+
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  max: PG_POOL_MAX,
+  idleTimeoutMillis: PG_IDLE_TIMEOUT_MS,
+  connectionTimeoutMillis: PG_CONNECT_TIMEOUT_MS,
+  allowExitOnIdle: process.env.PG_ALLOW_EXIT_ON_IDLE === '1',
+  ssl: sslDisabledByEnv || databaseUrlLooksLocal ? false : { rejectUnauthorized: false }
 });
+
+pool.on('error', (err) => {
+  console.error(
+    '[pg] Pool client error (idle connection may have been closed by the host — next query opens a fresh one):',
+    err && err.message ? err.message : err
+  );
+});
+
+console.log(
+  `[pg] Pool ready: max=${PG_POOL_MAX}, idleTimeout=${PG_IDLE_TIMEOUT_MS}ms, connectTimeout=${PG_CONNECT_TIMEOUT_MS}ms, ssl=${sslDisabledByEnv || databaseUrlLooksLocal ? 'off' : 'on'}`
+);
 
 const SESSION_TTL_MINUTES = 15;
 const upload = multer({
@@ -612,11 +644,24 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', async (req, res) => {
+  const started = Date.now();
   try {
-    await pool.query('SELECT 1');
-    res.json({ success: true });
+    await pool.query('SELECT 1 AS ok');
+    res.json({
+      success: true,
+      service: 'horizon-backend',
+      database: true,
+      latencyMs: Date.now() - started
+    });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    console.error('[health] Database check failed:', error && error.message ? error.message : error);
+    res.status(503).json({
+      success: false,
+      service: 'horizon-backend',
+      database: false,
+      error: error && error.message ? error.message : 'Database unreachable',
+      latencyMs: Date.now() - started
+    });
   }
 });
 
