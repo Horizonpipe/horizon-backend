@@ -79,6 +79,16 @@ function assertCategory(cat) {
   }
 }
 
+/** When folderPath is empty and category omitted (portal root upload), pick a bucket folder from the filename. */
+function inferCategoryFromFilename(name) {
+  const n = String(name || '').toLowerCase();
+  if (n.endsWith('.pdf')) return 'pdf';
+  if (n.endsWith('.db3')) return 'db3';
+  if (/\.(mp4|webm|ogg|mov|m4v|avi|mkv)$/i.test(n)) return 'videos';
+  if (/\.(jpg|jpeg|png|gif|webp|bmp|tif|tiff)$/i.test(n)) return 'photos';
+  return 'videos';
+}
+
 function objectKey(clientId, jobId, category, filename) {
   assertCategory(category);
   const safe = sanitizeFilename(filename);
@@ -524,11 +534,8 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
         const safe = sanitizeFilename(original);
         Key = `${jobPrefix(String(clientId), String(jobId))}${fp}/${safe}`;
       } else {
-        if (!req.body.category) {
-          fs.unlink(f.path, () => {});
-          return res.status(400).json({ error: 'category is required when folderPath is omitted' });
-        }
-        Key = objectKey(String(clientId), String(jobId), String(req.body.category), original);
+        const cat = req.body.category || inferCategoryFromFilename(original);
+        Key = objectKey(String(clientId), String(jobId), String(cat), original);
       }
       const stream = fs.createReadStream(f.path);
       const uploadTask = new Upload({
