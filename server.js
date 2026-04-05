@@ -180,7 +180,7 @@ function normalizeRoles(value) {
   };
 }
 
-/** Shared prefix for per-user portal uploads in Wasabi (`clients/portal-users/jobs/{userId}/…`). */
+/** Legacy per-user prefix (kept only when explicitly re-enabled). */
 const PORTAL_FILES_CLIENT_ID = 'portal-users';
 
 /**
@@ -189,6 +189,10 @@ const PORTAL_FILES_CLIENT_ID = 'portal-users';
 const PORTAL_FORCE_CLIENT_ID = (process.env.PORTAL_FORCE_CLIENT_ID || '').trim();
 const PORTAL_FORCE_JOB_ID = (process.env.PORTAL_FORCE_JOB_ID || '').trim();
 const PORTAL_FORCE_JOB_SCOPE = PORTAL_FORCE_CLIENT_ID && PORTAL_FORCE_JOB_ID;
+/** Backward-compat toggle: set `PORTAL_USER_SCOPED_DEFAULTS=1` to restore `portal-users/{userId}` defaults. */
+const PORTAL_USER_SCOPED_DEFAULTS =
+  String(process.env.PORTAL_USER_SCOPED_DEFAULTS || '').trim().toLowerCase() === '1' ||
+  String(process.env.PORTAL_USER_SCOPED_DEFAULTS || '').trim().toLowerCase() === 'true';
 
 function portalPermissionsWhitelistHas(username) {
   const u = String(username || '')
@@ -204,6 +208,7 @@ function portalPermissionsWhitelistHas(username) {
 
 function normalizeUser(row) {
   const id = row.id;
+  const legacyUserScoped = id != null && String(id).trim() && PORTAL_USER_SCOPED_DEFAULTS;
   return {
     id,
     username: row.username,
@@ -211,8 +216,12 @@ function normalizeUser(row) {
     isAdmin: !!row.is_admin,
     roles: normalizeRoles(row.roles),
     mustChangePassword: !!row.must_change_password,
-    portalFilesClientId: PORTAL_FORCE_JOB_SCOPE ? PORTAL_FORCE_CLIENT_ID : PORTAL_FILES_CLIENT_ID,
-    portalFilesJobId: PORTAL_FORCE_JOB_SCOPE ? PORTAL_FORCE_JOB_ID : String(id),
+    portalFilesClientId: PORTAL_FORCE_JOB_SCOPE
+      ? PORTAL_FORCE_CLIENT_ID
+      : legacyUserScoped
+        ? PORTAL_FILES_CLIENT_ID
+        : undefined,
+    portalFilesJobId: PORTAL_FORCE_JOB_SCOPE ? PORTAL_FORCE_JOB_ID : legacyUserScoped ? String(id) : undefined,
     portalPermissionsAccess:
       !!row.portal_permissions_access || portalPermissionsWhitelistHas(row.username)
   };
