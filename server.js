@@ -8,6 +8,7 @@ const initSqlJs = require('sql.js');
 const { Pool } = require('pg');
 const { ensureOutlookSchema, registerOutlookRoutes } = require('./outlook');
 const { registerPortalFilesRoutes } = require('./portal-files.routes');
+const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
 
 const app = express();
 app.use(express.json());
@@ -1579,6 +1580,43 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
 registerOutlookRoutes(app, { pool, requireAuth, currentToken, corsOrigins: CORS_ORIGINS });
 registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin });
 
+const autoImportPlugin = createAutoImportPlugin({
+  pool,
+  requireMike,
+  requireAuth,
+  writeSegment: async (jobsiteId, payload, savedBy) => {
+    const record = await fetchRecordById(String(jobsiteId));
+    if (!record) throw new Error(`Planner record not found for jobsite id ${jobsiteId}`);
+    const system = cleanString(payload.system || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
+    const segment = normalizeSegment(
+      {
+        id: payload.id,
+        reference: payload.reference,
+        upstream: payload.upstream,
+        downstream: payload.downstream,
+        dia: payload.dia,
+        material: payload.material,
+        length: payload.length,
+        footage: payload.footage,
+        street: record.street,
+        system,
+        versions: payload.versions
+      },
+      savedBy || 'System'
+    );
+    record.systems[system] = Array.isArray(record.systems[system]) ? record.systems[system] : [];
+    const refLower = String(segment.reference || '').toLowerCase();
+    record.systems[system] = record.systems[system].filter(
+      (item) => String(item.reference || '').toLowerCase() !== refLower
+    );
+    record.systems[system].push(segment);
+    record.saved_by = savedBy || record.saved_by;
+    await persistRecord(record);
+  },
+  buildVersion: (payload) => defaultVersion(payload.savedBy || 'System', payload)
+});
+app.use('/auto-import-plugin', requireAuth, autoImportPlugin.router);
+
 app.use((error, req, res, next) => {
   if (error && /CORS blocked/.test(error.message || '')) {
     return res.status(403).json({ success: false, error: error.message });
@@ -1588,7 +1626,8 @@ app.use((error, req, res, next) => {
 });
 
 ensureSchema()
-  .then(() => {
+  .then(async () => {
+    await autoImportPlugin.initSchema();
     app.listen(PORT, () => {
       console.log(`Horizon backend listening on port ${PORT}`);
     });

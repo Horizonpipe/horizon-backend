@@ -265,11 +265,16 @@ function createAutoImportPlugin(options = {}) {
     if (!binding) throw new Error('Bind this DB3 project to a client/city/jobsite before syncing.');
 
     const targetJobsiteResult = await pool.query(
-      'SELECT id FROM jobsites WHERE LOWER(client)=LOWER($1) AND LOWER(city)=LOWER($2) AND LOWER(jobsite)=LOWER($3) LIMIT 1',
+      `SELECT id FROM planner_records
+       WHERE LOWER(client) = LOWER($1) AND LOWER(city) = LOWER($2) AND LOWER(jobsite) = LOWER($3)
+       ORDER BY updated_at DESC
+       LIMIT 1`,
       [binding.client, binding.city, binding.jobsite]
     );
     if (!targetJobsiteResult.rows[0]) {
-      throw new Error('Selected target jobsite was not found in jobsites table.');
+      throw new Error(
+        'Selected target jobsite was not found. Create a planner record with the same client, city, and jobsite first.'
+      );
     }
     const targetJobsiteId = targetJobsiteResult.rows[0].id;
 
@@ -421,7 +426,7 @@ function createAutoImportPlugin(options = {}) {
 
   router.post('/bind/:projectId', requireMike, express.json(), async (req, res, next) => {
     try {
-      const binding = await upsertBinding(req.params.projectId, req.body, req.session?.user?.username || 'System');
+      const binding = await upsertBinding(req.params.projectId, req.body, req.user?.username || 'System');
       res.json({ success: true, binding });
     } catch (error) {
       next(error);
@@ -466,7 +471,7 @@ function createAutoImportPlugin(options = {}) {
       const rows = Array.isArray(req.body.rows) && req.body.rows.length
         ? req.body.rows
         : await parseDb3(project.db3_path);
-      const sync = await syncProjectRows(project, rows, req.session?.user?.username || 'System');
+      const sync = await syncProjectRows(project, rows, req.user?.username || 'System');
       const runId = uid();
       await pool.query(`
         INSERT INTO auto_import_runs (
@@ -507,11 +512,11 @@ function createAutoImportPlugin(options = {}) {
     }
   });
 
-  router.get('/jobsite-options', requireAuth, async (req, res, next) => {
+  router.get('/jobsite-options', requireMike, async (req, res, next) => {
     try {
       const result = await pool.query(`
         SELECT id, client, city, jobsite
-        FROM jobsites
+        FROM planner_records
         ORDER BY LOWER(client), LOWER(city), LOWER(jobsite)
       `);
       res.json({ success: true, jobsites: result.rows });
