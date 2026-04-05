@@ -383,7 +383,81 @@ async function assertPortalJobAccess(pool, user, clientId, jobId) {
   }
 }
 
-function registerPortalFilesRoutes(app, { pool, requireAuth }) {
+async function portalJobHasPathGrants(pool, clientId, jobId) {
+  const r = await pool.query(
+    `SELECT 1 FROM portal_path_grants WHERE client_id = $1 AND job_id = $2 LIMIT 1`,
+    [String(clientId), String(jobId)]
+  );
+  return r.rows.length > 0;
+}
+
+async function loadUserPathGrants(pool, clientId, jobId, username) {
+  const r = await pool.query(
+    `SELECT path_prefix, COALESCE(recursive, true) AS recursive FROM portal_path_grants
+     WHERE client_id = $1 AND job_id = $2 AND LOWER(TRIM(username)) = LOWER(TRIM($3))`,
+    [String(clientId), String(jobId), String(username || '')]
+  );
+  return r.rows;
+}
+
+function relPathMatchesGrant(relPath, pathPrefix, recursive) {
+  const rp = normalizeRelPath(relPath);
+  const p = normalizeRelPath(pathPrefix ?? '');
+  if (p === '') return true;
+  const rec = recursive !== false;
+  if (rec) return rp === p || rp.startsWith(`${p}/`);
+  if (rp === p) return true;
+  if (rp.startsWith(`${p}/`)) {
+    const rest = rp.slice(p.length + 1);
+    return !rest.includes('/');
+  }
+  return false;
+}
+
+async function assertPortalPathRel(pool, user, clientId, jobId, relPath) {
+  if (!user) return false;
+  if (user.isAdmin) return true;
+  const jobOk = await assertPortalJobAccess(pool, user, String(clientId), String(jobId));
+  if (!jobOk) return false;
+  const anyGrants = await portalJobHasPathGrants(pool, clientId, jobId);
+  if (!anyGrants) return true;
+  const grants = await loadUserPathGrants(pool, clientId, jobId, user.username);
+  if (!grants.length) return false;
+  const rp = normalizeRelPath(relPath);
+  return grants.some((g) => relPathMatchesGrant(rp, g.path_prefix, g.recursive));
+}
+
+function filterTreeByPathGrants(tree, grants, jobHasAnyGrant) {
+  if (!jobHasAnyGrant) return tree;
+  if (!grants.length) return { folders: [], files: [] };
+  const allows = (rp) =>
+    grants.some((g) => relPathMatchesGrant(normalizeRelPath(rp), g.path_prefix, g.recursive));
+  const files = (tree.files || []).filter((f) => allows(f.path));
+  const keepFolders = new Set();
+  for (const f of files) {
+    let p = f.parentPath || '';
+    while (p !== '') {
+      keepFolders.add(p);
+      p = parentRelPath(p);
+    }
+  }
+  for (const g of grants) {
+    const p = normalizeRelPath(g.path_prefix || '');
+    if (!p) {
+      return tree;
+    }
+    keepFolders.add(p);
+    let cur = p;
+    while (cur) {
+      keepFolders.add(cur);
+      cur = parentRelPath(cur);
+    }
+  }
+  const folders = (tree.folders || []).filter((fol) => keepFolders.has(fol.path));
+  return { folders, files };
+}
+
+function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
   const s3 = createWasabiClient();
   const bucket = bucketName();
 
@@ -410,11 +484,22 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
+      const anyGrant =
+        !req.user?.isAdmin && (await portalJobHasPathGrants(pool, clientId, jobId));
+      const userGrants = anyGrant
+        ? await loadUserPathGrants(pool, clientId, jobId, req.user.username)
+        : null;
       const out = [];
       const keys = await listAllKeys(s3, bucket, prefix);
       for (const obj of keys) {
         const rel = obj.Key.slice(prefix.length);
         if (!rel || isFolderMarkerKey(rel)) continue;
+        if (
+          userGrants &&
+          !userGrants.some((g) => relPathMatchesGrant(rel, g.path_prefix, g.recursive))
+        ) {
+          continue;
+        }
         out.push({
           id: keyToId(obj.Key),
           key: obj.Key,
@@ -441,11 +526,80 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
       const keys = await listAllKeys(s3, bucket, prefix);
-      const tree = buildTreeFromKeys(prefix, keys);
+      let tree = buildTreeFromKeys(prefix, keys);
+      if (!req.user?.isAdmin) {
+        const anyG = await portalJobHasPathGrants(pool, clientId, jobId);
+        if (anyG) {
+          const userGrants = await loadUserPathGrants(pool, clientId, jobId, req.user.username);
+          tree = filterTreeByPathGrants(tree, userGrants, true);
+        }
+      }
       return res.json(tree);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(400).json({ error: msg });
+    }
+  });
+
+  r.get('/permissions', async (req, res) => {
+    try {
+      const { clientId, jobId } = req.query;
+      if (!clientId || !jobId) {
+        return res.status(400).json({ error: 'clientId and jobId query params are required' });
+      }
+      if (!req.user?.isAdmin) {
+        return res.status(403).json({ error: 'Admin only' });
+      }
+      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const r2 = await pool.query(
+        `SELECT id, username, path_prefix AS "pathPrefix", recursive, created_at AS "createdAt"
+         FROM portal_path_grants
+         WHERE client_id = $1 AND job_id = $2
+         ORDER BY LOWER(username), path_prefix`,
+        [String(clientId), String(jobId)]
+      );
+      return res.json({ grants: r2.rows });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  r.put('/permissions', express.json({ limit: '512kb' }), requireAdmin, async (req, res) => {
+    try {
+      const { clientId, jobId, grants } = req.body || {};
+      if (!clientId || !jobId || !Array.isArray(grants)) {
+        return res.status(400).json({ error: 'clientId, jobId, and grants array are required' });
+      }
+      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      await pool.query(`DELETE FROM portal_path_grants WHERE client_id = $1 AND job_id = $2`, [
+        String(clientId),
+        String(jobId)
+      ]);
+      for (const g of grants) {
+        const u = String(g.username || '').trim();
+        if (!u) continue;
+        let pp = '';
+        try {
+          pp = normalizeRelPath(g.pathPrefix != null ? String(g.pathPrefix) : '');
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          return res.status(400).json({ error: `Invalid pathPrefix: ${m}` });
+        }
+        const rec = g.recursive !== false;
+        await pool.query(
+          `INSERT INTO portal_path_grants (client_id, job_id, username, path_prefix, recursive) VALUES ($1,$2,$3,$4,$5)`,
+          [String(clientId), String(jobId), u, pp, rec]
+        );
+      }
+      return res.json({ success: true });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
     }
   });
 
@@ -459,6 +613,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const rel = joinRel(parentPath || '', name);
+      if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, rel))) {
+        return res.status(403).json({ error: 'Forbidden for this path' });
+      }
       const pref = jobPrefix(String(clientId), String(jobId));
       const markerKey = rel ? `${pref}${rel}/${FOLDER_MARKER}` : `${pref}${FOLDER_MARKER}`;
 
@@ -520,6 +677,12 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
         if (oldKey === newKey) {
           return res.json({ id: keyToId(newKey), key: newKey, path: newRel });
         }
+        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, oldRel))) {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, newRel))) {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
         try {
           await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: newKey }));
           return res.status(409).json({ error: 'Destination already exists' });
@@ -551,6 +714,12 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
         const newRel = parent ? `${parent}/${seg}` : seg;
         if (oldFolderRel === newRel) {
           return res.json({ path: newRel });
+        }
+        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, oldFolderRel))) {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, newRel))) {
+          return res.status(403).json({ error: 'Forbidden' });
         }
 
         const oldPrefix = `${pref}${oldFolderRel}/`;
@@ -596,6 +765,111 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
     }
   });
 
+  r.patch('/move', express.json(), async (req, res) => {
+    try {
+      const { clientId, jobId, fileId, folderPath, toParentPath } = req.body || {};
+      if (!clientId || !jobId || toParentPath === undefined) {
+        return res.status(400).json({ error: 'clientId, jobId, and toParentPath are required' });
+      }
+      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const pref = jobPrefix(String(clientId), String(jobId));
+      const destParent = normalizeRelPath(toParentPath);
+
+      if (fileId) {
+        const oldKey = idToKey(String(fileId));
+        if (!oldKey.startsWith(pref) || isFolderMarkerKey(oldKey.slice(pref.length))) {
+          return res.status(400).json({ error: 'Invalid file id' });
+        }
+        const oldRel = oldKey.slice(pref.length);
+        const name = basenameRel(oldRel);
+        const newRel = destParent ? `${destParent}/${name}` : name;
+        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, oldRel))) {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, newRel))) {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+        const newKey = `${pref}${newRel}`;
+        if (oldKey === newKey) {
+          return res.json({ id: keyToId(newKey), key: newKey, path: newRel });
+        }
+        try {
+          await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: newKey }));
+          return res.status(409).json({ error: 'Destination already exists' });
+        } catch (he) {
+          const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
+          if (hn !== 'NotFound' && he?.$metadata?.httpStatusCode !== 404) throw he;
+        }
+        await s3.send(
+          new CopyObjectCommand({
+            Bucket: bucket,
+            Key: newKey,
+            CopySource: copySourceHeader(bucket, oldKey),
+            MetadataDirective: 'COPY'
+          })
+        );
+        await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: oldKey }));
+        return res.json({ id: keyToId(newKey), key: newKey, path: newRel, name });
+      }
+
+      if (folderPath !== undefined && String(folderPath).trim() !== '') {
+        const oldFolderRel = normalizeRelPath(folderPath);
+        if (!oldFolderRel) {
+          return res.status(400).json({ error: 'Invalid folder path' });
+        }
+        const seg = sanitizeFolderSegment(basenameRel(oldFolderRel));
+        const newRel = destParent ? `${destParent}/${seg}` : seg;
+        if (oldFolderRel === newRel) {
+          return res.json({ path: newRel });
+        }
+        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, oldFolderRel))) {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, newRel))) {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+        const oldPrefix = `${pref}${oldFolderRel}/`;
+        const keys = await listAllKeys(s3, bucket, oldPrefix);
+        if (keys.length === 0) {
+          return res.status(404).json({ error: 'Folder not found' });
+        }
+        const destProbe = await listAllKeys(s3, bucket, `${pref}${newRel}`);
+        const destTaken = destProbe.some(
+          (o) => o.Key === `${pref}${newRel}` || o.Key.startsWith(`${pref}${newRel}/`)
+        );
+        if (destTaken) {
+          return res.status(409).json({ error: 'Destination path is occupied' });
+        }
+        const newPrefix = `${pref}${newRel}/`;
+        const mapping = keys.map((o) => ({
+          from: o.Key,
+          to: `${newPrefix}${o.Key.slice(oldPrefix.length)}`
+        }));
+        for (const { from, to } of mapping) {
+          await s3.send(
+            new CopyObjectCommand({
+              Bucket: bucket,
+              Key: to,
+              CopySource: copySourceHeader(bucket, from),
+              MetadataDirective: 'COPY'
+            })
+          );
+        }
+        for (const { from } of mapping) {
+          await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: from }));
+        }
+        return res.json({ path: newRel, parentPath: parentRelPath(newRel), name: seg });
+      }
+
+      return res.status(400).json({ error: 'Provide fileId or folderPath' });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
   r.delete('/folders', async (req, res) => {
     try {
       const { clientId, jobId, path: pathParam } = req.query;
@@ -608,6 +882,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       const folderRel = normalizeRelPath(pathParam);
       if (!folderRel) {
         return res.status(400).json({ error: 'path must name a folder under the job (not the job root)' });
+      }
+      if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, folderRel))) {
+        return res.status(403).json({ error: 'Forbidden' });
       }
       const pref = jobPrefix(String(clientId), String(jobId));
       const prefix = `${pref}${folderRel}/`;
@@ -648,8 +925,13 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       const fp = normalizeRelPath(folderPath || '');
       const catExplicit = fp ? null : req.body.category || null;
       const Key = portalUploadKey(clientId, jobId, fp || '', original, catExplicit);
-      await s3UploadFromTempPath(s3, bucket, Key, f.path, f.mimetype || 'application/octet-stream');
       const pref = jobPrefix(String(clientId), String(jobId));
+      const relForAcl = Key.slice(pref.length);
+      if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, relForAcl))) {
+        fs.unlink(f.path, () => {});
+        return res.status(403).json({ error: 'Forbidden for this path' });
+      }
+      await s3UploadFromTempPath(s3, bucket, Key, f.path, f.mimetype || 'application/octet-stream');
       return res.status(201).json({
         id: keyToId(Key),
         key: Key,
@@ -723,6 +1005,20 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       const original = f.originalname || 'upload';
       try {
         const Key = portalUploadKey(clientId, jobId, pathsList[idx], original, null);
+        const relForAcl = Key.slice(pref.length);
+        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, relForAcl))) {
+          try {
+            fs.unlink(f.path, () => {});
+          } catch (_) {
+            /* ignore */
+          }
+          errSlot[idx] = {
+            index: idx,
+            name: original,
+            error: 'Forbidden for this path'
+          };
+          return;
+        }
         await s3UploadFromTempPath(s3, bucket, Key, f.path, f.mimetype || 'application/octet-stream');
         okSlot[idx] = {
           id: keyToId(Key),
@@ -766,6 +1062,11 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       }
       const parsed = parseJobFromObjectKey(Key);
       if (!parsed || !(await assertPortalJobAccess(pool, req.user, parsed.clientId, parsed.jobId))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const prefDl = jobPrefix(parsed.clientId, parsed.jobId);
+      const relPathDl = Key.slice(prefDl.length);
+      if (!(await assertPortalPathRel(pool, req.user, parsed.clientId, parsed.jobId, relPathDl))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
 
@@ -881,6 +1182,11 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       }
       const parsed = parseJobFromObjectKey(Key);
       if (!parsed || !(await assertPortalJobAccess(pool, req.user, parsed.clientId, parsed.jobId))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const prefDel = jobPrefix(parsed.clientId, parsed.jobId);
+      const relPathDel = Key.slice(prefDel.length);
+      if (!(await assertPortalPathRel(pool, req.user, parsed.clientId, parsed.jobId, relPathDel))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key }));

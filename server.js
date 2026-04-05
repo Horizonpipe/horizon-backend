@@ -568,6 +568,24 @@ async function ensureSchema() {
   ];
   for (const query of assetAlters) await pool.query(query);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS portal_path_grants (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      client_id TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      username TEXT NOT NULL,
+      path_prefix TEXT NOT NULL DEFAULT '',
+      recursive BOOLEAN NOT NULL DEFAULT true,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_portal_path_grants_cj ON portal_path_grants (client_id, job_id)`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_portal_path_grants_user ON portal_path_grants (client_id, job_id, lower(username))`
+  );
+
   await ensureOutlookSchema(pool);
 
   const countResult = await pool.query('SELECT COUNT(*)::int AS count FROM users');
@@ -1559,7 +1577,7 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
 });
 
 registerOutlookRoutes(app, { pool, requireAuth, currentToken, corsOrigins: CORS_ORIGINS });
-registerPortalFilesRoutes(app, { pool, requireAuth });
+registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin });
 
 app.use((error, req, res, next) => {
   if (error && /CORS blocked/.test(error.message || '')) {
