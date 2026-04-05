@@ -11,10 +11,19 @@ const os = require('os');
 const path = require('path');
 const express = require('express');
 const multer = require('multer');
-const { S3Client, DeleteObjectCommand, GetObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
+const {
+  S3Client,
+  CopyObjectCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  PutObjectCommand
+} = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
 
 const CATEGORIES = new Set(['videos', 'db3', 'pdf', 'photos']);
+const FOLDER_MARKER = '.hp-folder';
 
 const portalUpload = multer({
   dest: os.tmpdir(),
@@ -54,6 +63,16 @@ function sanitizeFilename(name) {
   return cleaned;
 }
 
+function sanitizeFolderSegment(name) {
+  const t = String(name ?? '').trim();
+  if (!t || t === '.' || t === '..') throw new Error('Invalid folder name');
+  if (t.includes('/') || t.includes('\\') || t.includes('..')) throw new Error('Invalid folder name');
+  const cleaned = t.replace(/[^\w.\- ()\[\]]+/g, '_').slice(0, 120);
+  if (!cleaned) throw new Error('Invalid folder name');
+  if (cleaned === FOLDER_MARKER) throw new Error('Reserved folder name');
+  return cleaned;
+}
+
 function assertCategory(cat) {
   if (!CATEGORIES.has(cat)) {
     throw new Error(`Invalid category. Use one of: ${[...CATEGORIES].join(', ')}`);
@@ -85,8 +104,134 @@ function idToKey(id) {
 }
 
 /**
- * Admin: all prefixes. Others: must match a planner row for this client + job (record id or jobsite label).
+ * Normalize relative path under job root (no leading/trailing slash).
  */
+function normalizeRelPath(p) {
+  const raw = String(p ?? '').trim().replace(/\\/g, '/');
+  if (!raw) return '';
+  const segments = raw.split('/').filter(Boolean);
+  if (segments.some((x) => x === '.' || x === '..')) throw new Error('Invalid path');
+  for (const seg of segments) {
+    sanitizeFolderSegment(seg);
+  }
+  return segments.join('/');
+}
+
+function joinRel(parentPath, name) {
+  const p = normalizeRelPath(parentPath);
+  const n = sanitizeFolderSegment(name);
+  return p ? `${p}/${n}` : n;
+}
+
+function parentRelPath(rel) {
+  const n = normalizeRelPath(rel);
+  if (!n) return '';
+  const i = n.lastIndexOf('/');
+  return i === -1 ? '' : n.slice(0, i);
+}
+
+function basenameRel(rel) {
+  const n = normalizeRelPath(rel);
+  if (!n) return '';
+  const i = n.lastIndexOf('/');
+  return i === -1 ? n : n.slice(i + 1);
+}
+
+function copySourceHeader(bucket, key) {
+  return `${bucket}/${key.split('/').map(encodeURIComponent).join('/')}`;
+}
+
+async function listAllKeys(s3, bucket, prefix) {
+  const keys = [];
+  let pageToken;
+  do {
+    const resp = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: prefix,
+        ContinuationToken: pageToken
+      })
+    );
+    for (const obj of resp.Contents || []) {
+      if (obj.Key) keys.push({ Key: obj.Key, Size: obj.Size ?? 0, LastModified: obj.LastModified });
+    }
+    pageToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+  } while (pageToken);
+  return keys;
+}
+
+function isFolderMarkerKey(relKey) {
+  return relKey.endsWith(`/${FOLDER_MARKER}`) || relKey === FOLDER_MARKER;
+}
+
+function markerRelToFolderRel(markerRel) {
+  if (markerRel === FOLDER_MARKER) return '';
+  if (markerRel.endsWith(`/${FOLDER_MARKER}`)) {
+    return markerRel.slice(0, -(FOLDER_MARKER.length + 1));
+  }
+  return null;
+}
+
+/**
+ * Build nested catalog from flat keys under job prefix.
+ */
+function buildTreeFromKeys(jobPref, entries) {
+  const rel = (key) => key.slice(jobPref.length);
+  const folderSet = new Set();
+  const folderMeta = new Map();
+
+  const files = [];
+
+  for (const { Key: key, Size: size, LastModified: lm } of entries) {
+    if (!key.startsWith(jobPref)) continue;
+    const r = rel(key);
+    if (!r) continue;
+
+    if (isFolderMarkerKey(r)) {
+      const folderRel = markerRelToFolderRel(r);
+      if (folderRel !== null && folderRel !== '') {
+        folderSet.add(folderRel);
+        const iso = lm ? lm.toISOString() : null;
+        const prev = folderMeta.get(folderRel);
+        if (!prev || (iso && (!prev.lastModified || iso > prev.lastModified))) {
+          folderMeta.set(folderRel, { lastModified: iso });
+        }
+      }
+      continue;
+    }
+
+    const slash = r.lastIndexOf('/');
+    const parentPath = slash === -1 ? '' : r.slice(0, slash);
+    const name = slash === -1 ? r : r.slice(slash + 1);
+    let p = parentPath;
+    while (p !== '') {
+      folderSet.add(p);
+      const ix = p.lastIndexOf('/');
+      p = ix === -1 ? '' : p.slice(0, ix);
+    }
+
+    files.push({
+      id: keyToId(key),
+      key,
+      path: r,
+      parentPath,
+      name,
+      size,
+      lastModified: lm ? lm.toISOString() : null
+    });
+  }
+
+  const folders = [...folderSet].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  const folderRows = folders.map((fp) => ({
+    path: fp,
+    parentPath: parentRelPath(fp),
+    name: basenameRel(fp),
+    lastModified: folderMeta.get(fp)?.lastModified ?? null
+  }));
+
+  return { folders: folderRows, files };
+}
+
 async function assertPortalJobAccess(pool, user, clientId, jobId) {
   if (user && user.isAdmin) return true;
   const c = String(clientId || '').trim();
@@ -138,32 +283,221 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
       const out = [];
-      let pageToken;
-      do {
-        const resp = await s3.send(
-          new ListObjectsV2Command({
-            Bucket: bucket,
-            Prefix: prefix,
-            ContinuationToken: pageToken
-          })
-        );
-        for (const obj of resp.Contents || []) {
-          if (!obj.Key.endsWith('/')) {
-            out.push({
-              id: keyToId(obj.Key),
-              key: obj.Key,
-              name: path.basename(obj.Key),
-              size: obj.Size ?? 0,
-              lastModified: obj.LastModified ? obj.LastModified.toISOString() : null
-            });
-          }
-        }
-        pageToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
-      } while (pageToken);
+      const keys = await listAllKeys(s3, bucket, prefix);
+      for (const obj of keys) {
+        const rel = obj.Key.slice(prefix.length);
+        if (!rel || isFolderMarkerKey(rel)) continue;
+        out.push({
+          id: keyToId(obj.Key),
+          key: obj.Key,
+          name: path.basename(obj.Key),
+          size: obj.Size ?? 0,
+          lastModified: obj.LastModified ? obj.LastModified.toISOString() : null
+        });
+      }
       return res.json({ files: out });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(400).json({ error: msg });
+    }
+  });
+
+  r.get('/tree', async (req, res) => {
+    try {
+      const { clientId, jobId } = req.query;
+      if (!clientId || !jobId) {
+        return res.status(400).json({ error: 'clientId and jobId query params are required' });
+      }
+      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const prefix = jobPrefix(String(clientId), String(jobId));
+      const keys = await listAllKeys(s3, bucket, prefix);
+      const tree = buildTreeFromKeys(prefix, keys);
+      return res.json(tree);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(400).json({ error: msg });
+    }
+  });
+
+  r.post('/folders', express.json(), async (req, res) => {
+    try {
+      const { clientId, jobId, parentPath, name } = req.body || {};
+      if (!clientId || !jobId || !name) {
+        return res.status(400).json({ error: 'clientId, jobId, and name are required' });
+      }
+      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const rel = joinRel(parentPath || '', name);
+      const pref = jobPrefix(String(clientId), String(jobId));
+      const markerKey = rel ? `${pref}${rel}/${FOLDER_MARKER}` : `${pref}${FOLDER_MARKER}`;
+
+      const probeP = `${pref}${rel}`;
+      const under = await listAllKeys(s3, bucket, `${probeP}/`);
+      if (under.length > 0) {
+        return res.status(409).json({ error: 'A file or folder already exists at this path' });
+      }
+      try {
+        await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: probeP }));
+        return res.status(409).json({ error: 'A file or folder already exists at this path' });
+      } catch (he) {
+        const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
+        if (hn !== 'NotFound' && he?.$metadata?.httpStatusCode !== 404) throw he;
+      }
+
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: markerKey,
+          Body: Buffer.from('', 'utf8'),
+          ContentType: 'application/octet-stream'
+        })
+      );
+      return res.status(201).json({
+        path: rel,
+        parentPath: parentRelPath(rel),
+        name: basenameRel(rel) || name,
+        markerKey
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(400).json({ error: msg });
+    }
+  });
+
+  r.patch('/rename', express.json(), async (req, res) => {
+    try {
+      const body = req.body || {};
+      const { clientId, jobId, newName } = body;
+      if (!clientId || !jobId || !newName) {
+        return res.status(400).json({ error: 'clientId, jobId, and newName are required' });
+      }
+      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const pref = jobPrefix(String(clientId), String(jobId));
+
+      if (body.fileId) {
+        const oldKey = idToKey(String(body.fileId));
+        if (!oldKey.startsWith(pref) || isFolderMarkerKey(oldKey.slice(pref.length))) {
+          return res.status(400).json({ error: 'Invalid file id' });
+        }
+        const oldRel = oldKey.slice(pref.length);
+        const par = parentRelPath(oldRel);
+        const sanitized = sanitizeFilename(newName);
+        const newRel = par ? `${par}/${sanitized}` : sanitized;
+        const newKey = `${pref}${newRel}`;
+        if (oldKey === newKey) {
+          return res.json({ id: keyToId(newKey), key: newKey, path: newRel });
+        }
+        try {
+          await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: newKey }));
+          return res.status(409).json({ error: 'Destination already exists' });
+        } catch (he) {
+          const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
+          if (hn !== 'NotFound' && he?.$metadata?.httpStatusCode !== 404) {
+            throw he;
+          }
+        }
+        await s3.send(
+          new CopyObjectCommand({
+            Bucket: bucket,
+            Key: newKey,
+            CopySource: copySourceHeader(bucket, oldKey),
+            MetadataDirective: 'COPY'
+          })
+        );
+        await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: oldKey }));
+        return res.json({ id: keyToId(newKey), key: newKey, path: newRel, name: sanitized });
+      }
+
+      if (body.path !== undefined) {
+        const oldFolderRel = normalizeRelPath(body.path);
+        if (!oldFolderRel) {
+          return res.status(400).json({ error: 'Cannot rename the job root folder' });
+        }
+        const parent = parentRelPath(oldFolderRel);
+        const seg = sanitizeFolderSegment(newName);
+        const newRel = parent ? `${parent}/${seg}` : seg;
+        if (oldFolderRel === newRel) {
+          return res.json({ path: newRel });
+        }
+
+        const oldPrefix = `${pref}${oldFolderRel}/`;
+        const keys = await listAllKeys(s3, bucket, oldPrefix);
+        if (keys.length === 0) {
+          return res.status(404).json({ error: 'Folder not found' });
+        }
+
+        const destProbe = await listAllKeys(s3, bucket, `${pref}${newRel}`);
+        const destTaken = destProbe.some(
+          (o) => o.Key === `${pref}${newRel}` || o.Key.startsWith(`${pref}${newRel}/`)
+        );
+        if (destTaken) {
+          return res.status(409).json({ error: 'Destination path is occupied' });
+        }
+
+        const newPrefix = `${pref}${newRel}/`;
+        const mapping = keys.map((o) => ({
+          from: o.Key,
+          to: `${newPrefix}${o.Key.slice(oldPrefix.length)}`
+        }));
+
+        for (const { from, to } of mapping) {
+          await s3.send(
+            new CopyObjectCommand({
+              Bucket: bucket,
+              Key: to,
+              CopySource: copySourceHeader(bucket, from),
+              MetadataDirective: 'COPY'
+            })
+          );
+        }
+        for (const { from } of mapping) {
+          await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: from }));
+        }
+        return res.json({ path: newRel, parentPath: parentRelPath(newRel), name: seg });
+      }
+
+      return res.status(400).json({ error: 'Provide fileId or path for folder rename' });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  r.delete('/folders', async (req, res) => {
+    try {
+      const { clientId, jobId, path: pathParam } = req.query;
+      if (!clientId || !jobId || pathParam === undefined || pathParam === '') {
+        return res.status(400).json({ error: 'clientId, jobId, and non-empty path query params are required' });
+      }
+      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const folderRel = normalizeRelPath(pathParam);
+      if (!folderRel) {
+        return res.status(400).json({ error: 'path must name a folder under the job (not the job root)' });
+      }
+      const pref = jobPrefix(String(clientId), String(jobId));
+      const prefix = `${pref}${folderRel}/`;
+      const keys = await listAllKeys(s3, bucket, prefix);
+      const markerKey = `${pref}${folderRel}/${FOLDER_MARKER}`;
+      const toDelete = new Set(keys.map((k) => k.Key));
+      toDelete.add(markerKey);
+      for (const Key of toDelete) {
+        try {
+          await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key }));
+        } catch (err) {
+          if (err && err.name !== 'NoSuchKey') throw err;
+        }
+      }
+      return res.status(204).send();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
     }
   });
 
@@ -173,17 +507,28 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       return res.status(400).json({ error: 'Missing file field "file"' });
     }
     try {
-      const { clientId, jobId, category } = req.body;
-      if (!clientId || !jobId || !category) {
+      const { clientId, jobId, category, folderPath } = req.body;
+      if (!clientId || !jobId) {
         fs.unlink(f.path, () => {});
-        return res.status(400).json({ error: 'clientId, jobId, and category are required' });
+        return res.status(400).json({ error: 'clientId and jobId are required' });
       }
       if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
         fs.unlink(f.path, () => {});
         return res.status(403).json({ error: 'Forbidden' });
       }
       const original = req.body.filename || f.originalname || 'upload';
-      const Key = objectKey(String(clientId), String(jobId), String(category), original);
+      const fp = normalizeRelPath(folderPath || '');
+      let Key;
+      if (fp) {
+        const safe = sanitizeFilename(original);
+        Key = `${jobPrefix(String(clientId), String(jobId))}${fp}/${safe}`;
+      } else {
+        if (!req.body.category) {
+          fs.unlink(f.path, () => {});
+          return res.status(400).json({ error: 'category is required when folderPath is omitted' });
+        }
+        Key = objectKey(String(clientId), String(jobId), String(req.body.category), original);
+      }
       const stream = fs.createReadStream(f.path);
       const uploadTask = new Upload({
         client: s3,
@@ -200,7 +545,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
         id: keyToId(Key),
         key: Key,
         name: path.basename(Key),
-        size: f.size
+        size: f.size,
+        path: Key.slice(jobPrefix(String(clientId), String(jobId)).length),
+        parentPath: parentRelPath(Key.slice(jobPrefix(String(clientId), String(jobId)).length))
       });
     } catch (e) {
       try {
@@ -218,6 +565,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       const Key = idToKey(req.params.id);
       if (!Key.startsWith('clients/')) {
         return res.status(400).json({ error: 'Invalid id' });
+      }
+      if (Key.endsWith(`/${FOLDER_MARKER}`) || path.basename(Key) === FOLDER_MARKER) {
+        return res.status(400).json({ error: 'Not a downloadable file' });
       }
       const parsed = parseJobFromObjectKey(Key);
       if (!parsed || !(await assertPortalJobAccess(pool, req.user, parsed.clientId, parsed.jobId))) {
@@ -250,6 +600,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       const Key = idToKey(req.params.id);
       if (!Key.startsWith('clients/')) {
         return res.status(400).json({ error: 'Invalid id' });
+      }
+      if (Key.endsWith(`/${FOLDER_MARKER}`)) {
+        return res.status(400).json({ error: 'Use DELETE /api/files/folders to remove folders' });
       }
       const parsed = parseJobFromObjectKey(Key);
       if (!parsed || !(await assertPortalJobAccess(pool, req.user, parsed.clientId, parsed.jobId))) {
