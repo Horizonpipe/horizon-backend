@@ -237,6 +237,7 @@ async function assertPortalJobAccess(pool, user, clientId, jobId) {
   const c = String(clientId || '').trim();
   const j = String(jobId || '').trim();
   if (!c || !j) return false;
+  if (c === 'portal-users' && user && j === String(user.id)) return true;
   try {
     const r = await pool.query(
       `SELECT 1 FROM planner_records

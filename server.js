@@ -91,14 +91,20 @@ function normalizeRoles(value) {
   return { camera: true, vac: true, simpleVac: false, email: false };
 }
 
+/** Shared prefix for per-user portal uploads in Wasabi (`clients/portal-users/jobs/{userId}/…`). */
+const PORTAL_FILES_CLIENT_ID = 'portal-users';
+
 function normalizeUser(row) {
+  const id = row.id;
   return {
-    id: row.id,
+    id,
     username: row.username,
     displayName: row.display_name || row.username,
     isAdmin: !!row.is_admin,
     roles: normalizeRoles(row.roles),
-    mustChangePassword: !!row.must_change_password
+    mustChangePassword: !!row.must_change_password,
+    portalFilesClientId: PORTAL_FILES_CLIENT_ID,
+    portalFilesJobId: String(id)
   };
 }
 
