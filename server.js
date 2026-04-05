@@ -191,8 +191,8 @@ const PORTAL_FORCE_JOB_ID = (process.env.PORTAL_FORCE_JOB_ID || '').trim();
 const PORTAL_FORCE_JOB_SCOPE = PORTAL_FORCE_CLIENT_ID && PORTAL_FORCE_JOB_ID;
 /** Backward-compat toggle: set `PORTAL_USER_SCOPED_DEFAULTS=1` to restore `portal-users/{userId}` defaults. */
 const PORTAL_USER_SCOPED_DEFAULTS =
-  String(process.env.PORTAL_USER_SCOPED_DEFAULTS || '').trim().toLowerCase() === '1' ||
-  String(process.env.PORTAL_USER_SCOPED_DEFAULTS || '').trim().toLowerCase() === 'true';
+  String(process.env.PORTAL_USER_SCOPED_DEFAULTS || '1').trim().toLowerCase() === '1' ||
+  String(process.env.PORTAL_USER_SCOPED_DEFAULTS || '1').trim().toLowerCase() === 'true';
 
 function portalPermissionsWhitelistHas(username) {
   const u = String(username || '')
