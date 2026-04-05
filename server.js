@@ -11,13 +11,67 @@ const { registerPortalFilesRoutes } = require('./portal-files.routes');
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
 
 const app = express();
-app.use(express.json());
-const PORT = Number(process.env.PORT || 3000);
-const DATABASE_URL = process.env.DATABASE_URL;
+app.set('trust proxy', 1);
+
+/** Comma-separated list, or a single `*` to reflect any Origin (Bearer auth still required for data). */
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
+
+function isOnRenderOrigin(origin) {
+  try {
+    const h = new URL(origin).hostname;
+    return h === 'onrender.com' || h.endsWith('.onrender.com');
+  } catch {
+    return false;
+  }
+}
+
+const corsOptions = {
+  origin(origin, callback) {
+    const allowAny = CORS_ORIGINS.length === 0 || (CORS_ORIGINS.length === 1 && CORS_ORIGINS[0] === '*');
+    if (allowAny) {
+      return callback(null, origin || true);
+    }
+    if (!origin) {
+      return callback(null, true);
+    }
+    if (CORS_ORIGINS.includes(origin)) {
+      return callback(null, origin);
+    }
+    if (isOnRenderOrigin(origin)) {
+      return callback(null, origin);
+    }
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true,
+  methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-Session-Token',
+    'Range',
+    'Accept',
+    'If-None-Match',
+    'If-Modified-Since'
+  ],
+  exposedHeaders: [
+    'Content-Disposition',
+    'Content-Length',
+    'Content-Type',
+    'Content-Range',
+    'Accept-Ranges'
+  ]
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+const PORT = Number(process.env.PORT || 3000);
+const DATABASE_URL = process.env.DATABASE_URL;
 
 if (!DATABASE_URL) {
   console.error('Missing DATABASE_URL');
@@ -68,7 +122,6 @@ const upload = multer({
 });
 const sqlJsPromise = initSqlJs();
 
-app.set('trust proxy', 1);
 function currentToken(req) {
   const auth = req.headers.authorization || '';
   if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
@@ -80,33 +133,6 @@ function currentToken(req) {
   }
   return '';
 }
-
-const corsOptions = {
-  origin(origin, callback) {
-    if (!origin) {
-      return callback(null, CORS_ORIGINS[0] || true);
-    }
-    if (!CORS_ORIGINS.length || CORS_ORIGINS.includes(origin)) {
-      return callback(null, origin);
-    }
-    return callback(new Error(`CORS blocked for origin: ${origin}`));
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Token', 'Range'],
-  exposedHeaders: [
-    'Content-Disposition',
-    'Content-Length',
-    'Content-Type',
-    'Content-Range',
-    'Accept-Ranges'
-  ]
-};
-
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ extended: true }));
 
 function cleanString(value) {
   return String(value || '').trim();
