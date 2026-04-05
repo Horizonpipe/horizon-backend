@@ -694,6 +694,11 @@ async function ensureSchema() {
     `CREATE INDEX IF NOT EXISTS idx_portal_share_access_log_share ON portal_share_access_log (share_link_id, accessed_at DESC)`
   );
 
+  await pool.query(`ALTER TABLE portal_share_access_log ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE portal_share_access_log ADD COLUMN IF NOT EXISTS company TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE portal_share_guest_sessions ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE portal_share_guest_sessions ADD COLUMN IF NOT EXISTS company TEXT NOT NULL DEFAULT ''`);
+
   try {
     await pool.query(`ALTER TABLE portal_share_links DROP CONSTRAINT IF EXISTS portal_share_links_kind_check`);
     await pool.query(

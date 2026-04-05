@@ -538,8 +538,8 @@ function registerPortalShareLinkRoutes(app, { pool, requireAuth, requireAdmin })
         return res.status(403).json({ error: 'Forbidden' });
       }
       const r2 = await pool.query(
-        `SELECT a.id, a.email, a.first_name AS "firstName", a.last_name AS "lastName", a.accessed_at AS "accessedAt",
-                l.kind, l.token, l.created_at AS "linkCreatedAt"
+        `SELECT a.id, a.email, a.first_name AS "firstName", a.last_name AS "lastName", a.role, a.company,
+                a.accessed_at AS "accessedAt", l.kind, l.token, l.created_at AS "linkCreatedAt"
          FROM portal_share_access_log a
          JOIN portal_share_links l ON l.id = a.share_link_id
          WHERE l.client_id = $1 AND l.job_id = $2
@@ -1512,10 +1512,16 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (row.kind !== 'interactive') {
         return res.status(400).json({ error: 'This link does not require registration' });
       }
-      const { email, firstName, lastName } = req.body || {};
+      const { email, firstName, lastName, role, company } = req.body || {};
       const em = String(email ?? '').trim();
       const fn = String(firstName ?? '').trim();
       const ln = String(lastName ?? '').trim();
+      const roleStr = String(role ?? '')
+        .trim()
+        .slice(0, 160);
+      const companyStr = String(company ?? '')
+        .trim()
+        .slice(0, 160);
       if (!isValidEmail(em)) return res.status(400).json({ error: 'Valid email is required' });
       if (fn.length < 1 || fn.length > 120) return res.status(400).json({ error: 'First name is required' });
       if (ln.length < 1 || ln.length > 120) return res.status(400).json({ error: 'Last name is required' });
@@ -1530,14 +1536,14 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       await pool.query('BEGIN');
       try {
         await pool.query(
-          `INSERT INTO portal_share_access_log (share_link_id, email, first_name, last_name, ip_inet, user_agent)
-           VALUES ($1,$2,$3,$4,$5,$6)`,
-          [row.id, em, fn, ln, ip, ua]
+          `INSERT INTO portal_share_access_log (share_link_id, email, first_name, last_name, role, company, ip_inet, user_agent)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [row.id, em, fn, ln, roleStr, companyStr, ip, ua]
         );
         await pool.query(
-          `INSERT INTO portal_share_guest_sessions (guest_token, share_link_id, email, first_name, last_name)
-           VALUES ($1,$2,$3,$4,$5)`,
-          [guestToken, row.id, em, fn, ln]
+          `INSERT INTO portal_share_guest_sessions (guest_token, share_link_id, email, first_name, last_name, role, company)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [guestToken, row.id, em, fn, ln, roleStr, companyStr]
         );
         await pool.query('COMMIT');
       } catch (e) {
