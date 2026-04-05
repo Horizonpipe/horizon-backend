@@ -183,6 +183,13 @@ function normalizeRoles(value) {
 /** Shared prefix for per-user portal uploads in Wasabi (`clients/portal-users/jobs/{userId}/…`). */
 const PORTAL_FILES_CLIENT_ID = 'portal-users';
 
+/**
+ * When both are set, every signed-in user gets this client/job in `/session` and the portal UI loads one shared Wasabi prefix (team bucket). Example: PORTAL_FORCE_CLIENT_ID=portal-users PORTAL_FORCE_JOB_ID=15
+ */
+const PORTAL_FORCE_CLIENT_ID = (process.env.PORTAL_FORCE_CLIENT_ID || '').trim();
+const PORTAL_FORCE_JOB_ID = (process.env.PORTAL_FORCE_JOB_ID || '').trim();
+const PORTAL_FORCE_JOB_SCOPE = PORTAL_FORCE_CLIENT_ID && PORTAL_FORCE_JOB_ID;
+
 function portalPermissionsWhitelistHas(username) {
   const u = String(username || '')
     .trim()
@@ -204,8 +211,8 @@ function normalizeUser(row) {
     isAdmin: !!row.is_admin,
     roles: normalizeRoles(row.roles),
     mustChangePassword: !!row.must_change_password,
-    portalFilesClientId: PORTAL_FILES_CLIENT_ID,
-    portalFilesJobId: String(id),
+    portalFilesClientId: PORTAL_FORCE_JOB_SCOPE ? PORTAL_FORCE_CLIENT_ID : PORTAL_FILES_CLIENT_ID,
+    portalFilesJobId: PORTAL_FORCE_JOB_SCOPE ? PORTAL_FORCE_JOB_ID : String(id),
     portalPermissionsAccess:
       !!row.portal_permissions_access || portalPermissionsWhitelistHas(row.username)
   };

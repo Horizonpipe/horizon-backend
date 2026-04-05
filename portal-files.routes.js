@@ -395,12 +395,34 @@ function buildTreeFromKeys(jobPref, entries) {
   return { folders: folderRows, files };
 }
 
+function portalForceJobScope() {
+  const fc = (process.env.PORTAL_FORCE_CLIENT_ID || '').trim();
+  const fj = (process.env.PORTAL_FORCE_JOB_ID || '').trim();
+  return fc && fj ? { clientId: fc, jobId: fj } : null;
+}
+
+/** Set `PORTAL_PORTAL_USERS_PEER_READ=1` so any signed-in user may list/read `portal-users/{userId}` when that user id exists (optional; prefer PORTAL_FORCE_* for one shared folder). */
+function portalUsersPeerReadEnabled() {
+  const v = String(process.env.PORTAL_PORTAL_USERS_PEER_READ || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
+
 async function assertPortalJobAccess(pool, user, clientId, jobId) {
   if (user && user.isAdmin) return true;
   const c = String(clientId || '').trim();
   const j = String(jobId || '').trim();
   if (!c || !j) return false;
+  const forced = portalForceJobScope();
+  if (forced && c === forced.clientId && j === forced.jobId) return true;
   if (c === 'portal-users' && user && j === String(user.id)) return true;
+  if (c === 'portal-users' && user && portalUsersPeerReadEnabled()) {
+    try {
+      const u = await pool.query(`SELECT 1 FROM users WHERE CAST(id AS text) = $1 LIMIT 1`, [j]);
+      if (u.rows.length > 0) return true;
+    } catch (e) {
+      console.error('[portal-files] peer read user lookup', e);
+    }
+  }
   try {
     const r = await pool.query(
       `SELECT 1 FROM planner_records
