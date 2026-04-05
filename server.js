@@ -209,6 +209,15 @@ function portalPermissionsWhitelistHas(username) {
 function normalizeUser(row) {
   const id = row.id;
   const legacyUserScoped = id != null && String(id).trim() && PORTAL_USER_SCOPED_DEFAULTS;
+  const explicitClient =
+    row?.portal_files_client_id != null && String(row.portal_files_client_id).trim()
+      ? String(row.portal_files_client_id).trim()
+      : '';
+  const explicitJob =
+    row?.portal_files_job_id != null && String(row.portal_files_job_id).trim()
+      ? String(row.portal_files_job_id).trim()
+      : '';
+  const hasExplicitScope = !!(explicitClient && explicitJob);
   return {
     id,
     username: row.username,
@@ -216,12 +225,20 @@ function normalizeUser(row) {
     isAdmin: !!row.is_admin,
     roles: normalizeRoles(row.roles),
     mustChangePassword: !!row.must_change_password,
-    portalFilesClientId: PORTAL_FORCE_JOB_SCOPE
+    portalFilesClientId: hasExplicitScope
+      ? explicitClient
+      : PORTAL_FORCE_JOB_SCOPE
       ? PORTAL_FORCE_CLIENT_ID
       : legacyUserScoped
         ? PORTAL_FILES_CLIENT_ID
         : undefined,
-    portalFilesJobId: PORTAL_FORCE_JOB_SCOPE ? PORTAL_FORCE_JOB_ID : legacyUserScoped ? String(id) : undefined,
+    portalFilesJobId: hasExplicitScope
+      ? explicitJob
+      : PORTAL_FORCE_JOB_SCOPE
+        ? PORTAL_FORCE_JOB_ID
+        : legacyUserScoped
+          ? String(id)
+          : undefined,
     portalPermissionsAccess:
       !!row.portal_permissions_access || portalPermissionsWhitelistHas(row.username)
   };
@@ -376,7 +393,7 @@ async function readSession(token) {
   await pool.query(`DELETE FROM auth_sessions WHERE expires_at < NOW()`);
   const result = await pool.query(
     `SELECT s.token, s.user_id, s.expires_at, u.id, u.username, u.display_name, u.password,
-            u.is_admin, u.roles, u.must_change_password
+            u.is_admin, u.roles, u.must_change_password, u.portal_files_client_id, u.portal_files_job_id
      FROM auth_sessions s
      JOIN users u ON CAST(u.id AS text) = s.user_id
      WHERE s.token = $1
@@ -546,6 +563,8 @@ async function ensureSchema() {
       display_name TEXT,
       password TEXT NOT NULL,
       is_admin BOOLEAN NOT NULL DEFAULT false,
+      portal_files_client_id TEXT,
+      portal_files_job_id TEXT,
       roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": false, "simpleVac": false, "email": false}'::jsonb,
       must_change_password BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -557,6 +576,8 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": false, "simpleVac": false, "email": false}'::jsonb`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_client_id TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_job_id TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_permissions_access BOOLEAN NOT NULL DEFAULT false`
@@ -864,7 +885,7 @@ app.get('/sync-state', requireAuth, async (req, res) => {
 app.get('/users', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, username, display_name, is_admin, roles, must_change_password
+      `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id
        FROM users
        ORDER BY LOWER(COALESCE(display_name, username)), LOWER(username)`
     );
@@ -898,7 +919,7 @@ app.post('/login', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT id, username, display_name, password, is_admin, roles, must_change_password
+      `SELECT id, username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id
        FROM users
        WHERE LOWER(username) = LOWER($1) OR LOWER(COALESCE(display_name, username)) = LOWER($1)
        LIMIT 1`,
@@ -1032,18 +1053,28 @@ app.post('/create-user', requireAuth, requireAdmin, async (req, res) => {
   const password = cleanString(req.body?.password || '1234');
   const isAdmin = !!req.body?.isAdmin;
   const roles = normalizeRoles(req.body?.roles);
+  const portalFilesClientId = cleanString(req.body?.portalFilesClientId);
+  const portalFilesJobId = cleanString(req.body?.portalFilesJobId);
 
   if (!username) {
     return res.status(400).json({ success: false, error: 'Username is required' });
+  }
+  if ((portalFilesClientId && !portalFilesJobId) || (!portalFilesClientId && portalFilesJobId)) {
+    return res.status(400).json({
+      success: false,
+      error: 'portalFilesClientId and portalFilesJobId must be set together (or both empty).'
+    });
   }
 
   try {
     const hash = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      `INSERT INTO users (username, display_name, password, is_admin, roles, must_change_password)
-       VALUES ($1, $2, $3, $4, $5::jsonb, true)
-       RETURNING id, username, display_name, is_admin, roles, must_change_password`,
-      [username, displayName, hash, isAdmin, JSON.stringify(roles)]
+      `INSERT INTO users (
+         username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id
+       )
+       VALUES ($1, $2, $3, $4, $5::jsonb, true, $6, $7)
+       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id`,
+      [username, displayName, hash, isAdmin, JSON.stringify(roles), portalFilesClientId || null, portalFilesJobId || null]
     );
     res.status(201).json({ success: true, user: normalizeUser(result.rows[0]) });
   } catch (error) {
@@ -1061,10 +1092,15 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
   const isAdmin = req.body?.isAdmin === undefined ? null : !!req.body.isAdmin;
   const roles = req.body?.roles === undefined ? null : normalizeRoles(req.body.roles);
   const password = cleanString(req.body?.password || '');
+  const hasPortalScopeInPayload =
+    Object.prototype.hasOwnProperty.call(req.body || {}, 'portalFilesClientId') ||
+    Object.prototype.hasOwnProperty.call(req.body || {}, 'portalFilesJobId');
+  const portalFilesClientId = hasPortalScopeInPayload ? cleanString(req.body?.portalFilesClientId) : null;
+  const portalFilesJobId = hasPortalScopeInPayload ? cleanString(req.body?.portalFilesJobId) : null;
 
   try {
     const currentResult = await pool.query(
-      'SELECT id, username, display_name, is_admin, roles, must_change_password FROM users WHERE id = $1 LIMIT 1',
+      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id FROM users WHERE id = $1 LIMIT 1',
       [id]
     );
     if (!currentResult.rows.length) {
@@ -1075,15 +1111,29 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
     const nextDisplayName = displayName || current.display_name || current.username;
     const nextIsAdmin = isAdmin === null ? current.is_admin : isAdmin;
     const nextRoles = roles === null ? normalizeRoles(current.roles) : roles;
+    let nextPortalFilesClientId = current.portal_files_client_id || null;
+    let nextPortalFilesJobId = current.portal_files_job_id || null;
+    if (hasPortalScopeInPayload) {
+      if ((portalFilesClientId && !portalFilesJobId) || (!portalFilesClientId && portalFilesJobId)) {
+        return res.status(400).json({
+          success: false,
+          error: 'portalFilesClientId and portalFilesJobId must be set together (or both empty).'
+        });
+      }
+      nextPortalFilesClientId = portalFilesClientId || null;
+      nextPortalFilesJobId = portalFilesJobId || null;
+    }
 
     await pool.query(
       `UPDATE users
        SET display_name = $1,
            is_admin = $2,
            roles = $3::jsonb,
+           portal_files_client_id = $4,
+           portal_files_job_id = $5,
            updated_at = NOW()
-       WHERE id = $4`,
-      [nextDisplayName, nextIsAdmin, JSON.stringify(nextRoles), id]
+       WHERE id = $6`,
+      [nextDisplayName, nextIsAdmin, JSON.stringify(nextRoles), nextPortalFilesClientId, nextPortalFilesJobId, id]
     );
 
     if (password) {
@@ -1095,7 +1145,7 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
     }
 
     const updatedResult = await pool.query(
-      'SELECT id, username, display_name, is_admin, roles, must_change_password FROM users WHERE id = $1 LIMIT 1',
+      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id FROM users WHERE id = $1 LIMIT 1',
       [id]
     );
 
