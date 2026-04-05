@@ -484,11 +484,12 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
-      const anyGrant =
-        !req.user?.isAdmin && (await portalJobHasPathGrants(pool, clientId, jobId));
-      const userGrants = anyGrant
-        ? await loadUserPathGrants(pool, clientId, jobId, req.user.username)
-        : null;
+      /** Only restrict when this user has at least one path grant; otherwise list full job (avoids empty UI when grants exist only for other users). */
+      let userGrants = null;
+      if (!req.user?.isAdmin && (await portalJobHasPathGrants(pool, clientId, jobId))) {
+        const ug = await loadUserPathGrants(pool, clientId, jobId, req.user.username);
+        if (ug.length > 0) userGrants = ug;
+      }
       const out = [];
       const keys = await listAllKeys(s3, bucket, prefix);
       for (const obj of keys) {
@@ -527,10 +528,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       const prefix = jobPrefix(String(clientId), String(jobId));
       const keys = await listAllKeys(s3, bucket, prefix);
       let tree = buildTreeFromKeys(prefix, keys);
-      if (!req.user?.isAdmin) {
-        const anyG = await portalJobHasPathGrants(pool, clientId, jobId);
-        if (anyG) {
-          const userGrants = await loadUserPathGrants(pool, clientId, jobId, req.user.username);
+      if (!req.user?.isAdmin && (await portalJobHasPathGrants(pool, clientId, jobId))) {
+        const userGrants = await loadUserPathGrants(pool, clientId, jobId, req.user.username);
+        if (userGrants.length > 0) {
           tree = filterTreeByPathGrants(tree, userGrants, true);
         }
       }
