@@ -18,13 +18,17 @@ const {
 } = require('./share-helpers.js');
 const multer = require('multer');
 const {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
   S3Client,
   CopyObjectCommand,
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
-  PutObjectCommand
+  PutObjectCommand,
+  UploadPartCommand
 } = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
@@ -122,6 +126,83 @@ async function runPool(array, concurrency, fn) {
     }
   });
   await Promise.all(workers);
+}
+
+let portalResumeSchemaReady = null;
+
+/**
+ * Server-side state for resumable multipart uploads.
+ * Keeps progress across tab close / browser restart / transient network outages.
+ */
+async function ensurePortalResumeSchema(pool) {
+  if (!portalResumeSchemaReady) {
+    portalResumeSchemaReady = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS portal_upload_sessions (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id TEXT NOT NULL,
+          client_id TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          folder_path TEXT NOT NULL DEFAULT '',
+          file_name TEXT NOT NULL,
+          file_size BIGINT NOT NULL,
+          mime_type TEXT NOT NULL DEFAULT '',
+          object_key TEXT NOT NULL,
+          multipart_upload_id TEXT NOT NULL,
+          chunk_size INTEGER NOT NULL,
+          sha256 TEXT,
+          status TEXT NOT NULL DEFAULT 'uploading',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          completed_at TIMESTAMPTZ
+        )
+      `);
+      await pool.query(
+        `CREATE INDEX IF NOT EXISTS idx_portal_upload_sessions_user_status
+         ON portal_upload_sessions (user_id, status, updated_at DESC)`
+      );
+      await pool.query(
+        `CREATE INDEX IF NOT EXISTS idx_portal_upload_sessions_scope
+         ON portal_upload_sessions (client_id, job_id, status, updated_at DESC)`
+      );
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS portal_upload_session_parts (
+          session_id UUID NOT NULL REFERENCES portal_upload_sessions(id) ON DELETE CASCADE,
+          part_number INTEGER NOT NULL,
+          etag TEXT NOT NULL,
+          size BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (session_id, part_number)
+        )
+      `);
+    })().catch((e) => {
+      portalResumeSchemaReady = null;
+      throw e;
+    });
+  }
+  return portalResumeSchemaReady;
+}
+
+function resumableChunkSize(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 8 * 1024 * 1024;
+  return Math.max(5 * 1024 * 1024, Math.min(64 * 1024 * 1024, Math.floor(n)));
+}
+
+function isUploadSessionOpen(row) {
+  return row && row.status === 'uploading' && row.multipart_upload_id;
+}
+
+function contiguousUploadedBytes(parts) {
+  let expect = 1;
+  let bytes = 0;
+  for (const p of parts) {
+    const pn = Number(p.part_number);
+    if (!Number.isFinite(pn) || pn !== expect) break;
+    bytes += Number(p.size || 0);
+    expect += 1;
+  }
+  return bytes;
 }
 
 function createWasabiClient() {
@@ -401,6 +482,12 @@ function portalForceJobScope() {
   return fc && fj ? { clientId: fc, jobId: fj } : null;
 }
 
+function portalSharedDefaultScope() {
+  const fc = (process.env.PORTAL_SHARED_DEFAULT_CLIENT_ID || 'portal-users').trim();
+  const fj = (process.env.PORTAL_SHARED_DEFAULT_JOB_ID || '8').trim();
+  return fc && fj ? { clientId: fc, jobId: fj } : null;
+}
+
 /** Set `PORTAL_PORTAL_USERS_PEER_READ=1` so any signed-in user may list/read `portal-users/{userId}` when that user id exists (optional; prefer PORTAL_FORCE_* for one shared folder). */
 function portalUsersPeerReadEnabled() {
   const v = String(process.env.PORTAL_PORTAL_USERS_PEER_READ || '').trim().toLowerCase();
@@ -414,6 +501,8 @@ async function assertPortalJobAccess(pool, user, clientId, jobId) {
   if (!c || !j) return false;
   const forced = portalForceJobScope();
   if (forced && c === forced.clientId && j === forced.jobId) return true;
+  const shared = portalSharedDefaultScope();
+  if (shared && c === shared.clientId && j === shared.jobId) return true;
   if (c === 'portal-users' && user && j === String(user.id)) return true;
   if (c === 'portal-users' && user && portalUsersPeerReadEnabled()) {
     try {
@@ -1257,6 +1346,337 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       items,
       ...(errors.length ? { errors } : {})
     });
+  });
+
+  r.get('/upload/resumable/active', async (req, res) => {
+    try {
+      await ensurePortalResumeSchema(pool);
+      const { clientId, jobId } = req.query;
+      const where = ['user_id = $1', "status = 'uploading'"];
+      const vals = [String(req.user?.id ?? req.user?.username ?? '')];
+      if (clientId) {
+        vals.push(String(clientId));
+        where.push(`client_id = $${vals.length}`);
+      }
+      if (jobId) {
+        vals.push(String(jobId));
+        where.push(`job_id = $${vals.length}`);
+      }
+      const out = await pool.query(
+        `SELECT id, client_id, job_id, folder_path, file_name, file_size, mime_type, object_key, chunk_size, updated_at
+         FROM portal_upload_sessions
+         WHERE ${where.join(' AND ')}
+         ORDER BY updated_at DESC
+         LIMIT 500`,
+        vals
+      );
+      const rows = [];
+      for (const s of out.rows) {
+        const p = await pool.query(
+          `SELECT part_number, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
+          [s.id]
+        );
+        const uploadedBytes = contiguousUploadedBytes(p.rows);
+        const nextPartNumber = p.rows.length + 1;
+        rows.push({
+          sessionId: s.id,
+          clientId: s.client_id,
+          jobId: s.job_id,
+          folderPath: s.folder_path || '',
+          fileName: s.file_name,
+          fileSize: Number(s.file_size || 0),
+          mimeType: s.mime_type || '',
+          objectKey: s.object_key,
+          chunkSize: Number(s.chunk_size || 0),
+          uploadedBytes,
+          nextPartNumber,
+          updatedAt: s.updated_at
+        });
+      }
+      return res.json({ sessions: rows });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  r.post('/upload/resumable/init', express.json({ limit: '256kb' }), async (req, res) => {
+    try {
+      await ensurePortalResumeSchema(pool);
+      const {
+        clientId,
+        jobId,
+        folderPath,
+        fileName,
+        fileSize,
+        mimeType,
+        chunkSize,
+        sha256
+      } = req.body || {};
+      if (!clientId || !jobId) {
+        return res.status(400).json({ error: 'clientId and jobId are required' });
+      }
+      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const original = String(fileName || '').trim();
+      if (!original) return res.status(400).json({ error: 'fileName is required' });
+      const sizeNum = Number(fileSize);
+      if (!Number.isFinite(sizeNum) || sizeNum <= 0) {
+        return res.status(400).json({ error: 'fileSize must be a positive number' });
+      }
+      const fp = normalizeRelPath(folderPath || '');
+      const key = portalUploadKey(String(clientId), String(jobId), fp, original, fp ? null : null);
+      const pref = jobPrefix(String(clientId), String(jobId));
+      const relForAcl = key.slice(pref.length);
+      if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, relForAcl))) {
+        return res.status(403).json({ error: 'Forbidden for this path' });
+      }
+
+      const userId = String(req.user?.id ?? req.user?.username ?? '');
+      const existing = await pool.query(
+        `SELECT id, multipart_upload_id, chunk_size, object_key, file_size, file_name, mime_type
+         FROM portal_upload_sessions
+         WHERE user_id = $1 AND client_id = $2 AND job_id = $3
+           AND folder_path = $4 AND file_name = $5 AND file_size = $6
+           AND status = 'uploading'
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+        [userId, String(clientId), String(jobId), fp, original, Math.floor(sizeNum)]
+      );
+      if (existing.rows.length) {
+        const s = existing.rows[0];
+        const p = await pool.query(
+          `SELECT part_number, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
+          [s.id]
+        );
+        return res.status(200).json({
+          sessionId: s.id,
+          objectKey: s.object_key,
+          chunkSize: Number(s.chunk_size || 0),
+          uploadedBytes: contiguousUploadedBytes(p.rows),
+          nextPartNumber: p.rows.length + 1,
+          resumed: true
+        });
+      }
+
+      const effectiveChunkSize = resumableChunkSize(chunkSize);
+      const start = await s3.send(
+        new CreateMultipartUploadCommand({
+          Bucket: bucket,
+          Key: key,
+          ContentType: String(mimeType || '').trim() || 'application/octet-stream'
+        })
+      );
+      const uploadId = start.UploadId;
+      if (!uploadId) {
+        throw new Error('Failed to start multipart upload');
+      }
+      const created = await pool.query(
+        `INSERT INTO portal_upload_sessions
+         (user_id, client_id, job_id, folder_path, file_name, file_size, mime_type, object_key, multipart_upload_id, chunk_size, sha256, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'uploading')
+         RETURNING id`,
+        [
+          userId,
+          String(clientId),
+          String(jobId),
+          fp,
+          original,
+          Math.floor(sizeNum),
+          String(mimeType || '').trim() || '',
+          key,
+          uploadId,
+          effectiveChunkSize,
+          sha256 != null && String(sha256).trim() ? String(sha256).trim() : null
+        ]
+      );
+      return res.status(201).json({
+        sessionId: created.rows[0].id,
+        objectKey: key,
+        chunkSize: effectiveChunkSize,
+        uploadedBytes: 0,
+        nextPartNumber: 1,
+        resumed: false
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  r.post('/upload/resumable/chunk', portalUpload.single('chunk'), async (req, res) => {
+    const f = req.file;
+    if (!f) return res.status(400).json({ error: 'Missing file field "chunk"' });
+    try {
+      await ensurePortalResumeSchema(pool);
+      const sessionId = String(req.body?.sessionId || '').trim();
+      const partNumber = Number(req.body?.partNumber);
+      if (!sessionId || !Number.isFinite(partNumber) || partNumber < 1 || !Number.isInteger(partNumber)) {
+        fs.unlink(f.path, () => {});
+        return res.status(400).json({ error: 'sessionId and integer partNumber are required' });
+      }
+      const sRes = await pool.query(
+        `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
+        [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
+      );
+      const sessionRow = sRes.rows[0];
+      if (!isUploadSessionOpen(sessionRow)) {
+        fs.unlink(f.path, () => {});
+        return res.status(404).json({ error: 'Upload session not found or closed' });
+      }
+      if (!(await assertPortalJobAccess(pool, req.user, sessionRow.client_id, sessionRow.job_id))) {
+        fs.unlink(f.path, () => {});
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id));
+      const relForAcl = String(sessionRow.object_key || '').slice(pref.length);
+      if (!(await assertPortalPathRel(pool, req.user, sessionRow.client_id, sessionRow.job_id, relForAcl))) {
+        fs.unlink(f.path, () => {});
+        return res.status(403).json({ error: 'Forbidden for this path' });
+      }
+
+      const partResp = await s3.send(
+        new UploadPartCommand({
+          Bucket: bucket,
+          Key: sessionRow.object_key,
+          UploadId: sessionRow.multipart_upload_id,
+          PartNumber: partNumber,
+          Body: fs.createReadStream(f.path),
+          ContentLength: f.size
+        })
+      );
+      fs.unlink(f.path, () => {});
+      const etag = String(partResp.ETag || '').replace(/^"+|"+$/g, '');
+      if (!etag) throw new Error('Missing ETag for uploaded part');
+      await pool.query(
+        `INSERT INTO portal_upload_session_parts (session_id, part_number, etag, size)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (session_id, part_number)
+         DO UPDATE SET etag = EXCLUDED.etag, size = EXCLUDED.size, created_at = NOW()`,
+        [sessionId, partNumber, etag, Math.floor(Number(f.size || 0))]
+      );
+      await pool.query(`UPDATE portal_upload_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
+      const parts = await pool.query(
+        `SELECT part_number, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
+        [sessionId]
+      );
+      const uploadedBytes = contiguousUploadedBytes(parts.rows);
+      return res.json({
+        sessionId,
+        partNumber,
+        uploadedBytes,
+        nextPartNumber: parts.rows.length + 1
+      });
+    } catch (e) {
+      try {
+        fs.unlink(f.path, () => {});
+      } catch (_) {
+        /* ignore */
+      }
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  r.post('/upload/resumable/complete', express.json({ limit: '128kb' }), async (req, res) => {
+    try {
+      await ensurePortalResumeSchema(pool);
+      const sessionId = String(req.body?.sessionId || '').trim();
+      const totalParts = Number(req.body?.totalParts);
+      const sha256 = req.body?.sha256 != null ? String(req.body.sha256).trim() : '';
+      if (!sessionId || !Number.isFinite(totalParts) || totalParts < 1 || !Number.isInteger(totalParts)) {
+        return res.status(400).json({ error: 'sessionId and integer totalParts are required' });
+      }
+      const sRes = await pool.query(
+        `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
+        [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
+      );
+      const sessionRow = sRes.rows[0];
+      if (!isUploadSessionOpen(sessionRow)) {
+        return res.status(404).json({ error: 'Upload session not found or closed' });
+      }
+      if (!(await assertPortalJobAccess(pool, req.user, sessionRow.client_id, sessionRow.job_id))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const parts = await pool.query(
+        `SELECT part_number, etag, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
+        [sessionId]
+      );
+      if (parts.rows.length < totalParts) {
+        return res.status(409).json({
+          error: `Missing parts: have ${parts.rows.length}, need ${totalParts}`
+        });
+      }
+      const use = [];
+      for (let i = 1; i <= totalParts; i++) {
+        const p = parts.rows[i - 1];
+        if (!p || Number(p.part_number) !== i || !p.etag) {
+          return res.status(409).json({ error: `Missing part ${i}` });
+        }
+        use.push({ ETag: String(p.etag), PartNumber: i });
+      }
+      await s3.send(
+        new CompleteMultipartUploadCommand({
+          Bucket: bucket,
+          Key: sessionRow.object_key,
+          UploadId: sessionRow.multipart_upload_id,
+          MultipartUpload: { Parts: use }
+        })
+      );
+      await pool.query(
+        `UPDATE portal_upload_sessions
+         SET status = 'completed', sha256 = COALESCE(NULLIF($2,''), sha256), completed_at = NOW(), updated_at = NOW()
+         WHERE id = $1`,
+        [sessionId, sha256]
+      );
+      const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id));
+      return res.status(201).json({
+        id: keyToId(sessionRow.object_key),
+        key: sessionRow.object_key,
+        name: path.basename(sessionRow.object_key),
+        size: Number(sessionRow.file_size || 0),
+        path: String(sessionRow.object_key).slice(pref.length),
+        parentPath: parentRelPath(String(sessionRow.object_key).slice(pref.length))
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  r.post('/upload/resumable/abort', express.json({ limit: '64kb' }), async (req, res) => {
+    try {
+      await ensurePortalResumeSchema(pool);
+      const sessionId = String(req.body?.sessionId || '').trim();
+      if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+      const sRes = await pool.query(
+        `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
+        [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
+      );
+      const sessionRow = sRes.rows[0];
+      if (!sessionRow) return res.status(404).json({ error: 'Upload session not found' });
+      if (isUploadSessionOpen(sessionRow)) {
+        try {
+          await s3.send(
+            new AbortMultipartUploadCommand({
+              Bucket: bucket,
+              Key: sessionRow.object_key,
+              UploadId: sessionRow.multipart_upload_id
+            })
+          );
+        } catch (_) {
+          /* ignore provider-side missing upload */
+        }
+      }
+      await pool.query(`UPDATE portal_upload_sessions SET status = 'aborted', updated_at = NOW() WHERE id = $1`, [
+        sessionId
+      ]);
+      return res.status(204).send();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
   });
 
   /**

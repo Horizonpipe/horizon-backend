@@ -189,6 +189,13 @@ const PORTAL_FILES_CLIENT_ID = 'portal-users';
 const PORTAL_FORCE_CLIENT_ID = (process.env.PORTAL_FORCE_CLIENT_ID || '').trim();
 const PORTAL_FORCE_JOB_ID = (process.env.PORTAL_FORCE_JOB_ID || '').trim();
 const PORTAL_FORCE_JOB_SCOPE = PORTAL_FORCE_CLIENT_ID && PORTAL_FORCE_JOB_ID;
+/**
+ * Shared default portal scope for all users when no explicit user mapping exists.
+ * Defaults to `portal-users/8` per current production bucket layout.
+ */
+const PORTAL_SHARED_DEFAULT_CLIENT_ID = (process.env.PORTAL_SHARED_DEFAULT_CLIENT_ID || 'portal-users').trim();
+const PORTAL_SHARED_DEFAULT_JOB_ID = (process.env.PORTAL_SHARED_DEFAULT_JOB_ID || '8').trim();
+const PORTAL_SHARED_DEFAULT_SCOPE = PORTAL_SHARED_DEFAULT_CLIENT_ID && PORTAL_SHARED_DEFAULT_JOB_ID;
 /** Backward-compat toggle: set `PORTAL_USER_SCOPED_DEFAULTS=1` to restore `portal-users/{userId}` defaults. */
 const PORTAL_USER_SCOPED_DEFAULTS =
   String(process.env.PORTAL_USER_SCOPED_DEFAULTS || '1').trim().toLowerCase() === '1' ||
@@ -228,17 +235,21 @@ function normalizeUser(row) {
     portalFilesClientId: hasExplicitScope
       ? explicitClient
       : PORTAL_FORCE_JOB_SCOPE
-      ? PORTAL_FORCE_CLIENT_ID
-      : legacyUserScoped
-        ? PORTAL_FILES_CLIENT_ID
-        : undefined,
+        ? PORTAL_FORCE_CLIENT_ID
+        : PORTAL_SHARED_DEFAULT_SCOPE
+          ? PORTAL_SHARED_DEFAULT_CLIENT_ID
+          : legacyUserScoped
+            ? PORTAL_FILES_CLIENT_ID
+            : undefined,
     portalFilesJobId: hasExplicitScope
       ? explicitJob
       : PORTAL_FORCE_JOB_SCOPE
         ? PORTAL_FORCE_JOB_ID
-        : legacyUserScoped
-          ? String(id)
-          : undefined,
+        : PORTAL_SHARED_DEFAULT_SCOPE
+          ? PORTAL_SHARED_DEFAULT_JOB_ID
+          : legacyUserScoped
+            ? String(id)
+            : undefined,
     portalPermissionsAccess:
       !!row.portal_permissions_access || portalPermissionsWhitelistHas(row.username)
   };
