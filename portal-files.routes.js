@@ -105,6 +105,24 @@ function parseJobFromObjectKey(key) {
   return { clientId: m[1], jobId: m[2] };
 }
 
+/** Guess Content-Type when S3 returns application/octet-stream so browsers decode video/PDF blobs correctly. */
+function contentTypeFromFilename(name) {
+  const n = String(name || '').toLowerCase();
+  if (n.endsWith('.mp4')) return 'video/mp4';
+  if (n.endsWith('.webm')) return 'video/webm';
+  if (n.endsWith('.ogg') || n.endsWith('.ogv')) return 'video/ogg';
+  if (n.endsWith('.mov') || n.endsWith('.m4v')) return 'video/quicktime';
+  if (n.endsWith('.mkv')) return 'video/x-matroska';
+  if (n.endsWith('.avi')) return 'video/x-msvideo';
+  if (n.endsWith('.pdf')) return 'application/pdf';
+  if (n.endsWith('.db3')) return 'application/octet-stream';
+  if (/\.(jpg|jpeg)$/i.test(n)) return 'image/jpeg';
+  if (n.endsWith('.png')) return 'image/png';
+  if (n.endsWith('.gif')) return 'image/gif';
+  if (n.endsWith('.webp')) return 'image/webp';
+  return null;
+}
+
 function keyToId(key) {
   return Buffer.from(key, 'utf8').toString('base64url');
 }
@@ -583,7 +601,12 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       }
       const head = await s3.send(new GetObjectCommand({ Bucket: bucket, Key }));
       const filename = path.basename(Key);
-      res.setHeader('Content-Type', head.ContentType || 'application/octet-stream');
+      const fromKey = contentTypeFromFilename(filename);
+      const s3Type = (head.ContentType || '').split(';')[0].trim().toLowerCase();
+      const useGuess =
+        fromKey &&
+        (!s3Type || s3Type === 'application/octet-stream' || s3Type === 'binary/octet-stream');
+      res.setHeader('Content-Type', useGuess ? fromKey : head.ContentType || 'application/octet-stream');
       res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
       if (head.ContentLength != null) {
         res.setHeader('Content-Length', String(head.ContentLength));
