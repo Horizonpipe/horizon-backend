@@ -480,7 +480,8 @@ async function assertPortalPathRel(pool, user, clientId, jobId, relPath) {
   const anyGrants = await portalJobHasPathGrants(pool, clientId, jobId);
   if (!anyGrants) return true;
   const grants = await loadUserPathGrants(pool, clientId, jobId, user.username);
-  if (!grants.length) return false;
+  /* Match tree/list semantics: if this user has no explicit rows, do not hard-block path access. */
+  if (!grants.length) return true;
   const rp = normalizeRelPath(relPath);
   return grants.some((g) => relPathMatchesGrant(rp, g.path_prefix, g.recursive));
 }
