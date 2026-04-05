@@ -157,6 +157,18 @@ function normalizeRoles(value) {
 /** Shared prefix for per-user portal uploads in Wasabi (`clients/portal-users/jobs/{userId}/…`). */
 const PORTAL_FILES_CLIENT_ID = 'portal-users';
 
+function portalPermissionsWhitelistHas(username) {
+  const u = String(username || '')
+    .trim()
+    .toLowerCase();
+  if (!u) return false;
+  const w = (process.env.PORTAL_PERMISSIONS_WHITELIST_USERS || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  return w.includes(u);
+}
+
 function normalizeUser(row) {
   const id = row.id;
   return {
@@ -167,7 +179,9 @@ function normalizeUser(row) {
     roles: normalizeRoles(row.roles),
     mustChangePassword: !!row.must_change_password,
     portalFilesClientId: PORTAL_FILES_CLIENT_ID,
-    portalFilesJobId: String(id)
+    portalFilesJobId: String(id),
+    portalPermissionsAccess:
+      !!row.portal_permissions_access || portalPermissionsWhitelistHas(row.username)
   };
 }
 
@@ -502,7 +516,8 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": false, "simpleVac": false, "email": false}'::jsonb`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_permissions_access BOOLEAN NOT NULL DEFAULT false`
   ];
   for (const query of userAlters) await pool.query(query);
   await pool.query(`UPDATE users SET display_name = username WHERE display_name IS NULL OR btrim(display_name) = ''`);

@@ -25,6 +25,27 @@ const { Upload } = require('@aws-sdk/lib-storage');
 const CATEGORIES = new Set(['videos', 'db3', 'pdf', 'photos']);
 const FOLDER_MARKER = '.hp-folder';
 
+function portalPermissionsWhitelist() {
+  return (process.env.PORTAL_PERMISSIONS_WHITELIST_USERS || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+/**
+ * Admin, explicit DB flag, or PORTAL_PERMISSIONS_WHITELIST_USERS.
+ * @param {import('express').Request['user']} user
+ */
+function userCanManagePortalExtras(user) {
+  if (!user) return false;
+  if (user.isAdmin) return true;
+  if (user.portalPermissionsAccess === true) return true;
+  const u = String(user.username || '')
+    .trim()
+    .toLowerCase();
+  return portalPermissionsWhitelist().includes(u);
+}
+
 const portalUpload = multer({
   dest: os.tmpdir(),
   limits: { fileSize: 25 * 1024 * 1024 * 1024 }
@@ -547,8 +568,8 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (!clientId || !jobId) {
         return res.status(400).json({ error: 'clientId and jobId query params are required' });
       }
-      if (!req.user?.isAdmin) {
-        return res.status(403).json({ error: 'Admin only' });
+      if (!userCanManagePortalExtras(req.user)) {
+        return res.status(403).json({ error: 'Forbidden' });
       }
       if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
@@ -567,8 +588,11 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
     }
   });
 
-  r.put('/permissions', express.json({ limit: '512kb' }), requireAdmin, async (req, res) => {
+  r.put('/permissions', express.json({ limit: '512kb' }), async (req, res) => {
     try {
+      if (!userCanManagePortalExtras(req.user)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
       const { clientId, jobId, grants } = req.body || {};
       if (!clientId || !jobId || !Array.isArray(grants)) {
         return res.status(400).json({ error: 'clientId, jobId, and grants array are required' });
