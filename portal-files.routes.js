@@ -30,6 +30,69 @@ const portalUpload = multer({
   limits: { fileSize: 25 * 1024 * 1024 * 1024 }
 });
 
+const portalBatchUpload = multer({
+  dest: os.tmpdir(),
+  limits: { fileSize: 25 * 1024 * 1024 * 1024, files: 100 }
+});
+
+/** Faster multipart uploads to S3-compatible storage (Wasabi). */
+const S3_UPLOAD_PARALLEL = { queueSize: 8, partSize: 8 * 1024 * 1024 };
+
+/**
+ * @param {import('@aws-sdk/client-s3').S3Client} s3Client
+ * @param {string} bucketName
+ * @param {string} Key
+ * @param {string} tempPath
+ * @param {string} contentType
+ */
+async function s3UploadFromTempPath(s3Client, bucketName, Key, tempPath, contentType) {
+  const stream = fs.createReadStream(tempPath);
+  const uploadTask = new Upload({
+    client: s3Client,
+    queueSize: S3_UPLOAD_PARALLEL.queueSize,
+    partSize: S3_UPLOAD_PARALLEL.partSize,
+    params: {
+      Bucket: bucketName,
+      Key,
+      Body: stream,
+      ContentType: contentType || 'application/octet-stream'
+    }
+  });
+  try {
+    await uploadTask.done();
+  } finally {
+    fs.unlink(tempPath, () => {});
+  }
+}
+
+function portalUploadKey(clientId, jobId, folderPathRel, originalName, explicitCategory) {
+  const fp = normalizeRelPath(folderPathRel || '');
+  if (fp) {
+    return `${jobPrefix(String(clientId), String(jobId))}${fp}/${sanitizeFilename(originalName)}`;
+  }
+  const cat = explicitCategory || inferCategoryFromFilename(originalName);
+  return objectKey(String(clientId), String(jobId), String(cat), originalName);
+}
+
+/**
+ * @template T
+ * @param {T[]} array
+ * @param {number} concurrency
+ * @param {(item: T, index: number) => Promise<void>} fn
+ */
+async function runPool(array, concurrency, fn) {
+  let i = 0;
+  const n = Math.max(1, Math.min(concurrency, array.length || 1));
+  const workers = Array.from({ length: n }, async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= array.length) return;
+      await fn(array[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+}
+
 function createWasabiClient() {
   const accessKeyId = process.env.WASABI_ACCESS_KEY_ID || process.env.WASABI_ACCESS_KEY;
   const secretAccessKey = process.env.WASABI_SECRET_ACCESS_KEY || process.env.WASABI_SECRET_KEY;
@@ -583,33 +646,17 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       }
       const original = req.body.filename || f.originalname || 'upload';
       const fp = normalizeRelPath(folderPath || '');
-      let Key;
-      if (fp) {
-        const safe = sanitizeFilename(original);
-        Key = `${jobPrefix(String(clientId), String(jobId))}${fp}/${safe}`;
-      } else {
-        const cat = req.body.category || inferCategoryFromFilename(original);
-        Key = objectKey(String(clientId), String(jobId), String(cat), original);
-      }
-      const stream = fs.createReadStream(f.path);
-      const uploadTask = new Upload({
-        client: s3,
-        params: {
-          Bucket: bucket,
-          Key,
-          Body: stream,
-          ContentType: f.mimetype || 'application/octet-stream'
-        }
-      });
-      await uploadTask.done();
-      fs.unlink(f.path, () => {});
+      const catExplicit = fp ? null : req.body.category || null;
+      const Key = portalUploadKey(clientId, jobId, fp || '', original, catExplicit);
+      await s3UploadFromTempPath(s3, bucket, Key, f.path, f.mimetype || 'application/octet-stream');
+      const pref = jobPrefix(String(clientId), String(jobId));
       return res.status(201).json({
         id: keyToId(Key),
         key: Key,
         name: path.basename(Key),
         size: f.size,
-        path: Key.slice(jobPrefix(String(clientId), String(jobId)).length),
-        parentPath: parentRelPath(Key.slice(jobPrefix(String(clientId), String(jobId)).length))
+        path: Key.slice(pref.length),
+        parentPath: parentRelPath(Key.slice(pref.length))
       });
     } catch (e) {
       try {
@@ -620,6 +667,92 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
     }
+  });
+
+  r.post('/upload/batch', portalBatchUpload.array('file', 100), async (req, res) => {
+    const files = req.files;
+    if (!Array.isArray(files) || files.length === 0) {
+      return res.status(400).json({ error: 'Missing file field(s) "file"' });
+    }
+    const { clientId, jobId, folderPath, folderPaths: folderPathsRaw } = req.body || {};
+    if (!clientId || !jobId) {
+      for (const f of files) fs.unlink(f.path, () => {});
+      return res.status(400).json({ error: 'clientId and jobId are required' });
+    }
+    if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      for (const f of files) fs.unlink(f.path, () => {});
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    /** @type {string[]} */
+    let pathsList;
+    if (folderPathsRaw != null && String(folderPathsRaw).trim()) {
+      try {
+        const parsed = JSON.parse(String(folderPathsRaw));
+        if (!Array.isArray(parsed) || parsed.length !== files.length) {
+          for (const f of files) fs.unlink(f.path, () => {});
+          return res.status(400).json({
+            error: 'folderPaths must be a JSON array with the same length as the number of files'
+          });
+        }
+        pathsList = parsed.map((p) => {
+          try {
+            return normalizeRelPath(p ?? '');
+          } catch (err) {
+            throw err;
+          }
+        });
+      } catch (e) {
+        for (const f of files) fs.unlink(f.path, () => {});
+        const msg = e instanceof Error ? e.message : String(e);
+        return res.status(400).json({ error: `Invalid folderPaths: ${msg}` });
+      }
+    } else {
+      const fp = normalizeRelPath(folderPath || '');
+      pathsList = files.map(() => fp);
+    }
+
+    const pref = jobPrefix(String(clientId), String(jobId));
+    /** @type {Array<{ id: string, key: string, name: string, size: number, path: string, parentPath: string } | null>} */
+    const okSlot = new Array(files.length).fill(null);
+    /** @type {Array<{ index: number, name: string, error: string } | null>} */
+    const errSlot = new Array(files.length).fill(null);
+    const concurrency = Math.min(8, Math.max(1, files.length));
+
+    await runPool(files, concurrency, async (f, idx) => {
+      const original = f.originalname || 'upload';
+      try {
+        const Key = portalUploadKey(clientId, jobId, pathsList[idx], original, null);
+        await s3UploadFromTempPath(s3, bucket, Key, f.path, f.mimetype || 'application/octet-stream');
+        okSlot[idx] = {
+          id: keyToId(Key),
+          key: Key,
+          name: path.basename(Key),
+          size: f.size,
+          path: Key.slice(pref.length),
+          parentPath: parentRelPath(Key.slice(pref.length))
+        };
+      } catch (e) {
+        try {
+          fs.unlink(f.path, () => {});
+        } catch (_) {
+          /* ignore */
+        }
+        errSlot[idx] = {
+          index: idx,
+          name: original,
+          error: e instanceof Error ? e.message : String(e)
+        };
+      }
+    });
+
+    const items = okSlot.filter(Boolean);
+    const errors = errSlot.filter(Boolean);
+    const status = errors.length === 0 ? 201 : items.length > 0 ? 207 : 500;
+    return res.status(status).json({
+      items,
+      ...(errors.length ? { errors } : {})
+    });
   });
 
   async function handlePortalFileDownload(req, res) {
