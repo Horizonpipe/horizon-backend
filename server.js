@@ -653,6 +653,56 @@ async function ensureSchema() {
     `CREATE INDEX IF NOT EXISTS idx_portal_path_grants_user ON portal_path_grants (client_id, job_id, lower(username))`
   );
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS portal_share_links (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      token TEXT NOT NULL UNIQUE,
+      client_id TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('public', 'interactive', 'signin')),
+      created_by_username TEXT,
+      payload JSONB NOT NULL DEFAULT '{"folderPaths":[],"fileIds":[]}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_portal_share_links_cj ON portal_share_links (client_id, job_id)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS portal_share_guest_sessions (
+      guest_token TEXT PRIMARY KEY,
+      share_link_id UUID NOT NULL REFERENCES portal_share_links(id) ON DELETE CASCADE,
+      email TEXT NOT NULL,
+      first_name TEXT NOT NULL,
+      last_name TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS portal_share_access_log (
+      id BIGSERIAL PRIMARY KEY,
+      share_link_id UUID NOT NULL REFERENCES portal_share_links(id) ON DELETE CASCADE,
+      email TEXT NOT NULL,
+      first_name TEXT NOT NULL,
+      last_name TEXT NOT NULL,
+      accessed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ip_inet TEXT,
+      user_agent TEXT
+    )
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_portal_share_access_log_share ON portal_share_access_log (share_link_id, accessed_at DESC)`
+  );
+
+  try {
+    await pool.query(`ALTER TABLE portal_share_links DROP CONSTRAINT IF EXISTS portal_share_links_kind_check`);
+    await pool.query(
+      `ALTER TABLE portal_share_links ADD CONSTRAINT portal_share_links_kind_check CHECK (kind IN ('public', 'interactive', 'signin'))`
+    );
+  } catch (e) {
+    console.warn('[schema] portal_share_links kind constraint migrate:', e instanceof Error ? e.message : e);
+  }
+
   await ensureOutlookSchema(pool);
 
   const countResult = await pool.query('SELECT COUNT(*)::int AS count FROM users');

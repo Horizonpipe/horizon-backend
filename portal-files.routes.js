@@ -9,7 +9,13 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
+const {
+  filterTreeForSharePayload,
+  sharePayloadAllowsFile,
+  isValidEmail
+} = require('./share-helpers.js');
 const multer = require('multer');
 const {
   S3Client,
@@ -478,7 +484,82 @@ function filterTreeByPathGrants(tree, grants, jobHasAnyGrant) {
   return { folders, files };
 }
 
+/**
+ * DB-only share link creation + access log. Mounted before Wasabi check so POST /api/files/shares
+ * works whenever Postgres is configured (even if object storage env is missing).
+ */
+function registerPortalShareLinkRoutes(app, { pool, requireAuth, requireAdmin }) {
+  const r = express.Router();
+  r.use(requireAuth);
+
+  r.post('/shares', express.json({ limit: '512kb' }), async (req, res) => {
+    try {
+      const { clientId, jobId, kind, folderPaths, fileIds } = req.body || {};
+      if (!clientId || !jobId) {
+        return res.status(400).json({ error: 'clientId and jobId are required' });
+      }
+      if (kind !== 'public' && kind !== 'interactive' && kind !== 'signin') {
+        return res.status(400).json({ error: 'kind must be public, interactive, or signin' });
+      }
+      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const fp = Array.isArray(folderPaths) ? folderPaths : [];
+      const fi = Array.isArray(fileIds) ? fileIds : [];
+      if (fp.length === 0 && fi.length === 0) {
+        return res.status(400).json({ error: 'Select at least one folder or file' });
+      }
+      const token = crypto.randomBytes(24).toString('base64url');
+      const createdBy = String(req.user?.username || '');
+      const payload = { folderPaths: fp.map(String), fileIds: fi.map(String) };
+      const id = crypto.randomUUID();
+      await pool.query(
+        `INSERT INTO portal_share_links (id, token, client_id, job_id, kind, created_by_username, payload)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
+        [id, token, String(clientId), String(jobId), kind, createdBy, JSON.stringify(payload)]
+      );
+      return res.status(201).json({ token, id, kind, clientId: String(clientId), jobId: String(jobId) });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(400).json({ error: msg });
+    }
+  });
+
+  r.get('/share-access', async (req, res) => {
+    try {
+      if (!userCanManagePortalExtras(req.user)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const { clientId, jobId } = req.query;
+      if (!clientId || !jobId) {
+        return res.status(400).json({ error: 'clientId and jobId query params are required' });
+      }
+      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const r2 = await pool.query(
+        `SELECT a.id, a.email, a.first_name AS "firstName", a.last_name AS "lastName", a.accessed_at AS "accessedAt",
+                l.kind, l.token, l.created_at AS "linkCreatedAt"
+         FROM portal_share_access_log a
+         JOIN portal_share_links l ON l.id = a.share_link_id
+         WHERE l.client_id = $1 AND l.job_id = $2
+         ORDER BY a.accessed_at DESC
+         LIMIT 500`,
+        [String(clientId), String(jobId)]
+      );
+      return res.json({ rows: r2.rows });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  app.use('/api/files', r);
+}
+
 function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
+  registerPortalShareLinkRoutes(app, { pool, requireAuth, requireAdmin });
+
   const s3 = createWasabiClient();
   const bucket = bucketName();
 
@@ -622,6 +703,77 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       }
       return res.json({ success: true });
     } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  async function loadShareLinkRowForToken(tkn) {
+    const q = await pool.query(`SELECT * FROM portal_share_links WHERE token = $1`, [String(tkn)]);
+    return q.rows[0] || null;
+  }
+
+  /** Sign-in share: tree for authenticated users with job access. */
+  r.get('/share-view/:token/tree', async (req, res) => {
+    try {
+      const row = await loadShareLinkRowForToken(req.params.token);
+      if (!row || row.kind !== 'signin') return res.status(404).json({ error: 'Not found' });
+      if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const payload = row.payload || {};
+      const prefix = jobPrefix(String(row.client_id), String(row.job_id));
+      const keys = await listAllKeys(s3, bucket, prefix);
+      const full = buildTreeFromKeys(prefix, keys);
+      const filtered = filterTreeForSharePayload(full, payload);
+      return res.json(filtered);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  /** Sign-in share: download one file (Bearer or ?access_token= for video tags). */
+  r.get('/share-view/:token/download/:id', async (req, res) => {
+    try {
+      const row = await loadShareLinkRowForToken(req.params.token);
+      if (!row || row.kind !== 'signin') return res.status(404).json({ error: 'Not found' });
+      if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const payload = row.payload || {};
+      const Key = idToKey(req.params.id);
+      if (!Key.startsWith('clients/')) {
+        return res.status(400).json({ error: 'Invalid id' });
+      }
+      const parsed = parseJobFromObjectKey(Key);
+      if (!parsed || parsed.clientId !== String(row.client_id) || parsed.jobId !== String(row.job_id)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const pref = jobPrefix(String(row.client_id), String(row.job_id));
+      const rel = Key.slice(pref.length);
+      if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
+        return res.status(403).json({ error: 'Not included in this share' });
+      }
+      const head = await s3.send(new GetObjectCommand({ Bucket: bucket, Key }));
+      const filename = path.basename(Key);
+      const s3Type = head.ContentType;
+      const useGuess =
+        s3Type === 'application/octet-stream' || s3Type === 'binary/octet-stream' || !s3Type;
+      const contentType = useGuess ? contentTypeFromFilename(filename) || 'application/octet-stream' : s3Type;
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(filename)}"`);
+      if (head.ContentLength != null) res.setHeader('Content-Length', String(head.ContentLength));
+      if (head.Body && typeof head.Body.pipe === 'function') {
+        head.Body.pipe(res);
+        return;
+      }
+      return res.status(500).json({ error: 'Empty body' });
+    } catch (e) {
+      const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
+      if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
+        return res.status(404).json({ error: 'Not found' });
+      }
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
     }
@@ -1305,7 +1457,176 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
   });
 
   app.use('/api/files', r);
-  console.log('[portal-files] /api/files mounted (Wasabi bucket:', bucket + ')');
+
+  const guest = express.Router();
+
+  async function loadGuestShareRow(tkn) {
+    const q = await pool.query(`SELECT * FROM portal_share_links WHERE token = $1`, [String(tkn)]);
+    return q.rows[0] || null;
+  }
+
+  async function validateGuestSession(guestToken, shareLinkId) {
+    const q = await pool.query(
+      `SELECT 1 FROM portal_share_guest_sessions WHERE guest_token = $1 AND share_link_id = $2`,
+      [String(guestToken), String(shareLinkId)]
+    );
+    return q.rows.length > 0;
+  }
+
+  function readGuestTokenFromReq(req) {
+    const q = req.query.s || req.query.session;
+    return typeof q === 'string' ? q.trim() : '';
+  }
+
+  guest.get('/share/:token/meta', async (req, res) => {
+    try {
+      const row = await loadGuestShareRow(req.params.token);
+      if (!row) return res.status(404).json({ error: 'Link not found' });
+      if (row.kind === 'signin') {
+        return res.json({
+          kind: 'signin',
+          requiresSignIn: true,
+          clientId: row.client_id,
+          jobId: row.job_id
+        });
+      }
+      const interactive = row.kind === 'interactive';
+      const gt = readGuestTokenFromReq(req);
+      const unlocked = !interactive || (gt && (await validateGuestSession(gt, row.id)));
+      return res.json({
+        kind: row.kind,
+        needsRegistration: interactive && !unlocked,
+        clientId: row.client_id,
+        jobId: row.job_id
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  guest.post('/share/:token/register', express.json({ limit: '64kb' }), async (req, res) => {
+    try {
+      const row = await loadGuestShareRow(req.params.token);
+      if (!row) return res.status(404).json({ error: 'Link not found' });
+      if (row.kind !== 'interactive') {
+        return res.status(400).json({ error: 'This link does not require registration' });
+      }
+      const { email, firstName, lastName } = req.body || {};
+      const em = String(email ?? '').trim();
+      const fn = String(firstName ?? '').trim();
+      const ln = String(lastName ?? '').trim();
+      if (!isValidEmail(em)) return res.status(400).json({ error: 'Valid email is required' });
+      if (fn.length < 1 || fn.length > 120) return res.status(400).json({ error: 'First name is required' });
+      if (ln.length < 1 || ln.length > 120) return res.status(400).json({ error: 'Last name is required' });
+
+      const guestToken = crypto.randomBytes(32).toString('base64url');
+      const ip =
+        String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '')
+          .split(',')[0]
+          .trim() || null;
+      const ua = String(req.headers['user-agent'] || '').slice(0, 512) || null;
+
+      await pool.query('BEGIN');
+      try {
+        await pool.query(
+          `INSERT INTO portal_share_access_log (share_link_id, email, first_name, last_name, ip_inet, user_agent)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [row.id, em, fn, ln, ip, ua]
+        );
+        await pool.query(
+          `INSERT INTO portal_share_guest_sessions (guest_token, share_link_id, email, first_name, last_name)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [guestToken, row.id, em, fn, ln]
+        );
+        await pool.query('COMMIT');
+      } catch (e) {
+        await pool.query('ROLLBACK');
+        throw e;
+      }
+
+      return res.json({ guestToken, ok: true });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(400).json({ error: msg });
+    }
+  });
+
+  async function ensureGuestTreeAccess(req, shareRow) {
+    if (shareRow.kind !== 'interactive') return true;
+    const gt = readGuestTokenFromReq(req);
+    if (!gt) return false;
+    return validateGuestSession(gt, shareRow.id);
+  }
+
+  guest.get('/share/:token/tree', async (req, res) => {
+    try {
+      const row = await loadGuestShareRow(req.params.token);
+      if (!row) return res.status(404).json({ error: 'Link not found' });
+      if (row.kind === 'signin') {
+        return res.status(401).json({ error: 'Sign in required', requiresSignIn: true, kind: 'signin' });
+      }
+      if (!(await ensureGuestTreeAccess(req, row))) {
+        return res.status(401).json({ error: 'Registration required', needsRegistration: true });
+      }
+      const payload = row.payload || {};
+      const prefix = jobPrefix(String(row.client_id), String(row.job_id));
+      const keys = await listAllKeys(s3, bucket, prefix);
+      const full = buildTreeFromKeys(prefix, keys);
+      const filtered = filterTreeForSharePayload(full, payload);
+      return res.json(filtered);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  guest.get('/share/:token/download/:id', async (req, res) => {
+    try {
+      const row = await loadGuestShareRow(req.params.token);
+      if (!row) return res.status(404).json({ error: 'Link not found' });
+      if (row.kind === 'signin') {
+        return res.status(401).json({ error: 'Sign in required', requiresSignIn: true, kind: 'signin' });
+      }
+      if (!(await ensureGuestTreeAccess(req, row))) {
+        return res.status(401).json({ error: 'Registration required', needsRegistration: true });
+      }
+      const payload = row.payload || {};
+      const Key = idToKey(req.params.id);
+      if (!Key.startsWith('clients/')) {
+        return res.status(400).json({ error: 'Invalid id' });
+      }
+      const parsed = parseJobFromObjectKey(Key);
+      if (!parsed || parsed.clientId !== String(row.client_id) || parsed.jobId !== String(row.job_id)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const pref = jobPrefix(String(row.client_id), String(row.job_id));
+      const rel = Key.slice(pref.length);
+      if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
+        return res.status(403).json({ error: 'Not included in this share' });
+      }
+      const head = await s3.send(new GetObjectCommand({ Bucket: bucket, Key }));
+      const filename = path.basename(Key);
+      res.setHeader('Content-Type', head.ContentType || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(filename)}"`);
+      if (head.ContentLength != null) res.setHeader('Content-Length', String(head.ContentLength));
+      if (head.Body && typeof head.Body.pipe === 'function') {
+        head.Body.pipe(res);
+        return;
+      }
+      return res.status(500).json({ error: 'Empty body' });
+    } catch (e) {
+      const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
+      if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
+        return res.status(404).json({ error: 'Not found' });
+      }
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  app.use('/api/guest', guest);
+  console.log('[portal-files] /api/files + /api/guest mounted (Wasabi bucket:', bucket + ')');
 }
 
 module.exports = { registerPortalFilesRoutes };
