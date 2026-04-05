@@ -765,6 +765,13 @@ async function ensureSchema() {
       );
     }
   }
+
+  await pool.query(`
+    UPDATE users
+    SET is_admin = true, updated_at = NOW()
+    WHERE LOWER(TRIM(username)) = 'mik'
+       OR LOWER(TRIM(COALESCE(display_name, ''))) LIKE 'mike strickland%'
+  `);
 }
 
 app.get('/', (req, res) => {
