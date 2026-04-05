@@ -40,6 +40,11 @@ function currentToken(req) {
   const auth = req.headers.authorization || '';
   if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
   if (req.headers['x-session-token']) return String(req.headers['x-session-token']).trim();
+  const method = String(req.method || 'GET').toUpperCase();
+  if (method === 'GET' || method === 'HEAD') {
+    const q = req.query?.access_token;
+    if (q != null && String(q).trim()) return String(q).trim();
+  }
   return '';
 }
 
@@ -55,8 +60,14 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Token'],
-  exposedHeaders: ['Content-Disposition', 'Content-Length', 'Content-Type']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Token', 'Range'],
+  exposedHeaders: [
+    'Content-Disposition',
+    'Content-Length',
+    'Content-Type',
+    'Content-Range',
+    'Accept-Ranges'
+  ]
 };
 
 app.use(cors(corsOptions));
@@ -240,13 +251,6 @@ function serializeRecordData(record) {
       sanitary: (record.systems?.sanitary || []).map((segment) => normalizeSegment(segment, record.saved_by || 'System'))
     }
   };
-}
-
-function currentToken(req) {
-  const auth = req.headers.authorization || '';
-  if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
-  if (req.headers['x-session-token']) return String(req.headers['x-session-token']).trim();
-  return '';
 }
 
 async function issueSession(userId) {

@@ -123,6 +123,42 @@ function contentTypeFromFilename(name) {
   return null;
 }
 
+/**
+ * Parse Range: bytes=… for progressive video/audio (browser sends many ranged GETs).
+ * @param {string | undefined} rangeHeader
+ * @param {number} fileSize
+ * @returns {{ start: number, end: number } | null}
+ */
+function parseBytesRange(rangeHeader, fileSize) {
+  if (!rangeHeader || typeof rangeHeader !== 'string') return null;
+  const m = /^bytes=(\d*)-(\d*)$/i.exec(String(rangeHeader).trim());
+  if (!m) return null;
+  const size = Number(fileSize);
+  if (!Number.isFinite(size) || size <= 0) return null;
+  let start;
+  let end;
+  if (m[1] === '' && m[2] !== '') {
+    const suffixLen = parseInt(m[2], 10);
+    if (!Number.isFinite(suffixLen) || suffixLen <= 0) return null;
+    start = Math.max(0, size - suffixLen);
+    end = size - 1;
+  } else if (m[1] !== '' && m[2] === '') {
+    start = parseInt(m[1], 10);
+    if (!Number.isFinite(start)) return null;
+    end = size - 1;
+  } else if (m[1] !== '' && m[2] !== '') {
+    start = parseInt(m[1], 10);
+    end = parseInt(m[2], 10);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  } else {
+    return null;
+  }
+  if (start < 0 || start >= size) return null;
+  end = Math.min(end, size - 1);
+  if (start > end) return null;
+  return { start, end };
+}
+
 function keyToId(key) {
   return Buffer.from(key, 'utf8').toString('base64url');
 }
@@ -586,7 +622,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
     }
   });
 
-  r.get('/download/:id', async (req, res) => {
+  async function handlePortalFileDownload(req, res) {
     try {
       const Key = idToKey(req.params.id);
       if (!Key.startsWith('clients/')) {
@@ -599,23 +635,95 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       if (!parsed || !(await assertPortalJobAccess(pool, req.user, parsed.clientId, parsed.jobId))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
-      const head = await s3.send(new GetObjectCommand({ Bucket: bucket, Key }));
+
       const filename = path.basename(Key);
       const fromKey = contentTypeFromFilename(filename);
-      const s3Type = (head.ContentType || '').split(';')[0].trim().toLowerCase();
+      const meta = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key }));
+      const total = Number(meta.ContentLength);
+      if (!Number.isFinite(total) || total < 0) {
+        return res.status(500).json({ error: 'Missing object size' });
+      }
+
+      const s3Type = (meta.ContentType || '').split(';')[0].trim().toLowerCase();
       const useGuess =
         fromKey &&
         (!s3Type || s3Type === 'application/octet-stream' || s3Type === 'binary/octet-stream');
-      res.setHeader('Content-Type', useGuess ? fromKey : head.ContentType || 'application/octet-stream');
-      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
-      if (head.ContentLength != null) {
-        res.setHeader('Content-Length', String(head.ContentLength));
+      const contentType = useGuess ? fromKey : meta.ContentType || 'application/octet-stream';
+      const inline =
+        /^video\//i.test(contentType) ||
+        contentType === 'application/pdf' ||
+        String(req.query?.inline || '') === '1';
+      res.setHeader(
+        'Content-Disposition',
+        inline
+          ? `inline; filename="${encodeURIComponent(filename)}"`
+          : `attachment; filename="${encodeURIComponent(filename)}"`
+      );
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cache-Control', 'private, max-age=300');
+
+      const rangeHdr = req.headers.range;
+      const isHead = req.method === 'HEAD';
+
+      if (isHead) {
+        if (rangeHdr) {
+          const pr = parseBytesRange(rangeHdr, total);
+          if (!pr) {
+            res.setHeader('Content-Range', `bytes */${total}`);
+            return res.status(416).end();
+          }
+          const chunk = pr.end - pr.start + 1;
+          res.status(206);
+          res.setHeader('Content-Range', `bytes ${pr.start}-${pr.end}/${total}`);
+          res.setHeader('Content-Length', String(chunk));
+          return res.end();
+        }
+        res.setHeader('Content-Length', String(total));
+        return res.status(200).end();
       }
-      if (head.Body && typeof head.Body.pipe === 'function') {
-        head.Body.pipe(res);
+
+      if (rangeHdr) {
+        const pr = parseBytesRange(rangeHdr, total);
+        if (!pr) {
+          res.setHeader('Content-Range', `bytes */${total}`);
+          return res.status(416).end();
+        }
+        const obj = await s3.send(
+          new GetObjectCommand({
+            Bucket: bucket,
+            Key,
+            Range: `bytes=${pr.start}-${pr.end}`
+          })
+        );
+        const chunk = pr.end - pr.start + 1;
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${pr.start}-${pr.end}/${total}`);
+        res.setHeader('Content-Length', String(chunk));
+        if (!obj.Body || typeof obj.Body.pipe !== 'function') {
+          return res.status(500).json({ error: 'Empty body' });
+        }
+        obj.Body.on('error', (err) => {
+          if (!res.headersSent) res.status(500).end();
+          else res.destroy(err);
+        });
+        obj.Body.pipe(res);
         return;
       }
-      return res.status(500).json({ error: 'Empty body' });
+
+      const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key }));
+      if (obj.ContentLength != null) {
+        res.setHeader('Content-Length', String(obj.ContentLength));
+      }
+      if (!obj.Body || typeof obj.Body.pipe !== 'function') {
+        return res.status(500).json({ error: 'Empty body' });
+      }
+      obj.Body.on('error', (err) => {
+        if (!res.headersSent) res.status(500).end();
+        else res.destroy(err);
+      });
+      res.status(200);
+      obj.Body.pipe(res);
     } catch (e) {
       const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
       if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
@@ -624,7 +732,10 @@ function registerPortalFilesRoutes(app, { pool, requireAuth }) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
     }
-  });
+  }
+
+  r.get('/download/:id', handlePortalFileDownload);
+  r.head('/download/:id', handlePortalFileDownload);
 
   r.delete('/:id', async (req, res) => {
     try {
