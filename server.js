@@ -7,6 +7,7 @@ const multer = require('multer');
 const initSqlJs = require('sql.js');
 const { Pool } = require('pg');
 const { ensureOutlookSchema, registerOutlookRoutes } = require('./outlook');
+const { registerPortalFilesRoutes } = require('./portal-files.routes');
 
 const app = express();
 app.use(express.json());
@@ -54,7 +55,8 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Token']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Token'],
+  exposedHeaders: ['Content-Disposition', 'Content-Length', 'Content-Type']
 };
 
 app.use(cors(corsOptions));
@@ -1547,6 +1549,7 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
 });
 
 registerOutlookRoutes(app, { pool, requireAuth, currentToken, corsOrigins: CORS_ORIGINS });
+registerPortalFilesRoutes(app, { pool, requireAuth });
 
 app.use((error, req, res, next) => {
   if (error && /CORS blocked/.test(error.message || '')) {
