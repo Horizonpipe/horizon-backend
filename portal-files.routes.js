@@ -10,6 +10,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const archiver = require('archiver');
 const express = require('express');
 const {
   filterTreeForSharePayload,
@@ -170,11 +171,16 @@ async function ensurePortalResumeSchema(pool) {
           session_id UUID NOT NULL REFERENCES portal_upload_sessions(id) ON DELETE CASCADE,
           part_number INTEGER NOT NULL,
           etag TEXT NOT NULL,
+          sha256 TEXT,
           size BIGINT NOT NULL,
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           PRIMARY KEY (session_id, part_number)
         )
       `);
+      await pool.query(
+        `ALTER TABLE portal_upload_session_parts
+         ADD COLUMN IF NOT EXISTS sha256 TEXT`
+      );
     })().catch((e) => {
       portalResumeSchemaReady = null;
       throw e;
@@ -203,6 +209,40 @@ function contiguousUploadedBytes(parts) {
     expect += 1;
   }
   return bytes;
+}
+
+function normalizeSha256Hex(input) {
+  return String(input || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-f0-9]/g, '');
+}
+
+/**
+ * @param {string} filePath
+ * @returns {Promise<string>}
+ */
+async function sha256HexForFilePath(filePath) {
+  const h = crypto.createHash('sha256');
+  return await new Promise((resolve, reject) => {
+    const s = fs.createReadStream(filePath);
+    s.on('data', (chunk) => h.update(chunk));
+    s.on('error', reject);
+    s.on('end', () => resolve(h.digest('hex')));
+  });
+}
+
+/**
+ * @param {NodeJS.ReadableStream} stream
+ * @returns {Promise<string>}
+ */
+async function sha256HexForReadable(stream) {
+  const h = crypto.createHash('sha256');
+  return await new Promise((resolve, reject) => {
+    stream.on('data', (chunk) => h.update(chunk));
+    stream.on('error', reject);
+    stream.on('end', () => resolve(h.digest('hex')));
+  });
 }
 
 function createWasabiClient() {
@@ -379,6 +419,23 @@ function basenameRel(rel) {
   if (!n) return '';
   const i = n.lastIndexOf('/');
   return i === -1 ? n : n.slice(i + 1);
+}
+
+function safeZipSegment(seg) {
+  return String(seg || '')
+    .replace(/\\/g, '/')
+    .replace(/[<>:"|?*\u0000-\u001F]/g, '_')
+    .trim();
+}
+
+function safeZipEntryPath(relPath) {
+  const bits = String(relPath || '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter(Boolean)
+    .map((seg) => safeZipSegment(seg).replace(/^\.+$/, '_'))
+    .filter(Boolean);
+  return bits.join('/');
 }
 
 function copySourceHeader(bucket, key) {
@@ -1421,6 +1478,10 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       }
       const original = String(fileName || '').trim();
       if (!original) return res.status(400).json({ error: 'fileName is required' });
+      const expectedFileSha256 = normalizeSha256Hex(sha256);
+      if (expectedFileSha256 && expectedFileSha256.length !== 64) {
+        return res.status(400).json({ error: 'sha256 must be a 64-char hex digest' });
+      }
       const sizeNum = Number(fileSize);
       if (!Number.isFinite(sizeNum) || sizeNum <= 0) {
         return res.status(400).json({ error: 'fileSize must be a positive number' });
@@ -1435,7 +1496,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
 
       const userId = String(req.user?.id ?? req.user?.username ?? '');
       const existing = await pool.query(
-        `SELECT id, multipart_upload_id, chunk_size, object_key, file_size, file_name, mime_type
+        `SELECT id, multipart_upload_id, chunk_size, object_key, file_size, file_name, mime_type, sha256
          FROM portal_upload_sessions
          WHERE user_id = $1 AND client_id = $2 AND job_id = $3
            AND folder_path = $4 AND file_name = $5 AND file_size = $6
@@ -1446,6 +1507,10 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       );
       if (existing.rows.length) {
         const s = existing.rows[0];
+        const sessionSha256 = normalizeSha256Hex(s.sha256 || '');
+        if (sessionSha256 && expectedFileSha256 && sessionSha256 !== expectedFileSha256) {
+          return res.status(409).json({ error: 'Existing resumable session hash mismatch for this file' });
+        }
         const p = await pool.query(
           `SELECT part_number, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
           [s.id]
@@ -1488,7 +1553,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
           key,
           uploadId,
           effectiveChunkSize,
-          sha256 != null && String(sha256).trim() ? String(sha256).trim() : null
+          expectedFileSha256 || null
         ]
       );
       return res.status(201).json({
@@ -1512,9 +1577,14 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       await ensurePortalResumeSchema(pool);
       const sessionId = String(req.body?.sessionId || '').trim();
       const partNumber = Number(req.body?.partNumber);
+      const chunkSha256 = normalizeSha256Hex(req.body?.chunkSha256 || '');
       if (!sessionId || !Number.isFinite(partNumber) || partNumber < 1 || !Number.isInteger(partNumber)) {
         fs.unlink(f.path, () => {});
         return res.status(400).json({ error: 'sessionId and integer partNumber are required' });
+      }
+      if (chunkSha256.length !== 64) {
+        fs.unlink(f.path, () => {});
+        return res.status(400).json({ error: 'chunkSha256 is required and must be a 64-char hex digest' });
       }
       const sRes = await pool.query(
         `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
@@ -1536,6 +1606,12 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         return res.status(403).json({ error: 'Forbidden for this path' });
       }
 
+      const actualChunkSha256 = normalizeSha256Hex(await sha256HexForFilePath(f.path));
+      if (actualChunkSha256 !== chunkSha256) {
+        fs.unlink(f.path, () => {});
+        return res.status(409).json({ error: 'Chunk hash mismatch', expected: chunkSha256, actual: actualChunkSha256 });
+      }
+
       const partResp = await s3.send(
         new UploadPartCommand({
           Bucket: bucket,
@@ -1550,11 +1626,11 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       const etag = String(partResp.ETag || '').replace(/^"+|"+$/g, '');
       if (!etag) throw new Error('Missing ETag for uploaded part');
       await pool.query(
-        `INSERT INTO portal_upload_session_parts (session_id, part_number, etag, size)
-         VALUES ($1,$2,$3,$4)
+        `INSERT INTO portal_upload_session_parts (session_id, part_number, etag, sha256, size)
+         VALUES ($1,$2,$3,$4,$5)
          ON CONFLICT (session_id, part_number)
-         DO UPDATE SET etag = EXCLUDED.etag, size = EXCLUDED.size, created_at = NOW()`,
-        [sessionId, partNumber, etag, Math.floor(Number(f.size || 0))]
+         DO UPDATE SET etag = EXCLUDED.etag, sha256 = EXCLUDED.sha256, size = EXCLUDED.size, created_at = NOW()`,
+        [sessionId, partNumber, etag, actualChunkSha256, Math.floor(Number(f.size || 0))]
       );
       await pool.query(`UPDATE portal_upload_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
       const parts = await pool.query(
@@ -1584,9 +1660,12 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       await ensurePortalResumeSchema(pool);
       const sessionId = String(req.body?.sessionId || '').trim();
       const totalParts = Number(req.body?.totalParts);
-      const sha256 = req.body?.sha256 != null ? String(req.body.sha256).trim() : '';
+      const bodySha256 = normalizeSha256Hex(req.body?.sha256 || '');
       if (!sessionId || !Number.isFinite(totalParts) || totalParts < 1 || !Number.isInteger(totalParts)) {
         return res.status(400).json({ error: 'sessionId and integer totalParts are required' });
+      }
+      if (bodySha256 && bodySha256.length !== 64) {
+        return res.status(400).json({ error: 'sha256 must be a 64-char hex digest' });
       }
       const sRes = await pool.query(
         `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
@@ -1598,6 +1677,14 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       }
       if (!(await assertPortalJobAccess(pool, req.user, sessionRow.client_id, sessionRow.job_id))) {
         return res.status(403).json({ error: 'Forbidden' });
+      }
+      const sessionSha256 = normalizeSha256Hex(sessionRow.sha256 || '');
+      if (sessionSha256 && bodySha256 && sessionSha256 !== bodySha256) {
+        return res.status(409).json({ error: 'Provided file hash does not match session hash' });
+      }
+      const expectedFileSha256 = bodySha256 || sessionSha256;
+      if (expectedFileSha256.length !== 64) {
+        return res.status(400).json({ error: 'sha256 is required to finalize resumable uploads' });
       }
       const parts = await pool.query(
         `SELECT part_number, etag, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
@@ -1624,11 +1711,34 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
           MultipartUpload: { Parts: use }
         })
       );
+      const finalObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+      if (!finalObj.Body || typeof finalObj.Body.pipe !== 'function') {
+        throw new Error('Missing completed object body for hash verification');
+      }
+      const actualFileSha256 = normalizeSha256Hex(await sha256HexForReadable(finalObj.Body));
+      if (actualFileSha256 !== expectedFileSha256) {
+        try {
+          await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+        } catch (_) {
+          /* ignore delete failure after hash mismatch */
+        }
+        await pool.query(
+          `UPDATE portal_upload_sessions
+           SET status = 'failed', sha256 = $2, updated_at = NOW()
+           WHERE id = $1`,
+          [sessionId, actualFileSha256]
+        );
+        return res.status(409).json({
+          error: 'Final file hash mismatch',
+          expected: expectedFileSha256,
+          actual: actualFileSha256
+        });
+      }
       await pool.query(
         `UPDATE portal_upload_sessions
-         SET status = 'completed', sha256 = COALESCE(NULLIF($2,''), sha256), completed_at = NOW(), updated_at = NOW()
+         SET status = 'completed', sha256 = $2, completed_at = NOW(), updated_at = NOW()
          WHERE id = $1`,
-        [sessionId, sha256]
+        [sessionId, actualFileSha256]
       );
       const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id));
       return res.status(201).json({
@@ -1877,6 +1987,77 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       return res.status(500).json({ error: msg });
     }
   }
+
+  r.get('/folders/download', async (req, res) => {
+    try {
+      const { clientId, jobId, path: pathParam } = req.query || {};
+      if (!clientId || !jobId || pathParam == null || String(pathParam).trim() === '') {
+        return res.status(400).json({ error: 'clientId, jobId, and folder path are required' });
+      }
+      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const folderRel = normalizeRelPath(pathParam);
+      if (!folderRel) {
+        return res.status(400).json({ error: 'Folder path must be non-empty' });
+      }
+      if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, folderRel))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+
+      const pref = jobPrefix(String(clientId), String(jobId));
+      const prefix = `${pref}${folderRel}/`;
+      const keys = await listAllKeys(s3, bucket, prefix);
+      if (!keys.length) {
+        return res.status(404).json({ error: 'Folder not found' });
+      }
+
+      /** @type {Array<{ key: string, rel: string }>} */
+      const files = [];
+      for (const entry of keys) {
+        const rel = entry.Key.slice(pref.length);
+        if (!rel || isFolderMarkerKey(rel)) continue;
+        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, rel))) continue;
+        const subRel = rel.slice(folderRel.length + 1);
+        const zipRel = safeZipEntryPath(subRel);
+        if (!zipRel) continue;
+        files.push({ key: entry.Key, rel: zipRel });
+      }
+
+      const rootName = safeZipSegment(basenameRel(folderRel) || 'folder') || 'folder';
+      const downloadName = `${rootName}.zip`;
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(downloadName)}"`);
+      res.setHeader('Cache-Control', 'private, max-age=60');
+
+      const zip = archiver('zip', { zlib: { level: 9 } });
+      zip.on('warning', (warn) => {
+        console.warn('[portal-files] zip warning', warn);
+      });
+      zip.on('error', (err) => {
+        if (!res.headersSent) res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+        else res.destroy(err);
+      });
+      zip.pipe(res);
+
+      if (!files.length) {
+        zip.append('', { name: `${rootName}/` });
+        await zip.finalize();
+        return;
+      }
+
+      for (const file of files) {
+        const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: file.key }));
+        if (!obj.Body || typeof obj.Body.pipe !== 'function') continue;
+        zip.append(obj.Body, { name: `${rootName}/${file.rel}` });
+      }
+      await zip.finalize();
+      return;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
 
   r.get('/download/:id', handlePortalFileDownload);
   r.head('/download/:id', handlePortalFileDownload);
