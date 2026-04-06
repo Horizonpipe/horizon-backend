@@ -627,6 +627,13 @@ async function assertPortalJobAccess(pool, user, clientId, jobId) {
   const c = String(clientId || '').trim();
   const j = String(jobId || '').trim();
   if (!c || !j) return false;
+  if (user && user.selfSignup === true) {
+    // Self-signup accounts are denied by default; explicit portal scope must be assigned by admin.
+    const uc = String(user.portalFilesClientId || '').trim();
+    const uj = String(user.portalFilesJobId || '').trim();
+    if (!uc || !uj) return false;
+    return c === uc && j === uj;
+  }
   const forced = portalForceJobScope();
   if (forced && c === forced.clientId && j === forced.jobId) return true;
   const shared = portalSharedDefaultScope();

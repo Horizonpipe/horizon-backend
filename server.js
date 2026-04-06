@@ -230,6 +230,7 @@ function portalPermissionsWhitelistHas(username) {
 
 function normalizeUser(row) {
   const id = row.id;
+  const selfSignup = row?.self_signup === true;
   const legacyUserScoped = id != null && String(id).trim() && PORTAL_USER_SCOPED_DEFAULTS;
   const explicitClient =
     row?.portal_files_client_id != null && String(row.portal_files_client_id).trim()
@@ -251,6 +252,10 @@ function normalizeUser(row) {
   } else if (hasExplicitScope) {
     portalFilesClientId = explicitClient;
     portalFilesJobId = explicitJob;
+  } else if (selfSignup) {
+    // Self-signup users must be explicitly scoped by admin before any portal file visibility.
+    portalFilesClientId = undefined;
+    portalFilesJobId = undefined;
   } else if (PORTAL_FORCE_JOB_SCOPE) {
     portalFilesClientId = PORTAL_FORCE_CLIENT_ID;
     portalFilesJobId = PORTAL_FORCE_JOB_ID;
@@ -279,6 +284,7 @@ function normalizeUser(row) {
     isAdmin: !!row.is_admin,
     roles: normalizeRoles(row.roles),
     mustChangePassword: !!row.must_change_password,
+    selfSignup,
     portalFilesAccessGranted,
     portalFilesClientId,
     portalFilesJobId,
@@ -437,7 +443,7 @@ async function readSession(token) {
   const result = await pool.query(
     `SELECT s.token, s.user_id, s.expires_at, u.id, u.username, u.display_name, u.password,
             u.is_admin, u.roles, u.must_change_password, u.portal_files_client_id, u.portal_files_job_id,
-            u.portal_permissions_access, u.portal_files_access_granted, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified
+            u.portal_permissions_access, u.portal_files_access_granted, u.self_signup, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified
      FROM auth_sessions s
      JOIN users u ON CAST(u.id AS text) = s.user_id
      WHERE s.token = $1
@@ -632,7 +638,8 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS title TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_access_granted BOOLEAN NOT NULL DEFAULT true`
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_access_granted BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS self_signup BOOLEAN NOT NULL DEFAULT false`
   ];
   for (const query of userAlters) await pool.query(query);
   await pool.query(`
@@ -962,7 +969,7 @@ app.get('/sync-state', requireAuth, async (req, res) => {
 app.get('/users', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted
+      `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup
        FROM users
        ORDER BY LOWER(COALESCE(display_name, username)), LOWER(username)`
     );
@@ -997,7 +1004,7 @@ app.post('/login', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-              email, email_verified, portal_files_access_granted, portal_permissions_access
+              email, email_verified, portal_files_access_granted, portal_permissions_access, self_signup
        FROM users u
        WHERE LOWER(TRIM(u.username)) = LOWER(TRIM($1))
           OR LOWER(TRIM(COALESCE(u.display_name, u.username))) = LOWER(TRIM($1))
@@ -1164,10 +1171,10 @@ app.post('/create-user', requireAuth, requireAdmin, async (req, res) => {
     const hash = await bcrypt.hash(password, 10);
     const result = await pool.query(
       `INSERT INTO users (
-         username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted
+         username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup
        )
-       VALUES ($1, $2, $3, $4, $5::jsonb, true, $6, $7, true)
-       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted`,
+       VALUES ($1, $2, $3, $4, $5::jsonb, true, $6, $7, true, false)
+       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup`,
       [username, displayName, hash, isAdmin, JSON.stringify(roles), portalFilesClientId || null, portalFilesJobId || null]
     );
     res.status(201).json({ success: true, user: normalizeUser(result.rows[0]) });
@@ -1198,7 +1205,7 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
 
   try {
     const currentResult = await pool.query(
-      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted FROM users WHERE id = $1 LIMIT 1',
+      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup FROM users WHERE id = $1 LIMIT 1',
       [id]
     );
     if (!currentResult.rows.length) {
@@ -1259,7 +1266,7 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
     }
 
     const updatedResult = await pool.query(
-      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted FROM users WHERE id = $1 LIMIT 1',
+      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup FROM users WHERE id = $1 LIMIT 1',
       [id]
     );
 

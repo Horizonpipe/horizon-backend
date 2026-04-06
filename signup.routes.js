@@ -234,12 +234,12 @@ function registerSignupRoutes(app, deps) {
         inserted = await client.query(
           `INSERT INTO users (
              username, display_name, password, is_admin, roles, must_change_password,
-             portal_files_client_id, portal_files_job_id, portal_files_access_granted,
+             portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup,
              email, first_name, last_name, company, title, phone, email_verified
            )
-           VALUES ($1, $2, $3, false, $4::jsonb, false, NULL, NULL, false, $5, $6, $7, $8, $9, $10, true)
+           VALUES ($1, $2, $3, false, $4::jsonb, false, NULL, NULL, false, true, $5, $6, $7, $8, $9, $10, true)
            RETURNING id, username, display_name, is_admin, roles, must_change_password,
-                     portal_files_client_id, portal_files_job_id, portal_files_access_granted,
+                     portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup,
                      email, first_name, last_name, company, title, phone, email_verified`,
           [
             email,
