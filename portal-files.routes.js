@@ -630,6 +630,13 @@ function normalizeGrantAccessMode(mode) {
   return 'full';
 }
 
+function isValidGrantAccessMode(mode) {
+  const m = String(mode || '')
+    .trim()
+    .toLowerCase();
+  return m === 'full' || m === 'view' || m === 'view_download';
+}
+
 function grantModeAllows(mode, required) {
   const m = normalizeGrantAccessMode(mode);
   if (required === 'view') return true;
@@ -895,6 +902,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
           return res.status(400).json({ error: `Invalid pathPrefix: ${m}` });
         }
         const rec = g.recursive !== false;
+        if (g.accessMode != null && !isValidGrantAccessMode(g.accessMode)) {
+          return res.status(400).json({ error: 'Invalid accessMode. Allowed: full, view, view_download' });
+        }
         const accessMode = normalizeGrantAccessMode(g.accessMode || g.access_mode || 'full');
         await pool.query(
           `INSERT INTO portal_path_grants (client_id, job_id, username, path_prefix, recursive, access_mode) VALUES ($1,$2,$3,$4,$5,$6)`,
