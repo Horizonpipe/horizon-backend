@@ -70,12 +70,124 @@ async function sendPinEmail(to, pin) {
   }
 }
 
+function approvalNotifyRecipients() {
+  return (process.env.ACCOUNT_APPROVAL_NOTIFY_TO || process.env.SIGNUP_APPROVAL_NOTIFY_TO || '')
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function hasAnyAssignedAccess(row, normalizeRoles) {
+  if (row?.is_admin) return true;
+  const roles = normalizeRoles(row?.roles);
+  const hasRoleAccess = Object.values(roles).some((v) => v === true);
+  const hasPortalFiles = row?.portal_files_access_granted === true;
+  const hasPortalPermissions = row?.portal_permissions_access === true;
+  return hasRoleAccess || hasPortalFiles || hasPortalPermissions;
+}
+
+/**
+ * @returns {Promise<{ ok: true } | { ok: false, reason: 'not_configured' | 'send_failed', message?: string }>}
+ */
+async function sendApprovalRequestEmail(payload) {
+  const transporter = getMailer();
+  const to = approvalNotifyRecipients();
+  if (!transporter || !to.length) {
+    return { ok: false, reason: 'not_configured' };
+  }
+  const from = (process.env.SMTP_FROM || process.env.SMTP_USER || 'Horizon Pipe').trim();
+  const subject = 'Horizon Pipe account approval request';
+  const text = [
+    'A user requested account approval.',
+    '',
+    `Identifier entered: ${payload.identifier || '(none)'}`,
+    `Matched username: ${payload.username || '(not found)'}`,
+    `Matched email: ${payload.email || '(not found)'}`,
+    `Display name: ${payload.displayName || '(not found)'}`,
+    `Requested at: ${new Date().toISOString()}`
+  ].join('\n');
+  try {
+    await transporter.sendMail({ from, to, subject, text });
+    return { ok: true };
+  } catch (err) {
+    const message = err && typeof err.message === 'string' ? err.message : String(err);
+    console.error('[signup] approval request email failed:', message);
+    return { ok: false, reason: 'send_failed', message };
+  }
+}
+
 /**
  * @param {import('express').Express} app
  * @param {{ pool: import('pg').Pool, cleanString: (v: unknown) => string, normalizeRoles: (v: unknown) => object, normalizeUser: (row: object) => object }} deps
  */
 function registerSignupRoutes(app, deps) {
   const { pool, cleanString, normalizeRoles, normalizeUser } = deps;
+
+  app.post('/account/request-approval', async (req, res) => {
+    const identifierRaw = cleanString(req.body?.emailOrUsername || req.body?.email || req.body?.username);
+    const identifier = identifierRaw.toLowerCase();
+    if (!identifier) {
+      return res.status(400).json({ success: false, error: 'Email or username is required' });
+    }
+
+    try {
+      const q = await pool.query(
+        `SELECT id, username, display_name, email, is_admin, roles, portal_files_access_granted, portal_permissions_access
+           FROM users
+          WHERE LOWER(TRIM(username)) = LOWER(TRIM($1))
+             OR (email IS NOT NULL AND BTRIM(email) <> '' AND LOWER(TRIM(email)) = LOWER(TRIM($1)))
+          LIMIT 1`,
+        [identifier]
+      );
+      const row = q.rows[0] || null;
+
+      // Avoid account enumeration: always return success-style response, even when account is missing.
+      if (!row) {
+        return res.json({
+          success: true,
+          message: 'If the account exists, your approval request has been sent to an administrator.'
+        });
+      }
+
+      if (hasAnyAssignedAccess(row, normalizeRoles)) {
+        return res.json({
+          success: true,
+          message: 'This account already has access. Try signing in again.'
+        });
+      }
+
+      const sendResult = await sendApprovalRequestEmail({
+        identifier,
+        username: row.username,
+        email: row.email,
+        displayName: row.display_name
+      });
+
+      if (!sendResult.ok && sendResult.reason === 'send_failed') {
+        return res.json({
+          success: true,
+          message:
+            'Approval request captured, but admin notification email failed. Please contact your administrator directly.'
+        });
+      }
+
+      if (!sendResult.ok && sendResult.reason === 'not_configured') {
+        return res.json({
+          success: true,
+          message:
+            'Approval request received. Admin email notifications are not configured yet, so please contact your administrator directly.'
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: 'Approval request sent. An administrator will review your account.'
+      });
+    } catch (error) {
+      console.error('ACCOUNT APPROVAL REQUEST ERROR:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  });
 
   app.post('/signup/request', async (req, res) => {
     const firstName = cleanString(req.body?.firstName);
