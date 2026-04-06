@@ -9,6 +9,7 @@ const { Pool } = require('pg');
 const { ensureOutlookSchema, registerOutlookRoutes } = require('./outlook');
 const { registerPortalFilesRoutes } = require('./portal-files.routes');
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
+const { registerSignupRoutes } = require('./signup.routes');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -229,6 +230,13 @@ function normalizeUser(row) {
     id,
     username: row.username,
     displayName: row.display_name || row.username,
+    email: row.email || undefined,
+    firstName: row.first_name || undefined,
+    lastName: row.last_name || undefined,
+    company: row.company || undefined,
+    title: row.title || undefined,
+    phone: row.phone || undefined,
+    emailVerified: row.email_verified !== false,
     isAdmin: !!row.is_admin,
     roles: normalizeRoles(row.roles),
     mustChangePassword: !!row.must_change_password,
@@ -404,7 +412,8 @@ async function readSession(token) {
   await pool.query(`DELETE FROM auth_sessions WHERE expires_at < NOW()`);
   const result = await pool.query(
     `SELECT s.token, s.user_id, s.expires_at, u.id, u.username, u.display_name, u.password,
-            u.is_admin, u.roles, u.must_change_password, u.portal_files_client_id, u.portal_files_job_id
+            u.is_admin, u.roles, u.must_change_password, u.portal_files_client_id, u.portal_files_job_id,
+            u.portal_permissions_access, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified
      FROM auth_sessions s
      JOIN users u ON CAST(u.id AS text) = s.user_id
      WHERE s.token = $1
@@ -591,9 +600,36 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_job_id TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_permissions_access BOOLEAN NOT NULL DEFAULT false`
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_permissions_access BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS company TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS title TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true`
   ];
   for (const query of userAlters) await pool.query(query);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uq
+    ON users (LOWER(TRIM(email)))
+    WHERE email IS NOT NULL AND BTRIM(email) <> ''
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS signup_verifications (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      email_normalized TEXT NOT NULL UNIQUE,
+      pin_hash TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      first_name TEXT NOT NULL,
+      last_name TEXT NOT NULL,
+      company TEXT NOT NULL,
+      title TEXT,
+      phone TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL
+    )
+  `);
   await pool.query(`UPDATE users SET display_name = username WHERE display_name IS NULL OR btrim(display_name) = ''`);
   await pool.query(`UPDATE users SET roles = '{"camera": true, "vac": false, "simpleVac": false, "email": false}'::jsonb WHERE roles IS NULL`);
   await pool.query(`UPDATE users SET roles = '{"camera": true, "vac": false, "simpleVac": false, "email": false}'::jsonb || COALESCE(roles, '{}'::jsonb)`);
@@ -930,23 +966,33 @@ app.post('/login', async (req, res) => {
   const submittedPassword = cleanString(req.body?.password);
 
   if (!submittedUsername || !submittedPassword) {
-    return res.status(400).json({ success: false, error: 'Username and password are required' });
+    return res.status(400).json({ success: false, error: 'Email (or username) and password are required' });
   }
 
   try {
     const result = await pool.query(
-      `SELECT id, username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id
-       FROM users
-       WHERE LOWER(username) = LOWER($1) OR LOWER(COALESCE(display_name, username)) = LOWER($1)
+      `SELECT id, username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
+              email, email_verified
+       FROM users u
+       WHERE LOWER(TRIM(u.username)) = LOWER(TRIM($1))
+          OR LOWER(TRIM(COALESCE(u.display_name, u.username))) = LOWER(TRIM($1))
+          OR (u.email IS NOT NULL AND BTRIM(u.email) <> '' AND LOWER(TRIM(u.email)) = LOWER(TRIM($1)))
        LIMIT 1`,
       [submittedUsername]
     );
 
     if (!result.rows.length) {
-      return res.status(401).json({ success: false, error: 'Invalid username or password' });
+      return res.status(401).json({ success: false, error: 'Invalid email or password' });
     }
 
     const row = result.rows[0];
+    if (row.email_verified === false) {
+      return res.status(403).json({
+        success: false,
+        error: 'This email is not verified yet. Complete sign-up or contact an administrator.'
+      });
+    }
+
     let passwordOk = false;
     let needsRehash = false;
 
@@ -958,7 +1004,7 @@ app.post('/login', async (req, res) => {
     }
 
     if (!passwordOk) {
-      return res.status(401).json({ success: false, error: 'Invalid username or password' });
+      return res.status(401).json({ success: false, error: 'Invalid email or password' });
     }
 
     if (needsRehash) {
@@ -1867,6 +1913,7 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
 
 registerOutlookRoutes(app, { pool, requireAuth, currentToken, corsOrigins: CORS_ORIGINS });
 registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin });
+registerSignupRoutes(app, { pool, cleanString, normalizeRoles, issueSession, normalizeUser });
 
 const autoImportPlugin = createAutoImportPlugin({
   pool,
