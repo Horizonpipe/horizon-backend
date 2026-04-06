@@ -717,9 +717,14 @@ async function ensureSchema() {
       username TEXT NOT NULL,
       path_prefix TEXT NOT NULL DEFAULT '',
       recursive BOOLEAN NOT NULL DEFAULT true,
+      access_mode TEXT NOT NULL DEFAULT 'full',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(
+    `ALTER TABLE portal_path_grants
+     ADD COLUMN IF NOT EXISTS access_mode TEXT NOT NULL DEFAULT 'full'`
+  );
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_portal_path_grants_cj ON portal_path_grants (client_id, job_id)`
   );
