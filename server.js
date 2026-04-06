@@ -181,6 +181,20 @@ function normalizeRoles(value) {
   };
 }
 
+/**
+ * Self-signup accounts must be explicitly enabled by admin before they can sign in.
+ * We treat "any one permission enabled" as active access.
+ */
+function userHasAnyAssignedAccess(row) {
+  if (row?.is_admin) return true;
+  const roles = normalizeRoles(row?.roles);
+  const hasRoleAccess = Object.values(roles).some((v) => v === true);
+  const hasPortalFiles = row?.portal_files_access_granted === true;
+  const hasPortalPermissionUi =
+    !!row?.portal_permissions_access || portalPermissionsWhitelistHas(row?.username);
+  return hasRoleAccess || hasPortalFiles || hasPortalPermissionUi;
+}
+
 /** Legacy per-user prefix (kept only when explicitly re-enabled). */
 const PORTAL_FILES_CLIENT_ID = 'portal-users';
 
@@ -983,7 +997,7 @@ app.post('/login', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-              email, email_verified, portal_files_access_granted
+              email, email_verified, portal_files_access_granted, portal_permissions_access
        FROM users u
        WHERE LOWER(TRIM(u.username)) = LOWER(TRIM($1))
           OR LOWER(TRIM(COALESCE(u.display_name, u.username))) = LOWER(TRIM($1))
@@ -1016,6 +1030,13 @@ app.post('/login', async (req, res) => {
 
     if (!passwordOk) {
       return res.status(401).json({ success: false, error: 'Invalid email or password' });
+    }
+
+    if (!userHasAnyAssignedAccess(row)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Account created. Your access is pending admin approval.'
+      });
     }
 
     if (needsRehash) {

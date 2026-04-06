@@ -72,10 +72,10 @@ async function sendPinEmail(to, pin) {
 
 /**
  * @param {import('express').Express} app
- * @param {{ pool: import('pg').Pool, cleanString: (v: unknown) => string, normalizeRoles: (v: unknown) => object, issueSession: (userId: string) => Promise<string>, normalizeUser: (row: object) => object }} deps
+ * @param {{ pool: import('pg').Pool, cleanString: (v: unknown) => string, normalizeRoles: (v: unknown) => object, normalizeUser: (row: object) => object }} deps
  */
 function registerSignupRoutes(app, deps) {
-  const { pool, cleanString, normalizeRoles, issueSession, normalizeUser } = deps;
+  const { pool, cleanString, normalizeRoles, normalizeUser } = deps;
 
   app.post('/signup/request', async (req, res) => {
     const firstName = cleanString(req.body?.firstName);
@@ -218,7 +218,16 @@ function registerSignupRoutes(app, deps) {
       }
 
       const displayName = `${row.first_name} ${row.last_name}`.trim() || email;
-      const roles = normalizeRoles(undefined);
+      /** New self-signup accounts start with no planner/report/email/file privileges until admin assigns access. */
+      const roles = normalizeRoles({
+        camera: false,
+        vac: false,
+        simpleVac: false,
+        email: false,
+        psrPlanner: false,
+        pricingView: false,
+        footageView: false
+      });
 
       let inserted;
       try {
@@ -257,9 +266,13 @@ function registerSignupRoutes(app, deps) {
       await client.query('COMMIT');
 
       const userRow = inserted.rows[0];
-      const token = await issueSession(userRow.id);
       const user = normalizeUser(userRow);
-      res.json({ success: true, user, token, message: 'Account created. You are signed in.' });
+      res.json({
+        success: true,
+        user,
+        requiresApproval: true,
+        message: 'Account created. An administrator must grant access before you can sign in.'
+      });
     } catch (error) {
       try {
         await client.query('ROLLBACK');
