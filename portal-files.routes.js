@@ -69,6 +69,15 @@ const portalBatchUpload = multer({
 });
 
 /**
+ * Resumable chunk endpoint benefits from in-memory buffers:
+ * avoids temp-disk write + re-read before hashing/uploading.
+ */
+const portalChunkUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 80 * 1024 * 1024 }
+});
+
+/**
  * Multipart upload to Wasabi (S3 API): parallel part uploads over multiple connections.
  * queueSize = concurrent UploadPart calls; partSize must be ≥5MB (S3 rules, except last part).
  */
@@ -222,14 +231,8 @@ function normalizeSha256Hex(input) {
  * @param {string} filePath
  * @returns {Promise<string>}
  */
-async function sha256HexForFilePath(filePath) {
-  const h = crypto.createHash('sha256');
-  return await new Promise((resolve, reject) => {
-    const s = fs.createReadStream(filePath);
-    s.on('data', (chunk) => h.update(chunk));
-    s.on('error', reject);
-    s.on('end', () => resolve(h.digest('hex')));
-  });
+function sha256HexForBuffer(buf) {
+  return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
 /**
@@ -1570,7 +1573,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
     }
   });
 
-  r.post('/upload/resumable/chunk', portalUpload.single('chunk'), async (req, res) => {
+  r.post('/upload/resumable/chunk', portalChunkUpload.single('chunk'), async (req, res) => {
     const f = req.file;
     if (!f) return res.status(400).json({ error: 'Missing file field "chunk"' });
     try {
@@ -1579,12 +1582,13 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       const partNumber = Number(req.body?.partNumber);
       const chunkSha256 = normalizeSha256Hex(req.body?.chunkSha256 || '');
       if (!sessionId || !Number.isFinite(partNumber) || partNumber < 1 || !Number.isInteger(partNumber)) {
-        fs.unlink(f.path, () => {});
         return res.status(400).json({ error: 'sessionId and integer partNumber are required' });
       }
       if (chunkSha256.length !== 64) {
-        fs.unlink(f.path, () => {});
         return res.status(400).json({ error: 'chunkSha256 is required and must be a 64-char hex digest' });
+      }
+      if (!f.buffer || !Number.isFinite(Number(f.size || 0)) || Number(f.size || 0) <= 0) {
+        return res.status(400).json({ error: 'Uploaded chunk body is empty' });
       }
       const sRes = await pool.query(
         `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
@@ -1592,23 +1596,19 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       );
       const sessionRow = sRes.rows[0];
       if (!isUploadSessionOpen(sessionRow)) {
-        fs.unlink(f.path, () => {});
         return res.status(404).json({ error: 'Upload session not found or closed' });
       }
       if (!(await assertPortalJobAccess(pool, req.user, sessionRow.client_id, sessionRow.job_id))) {
-        fs.unlink(f.path, () => {});
         return res.status(403).json({ error: 'Forbidden' });
       }
       const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id));
       const relForAcl = String(sessionRow.object_key || '').slice(pref.length);
       if (!(await assertPortalPathRel(pool, req.user, sessionRow.client_id, sessionRow.job_id, relForAcl))) {
-        fs.unlink(f.path, () => {});
         return res.status(403).json({ error: 'Forbidden for this path' });
       }
 
-      const actualChunkSha256 = normalizeSha256Hex(await sha256HexForFilePath(f.path));
+      const actualChunkSha256 = normalizeSha256Hex(sha256HexForBuffer(f.buffer));
       if (actualChunkSha256 !== chunkSha256) {
-        fs.unlink(f.path, () => {});
         return res.status(409).json({ error: 'Chunk hash mismatch', expected: chunkSha256, actual: actualChunkSha256 });
       }
 
@@ -1618,11 +1618,10 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
           Key: sessionRow.object_key,
           UploadId: sessionRow.multipart_upload_id,
           PartNumber: partNumber,
-          Body: fs.createReadStream(f.path),
+          Body: f.buffer,
           ContentLength: f.size
         })
       );
-      fs.unlink(f.path, () => {});
       const etag = String(partResp.ETag || '').replace(/^"+|"+$/g, '');
       if (!etag) throw new Error('Missing ETag for uploaded part');
       await pool.query(
@@ -1645,11 +1644,6 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         nextPartNumber: parts.rows.length + 1
       });
     } catch (e) {
-      try {
-        fs.unlink(f.path, () => {});
-      } catch (_) {
-        /* ignore */
-      }
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
     }
