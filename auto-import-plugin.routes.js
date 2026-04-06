@@ -110,6 +110,17 @@ function createAutoImportPlugin(options = {}) {
       CREATE INDEX IF NOT EXISTS idx_auto_import_projects_seen ON auto_import_projects(last_seen_at DESC);
       CREATE INDEX IF NOT EXISTS idx_auto_import_runs_project_started ON auto_import_runs(project_id, started_at DESC);
       CREATE INDEX IF NOT EXISTS idx_auto_import_row_cache_project_seen ON auto_import_row_cache(project_id, last_seen_at DESC);
+
+      CREATE TABLE IF NOT EXISTS auto_import_logs (
+        id TEXT PRIMARY KEY,
+        project_id TEXT REFERENCES auto_import_projects(id) ON DELETE CASCADE,
+        source TEXT NOT NULL DEFAULT 'server',
+        level TEXT NOT NULL DEFAULT 'info',
+        message TEXT NOT NULL,
+        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_auto_import_logs_project_created ON auto_import_logs(project_id, created_at DESC);
     `);
   }
 
@@ -136,6 +147,18 @@ function createAutoImportPlugin(options = {}) {
 
   function sha(value) {
     return crypto.createHash('sha1').update(value).digest('hex');
+  }
+
+  async function logEvent(projectId, source, level, message, payload = {}) {
+    try {
+      await pool.query(
+        `INSERT INTO auto_import_logs (id, project_id, source, level, message, payload)
+         VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
+        [uid(), projectId || null, clean(source || 'server') || 'server', clean(level || 'info') || 'info', clean(message), JSON.stringify(payload || {})]
+      );
+    } catch (e) {
+      logger.warn?.('AUTO IMPORT LOG WRITE FAILED:', e?.message || e);
+    }
   }
 
   function rowKeyFor(row) {
@@ -281,6 +304,7 @@ function createAutoImportPlugin(options = {}) {
     let changed = 0;
     let inserted = 0;
     let updated = 0;
+    let omitted = 0;
 
     for (const row of rows) {
       const rowKey = rowKeyFor(row);
@@ -296,6 +320,7 @@ function createAutoImportPlugin(options = {}) {
           'UPDATE auto_import_row_cache SET last_seen_at = NOW() WHERE id = $1',
           [cache.id]
         );
+        omitted += 1;
         continue;
       }
 
@@ -374,8 +399,17 @@ function createAutoImportPlugin(options = {}) {
       }
     }
 
-    return { changed, inserted, updated };
+    return { changed, inserted, updated, omitted };
   }
+
+  router.get('/health', requireMike, async (req, res) => {
+    res.json({
+      success: true,
+      service: 'auto-import-plugin',
+      connected: true,
+      now: nowIso()
+    });
+  });
 
   router.get('/projects', requireMike, async (req, res, next) => {
     try {
@@ -418,7 +452,80 @@ function createAutoImportPlugin(options = {}) {
         clean(sample.projectName || sample.street || project.display_name),
         JSON.stringify({ sampleRowCount: rows.length, source: 'manual-discover' })
       ]);
+      await logEvent(project.id, 'web', 'info', 'Preview discovered from DB3 path.', {
+        db3Path,
+        rowCount: rows.length
+      });
       res.json({ success: true, project: { ...project, rowCount: rows.length }, rows: rows.slice(0, 50) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.get('/status/:projectId', requireMike, async (req, res, next) => {
+    try {
+      const projectResult = await pool.query('SELECT * FROM auto_import_projects WHERE id = $1 LIMIT 1', [req.params.projectId]);
+      const project = projectResult.rows[0];
+      if (!project) return res.status(404).json({ error: 'Project not found.' });
+      const runResult = await pool.query(
+        'SELECT * FROM auto_import_runs WHERE project_id = $1 ORDER BY started_at DESC LIMIT 1',
+        [req.params.projectId]
+      );
+      res.json({
+        success: true,
+        status: {
+          projectId: project.id,
+          state: project.status || 'idle',
+          detectionMode: project.detection_mode || 'auto',
+          db3Path: project.db3_path || '',
+          lastScanAt: project.last_scan_at || null,
+          lastError: project.last_error || '',
+          activeRun: runResult.rows[0] || null
+        }
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post('/start/:projectId', requireMike, express.json(), async (req, res, next) => {
+    try {
+      const result = await pool.query(
+        `UPDATE auto_import_projects
+         SET status = 'running',
+             last_error = '',
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [req.params.projectId]
+      );
+      const project = result.rows[0];
+      if (!project) return res.status(404).json({ error: 'Project not found.' });
+      await logEvent(project.id, 'web', 'info', 'Start requested from web UI.', {
+        requestedBy: req.user?.username || 'System'
+      });
+      res.json({ success: true, project });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post('/stop/:projectId', requireMike, express.json(), async (req, res, next) => {
+    try {
+      const result = await pool.query(
+        `UPDATE auto_import_projects
+         SET status = 'idle',
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [req.params.projectId]
+      );
+      const project = result.rows[0];
+      if (!project) return res.status(404).json({ error: 'Project not found.' });
+      await logEvent(project.id, 'web', 'warn', 'Stop requested from web UI.', {
+        requestedBy: req.user?.username || 'System'
+      });
+      res.json({ success: true, project });
     } catch (error) {
       next(error);
     }
@@ -471,6 +578,11 @@ function createAutoImportPlugin(options = {}) {
       const rows = Array.isArray(req.body.rows) && req.body.rows.length
         ? req.body.rows
         : await parseDb3(project.db3_path);
+      await logEvent(project.id, 'web', 'info', 'Sync started.', {
+        requestedBy: req.user?.username || 'System',
+        rowCount: rows.length,
+        reason: clean(req.body.switchReason || 'manual sync')
+      });
       const sync = await syncProjectRows(project, rows, req.user?.username || 'System');
       const runId = uid();
       await pool.query(`
@@ -496,6 +608,13 @@ function createAutoImportPlugin(options = {}) {
             updated_at = NOW()
         WHERE id = $1
       `, [project.id]);
+      await logEvent(project.id, 'server', 'info', 'Sync completed.', {
+        changed: sync.changed,
+        inserted: sync.inserted,
+        updated: sync.updated,
+        omitted: sync.omitted,
+        totalRows: rows.length
+      });
       res.json({ success: true, sync, totalRows: rows.length });
     } catch (error) {
       logger.error('AUTO IMPORT SYNC ERROR:', error);
@@ -508,6 +627,46 @@ function createAutoImportPlugin(options = {}) {
           WHERE id = $1
         `, [req.params.projectId, String(error.message || error)]);
       } catch {}
+      await logEvent(req.params.projectId, 'server', 'error', 'Sync failed.', {
+        error: String(error.message || error)
+      });
+      next(error);
+    }
+  });
+
+  router.post('/sync-current/:projectId', requireMike, express.json(), async (req, res, next) => {
+    try {
+      const projectResult = await pool.query('SELECT * FROM auto_import_projects WHERE id = $1 LIMIT 1', [req.params.projectId]);
+      const project = projectResult.rows[0];
+      if (!project) return res.status(404).json({ error: 'Project not found.' });
+      const rows = await parseDb3(project.db3_path);
+      await logEvent(project.id, 'web', 'info', 'Manual import current DB3 requested.', {
+        requestedBy: req.user?.username || 'System',
+        db3Path: project.db3_path,
+        rowCount: rows.length
+      });
+      const sync = await syncProjectRows(project, rows, req.user?.username || 'System');
+      await pool.query(
+        `UPDATE auto_import_projects
+         SET status = 'synced',
+             last_scan_at = NOW(),
+             last_error = '',
+             updated_at = NOW()
+         WHERE id = $1`,
+        [project.id]
+      );
+      await logEvent(project.id, 'server', 'info', 'Manual import current DB3 completed.', {
+        changed: sync.changed,
+        inserted: sync.inserted,
+        updated: sync.updated,
+        omitted: sync.omitted,
+        totalRows: rows.length
+      });
+      res.json({ success: true, sync, totalRows: rows.length });
+    } catch (error) {
+      await logEvent(req.params.projectId, 'server', 'error', 'Manual import current DB3 failed.', {
+        error: String(error.message || error)
+      });
       next(error);
     }
   });
@@ -532,6 +691,36 @@ function createAutoImportPlugin(options = {}) {
         [req.params.projectId]
       );
       res.json({ success: true, runs: result.rows });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.get('/logs/:projectId', requireMike, async (req, res, next) => {
+    try {
+      const limit = Math.max(20, Math.min(500, Number(req.query.limit || 200)));
+      const result = await pool.query(
+        `SELECT * FROM auto_import_logs
+         WHERE project_id = $1 OR project_id IS NULL
+         ORDER BY created_at DESC
+         LIMIT $2`,
+        [req.params.projectId, limit]
+      );
+      res.json({ success: true, logs: result.rows.reverse() });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Optional endpoint for desktop helper/EXE to push connection/activity logs.
+  router.post('/logs/:projectId', requireMike, express.json({ limit: '128kb' }), async (req, res, next) => {
+    try {
+      const source = clean(req.body?.source || 'desktop');
+      const level = clean(req.body?.level || 'info').toLowerCase();
+      const message = clean(req.body?.message || '');
+      if (!message) return res.status(400).json({ error: 'message is required.' });
+      await logEvent(req.params.projectId, source, level, message, req.body?.payload || {});
+      res.json({ success: true });
     } catch (error) {
       next(error);
     }
