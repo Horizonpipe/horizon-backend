@@ -1207,6 +1207,7 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
     req.body || {},
     'portalFilesAccessGranted'
   );
+  const hasSelfSignupPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'selfSignup');
 
   try {
     const currentResult = await pool.query(
@@ -1240,6 +1241,14 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
     } else if (hasPortalScopeInPayload && portalFilesClientId && portalFilesJobId) {
       nextPortalFilesAccessGranted = true;
     }
+    let nextSelfSignup = current.self_signup === true;
+    if (hasSelfSignupPayload) {
+      nextSelfSignup = !!req.body.selfSignup;
+    }
+    // When an admin approves/assigns access, this account should no longer be treated as locked self-signup.
+    if (nextPortalFilesAccessGranted === true || nextIsAdmin === true) {
+      nextSelfSignup = false;
+    }
 
     await pool.query(
       `UPDATE users
@@ -1249,8 +1258,9 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
            portal_files_client_id = $4,
            portal_files_job_id = $5,
            portal_files_access_granted = $6,
+           self_signup = $7,
            updated_at = NOW()
-       WHERE id = $7`,
+       WHERE id = $8`,
       [
         nextDisplayName,
         nextIsAdmin,
@@ -1258,6 +1268,7 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
         nextPortalFilesClientId,
         nextPortalFilesJobId,
         nextPortalFilesAccessGranted,
+        nextSelfSignup,
         id
       ]
     );
