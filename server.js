@@ -1153,18 +1153,19 @@ app.post('/create-user', requireAuth, requireAdmin, async (req, res) => {
   const displayName = cleanString(req.body?.displayName || username);
   const password = cleanString(req.body?.password || '1234');
   const isAdmin = !!req.body?.isAdmin;
-  const roles = normalizeRoles(req.body?.roles);
-  const portalFilesClientId = cleanString(req.body?.portalFilesClientId);
-  const portalFilesJobId = cleanString(req.body?.portalFilesJobId);
+  /** Planner-created accounts now default to no permissions until explicitly assigned by admin edit. */
+  const roles = normalizeRoles({
+    camera: false,
+    vac: false,
+    simpleVac: false,
+    email: false,
+    psrPlanner: false,
+    pricingView: false,
+    footageView: false
+  });
 
   if (!username) {
     return res.status(400).json({ success: false, error: 'Username is required' });
-  }
-  if ((portalFilesClientId && !portalFilesJobId) || (!portalFilesClientId && portalFilesJobId)) {
-    return res.status(400).json({
-      success: false,
-      error: 'portalFilesClientId and portalFilesJobId must be set together (or both empty).'
-    });
   }
 
   try {
@@ -1173,11 +1174,15 @@ app.post('/create-user', requireAuth, requireAdmin, async (req, res) => {
       `INSERT INTO users (
          username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup
        )
-       VALUES ($1, $2, $3, $4, $5::jsonb, true, $6, $7, true, false)
+       VALUES ($1, $2, $3, $4, $5::jsonb, true, NULL, NULL, false, false)
        RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup`,
-      [username, displayName, hash, isAdmin, JSON.stringify(roles), portalFilesClientId || null, portalFilesJobId || null]
+      [username, displayName, hash, isAdmin, JSON.stringify(roles)]
     );
-    res.status(201).json({ success: true, user: normalizeUser(result.rows[0]) });
+    res.status(201).json({
+      success: true,
+      user: normalizeUser(result.rows[0]),
+      message: 'User created with no access. Assign roles/portal scope to enable.'
+    });
   } catch (error) {
     console.error('CREATE USER ERROR:', error);
     if (error.code === '23505') {
