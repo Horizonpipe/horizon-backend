@@ -254,6 +254,14 @@ function createWasabiClient() {
   const region = process.env.WASABI_REGION || 'us-east-1';
   const endpoint = process.env.WASABI_ENDPOINT || 'https://s3.us-east-1.wasabisys.com';
   if (!accessKeyId || !secretAccessKey) return null;
+  const maxSockets = Math.max(
+    8,
+    Math.min(128, Number(process.env.WASABI_MAX_SOCKETS || process.env.PORTAL_S3_MAX_SOCKETS || 32))
+  );
+  const socketTimeoutMs = Math.max(
+    30000,
+    Math.min(600000, Number(process.env.WASABI_SOCKET_TIMEOUT_MS || 120000))
+  );
   return new S3Client({
     region,
     endpoint,
@@ -261,8 +269,8 @@ function createWasabiClient() {
     forcePathStyle: true,
     requestHandler: new NodeHttpHandler({
       connectionTimeout: 30000,
-      socketTimeout: 0,
-      maxSockets: 50
+      socketTimeout: socketTimeoutMs,
+      maxSockets
     })
   });
 }
@@ -380,6 +388,63 @@ function parseBytesRange(rangeHeader, fileSize) {
   end = Math.min(end, size - 1);
   if (start > end) return null;
   return { start, end };
+}
+
+/**
+ * Cap how many bytes one Range GET may serve (browsers reopen ranges while scrubbing; without a cap,
+ * `bytes=0-` can pull an entire large MP4 in one connection).
+ * @param {{ start: number, end: number }} pr
+ * @param {number} fileSize
+ * @param {number} maxChunk
+ */
+function clampBytesRangeToMaxChunk(pr, fileSize, maxChunk) {
+  if (!pr || !Number.isFinite(maxChunk) || maxChunk <= 0) return pr;
+  const chunk = pr.end - pr.start + 1;
+  if (chunk <= maxChunk) return pr;
+  const end = Math.min(pr.start + maxChunk - 1, fileSize - 1);
+  if (pr.start > end) return pr;
+  return { start: pr.start, end };
+}
+
+/**
+ * When the browser aborts a video range (scrub), destroy the S3 stream so sockets do not pile up.
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {import('stream').Readable} body
+ */
+function pipeS3BodyWithAbortSupport(req, res, body) {
+  if (!body || typeof body.pipe !== 'function') return false;
+  const stream = body;
+  const detach = () => {
+    req.removeListener('close', onClientGone);
+    req.removeListener('aborted', onClientGone);
+  };
+  const onClientGone = () => {
+    detach();
+    if (!res.writableEnded) {
+      try {
+        res.destroy();
+      } catch {
+        /* ignore */
+      }
+      try {
+        stream.destroy();
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+  req.on('close', onClientGone);
+  req.on('aborted', onClientGone);
+  res.once('finish', detach);
+  res.once('close', detach);
+  stream.on('error', (err) => {
+    detach();
+    if (!res.headersSent) res.status(500).end();
+    else res.destroy(err);
+  });
+  stream.pipe(res);
+  return true;
 }
 
 function keyToId(key) {
@@ -556,6 +621,9 @@ function portalUsersPeerReadEnabled() {
 
 async function assertPortalJobAccess(pool, user, clientId, jobId) {
   if (user && user.isAdmin) return true;
+  if (user && user.portalFilesAccessGranted === false) {
+    return false;
+  }
   const c = String(clientId || '').trim();
   const j = String(jobId || '').trim();
   if (!c || !j) return false;
@@ -1822,6 +1890,49 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
   const portalDlAuthCache = new Map();
   const portalDlObjectMetaCache = new Map();
 
+  /** One Range GET cannot exceed this many bytes (limits work per scrub seek). */
+  const PORTAL_DL_MAX_RANGE_BYTES = Math.max(
+    256 * 1024,
+    Math.min(64 * 1024 * 1024, Number(process.env.PORTAL_DL_MAX_RANGE_BYTES || 8 * 1024 * 1024))
+  );
+  /** Per-IP concurrent GET streams to S3 (scrubbing opens many; cap avoids Render OOM / socket exhaustion). */
+  const PORTAL_DL_MAX_CONCURRENT_PER_IP = Math.max(
+    4,
+    Math.min(120, Number(process.env.PORTAL_DL_MAX_CONCURRENT_PER_IP || 24))
+  );
+  const portalDlActiveByIp = new Map();
+
+  function portalDlClientIp(req) {
+    const raw = String(req.ip || req.socket?.remoteAddress || 'unknown')
+      .split(',')[0]
+      .trim();
+    return raw || 'unknown';
+  }
+
+  /**
+   * @returns {boolean} false if this IP already has too many open download streams
+   */
+  function portalDlTryAcquireStreamSlot(req, res) {
+    if (req.method !== 'GET') return true;
+    const ip = portalDlClientIp(req);
+    const n = (portalDlActiveByIp.get(ip) || 0) + 1;
+    if (n > PORTAL_DL_MAX_CONCURRENT_PER_IP) {
+      return false;
+    }
+    portalDlActiveByIp.set(ip, n);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      const c = (portalDlActiveByIp.get(ip) || 1) - 1;
+      if (c <= 0) portalDlActiveByIp.delete(ip);
+      else portalDlActiveByIp.set(ip, c);
+    };
+    res.once('finish', release);
+    res.once('close', release);
+    return true;
+  }
+
   function portalDlAuthCacheKey(user, fileId) {
     if (user && user.isAdmin) return `admin::${fileId}`;
     const uid = user && user.id != null ? `id:${user.id}` : '';
@@ -1945,11 +2056,12 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
 
       if (isHead) {
         if (rangeHdr) {
-          const pr = parseBytesRange(rangeHdr, total);
+          let pr = parseBytesRange(rangeHdr, total);
           if (!pr) {
             res.setHeader('Content-Range', `bytes */${total}`);
             return res.status(416).end();
           }
+          pr = clampBytesRangeToMaxChunk(pr, total, PORTAL_DL_MAX_RANGE_BYTES);
           const chunk = pr.end - pr.start + 1;
           res.status(206);
           res.setHeader('Content-Range', `bytes ${pr.start}-${pr.end}/${total}`);
@@ -1961,10 +2073,20 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       }
 
       if (rangeHdr) {
-        const pr = parseBytesRange(rangeHdr, total);
+        let pr = parseBytesRange(rangeHdr, total);
         if (!pr) {
           res.setHeader('Content-Range', `bytes */${total}`);
           return res.status(416).end();
+        }
+        pr = clampBytesRangeToMaxChunk(pr, total, PORTAL_DL_MAX_RANGE_BYTES);
+        if (!portalDlTryAcquireStreamSlot(req, res)) {
+          return res
+            .status(429)
+            .setHeader('Retry-After', '2')
+            .json({
+              error:
+                'Too many simultaneous video/download requests from this connection. Wait a second or avoid rapid scrubbing.'
+            });
         }
         const obj = await s3.send(
           new GetObjectCommand({
@@ -1980,12 +2102,20 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         if (!obj.Body || typeof obj.Body.pipe !== 'function') {
           return res.status(500).json({ error: 'Empty body' });
         }
-        obj.Body.on('error', (err) => {
-          if (!res.headersSent) res.status(500).end();
-          else res.destroy(err);
-        });
-        obj.Body.pipe(res);
+        if (!pipeS3BodyWithAbortSupport(req, res, /** @type {import('stream').Readable} */ (obj.Body))) {
+          return res.status(500).json({ error: 'Empty body' });
+        }
         return;
+      }
+
+      if (!portalDlTryAcquireStreamSlot(req, res)) {
+        return res
+          .status(429)
+          .setHeader('Retry-After', '2')
+          .json({
+            error:
+              'Too many simultaneous video/download requests from this connection. Wait a second or avoid rapid scrubbing.'
+          });
       }
 
       const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key }));
@@ -1995,12 +2125,10 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (!obj.Body || typeof obj.Body.pipe !== 'function') {
         return res.status(500).json({ error: 'Empty body' });
       }
-      obj.Body.on('error', (err) => {
-        if (!res.headersSent) res.status(500).end();
-        else res.destroy(err);
-      });
       res.status(200);
-      obj.Body.pipe(res);
+      if (!pipeS3BodyWithAbortSupport(req, res, /** @type {import('stream').Readable} */ (obj.Body))) {
+        return res.status(500).json({ error: 'Empty body' });
+      }
     } catch (e) {
       const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
       if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {

@@ -226,6 +226,31 @@ function normalizeUser(row) {
       ? String(row.portal_files_job_id).trim()
       : '';
   const hasExplicitScope = !!(explicitClient && explicitJob);
+  /** Self-signup users start false until an admin enables portal file access. */
+  const portalFilesAccessGranted = row.portal_files_access_granted !== false;
+
+  let portalFilesClientId;
+  let portalFilesJobId;
+  if (!portalFilesAccessGranted) {
+    portalFilesClientId = undefined;
+    portalFilesJobId = undefined;
+  } else if (hasExplicitScope) {
+    portalFilesClientId = explicitClient;
+    portalFilesJobId = explicitJob;
+  } else if (PORTAL_FORCE_JOB_SCOPE) {
+    portalFilesClientId = PORTAL_FORCE_CLIENT_ID;
+    portalFilesJobId = PORTAL_FORCE_JOB_ID;
+  } else if (PORTAL_SHARED_DEFAULT_SCOPE) {
+    portalFilesClientId = PORTAL_SHARED_DEFAULT_CLIENT_ID;
+    portalFilesJobId = PORTAL_SHARED_DEFAULT_JOB_ID;
+  } else if (legacyUserScoped) {
+    portalFilesClientId = PORTAL_FILES_CLIENT_ID;
+    portalFilesJobId = String(id);
+  } else {
+    portalFilesClientId = undefined;
+    portalFilesJobId = undefined;
+  }
+
   return {
     id,
     username: row.username,
@@ -240,24 +265,9 @@ function normalizeUser(row) {
     isAdmin: !!row.is_admin,
     roles: normalizeRoles(row.roles),
     mustChangePassword: !!row.must_change_password,
-    portalFilesClientId: hasExplicitScope
-      ? explicitClient
-      : PORTAL_FORCE_JOB_SCOPE
-        ? PORTAL_FORCE_CLIENT_ID
-        : PORTAL_SHARED_DEFAULT_SCOPE
-          ? PORTAL_SHARED_DEFAULT_CLIENT_ID
-          : legacyUserScoped
-            ? PORTAL_FILES_CLIENT_ID
-            : undefined,
-    portalFilesJobId: hasExplicitScope
-      ? explicitJob
-      : PORTAL_FORCE_JOB_SCOPE
-        ? PORTAL_FORCE_JOB_ID
-        : PORTAL_SHARED_DEFAULT_SCOPE
-          ? PORTAL_SHARED_DEFAULT_JOB_ID
-          : legacyUserScoped
-            ? String(id)
-            : undefined,
+    portalFilesAccessGranted,
+    portalFilesClientId,
+    portalFilesJobId,
     portalPermissionsAccess:
       !!row.portal_permissions_access || portalPermissionsWhitelistHas(row.username)
   };
@@ -413,7 +423,7 @@ async function readSession(token) {
   const result = await pool.query(
     `SELECT s.token, s.user_id, s.expires_at, u.id, u.username, u.display_name, u.password,
             u.is_admin, u.roles, u.must_change_password, u.portal_files_client_id, u.portal_files_job_id,
-            u.portal_permissions_access, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified
+            u.portal_permissions_access, u.portal_files_access_granted, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified
      FROM auth_sessions s
      JOIN users u ON CAST(u.id AS text) = s.user_id
      WHERE s.token = $1
@@ -607,7 +617,8 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS company TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS title TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true`
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_access_granted BOOLEAN NOT NULL DEFAULT true`
   ];
   for (const query of userAlters) await pool.query(query);
   await pool.query(`
@@ -937,7 +948,7 @@ app.get('/sync-state', requireAuth, async (req, res) => {
 app.get('/users', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id
+      `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted
        FROM users
        ORDER BY LOWER(COALESCE(display_name, username)), LOWER(username)`
     );
@@ -972,7 +983,7 @@ app.post('/login', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-              email, email_verified
+              email, email_verified, portal_files_access_granted
        FROM users u
        WHERE LOWER(TRIM(u.username)) = LOWER(TRIM($1))
           OR LOWER(TRIM(COALESCE(u.display_name, u.username))) = LOWER(TRIM($1))
@@ -1132,10 +1143,10 @@ app.post('/create-user', requireAuth, requireAdmin, async (req, res) => {
     const hash = await bcrypt.hash(password, 10);
     const result = await pool.query(
       `INSERT INTO users (
-         username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id
+         username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted
        )
-       VALUES ($1, $2, $3, $4, $5::jsonb, true, $6, $7)
-       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id`,
+       VALUES ($1, $2, $3, $4, $5::jsonb, true, $6, $7, true)
+       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted`,
       [username, displayName, hash, isAdmin, JSON.stringify(roles), portalFilesClientId || null, portalFilesJobId || null]
     );
     res.status(201).json({ success: true, user: normalizeUser(result.rows[0]) });
@@ -1159,10 +1170,14 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
     Object.prototype.hasOwnProperty.call(req.body || {}, 'portalFilesJobId');
   const portalFilesClientId = hasPortalScopeInPayload ? cleanString(req.body?.portalFilesClientId) : null;
   const portalFilesJobId = hasPortalScopeInPayload ? cleanString(req.body?.portalFilesJobId) : null;
+  const hasAccessPayload = Object.prototype.hasOwnProperty.call(
+    req.body || {},
+    'portalFilesAccessGranted'
+  );
 
   try {
     const currentResult = await pool.query(
-      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id FROM users WHERE id = $1 LIMIT 1',
+      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted FROM users WHERE id = $1 LIMIT 1',
       [id]
     );
     if (!currentResult.rows.length) {
@@ -1186,6 +1201,13 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
       nextPortalFilesJobId = portalFilesJobId || null;
     }
 
+    let nextPortalFilesAccessGranted = current.portal_files_access_granted !== false;
+    if (hasAccessPayload) {
+      nextPortalFilesAccessGranted = !!req.body.portalFilesAccessGranted;
+    } else if (hasPortalScopeInPayload && portalFilesClientId && portalFilesJobId) {
+      nextPortalFilesAccessGranted = true;
+    }
+
     await pool.query(
       `UPDATE users
        SET display_name = $1,
@@ -1193,9 +1215,18 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
            roles = $3::jsonb,
            portal_files_client_id = $4,
            portal_files_job_id = $5,
+           portal_files_access_granted = $6,
            updated_at = NOW()
-       WHERE id = $6`,
-      [nextDisplayName, nextIsAdmin, JSON.stringify(nextRoles), nextPortalFilesClientId, nextPortalFilesJobId, id]
+       WHERE id = $7`,
+      [
+        nextDisplayName,
+        nextIsAdmin,
+        JSON.stringify(nextRoles),
+        nextPortalFilesClientId,
+        nextPortalFilesJobId,
+        nextPortalFilesAccessGranted,
+        id
+      ]
     );
 
     if (password) {
@@ -1207,7 +1238,7 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
     }
 
     const updatedResult = await pool.query(
-      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id FROM users WHERE id = $1 LIMIT 1',
+      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted FROM users WHERE id = $1 LIMIT 1',
       [id]
     );
 
