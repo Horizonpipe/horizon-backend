@@ -1282,6 +1282,41 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+app.delete('/users/:id', requireAuth, requireAdmin, async (req, res) => {
+  const id = cleanString(req.params.id);
+  if (!id) {
+    return res.status(400).json({ success: false, error: 'User id is required' });
+  }
+  if (String(req.user?.id || '') === id) {
+    return res.status(400).json({ success: false, error: 'You cannot delete your own account.' });
+  }
+  try {
+    const targetResult = await pool.query(
+      'SELECT id, username, is_admin FROM users WHERE id = $1 LIMIT 1',
+      [id]
+    );
+    if (!targetResult.rows.length) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+    const target = targetResult.rows[0];
+    if (target.is_admin) {
+      const admins = await pool.query('SELECT COUNT(*)::int AS count FROM users WHERE is_admin = true');
+      const adminCount = Number(admins.rows?.[0]?.count || 0);
+      if (adminCount <= 1) {
+        return res
+          .status(400)
+          .json({ success: false, error: 'Cannot delete the last admin account.' });
+      }
+    }
+    await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [id]);
+    await pool.query('DELETE FROM users WHERE id = $1', [id]);
+    return res.json({ success: true, deletedUserId: id, username: target.username });
+  } catch (error) {
+    console.error('DELETE USER ERROR:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/records', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
