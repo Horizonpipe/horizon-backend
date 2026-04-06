@@ -621,48 +621,15 @@ function portalUsersPeerReadEnabled() {
 
 async function assertPortalJobAccess(pool, user, clientId, jobId) {
   if (user && user.isAdmin) return true;
-  if (user && user.portalFilesAccessGranted === false) {
-    return false;
-  }
+  if (!user || user.portalFilesAccessGranted !== true) return false;
   const c = String(clientId || '').trim();
   const j = String(jobId || '').trim();
   if (!c || !j) return false;
-  if (user && user.selfSignup === true) {
-    // Self-signup accounts are denied by default; explicit portal scope must be assigned by admin.
-    const uc = String(user.portalFilesClientId || '').trim();
-    const uj = String(user.portalFilesJobId || '').trim();
-    if (!uc || !uj) return false;
-    return c === uc && j === uj;
-  }
-  const forced = portalForceJobScope();
-  if (forced && c === forced.clientId && j === forced.jobId) return true;
-  const shared = portalSharedDefaultScope();
-  if (shared && c === shared.clientId && j === shared.jobId) return true;
-  if (c === 'portal-users' && user && j === String(user.id)) return true;
-  if (c === 'portal-users' && user && portalUsersPeerReadEnabled()) {
-    try {
-      const u = await pool.query(`SELECT 1 FROM users WHERE CAST(id AS text) = $1 LIMIT 1`, [j]);
-      if (u.rows.length > 0) return true;
-    } catch (e) {
-      console.error('[portal-files] peer read user lookup', e);
-    }
-  }
-  try {
-    const r = await pool.query(
-      `SELECT 1 FROM planner_records
-       WHERE LOWER(TRIM(client)) = LOWER(TRIM($1))
-         AND (
-           CAST(id AS TEXT) = $2
-           OR LOWER(TRIM(jobsite)) = LOWER(TRIM($2))
-         )
-       LIMIT 1`,
-      [c, j]
-    );
-    return r.rows.length > 0;
-  } catch (e) {
-    console.error('[portal-files] assertPortalJobAccess', e);
-    return false;
-  }
+  // Universal default-deny for non-admin accounts: portal access requires explicit user scope.
+  const uc = String(user.portalFilesClientId || '').trim();
+  const uj = String(user.portalFilesJobId || '').trim();
+  if (!uc || !uj) return false;
+  return c === uc && j === uj;
 }
 
 async function portalJobHasPathGrants(pool, clientId, jobId) {
@@ -727,8 +694,7 @@ async function assertPortalPathRel(pool, user, clientId, jobId, relPath, require
   const anyGrants = await portalJobHasPathGrants(pool, clientId, jobId);
   if (!anyGrants) return true;
   const grants = await loadUserPathGrants(pool, clientId, jobId, user.username);
-  /* Match tree/list semantics: if this user has no explicit rows, do not hard-block path access. */
-  if (!grants.length) return true;
+  if (!grants.length) return false;
   const rp = normalizeRelPath(relPath);
   return grants.some(
     (g) => relPathMatchesGrant(rp, g.path_prefix, g.recursive) && grantModeAllows(g.access_mode, required)
@@ -867,21 +833,16 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
-      /** Only restrict when this user has at least one path grant; otherwise list full job (avoids empty UI when grants exist only for other users). */
       let userGrants = null;
       if (!req.user?.isAdmin && (await portalJobHasPathGrants(pool, clientId, jobId))) {
-        const ug = await loadUserPathGrants(pool, clientId, jobId, req.user.username);
-        if (ug.length > 0) userGrants = ug;
+        userGrants = await loadUserPathGrants(pool, clientId, jobId, req.user.username);
       }
       const out = [];
       const keys = await listAllKeys(s3, bucket, prefix);
       for (const obj of keys) {
         const rel = obj.Key.slice(prefix.length);
         if (!rel || isFolderMarkerKey(rel)) continue;
-        if (
-          userGrants &&
-          !userGrants.some((g) => relPathMatchesGrant(rel, g.path_prefix, g.recursive))
-        ) {
+        if (userGrants && !userGrants.some((g) => relPathMatchesGrant(rel, g.path_prefix, g.recursive))) {
           continue;
         }
         out.push({
@@ -913,9 +874,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       let tree = buildTreeFromKeys(prefix, keys);
       if (!req.user?.isAdmin && (await portalJobHasPathGrants(pool, clientId, jobId))) {
         const userGrants = await loadUserPathGrants(pool, clientId, jobId, req.user.username);
-        if (userGrants.length > 0) {
-          tree = filterTreeByPathGrants(tree, userGrants, true);
-        }
+        tree = filterTreeByPathGrants(tree, userGrants, true);
       }
       return res.json(tree);
     } catch (e) {

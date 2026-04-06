@@ -143,42 +143,39 @@ function upperCleanString(value) {
   return cleanString(value).toUpperCase();
 }
 
+function emptyRoles() {
+  return {
+    camera: false,
+    vac: false,
+    simpleVac: false,
+    email: false,
+    psrPlanner: false,
+    pricingView: false,
+    footageView: false
+  };
+}
+
 function normalizeRoles(value) {
+  const defaults = emptyRoles();
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     return {
-      camera: value.camera !== false,
-      vac: value.vac !== false,
-      simpleVac: !!(value.simpleVac ?? value.simple_vac ?? false),
-      email: !!value.email,
-      psrPlanner: value.psrPlanner !== false && value.viewPsr !== false,
-      pricingView: !!value.pricingView,
-      footageView: !!value.footageView
+      camera: value.camera === true || value.can_camera === true,
+      vac: value.vac === true || value.can_vac === true,
+      simpleVac: value.simpleVac === true || value.simple_vac === true,
+      email: value.email === true,
+      psrPlanner: value.psrPlanner === true || value.viewPsr === true,
+      pricingView: value.pricingView === true || value.pricing === true,
+      footageView: value.footageView === true || value.footage === true
     };
   }
   if (typeof value === 'string') {
     try {
       return normalizeRoles(JSON.parse(value));
     } catch (error) {
-      return {
-        camera: true,
-        vac: true,
-        simpleVac: false,
-        email: false,
-        psrPlanner: true,
-        pricingView: false,
-        footageView: false
-      };
+      return defaults;
     }
   }
-  return {
-    camera: true,
-    vac: true,
-    simpleVac: false,
-    email: false,
-    psrPlanner: true,
-    pricingView: false,
-    footageView: false
-  };
+  return defaults;
 }
 
 /**
@@ -242,7 +239,7 @@ function normalizeUser(row) {
       : '';
   const hasExplicitScope = !!(explicitClient && explicitJob);
   /** Self-signup users start false until an admin enables portal file access. */
-  const portalFilesAccessGranted = row.portal_files_access_granted !== false;
+  const portalFilesAccessGranted = row.portal_files_access_granted === true;
 
   let portalFilesClientId;
   let portalFilesJobId;
@@ -489,6 +486,41 @@ function requireAdmin(req, res, next) {
   return next();
 }
 
+function userRoleEnabled(user, roleKey) {
+  if (!user || !roleKey) return false;
+  if (user.isAdmin) return true;
+  const roles = normalizeRoles(user.roles);
+  return roles[roleKey] === true;
+}
+
+function requireAnyRole(roleKeys, message = 'Access denied for this feature') {
+  const keys = Array.isArray(roleKeys) ? roleKeys.filter(Boolean) : [];
+  return function requireAnyRoleMiddleware(req, res, next) {
+    if (!req.user) {
+      return res.status(401).json({ success: false, error: 'Authentication required' });
+    }
+    if (req.user.isAdmin) return next();
+    const allowed = keys.some((k) => userRoleEnabled(req.user, k));
+    if (!allowed) {
+      return res.status(403).json({ success: false, error: message });
+    }
+    return next();
+  };
+}
+
+const requirePlannerAccess = requireAnyRole(
+  ['psrPlanner', 'camera', 'vac', 'simpleVac', 'pricingView', 'footageView'],
+  'Planner access is not enabled for this account'
+);
+const requirePricingAccess = requireAnyRole(
+  ['pricingView'],
+  'Pricing access is not enabled for this account'
+);
+const requireFootageAccess = requireAnyRole(
+  ['footageView'],
+  'Footage access is not enabled for this account'
+);
+
 function requireMike(req, res, next) {
   const name = String(req.user?.displayName || req.user?.username || '').trim().toLowerCase();
   if (name !== 'mike strickland' && name !== 'mik') {
@@ -615,7 +647,7 @@ async function ensureSchema() {
       is_admin BOOLEAN NOT NULL DEFAULT false,
       portal_files_client_id TEXT,
       portal_files_job_id TEXT,
-      roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": false, "simpleVac": false, "email": false}'::jsonb,
+      roles JSONB NOT NULL DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "pricingView": false, "footageView": false}'::jsonb,
       must_change_password BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -624,7 +656,7 @@ async function ensureSchema() {
 
   const userAlters = [
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": true, "vac": false, "simpleVac": false, "email": false}'::jsonb`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "pricingView": false, "footageView": false}'::jsonb`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_client_id TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_job_id TEXT`,
@@ -638,7 +670,7 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS title TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_access_granted BOOLEAN NOT NULL DEFAULT true`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_access_granted BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS self_signup BOOLEAN NOT NULL DEFAULT false`
   ];
   for (const query of userAlters) await pool.query(query);
@@ -663,8 +695,25 @@ async function ensureSchema() {
     )
   `);
   await pool.query(`UPDATE users SET display_name = username WHERE display_name IS NULL OR btrim(display_name) = ''`);
-  await pool.query(`UPDATE users SET roles = '{"camera": true, "vac": false, "simpleVac": false, "email": false}'::jsonb WHERE roles IS NULL`);
-  await pool.query(`UPDATE users SET roles = '{"camera": true, "vac": false, "simpleVac": false, "email": false}'::jsonb || COALESCE(roles, '{}'::jsonb)`);
+  await pool.query(
+    `ALTER TABLE users ALTER COLUMN roles SET DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "pricingView": false, "footageView": false}'::jsonb`
+  );
+  await pool.query(`ALTER TABLE users ALTER COLUMN portal_files_access_granted SET DEFAULT false`);
+  await pool.query(
+    `UPDATE users
+     SET roles = '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "pricingView": false, "footageView": false}'::jsonb
+     WHERE roles IS NULL`
+  );
+  await pool.query(
+    `UPDATE users
+     SET roles = '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "pricingView": false, "footageView": false}'::jsonb
+                 || COALESCE(roles, '{}'::jsonb)`
+  );
+  await pool.query(
+    `UPDATE users
+     SET portal_files_access_granted = false
+     WHERE portal_files_access_granted IS NULL`
+  );
   await pool.query(`UPDATE users SET must_change_password = false WHERE must_change_password IS NULL`);
 
   await pool.query(`DROP TABLE IF EXISTS auth_sessions`);
@@ -966,15 +1015,14 @@ app.get('/sync-state', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/users', async (req, res) => {
+app.get('/users', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup
+      `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup
        FROM users
        ORDER BY LOWER(COALESCE(display_name, username)), LOWER(username)`
     );
-    const token = currentToken(req);
-    const currentUser = await readSession(token);
+    const currentUser = req.user;
     const users = result.rows.map((row) => {
       const normalized = normalizeUser(row);
       if (!currentUser?.isAdmin) {
@@ -1208,10 +1256,14 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
     'portalFilesAccessGranted'
   );
   const hasSelfSignupPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'selfSignup');
+  const hasPortalPermissionsPayload = Object.prototype.hasOwnProperty.call(
+    req.body || {},
+    'portalPermissionsAccess'
+  );
 
   try {
     const currentResult = await pool.query(
-      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup FROM users WHERE id = $1 LIMIT 1',
+      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup FROM users WHERE id = $1 LIMIT 1',
       [id]
     );
     if (!currentResult.rows.length) {
@@ -1235,7 +1287,7 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
       nextPortalFilesJobId = portalFilesJobId || null;
     }
 
-    let nextPortalFilesAccessGranted = current.portal_files_access_granted !== false;
+    let nextPortalFilesAccessGranted = current.portal_files_access_granted === true;
     if (hasAccessPayload) {
       nextPortalFilesAccessGranted = !!req.body.portalFilesAccessGranted;
     } else if (hasPortalScopeInPayload && portalFilesClientId && portalFilesJobId) {
@@ -1250,6 +1302,10 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
       nextSelfSignup = false;
     }
 
+    const nextPortalPermissionsAccess = hasPortalPermissionsPayload
+      ? !!req.body.portalPermissionsAccess
+      : current.portal_permissions_access === true;
+
     await pool.query(
       `UPDATE users
        SET display_name = $1,
@@ -1259,8 +1315,9 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
            portal_files_job_id = $5,
            portal_files_access_granted = $6,
            self_signup = $7,
+           portal_permissions_access = $8,
            updated_at = NOW()
-       WHERE id = $8`,
+       WHERE id = $9`,
       [
         nextDisplayName,
         nextIsAdmin,
@@ -1269,6 +1326,7 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
         nextPortalFilesJobId,
         nextPortalFilesAccessGranted,
         nextSelfSignup,
+        nextPortalPermissionsAccess,
         id
       ]
     );
@@ -1282,7 +1340,7 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
     }
 
     const updatedResult = await pool.query(
-      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup FROM users WHERE id = $1 LIMIT 1',
+      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup FROM users WHERE id = $1 LIMIT 1',
       [id]
     );
 
@@ -1328,7 +1386,7 @@ app.delete('/users/:id', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-app.get('/records', requireAuth, async (req, res) => {
+app.get('/records', requireAuth, requirePlannerAccess, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, record_date, client, city, street, jobsite, status, saved_by, data, created_at, updated_at
@@ -1343,7 +1401,7 @@ app.get('/records', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/records', requireAuth, async (req, res) => {
+app.post('/records', requireAuth, requirePlannerAccess, async (req, res) => {
   try {
     const record = {
       record_date: cleanString(req.body?.record_date || req.body?.date || new Date().toISOString().slice(0, 10)),
@@ -1417,7 +1475,7 @@ async function persistRecord(record) {
   return normalizeRecordRow(result.rows[0]);
 }
 
-app.put('/records/:id', requireAuth, async (req, res) => {
+app.put('/records/:id', requireAuth, requirePlannerAccess, async (req, res) => {
   try {
     const record = await fetchRecordById(req.params.id);
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
@@ -1494,7 +1552,7 @@ app.delete('/clients/:client', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/records/:id/segments', requireAuth, async (req, res) => {
+app.post('/records/:id/segments', requireAuth, requirePlannerAccess, async (req, res) => {
   try {
     const record = await fetchRecordById(req.params.id);
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
@@ -1533,7 +1591,7 @@ app.post('/records/:id/segments', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/records/:id/segments/bulk', requireAuth, async (req, res) => {
+app.post('/records/:id/segments/bulk', requireAuth, requirePlannerAccess, async (req, res) => {
   try {
     const record = await fetchRecordById(req.params.id);
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
@@ -1565,7 +1623,7 @@ app.post('/records/:id/segments/bulk', requireAuth, async (req, res) => {
   }
 });
 
-app.put('/records/:id/segments/:segmentId', requireAuth, async (req, res) => {
+app.put('/records/:id/segments/:segmentId', requireAuth, requirePlannerAccess, async (req, res) => {
   try {
     const record = await fetchRecordById(req.params.id);
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
@@ -1730,7 +1788,7 @@ app.post('/records/:id/segments/:segmentId/move', requireAuth, requireAdmin, asy
   }
 });
 
-app.get('/pricing-rates', requireAuth, async (req, res) => {
+app.get('/pricing-rates', requireAuth, requirePricingAccess, async (req, res) => {
   try {
     const result = await pool.query('SELECT dia, rate, updated_at FROM pricing_rates ORDER BY dia');
     res.json({ success: true, rates: result.rows });
@@ -1845,7 +1903,7 @@ app.delete('/daily-reports/:id', requireAuth, requireAdmin, async (req, res) => 
   }
 });
 
-app.get('/jobsite-assets', requireAuth, async (req, res) => {
+app.get('/jobsite-assets', requireAuth, requireFootageAccess, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM jobsite_assets ORDER BY LOWER(client), LOWER(city), LOWER(jobsite), updated_at DESC');
     const assets = result.rows.map((row) => ({ ...row, files: Array.isArray(row.files) ? row.files : parseJsonObject(row.files, []) }));
