@@ -36,6 +36,8 @@ const { NodeHttpHandler } = require('@smithy/node-http-handler');
 
 const CATEGORIES = new Set(['videos', 'db3', 'pdf', 'photos']);
 const FOLDER_MARKER = '.hp-folder';
+const DATA_AUTO_SYNC_MODE = 'dataautosync';
+const DATA_AUTO_SYNC_JOB_ID = '1';
 
 function portalPermissionsWhitelist() {
   return (process.env.PORTAL_PERMISSIONS_WHITELIST_USERS || '')
@@ -72,6 +74,59 @@ function userCanPortalCapability(user, capability) {
   if (capability === 'edit') return roles.portalEdit === true;
   if (capability === 'delete') return roles.portalDelete === true;
   return false;
+}
+
+/**
+ * @param {import('express').Request['user']} user
+ */
+function userCanDataAutoSync(user) {
+  if (!user) return false;
+  if (user.isAdmin) return true;
+  const roles = user.roles && typeof user.roles === 'object' ? user.roles : {};
+  return roles.dataAutoSyncEmployee === true;
+}
+
+function pickUserDefaultClientId(user) {
+  if (!user) return '';
+  const scoped = Array.isArray(user.portalScopes) ? user.portalScopes : [];
+  const firstScopedClient = String(scoped[0]?.clientId || '').trim();
+  if (firstScopedClient) return firstScopedClient;
+  return String(user.portalFilesClientId || '').trim();
+}
+
+function readPortalMode(req, source) {
+  const bodyMode =
+    source && typeof source === 'object'
+      ? String(source.portalMode || source.mode || source.appMode || '').trim().toLowerCase()
+      : '';
+  const queryMode = String(req?.query?.portalMode || req?.query?.mode || '').trim().toLowerCase();
+  const headerMode = String(req?.headers?.['x-hp-portal-mode'] || '').trim().toLowerCase();
+  return bodyMode || queryMode || headerMode;
+}
+
+/**
+ * Resolve effective client/job for regular portal or DataAutoSync mode.
+ * DataAutoSync mode always forces jobId=1 and requires employee role (or admin).
+ */
+function resolvePortalScope(req, source, options = {}) {
+  const mode = readPortalMode(req, source);
+  const isDataAutoSync = mode === DATA_AUTO_SYNC_MODE;
+  if (isDataAutoSync && !userCanDataAutoSync(req?.user)) {
+    return { error: 'DataAutoSync employee access is not enabled for this account' };
+  }
+  const rawClient =
+    source && typeof source === 'object'
+      ? String(source.clientId || source.client_id || '').trim()
+      : '';
+  const rawJob =
+    source && typeof source === 'object' ? String(source.jobId || source.job_id || '').trim() : '';
+  const clientId = rawClient || (isDataAutoSync ? pickUserDefaultClientId(req?.user) : '');
+  const requireJob = options.requireJob !== false;
+  const jobId = isDataAutoSync ? DATA_AUTO_SYNC_JOB_ID : rawJob;
+  if (!clientId || (requireJob && !jobId)) {
+    return { error: 'clientId and jobId are required' };
+  }
+  return { clientId, jobId, isDataAutoSync };
 }
 
 const portalUpload = multer({
@@ -635,25 +690,47 @@ function portalUsersPeerReadEnabled() {
   return v === '1' || v === 'true' || v === 'yes' || v === 'on';
 }
 
-async function assertPortalJobAccess(pool, user, clientId, jobId) {
+async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) {
   if (user && user.isAdmin) return true;
   if (!user || user.portalFilesAccessGranted !== true) return false;
   const c = String(clientId || '').trim();
   const j = String(jobId || '').trim();
   if (!c || !j) return false;
+  if (j === DATA_AUTO_SYNC_JOB_ID && !userCanDataAutoSync(user)) return false;
+  const allowClientWideDataAutoSync =
+    options.allowClientWideDataAutoSync !== false &&
+    j === DATA_AUTO_SYNC_JOB_ID &&
+    userCanDataAutoSync(user);
   const scopeList = Array.isArray(user.portalScopes) ? user.portalScopes : [];
   if (scopeList.length) {
-    return scopeList.some((scope) => {
-      const uc = String(scope?.clientId || '').trim();
-      const uj = String(scope?.jobId || '').trim();
-      return uc === c && uj === j;
-    });
+    if (
+      scopeList.some((scope) => {
+        const uc = String(scope?.clientId || '').trim();
+        const uj = String(scope?.jobId || '').trim();
+        return uc === c && uj === j;
+      })
+    ) {
+      return true;
+    }
+    if (allowClientWideDataAutoSync) {
+      return scopeList.some((scope) => String(scope?.clientId || '').trim() === c);
+    }
+    return false;
   }
   // Backward-compatible fallback while legacy fields are still present.
   const legacyClient = String(user.portalFilesClientId || '').trim();
   const legacyJob = String(user.portalFilesJobId || '').trim();
   if (!legacyClient || !legacyJob) return false;
-  return c === legacyClient && j === legacyJob;
+  if (c === legacyClient && j === legacyJob) return true;
+  if (allowClientWideDataAutoSync && c === legacyClient) return true;
+  return false;
+}
+
+async function assertPortalJobAccessForRequest(pool, req, clientId, jobId) {
+  const isDataAutoSync = readPortalMode(req) === DATA_AUTO_SYNC_MODE;
+  return assertPortalJobAccess(pool, req.user, clientId, jobId, {
+    allowClientWideDataAutoSync: isDataAutoSync
+  });
 }
 
 async function portalJobHasPathGrants(pool, clientId, jobId) {
@@ -796,6 +873,12 @@ function filterTreeByPathGrants(tree, grants, jobHasAnyGrant) {
 function registerPortalShareLinkRoutes(app, { pool, requireAuth, requireAdmin }) {
   const r = express.Router();
   r.use(requireAuth);
+  r.use((req, res, next) => {
+    if (readPortalMode(req) === DATA_AUTO_SYNC_MODE && !userCanDataAutoSync(req.user)) {
+      return res.status(403).json({ error: 'DataAutoSync employee access is not enabled for this account' });
+    }
+    return next();
+  });
 
   r.post('/shares', express.json({ limit: '512kb' }), async (req, res) => {
     try {
@@ -883,11 +966,12 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
 
   r.get('/', async (req, res) => {
     try {
-      const { clientId, jobId } = req.query;
-      if (!clientId || !jobId) {
+      const scope = resolvePortalScope(req, req.query);
+      if (scope.error) {
         return res.status(400).json({ error: 'clientId and jobId query params are required' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
@@ -920,11 +1004,12 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
 
   r.get('/tree', async (req, res) => {
     try {
-      const { clientId, jobId } = req.query;
-      if (!clientId || !jobId) {
+      const scope = resolvePortalScope(req, req.query);
+      if (scope.error) {
         return res.status(400).json({ error: 'clientId and jobId query params are required' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
@@ -943,14 +1028,15 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
 
   r.get('/permissions', async (req, res) => {
     try {
-      const { clientId, jobId } = req.query;
-      if (!clientId || !jobId) {
+      const scope = resolvePortalScope(req, req.query);
+      if (scope.error) {
         return res.status(400).json({ error: 'clientId and jobId query params are required' });
       }
+      const { clientId, jobId } = scope;
       if (!userCanManagePortalExtras(req.user)) {
         return res.status(403).json({ error: 'Forbidden' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const r2 = await pool.query(
@@ -972,11 +1058,14 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (!userCanManagePortalExtras(req.user)) {
         return res.status(403).json({ error: 'Forbidden' });
       }
-      const { clientId, jobId, grants } = req.body || {};
-      if (!clientId || !jobId || !Array.isArray(grants)) {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      const grants = body.grants;
+      if (scope.error || !Array.isArray(grants)) {
         return res.status(400).json({ error: 'clientId, jobId, and grants array are required' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       await pool.query(`DELETE FROM portal_path_grants WHERE client_id = $1 AND job_id = $2`, [
@@ -1083,11 +1172,14 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
 
   r.post('/folders', express.json(), async (req, res) => {
     try {
-      const { clientId, jobId, parentPath, name } = req.body || {};
-      if (!clientId || !jobId || !name) {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      const { parentPath, name } = body;
+      if (scope.error || !name) {
         return res.status(400).json({ error: 'clientId, jobId, and name are required' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const rel = joinRel(parentPath || '', name);
@@ -1133,11 +1225,13 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
   r.patch('/rename', express.json(), async (req, res) => {
     try {
       const body = req.body || {};
-      const { clientId, jobId, newName } = body;
-      if (!clientId || !jobId || !newName) {
+      const scope = resolvePortalScope(req, body);
+      const { newName } = body;
+      if (scope.error || !newName) {
         return res.status(400).json({ error: 'clientId, jobId, and newName are required' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'edit')) {
@@ -1250,11 +1344,14 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
 
   r.patch('/move', express.json(), async (req, res) => {
     try {
-      const { clientId, jobId, fileId, folderPath, toParentPath } = req.body || {};
-      if (!clientId || !jobId || toParentPath === undefined) {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      const { fileId, folderPath, toParentPath } = body;
+      if (scope.error || toParentPath === undefined) {
         return res.status(400).json({ error: 'clientId, jobId, and toParentPath are required' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'edit')) {
@@ -1360,11 +1457,13 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
 
   r.delete('/folders', async (req, res) => {
     try {
-      const { clientId, jobId, path: pathParam } = req.query;
-      if (!clientId || !jobId || pathParam === undefined || pathParam === '') {
+      const scope = resolvePortalScope(req, req.query);
+      const pathParam = req.query?.path;
+      if (scope.error || pathParam === undefined || pathParam === '') {
         return res.status(400).json({ error: 'clientId, jobId, and non-empty path query params are required' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'delete')) {
@@ -1404,12 +1503,15 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       return res.status(400).json({ error: 'Missing file field "file"' });
     }
     try {
-      const { clientId, jobId, category, folderPath } = req.body;
-      if (!clientId || !jobId) {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      const { folderPath } = body;
+      if (scope.error) {
         fs.unlink(f.path, () => {});
         return res.status(400).json({ error: 'clientId and jobId are required' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         fs.unlink(f.path, () => {});
         return res.status(403).json({ error: 'Forbidden' });
       }
@@ -1419,7 +1521,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       }
       const original = req.body.filename || f.originalname || 'upload';
       const fp = normalizeRelPath(folderPath || '');
-      const catExplicit = fp ? null : req.body.category || null;
+      const catExplicit = fp ? null : body.category || null;
       const Key = portalUploadKey(clientId, jobId, fp || '', original, catExplicit);
       const pref = jobPrefix(String(clientId), String(jobId));
       const relForAcl = Key.slice(pref.length);
@@ -1452,12 +1554,15 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
     if (!Array.isArray(files) || files.length === 0) {
       return res.status(400).json({ error: 'Missing file field(s) "file"' });
     }
-    const { clientId, jobId, folderPath, folderPaths: folderPathsRaw } = req.body || {};
-    if (!clientId || !jobId) {
+    const body = req.body || {};
+    const scope = resolvePortalScope(req, body);
+    const { folderPath, folderPaths: folderPathsRaw } = body;
+    if (scope.error) {
       for (const f of files) fs.unlink(f.path, () => {});
       return res.status(400).json({ error: 'clientId and jobId are required' });
     }
-    if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+    const { clientId, jobId } = scope;
+    if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
       for (const f of files) fs.unlink(f.path, () => {});
       return res.status(403).json({ error: 'Forbidden' });
     }
@@ -1560,7 +1665,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
   r.get('/upload/resumable/active', async (req, res) => {
     try {
       await ensurePortalResumeSchema(pool);
-      const { clientId, jobId } = req.query;
+      const scope = resolvePortalScope(req, req.query, { requireJob: false });
+      const clientId = scope.error ? '' : scope.clientId;
+      const jobId = scope.error ? '' : scope.jobId;
       const where = ['user_id = $1', "status = 'uploading'"];
       const vals = [String(req.user?.id ?? req.user?.username ?? '')];
       if (clientId) {
@@ -1612,20 +1719,14 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
   r.post('/upload/resumable/init', express.json({ limit: '256kb' }), async (req, res) => {
     try {
       await ensurePortalResumeSchema(pool);
-      const {
-        clientId,
-        jobId,
-        folderPath,
-        fileName,
-        fileSize,
-        mimeType,
-        chunkSize,
-        sha256
-      } = req.body || {};
-      if (!clientId || !jobId) {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      const { folderPath, fileName, fileSize, mimeType, chunkSize, sha256 } = body;
+      if (scope.error) {
         return res.status(400).json({ error: 'clientId and jobId are required' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'upload')) {
@@ -1750,7 +1851,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (!isUploadSessionOpen(sessionRow)) {
         return res.status(404).json({ error: 'Upload session not found or closed' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, sessionRow.client_id, sessionRow.job_id))) {
+      if (!(await assertPortalJobAccessForRequest(pool, req, sessionRow.client_id, sessionRow.job_id))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'upload')) {
@@ -1824,7 +1925,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (!isUploadSessionOpen(sessionRow)) {
         return res.status(404).json({ error: 'Upload session not found or closed' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, sessionRow.client_id, sessionRow.job_id))) {
+      if (!(await assertPortalJobAccessForRequest(pool, req, sessionRow.client_id, sessionRow.job_id))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'upload')) {
@@ -2216,11 +2317,13 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (!userCanPortalCapability(req.user, 'download')) {
         return res.status(403).json({ error: 'Portal download is not enabled for this account' });
       }
-      const { clientId, jobId, path: pathParam } = req.query || {};
-      if (!clientId || !jobId || pathParam == null || String(pathParam).trim() === '') {
+      const scope = resolvePortalScope(req, req.query || {});
+      const pathParam = req.query?.path;
+      if (scope.error || pathParam == null || String(pathParam).trim() === '') {
         return res.status(400).json({ error: 'clientId, jobId, and folder path are required' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const folderRel = normalizeRelPath(pathParam);
@@ -2301,7 +2404,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         return res.status(400).json({ error: 'Use DELETE /api/files/folders to remove folders' });
       }
       const parsed = parseJobFromObjectKey(Key);
-      if (!parsed || !(await assertPortalJobAccess(pool, req.user, parsed.clientId, parsed.jobId))) {
+      if (!parsed || !(await assertPortalJobAccessForRequest(pool, req, parsed.clientId, parsed.jobId))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefDel = jobPrefix(parsed.clientId, parsed.jobId);

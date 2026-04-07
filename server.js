@@ -152,6 +152,7 @@ function emptyRoles() {
     psrPlanner: false,
     psrViewer: false,
     psrDataEntry: false,
+    dataAutoSyncEmployee: false,
     pricingView: false,
     footageView: false,
     portalUpload: false,
@@ -172,6 +173,10 @@ function normalizeRoles(value) {
       psrPlanner: value.psrPlanner === true || value.viewPsr === true,
       psrViewer: value.psrViewer === true || value.psr_viewer === true,
       psrDataEntry: value.psrDataEntry === true || value.psr_data_entry === true,
+      dataAutoSyncEmployee:
+        value.dataAutoSyncEmployee === true ||
+        value.data_auto_sync_employee === true ||
+        value.employee === true,
       pricingView: value.pricingView === true || value.pricing === true,
       footageView: value.footageView === true || value.footage === true,
       portalUpload: value.portalUpload === true || value.portal_upload === true,
@@ -668,6 +673,10 @@ const requirePsrDataEntryAccess = requireAnyRole(
   ['psrDataEntry', 'psrPlanner', 'camera', 'vac', 'simpleVac'],
   'PSR data entry access is not enabled for this account'
 );
+const requireDataAutoSyncEmployeeAccess = requireAnyRole(
+  ['dataAutoSyncEmployee'],
+  'DataAutoSync employee access is not enabled for this account'
+);
 const requirePricingAccess = requireAnyRole(
   ['pricingView'],
   'Pricing access is not enabled for this account'
@@ -852,7 +861,7 @@ async function ensureSchema() {
       is_admin BOOLEAN NOT NULL DEFAULT false,
       portal_files_client_id TEXT,
       portal_files_job_id TEXT,
-      roles JSONB NOT NULL DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb,
+      roles JSONB NOT NULL DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "dataAutoSyncEmployee": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb,
       must_change_password BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -861,7 +870,7 @@ async function ensureSchema() {
 
   const userAlters = [
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "dataAutoSyncEmployee": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_client_id TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_job_id TEXT`,
@@ -901,17 +910,17 @@ async function ensureSchema() {
   `);
   await pool.query(`UPDATE users SET display_name = username WHERE display_name IS NULL OR btrim(display_name) = ''`);
   await pool.query(
-    `ALTER TABLE users ALTER COLUMN roles SET DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb`
+    `ALTER TABLE users ALTER COLUMN roles SET DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "dataAutoSyncEmployee": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb`
   );
   await pool.query(`ALTER TABLE users ALTER COLUMN portal_files_access_granted SET DEFAULT false`);
   await pool.query(
     `UPDATE users
-     SET roles = '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb
+     SET roles = '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "dataAutoSyncEmployee": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb
      WHERE roles IS NULL`
   );
   await pool.query(
     `UPDATE users
-     SET roles = '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb
+     SET roles = '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "dataAutoSyncEmployee": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb
                  || COALESCE(roles, '{}'::jsonb)`
   );
   await pool.query(
@@ -1549,6 +1558,10 @@ app.post('/login', async (req, res) => {
 
 app.get('/session', requireAuth, async (req, res) => {
   res.json({ success: true, user: req.user });
+});
+
+app.get('/data-auto-sync/access', requireAuth, requireDataAutoSyncEmployeeAccess, async (req, res) => {
+  res.json({ success: true, allowed: true });
 });
 
 /** WinCan / desktop EXE pushes rows using the same session token as the web planner (not a static API key). */
