@@ -38,7 +38,7 @@ function createAutoImportPlugin(options = {}) {
 
   const router = express.Router();
   const desktopHeartbeatByUser = new Map();
-  const HEARTBEAT_TTL_MS = 95_000;
+  const HEARTBEAT_TTL_MS = 12_000;
 
   function heartbeatKey(req) {
     const id = req?.user?.id;
@@ -446,7 +446,7 @@ function createAutoImportPlugin(options = {}) {
     const rec = desktopHeartbeatByUser.get(key) || null;
     const nowMs = Date.now();
     const ageMs = rec ? Math.max(0, nowMs - Number(rec.atMs || 0)) : Number.POSITIVE_INFINITY;
-    const connected = !!(rec && ageMs <= HEARTBEAT_TTL_MS);
+    const connected = !!(rec && ageMs <= HEARTBEAT_TTL_MS && String(rec.state || '').toLowerCase() !== 'offline');
     res.json({
       success: true,
       connected,
