@@ -302,11 +302,12 @@ function normalizePortalScopeEntry(value) {
 
 function normalizePsrScopeEntry(value) {
   if (!value || typeof value !== 'object') return null;
+  const recordId = cleanString(value.recordId || value.record_id || value.jobsiteId || value.record || '');
   const client = upperCleanString(value.client);
   const city = upperCleanString(value.city);
   const jobsite = normalizeJobsiteName(value.jobsite, value.street);
   if (!client || !city || !jobsite) return null;
-  return { client, city, jobsite };
+  return { recordId: recordId || null, client, city, jobsite };
 }
 
 function dedupePortalScopes(scopes) {
@@ -329,7 +330,7 @@ function dedupePsrScopes(scopes) {
   for (const item of Array.isArray(scopes) ? scopes : []) {
     const n = normalizePsrScopeEntry(item);
     if (!n) continue;
-    const key = `${n.client}::${n.city}::${n.jobsite}`;
+    const key = n.recordId ? `id:${n.recordId}` : `${n.client}::${n.city}::${n.jobsite}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(n);
@@ -383,7 +384,7 @@ async function readScopesForUserIds(userIds) {
   }
 
   const psrRes = await pool.query(
-    `SELECT user_id::text AS user_id, client, city, jobsite
+    `SELECT user_id::text AS user_id, client, city, jobsite, psr_record_id
      FROM user_psr_scopes
      WHERE user_id::text = ANY($1::text[])
      ORDER BY client, city, jobsite`,
@@ -394,7 +395,12 @@ async function readScopesForUserIds(userIds) {
     if (!byUser.has(key)) byUser.set(key, { portalScopes: [], psrScopes: [] });
     byUser
       .get(key)
-      .psrScopes.push({ client: String(row.client || ''), city: String(row.city || ''), jobsite: String(row.jobsite || '') });
+      .psrScopes.push({
+        recordId: cleanString(row.psr_record_id || '') || null,
+        client: String(row.client || ''),
+        city: String(row.city || ''),
+        jobsite: String(row.jobsite || '')
+      });
   }
 
   return byUser;
@@ -654,6 +660,10 @@ function userCanAccessPsrScope(user, scope) {
   if (user?.isAdmin) return true;
   const scopes = dedupePsrScopes(user?.psrScopes || []);
   if (!scopes.length) return false;
+  const recordId = cleanString(scope?.id || scope?.recordId || '');
+  if (recordId) {
+    return scopes.some((entry) => cleanString(entry.recordId || '') === recordId);
+  }
   const client = upperCleanString(scope?.client);
   const city = upperCleanString(scope?.city);
   const jobsite = normalizeJobsiteName(scope?.jobsite, scope?.street);
@@ -675,10 +685,18 @@ function buildPsrScopeWhere(user, alias = '') {
   const params = [];
   let index = 1;
   for (const scope of scopes) {
-    clauses.push(
-      `(LOWER(${prefix}client) = LOWER($${index++}) AND LOWER(${prefix}city) = LOWER($${index++}) AND LOWER(${prefix}jobsite) = LOWER($${index++}))`
-    );
-    params.push(scope.client, scope.city, scope.jobsite);
+    const rid = cleanString(scope.recordId || '');
+    if (rid) {
+      clauses.push(
+        `(CAST(${prefix}id AS text) = $${index++} OR (LOWER(${prefix}client) = LOWER($${index++}) AND LOWER(${prefix}city) = LOWER($${index++}) AND LOWER(${prefix}jobsite) = LOWER($${index++})))`
+      );
+      params.push(rid, scope.client, scope.city, scope.jobsite);
+    } else {
+      clauses.push(
+        `(LOWER(${prefix}client) = LOWER($${index++}) AND LOWER(${prefix}city) = LOWER($${index++}) AND LOWER(${prefix}jobsite) = LOWER($${index++}))`
+      );
+      params.push(scope.client, scope.city, scope.jobsite);
+    }
   }
   return { clause: clauses.join(' OR '), params };
 }
@@ -931,10 +949,12 @@ async function ensureSchema() {
       client TEXT NOT NULL,
       city TEXT NOT NULL,
       jobsite TEXT NOT NULL,
+      psr_record_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE (user_id, client, city, jobsite)
     )
   `);
+  await pool.query(`ALTER TABLE user_psr_scopes ADD COLUMN IF NOT EXISTS psr_record_id TEXT`);
   await pool.query(`
     DO $$
     BEGIN
@@ -954,6 +974,9 @@ async function ensureSchema() {
   );
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_user_psr_scopes_scope ON user_psr_scopes (client, city, jobsite)`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_user_psr_scopes_record_id ON user_psr_scopes (psr_record_id)`
   );
 
   await pool.query(`DROP TABLE IF EXISTS auth_sessions`);
@@ -1005,8 +1028,8 @@ async function ensureSchema() {
   await pool.query(`UPDATE planner_records SET saved_by = '' WHERE saved_by IS NULL`);
   await pool.query(`UPDATE planner_records SET data = '{}'::jsonb WHERE data IS NULL`);
   await pool.query(
-    `INSERT INTO user_psr_scopes (user_id, client, city, jobsite)
-     SELECT DISTINCT CAST(u.id AS text), pr.client, pr.city, pr.jobsite
+    `INSERT INTO user_psr_scopes (user_id, client, city, jobsite, psr_record_id)
+     SELECT DISTINCT CAST(u.id AS text), pr.client, pr.city, pr.jobsite, CAST(pr.id AS text)
      FROM users u
      JOIN planner_records pr ON true
      LEFT JOIN user_psr_scopes ups ON ups.user_id = CAST(u.id AS text)
@@ -1021,6 +1044,15 @@ async function ensureSchema() {
          OR LOWER(COALESCE(u.roles ->> 'footageView', 'false')) = 'true'
        )
      ON CONFLICT (user_id, client, city, jobsite) DO NOTHING`
+  );
+  await pool.query(
+    `UPDATE user_psr_scopes ups
+     SET psr_record_id = CAST(pr.id AS text)
+     FROM planner_records pr
+     WHERE (ups.psr_record_id IS NULL OR BTRIM(ups.psr_record_id) = '')
+       AND LOWER(BTRIM(ups.client)) = LOWER(BTRIM(pr.client))
+       AND LOWER(BTRIM(ups.city)) = LOWER(BTRIM(pr.city))
+       AND LOWER(BTRIM(ups.jobsite)) = LOWER(BTRIM(pr.jobsite))`
   );
 
   await pool.query(`
@@ -1349,7 +1381,7 @@ app.get('/permissions/tree', requireAuth, requireAdmin, async (req, res) => {
          ORDER BY client_id, job_id, path_prefix`
       ),
       pool.query(
-        `SELECT DISTINCT client, city, jobsite
+        `SELECT DISTINCT id, client, city, jobsite
          FROM planner_records
          WHERE BTRIM(client) <> '' AND BTRIM(city) <> '' AND BTRIM(jobsite) <> ''
          ORDER BY client, city, jobsite`
@@ -1403,17 +1435,20 @@ app.get('/permissions/tree', requireAuth, requireAdmin, async (req, res) => {
       const client = upperCleanString(row.client);
       const city = upperCleanString(row.city);
       const jobsite = normalizeJobsiteName(row.jobsite, row.street);
+      const recordId = cleanString(row.id || '');
       if (!client || !city || !jobsite) continue;
       if (!psrMap.has(client)) psrMap.set(client, new Map());
       const cityMap = psrMap.get(client);
       if (!cityMap.has(city)) cityMap.set(city, []);
-      cityMap.get(city).push(jobsite);
+      cityMap.get(city).push({ recordId, jobsite });
     }
     const psrTree = [...psrMap.entries()].map(([client, cityMap]) => ({
       client,
       cities: [...cityMap.entries()].map(([city, jobsites]) => ({
         city,
-        jobsites: [...new Set(jobsites)].sort()
+        jobsites: jobsites
+          .filter((item, idx, arr) => arr.findIndex((x) => x.recordId === item.recordId) === idx)
+          .sort((a, b) => String(a.jobsite || '').localeCompare(String(b.jobsite || ''), undefined, { sensitivity: 'base' }))
       }))
     }));
 
@@ -1752,10 +1787,10 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
       await pool.query('DELETE FROM user_psr_scopes WHERE user_id = $1', [String(id)]);
       for (const scope of nextPsrScopes) {
         await pool.query(
-          `INSERT INTO user_psr_scopes (user_id, client, city, jobsite)
-           VALUES ($1, $2, $3, $4)
+          `INSERT INTO user_psr_scopes (user_id, client, city, jobsite, psr_record_id)
+           VALUES ($1, $2, $3, $4, $5)
            ON CONFLICT (user_id, client, city, jobsite) DO NOTHING`,
-          [String(id), scope.client, scope.city, scope.jobsite]
+          [String(id), scope.client, scope.city, scope.jobsite, cleanString(scope.recordId || '') || null]
         );
       }
     }

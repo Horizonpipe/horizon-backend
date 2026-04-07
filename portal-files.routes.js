@@ -657,6 +657,40 @@ async function loadUserPathGrants(pool, clientId, jobId, username) {
   return r.rows;
 }
 
+async function remapPortalPathGrantPrefixes(pool, clientId, jobId, fromRelPath, toRelPath) {
+  const from = normalizeRelPath(fromRelPath || '');
+  const to = normalizeRelPath(toRelPath || '');
+  if (!from || !to || from === to) return;
+  const rows = await pool.query(
+    `SELECT id, path_prefix
+     FROM portal_path_grants
+     WHERE client_id = $1 AND job_id = $2`,
+    [String(clientId), String(jobId)]
+  );
+  for (const row of rows.rows) {
+    const current = normalizeRelPath(row.path_prefix || '');
+    if (current === from) {
+      await pool.query(`UPDATE portal_path_grants SET path_prefix = $1 WHERE id = $2`, [to, row.id]);
+      continue;
+    }
+    if (current.startsWith(`${from}/`)) {
+      const suffix = current.slice(from.length);
+      await pool.query(`UPDATE portal_path_grants SET path_prefix = $1 WHERE id = $2`, [`${to}${suffix}`, row.id]);
+    }
+  }
+}
+
+async function removePortalPathGrantPrefixes(pool, clientId, jobId, rootRelPath) {
+  const root = normalizeRelPath(rootRelPath || '');
+  if (!root) return;
+  await pool.query(
+    `DELETE FROM portal_path_grants
+     WHERE client_id = $1 AND job_id = $2
+       AND (path_prefix = $3 OR path_prefix LIKE $4)`,
+    [String(clientId), String(jobId), root, `${root}/%`]
+  );
+}
+
 function relPathMatchesGrant(relPath, pathPrefix, recursive) {
   const rp = normalizeRelPath(relPath);
   const p = normalizeRelPath(pathPrefix ?? '');
@@ -1129,6 +1163,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
           })
         );
         await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: oldKey }));
+        await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldRel, newRel);
         return res.json({ id: keyToId(newKey), key: newKey, path: newRel, name: sanitized });
       }
 
@@ -1183,6 +1218,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         for (const { from } of mapping) {
           await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: from }));
         }
+        await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldFolderRel, newRel);
         return res.json({ path: newRel, parentPath: parentRelPath(newRel), name: seg });
       }
 
@@ -1239,6 +1275,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
           })
         );
         await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: oldKey }));
+        await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldRel, newRel);
         return res.json({ id: keyToId(newKey), key: newKey, path: newRel, name });
       }
 
@@ -1288,6 +1325,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         for (const { from } of mapping) {
           await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: from }));
         }
+        await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldFolderRel, newRel);
         return res.json({ path: newRel, parentPath: parentRelPath(newRel), name: seg });
       }
 
@@ -1327,6 +1365,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
           if (err && err.name !== 'NoSuchKey') throw err;
         }
       }
+      await removePortalPathGrantPrefixes(pool, clientId, jobId, folderRel);
       return res.status(204).send();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
