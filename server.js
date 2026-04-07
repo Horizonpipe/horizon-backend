@@ -1301,24 +1301,52 @@ app.get('/users', requireAuth, async (req, res) => {
 
 app.get('/permissions/tree', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const [portalRows, psrRows] = await Promise.all([
+    const [portalRows, portalPathRows, psrRows] = await Promise.all([
       pool.query(
-        `SELECT DISTINCT client_id, job_id
-         FROM (
+        `WITH scope_pairs AS (
            SELECT client_id, job_id FROM user_portal_scopes
-           UNION ALL
+           UNION
            SELECT portal_files_client_id AS client_id, portal_files_job_id AS job_id
            FROM users
            WHERE portal_files_client_id IS NOT NULL
              AND BTRIM(portal_files_client_id) <> ''
              AND portal_files_job_id IS NOT NULL
              AND BTRIM(portal_files_job_id) <> ''
-           UNION ALL
+           UNION
            SELECT client_id, job_id FROM portal_path_grants
-         ) s
+         ),
+         scope_pairs_clean AS (
+           SELECT DISTINCT BTRIM(client_id) AS client_id, BTRIM(job_id) AS job_id
+           FROM scope_pairs
+           WHERE client_id IS NOT NULL AND BTRIM(client_id) <> ''
+             AND job_id IS NOT NULL AND BTRIM(job_id) <> ''
+         ),
+         job_labels AS (
+           SELECT DISTINCT ON (sp.client_id, sp.job_id)
+             sp.client_id,
+             sp.job_id,
+             pr.client AS label_client,
+             pr.city AS label_city,
+             pr.jobsite AS label_jobsite
+           FROM scope_pairs_clean sp
+           LEFT JOIN planner_records pr
+             ON LOWER(BTRIM(pr.client)) = LOWER(sp.client_id)
+            AND (
+              LOWER(BTRIM(pr.jobsite)) = LOWER(sp.job_id)
+              OR CAST(pr.id AS text) = sp.job_id
+            )
+           ORDER BY sp.client_id, sp.job_id, pr.updated_at DESC NULLS LAST
+         )
+         SELECT client_id, job_id, label_client, label_city, label_jobsite
+         FROM job_labels
+         ORDER BY COALESCE(label_client, client_id), COALESCE(label_city, 'ZZZ'), COALESCE(label_jobsite, job_id)`
+      ),
+      pool.query(
+        `SELECT client_id, job_id, path_prefix
+         FROM portal_path_grants
          WHERE client_id IS NOT NULL AND BTRIM(client_id) <> ''
            AND job_id IS NOT NULL AND BTRIM(job_id) <> ''
-         ORDER BY client_id, job_id`
+         ORDER BY client_id, job_id, path_prefix`
       ),
       pool.query(
         `SELECT DISTINCT client, city, jobsite
@@ -1328,17 +1356,46 @@ app.get('/permissions/tree', requireAuth, requireAdmin, async (req, res) => {
       )
     ]);
 
+    const pathMap = new Map();
+    for (const row of portalPathRows.rows) {
+      const clientId = String(row.client_id || '').trim();
+      const jobId = String(row.job_id || '').trim();
+      if (!clientId || !jobId) continue;
+      const key = `${clientId}|||${jobId}`;
+      if (!pathMap.has(key)) pathMap.set(key, new Set());
+      const p = String(row.path_prefix || '')
+        .replace(/\\/g, '/')
+        .replace(/^\/+|\/+$/g, '')
+        .replace(/\/+/g, '/');
+      pathMap.get(key).add(p || '/');
+    }
+
     const portalMap = new Map();
     for (const row of portalRows.rows) {
       const clientId = String(row.client_id || '').trim();
       const jobId = String(row.job_id || '').trim();
       if (!clientId || !jobId) continue;
-      if (!portalMap.has(clientId)) portalMap.set(clientId, []);
-      portalMap.get(clientId).push(jobId);
+      const displayClient = upperCleanString(row.label_client || clientId);
+      const displayCity = upperCleanString(row.label_city || 'NOT SET');
+      const displayJobsite = normalizeJobsiteName(row.label_jobsite || jobId);
+      if (!portalMap.has(displayClient)) portalMap.set(displayClient, new Map());
+      const cityMap = portalMap.get(displayClient);
+      if (!cityMap.has(displayCity)) cityMap.set(displayCity, []);
+      cityMap.get(displayCity).push({
+        clientId,
+        jobId,
+        jobsite: displayJobsite,
+        paths: [...(pathMap.get(`${clientId}|||${jobId}`) || new Set(['/']))]
+      });
     }
-    const portalTree = [...portalMap.entries()].map(([clientId, jobs]) => ({
-      clientId,
-      jobs: [...new Set(jobs)].sort()
+    const portalTree = [...portalMap.entries()].map(([client, cityMap]) => ({
+      client,
+      cities: [...cityMap.entries()].map(([city, jobs]) => ({
+        city,
+        jobs: jobs
+          .filter((j, idx, arr) => arr.findIndex((x) => x.clientId === j.clientId && x.jobId === j.jobId) === idx)
+          .sort((a, b) => a.jobsite.localeCompare(b.jobsite, undefined, { sensitivity: 'base' }))
+      }))
     }));
 
     const psrMap = new Map();
