@@ -625,11 +625,19 @@ async function assertPortalJobAccess(pool, user, clientId, jobId) {
   const c = String(clientId || '').trim();
   const j = String(jobId || '').trim();
   if (!c || !j) return false;
-  // Universal default-deny for non-admin accounts: portal access requires explicit user scope.
-  const uc = String(user.portalFilesClientId || '').trim();
-  const uj = String(user.portalFilesJobId || '').trim();
-  if (!uc || !uj) return false;
-  return c === uc && j === uj;
+  const scopeList = Array.isArray(user.portalScopes) ? user.portalScopes : [];
+  if (scopeList.length) {
+    return scopeList.some((scope) => {
+      const uc = String(scope?.clientId || '').trim();
+      const uj = String(scope?.jobId || '').trim();
+      return uc === c && uj === j;
+    });
+  }
+  // Backward-compatible fallback while legacy fields are still present.
+  const legacyClient = String(user.portalFilesClientId || '').trim();
+  const legacyJob = String(user.portalFilesJobId || '').trim();
+  if (!legacyClient || !legacyJob) return false;
+  return c === legacyClient && j === legacyJob;
 }
 
 async function portalJobHasPathGrants(pool, clientId, jobId) {

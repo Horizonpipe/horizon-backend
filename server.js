@@ -285,9 +285,138 @@ function normalizeUser(row) {
     portalFilesAccessGranted,
     portalFilesClientId,
     portalFilesJobId,
+    portalScopes: [],
+    psrScopes: [],
     portalPermissionsAccess:
       !!row.portal_permissions_access || portalPermissionsWhitelistHas(row.username)
   };
+}
+
+function normalizePortalScopeEntry(value) {
+  if (!value || typeof value !== 'object') return null;
+  const clientId = cleanString(value.clientId || value.client_id || value.client);
+  const jobId = cleanString(value.jobId || value.job_id || value.job);
+  if (!clientId || !jobId) return null;
+  return { clientId, jobId };
+}
+
+function normalizePsrScopeEntry(value) {
+  if (!value || typeof value !== 'object') return null;
+  const client = upperCleanString(value.client);
+  const city = upperCleanString(value.city);
+  const jobsite = normalizeJobsiteName(value.jobsite, value.street);
+  if (!client || !city || !jobsite) return null;
+  return { client, city, jobsite };
+}
+
+function dedupePortalScopes(scopes) {
+  const seen = new Set();
+  const out = [];
+  for (const item of Array.isArray(scopes) ? scopes : []) {
+    const n = normalizePortalScopeEntry(item);
+    if (!n) continue;
+    const key = `${n.clientId}::${n.jobId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(n);
+  }
+  return out;
+}
+
+function dedupePsrScopes(scopes) {
+  const seen = new Set();
+  const out = [];
+  for (const item of Array.isArray(scopes) ? scopes : []) {
+    const n = normalizePsrScopeEntry(item);
+    if (!n) continue;
+    const key = `${n.client}::${n.city}::${n.jobsite}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(n);
+  }
+  return out;
+}
+
+function normalizePortalScopesPayload(value) {
+  if (Array.isArray(value)) return dedupePortalScopes(value);
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return normalizePortalScopesPayload(parsed);
+    } catch (error) {
+      return [];
+    }
+  }
+  return [];
+}
+
+function normalizePsrScopesPayload(value) {
+  if (Array.isArray(value)) return dedupePsrScopes(value);
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return normalizePsrScopesPayload(parsed);
+    } catch (error) {
+      return [];
+    }
+  }
+  return [];
+}
+
+async function readScopesForUserIds(userIds) {
+  const ids = [...new Set((Array.isArray(userIds) ? userIds : []).map((id) => String(id || '').trim()).filter(Boolean))];
+  const byUser = new Map();
+  for (const id of ids) byUser.set(id, { portalScopes: [], psrScopes: [] });
+  if (!ids.length) return byUser;
+
+  const portalRes = await pool.query(
+    `SELECT user_id::text AS user_id, client_id, job_id
+     FROM user_portal_scopes
+     WHERE user_id::text = ANY($1::text[])
+     ORDER BY client_id, job_id`,
+    [ids]
+  );
+  for (const row of portalRes.rows) {
+    const key = String(row.user_id);
+    if (!byUser.has(key)) byUser.set(key, { portalScopes: [], psrScopes: [] });
+    byUser.get(key).portalScopes.push({ clientId: String(row.client_id), jobId: String(row.job_id) });
+  }
+
+  const psrRes = await pool.query(
+    `SELECT user_id::text AS user_id, client, city, jobsite
+     FROM user_psr_scopes
+     WHERE user_id::text = ANY($1::text[])
+     ORDER BY client, city, jobsite`,
+    [ids]
+  );
+  for (const row of psrRes.rows) {
+    const key = String(row.user_id);
+    if (!byUser.has(key)) byUser.set(key, { portalScopes: [], psrScopes: [] });
+    byUser
+      .get(key)
+      .psrScopes.push({ client: String(row.client || ''), city: String(row.city || ''), jobsite: String(row.jobsite || '') });
+  }
+
+  return byUser;
+}
+
+async function attachScopesToUsers(users) {
+  const list = Array.isArray(users) ? users : [];
+  const map = await readScopesForUserIds(list.map((u) => u.id));
+  return list.map((u) => {
+    const entry = map.get(String(u.id || '')) || { portalScopes: [], psrScopes: [] };
+    return {
+      ...u,
+      portalScopes: dedupePortalScopes(entry.portalScopes),
+      psrScopes: dedupePsrScopes(entry.psrScopes)
+    };
+  });
+}
+
+async function attachScopesToUser(user) {
+  if (!user?.id) return { ...user, portalScopes: [], psrScopes: [] };
+  const [withScopes] = await attachScopesToUsers([user]);
+  return withScopes;
 }
 
 function parseJsonObject(value, fallback = {}) {
@@ -460,7 +589,7 @@ async function readSession(token) {
      WHERE token = $1`,
     [token, SESSION_TTL_MINUTES]
   );
-  return normalizeUser(row);
+  return attachScopesToUser(normalizeUser(row));
 }
 
 async function requireAuth(req, res, next) {
@@ -520,6 +649,43 @@ const requireFootageAccess = requireAnyRole(
   ['footageView'],
   'Footage access is not enabled for this account'
 );
+
+function userCanAccessPsrScope(user, scope) {
+  if (user?.isAdmin) return true;
+  const scopes = dedupePsrScopes(user?.psrScopes || []);
+  if (!scopes.length) return false;
+  const client = upperCleanString(scope?.client);
+  const city = upperCleanString(scope?.city);
+  const jobsite = normalizeJobsiteName(scope?.jobsite, scope?.street);
+  if (!client || !city || !jobsite) return false;
+  return scopes.some(
+    (entry) =>
+      String(entry.client || '').toLowerCase() === client.toLowerCase() &&
+      String(entry.city || '').toLowerCase() === city.toLowerCase() &&
+      String(entry.jobsite || '').toLowerCase() === jobsite.toLowerCase()
+  );
+}
+
+function buildPsrScopeWhere(user, alias = '') {
+  if (user?.isAdmin) return { clause: 'TRUE', params: [] };
+  const scopes = dedupePsrScopes(user?.psrScopes || []);
+  if (!scopes.length) return { clause: 'FALSE', params: [] };
+  const prefix = alias ? `${alias}.` : '';
+  const clauses = [];
+  const params = [];
+  let index = 1;
+  for (const scope of scopes) {
+    clauses.push(
+      `(LOWER(${prefix}client) = LOWER($${index++}) AND LOWER(${prefix}city) = LOWER($${index++}) AND LOWER(${prefix}jobsite) = LOWER($${index++}))`
+    );
+    params.push(scope.client, scope.city, scope.jobsite);
+  }
+  return { clause: clauses.join(' OR '), params };
+}
+
+function denyOutOfScope(res) {
+  return res.status(403).json({ success: false, error: 'This account is not permitted for that PSR scope' });
+}
 
 function requireMike(req, res, next) {
   const name = String(req.user?.displayName || req.user?.username || '').trim().toLowerCase();
@@ -716,6 +882,52 @@ async function ensureSchema() {
   );
   await pool.query(`UPDATE users SET must_change_password = false WHERE must_change_password IS NULL`);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_portal_scopes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      client_id TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (user_id, client_id, job_id)
+    )
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_user_portal_scopes_user_id ON user_portal_scopes (user_id)`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_user_portal_scopes_scope ON user_portal_scopes (client_id, job_id)`
+  );
+  await pool.query(
+    `INSERT INTO user_portal_scopes (user_id, client_id, job_id)
+     SELECT id, portal_files_client_id, portal_files_job_id
+     FROM users
+     WHERE portal_files_access_granted = true
+       AND portal_files_client_id IS NOT NULL
+       AND BTRIM(portal_files_client_id) <> ''
+       AND portal_files_job_id IS NOT NULL
+       AND BTRIM(portal_files_job_id) <> ''
+     ON CONFLICT (user_id, client_id, job_id) DO NOTHING`
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_psr_scopes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      client TEXT NOT NULL,
+      city TEXT NOT NULL,
+      jobsite TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (user_id, client, city, jobsite)
+    )
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_user_psr_scopes_user_id ON user_psr_scopes (user_id)`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_user_psr_scopes_scope ON user_psr_scopes (client, city, jobsite)`
+  );
+
   await pool.query(`DROP TABLE IF EXISTS auth_sessions`);
   await pool.query(`
     CREATE TABLE auth_sessions (
@@ -764,6 +976,24 @@ async function ensureSchema() {
   await pool.query(`UPDATE planner_records SET status = '' WHERE status IS NULL`);
   await pool.query(`UPDATE planner_records SET saved_by = '' WHERE saved_by IS NULL`);
   await pool.query(`UPDATE planner_records SET data = '{}'::jsonb WHERE data IS NULL`);
+  await pool.query(
+    `INSERT INTO user_psr_scopes (user_id, client, city, jobsite)
+     SELECT DISTINCT u.id, pr.client, pr.city, pr.jobsite
+     FROM users u
+     JOIN planner_records pr ON true
+     LEFT JOIN user_psr_scopes ups ON ups.user_id = u.id
+     WHERE ups.user_id IS NULL
+       AND u.is_admin = false
+       AND (
+         COALESCE((u.roles ->> 'psrPlanner')::boolean, false)
+         OR COALESCE((u.roles ->> 'camera')::boolean, false)
+         OR COALESCE((u.roles ->> 'vac')::boolean, false)
+         OR COALESCE((u.roles ->> 'simpleVac')::boolean, false)
+         OR COALESCE((u.roles ->> 'pricingView')::boolean, false)
+         OR COALESCE((u.roles ->> 'footageView')::boolean, false)
+       )
+     ON CONFLICT (user_id, client, city, jobsite) DO NOTHING`
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pricing_rates (
@@ -1023,8 +1253,8 @@ app.get('/users', requireAuth, async (req, res) => {
        ORDER BY LOWER(COALESCE(display_name, username)), LOWER(username)`
     );
     const currentUser = req.user;
-    const users = result.rows.map((row) => {
-      const normalized = normalizeUser(row);
+    const normalizedRows = await attachScopesToUsers(result.rows.map((row) => normalizeUser(row)));
+    const users = normalizedRows.map((normalized) => {
       if (!currentUser?.isAdmin) {
         return {
           id: normalized.id,
@@ -1037,6 +1267,74 @@ app.get('/users', requireAuth, async (req, res) => {
     res.json({ success: true, users });
   } catch (error) {
     console.error('USERS ERROR:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/permissions/tree', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const [portalRows, psrRows] = await Promise.all([
+      pool.query(
+        `SELECT DISTINCT client_id, job_id
+         FROM (
+           SELECT client_id, job_id FROM user_portal_scopes
+           UNION ALL
+           SELECT portal_files_client_id AS client_id, portal_files_job_id AS job_id
+           FROM users
+           WHERE portal_files_client_id IS NOT NULL
+             AND BTRIM(portal_files_client_id) <> ''
+             AND portal_files_job_id IS NOT NULL
+             AND BTRIM(portal_files_job_id) <> ''
+           UNION ALL
+           SELECT client_id, job_id FROM portal_path_grants
+         ) s
+         WHERE client_id IS NOT NULL AND BTRIM(client_id) <> ''
+           AND job_id IS NOT NULL AND BTRIM(job_id) <> ''
+         ORDER BY client_id, job_id`
+      ),
+      pool.query(
+        `SELECT DISTINCT client, city, jobsite
+         FROM planner_records
+         WHERE BTRIM(client) <> '' AND BTRIM(city) <> '' AND BTRIM(jobsite) <> ''
+         ORDER BY client, city, jobsite`
+      )
+    ]);
+
+    const portalMap = new Map();
+    for (const row of portalRows.rows) {
+      const clientId = String(row.client_id || '').trim();
+      const jobId = String(row.job_id || '').trim();
+      if (!clientId || !jobId) continue;
+      if (!portalMap.has(clientId)) portalMap.set(clientId, []);
+      portalMap.get(clientId).push(jobId);
+    }
+    const portalTree = [...portalMap.entries()].map(([clientId, jobs]) => ({
+      clientId,
+      jobs: [...new Set(jobs)].sort()
+    }));
+
+    const psrMap = new Map();
+    for (const row of psrRows.rows) {
+      const client = upperCleanString(row.client);
+      const city = upperCleanString(row.city);
+      const jobsite = normalizeJobsiteName(row.jobsite, row.street);
+      if (!client || !city || !jobsite) continue;
+      if (!psrMap.has(client)) psrMap.set(client, new Map());
+      const cityMap = psrMap.get(client);
+      if (!cityMap.has(city)) cityMap.set(city, []);
+      cityMap.get(city).push(jobsite);
+    }
+    const psrTree = [...psrMap.entries()].map(([client, cityMap]) => ({
+      client,
+      cities: [...cityMap.entries()].map(([city, jobsites]) => ({
+        city,
+        jobsites: [...new Set(jobsites)].sort()
+      }))
+    }));
+
+    res.json({ success: true, portalTree, psrTree });
+  } catch (error) {
+    console.error('PERMISSIONS TREE ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -1099,7 +1397,7 @@ app.post('/login', async (req, res) => {
       await pool.query('UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2', [hash, row.id]);
     }
 
-    const user = normalizeUser(row);
+    const user = await attachScopesToUser(normalizeUser(row));
     const token = await issueSession(row.id);
     res.json({ success: true, user, token });
   } catch (error) {
@@ -1226,9 +1524,10 @@ app.post('/create-user', requireAuth, requireAdmin, async (req, res) => {
        RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup`,
       [username, displayName, hash, isAdmin, JSON.stringify(roles)]
     );
+    const user = await attachScopesToUser(normalizeUser(result.rows[0]));
     res.status(201).json({
       success: true,
-      user: normalizeUser(result.rows[0]),
+      user,
       message: 'User created with no access. Assign roles/portal scope to enable.'
     });
   } catch (error) {
@@ -1260,6 +1559,8 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
     req.body || {},
     'portalPermissionsAccess'
   );
+  const hasPortalScopesPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'portalScopes');
+  const hasPsrScopesPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'psrScopes');
 
   try {
     const currentResult = await pool.query(
@@ -1270,6 +1571,8 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
       return res.status(404).json({ success: false, error: 'User not found' });
     }
     const current = currentResult.rows[0];
+    const scopeMap = await readScopesForUserIds([id]);
+    const currentScopes = scopeMap.get(String(id)) || { portalScopes: [], psrScopes: [] };
 
     const nextDisplayName = displayName || current.display_name || current.username;
     const nextIsAdmin = isAdmin === null ? current.is_admin : isAdmin;
@@ -1286,10 +1589,27 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
       nextPortalFilesClientId = portalFilesClientId || null;
       nextPortalFilesJobId = portalFilesJobId || null;
     }
+    let nextPortalScopes = dedupePortalScopes(currentScopes.portalScopes);
+    if (hasPortalScopesPayload) {
+      nextPortalScopes = normalizePortalScopesPayload(req.body.portalScopes);
+      nextPortalFilesClientId = nextPortalScopes[0]?.clientId || null;
+      nextPortalFilesJobId = nextPortalScopes[0]?.jobId || null;
+    } else if (hasPortalScopeInPayload) {
+      nextPortalScopes =
+        portalFilesClientId && portalFilesJobId
+          ? [{ clientId: portalFilesClientId, jobId: portalFilesJobId }]
+          : [];
+    }
+    let nextPsrScopes = dedupePsrScopes(currentScopes.psrScopes);
+    if (hasPsrScopesPayload) {
+      nextPsrScopes = normalizePsrScopesPayload(req.body.psrScopes);
+    }
 
     let nextPortalFilesAccessGranted = current.portal_files_access_granted === true;
     if (hasAccessPayload) {
       nextPortalFilesAccessGranted = !!req.body.portalFilesAccessGranted;
+    } else if (hasPortalScopesPayload) {
+      nextPortalFilesAccessGranted = nextPortalScopes.length > 0;
     } else if (hasPortalScopeInPayload && portalFilesClientId && portalFilesJobId) {
       nextPortalFilesAccessGranted = true;
     }
@@ -1331,6 +1651,30 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
       ]
     );
 
+    if (hasPortalScopesPayload || hasPortalScopeInPayload) {
+      await pool.query('DELETE FROM user_portal_scopes WHERE user_id = $1::uuid', [id]);
+      for (const scope of nextPortalScopes) {
+        await pool.query(
+          `INSERT INTO user_portal_scopes (user_id, client_id, job_id)
+           VALUES ($1::uuid, $2, $3)
+           ON CONFLICT (user_id, client_id, job_id) DO NOTHING`,
+          [id, scope.clientId, scope.jobId]
+        );
+      }
+    }
+
+    if (hasPsrScopesPayload) {
+      await pool.query('DELETE FROM user_psr_scopes WHERE user_id = $1::uuid', [id]);
+      for (const scope of nextPsrScopes) {
+        await pool.query(
+          `INSERT INTO user_psr_scopes (user_id, client, city, jobsite)
+           VALUES ($1::uuid, $2, $3, $4)
+           ON CONFLICT (user_id, client, city, jobsite) DO NOTHING`,
+          [id, scope.client, scope.city, scope.jobsite]
+        );
+      }
+    }
+
     if (password) {
       const hash = await bcrypt.hash(password, 10);
       await pool.query(
@@ -1344,7 +1688,8 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
       [id]
     );
 
-    res.json({ success: true, user: normalizeUser(updatedResult.rows[0]) });
+    const user = await attachScopesToUser(normalizeUser(updatedResult.rows[0]));
+    res.json({ success: true, user });
   } catch (error) {
     console.error('UPDATE USER ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -1388,10 +1733,13 @@ app.delete('/users/:id', requireAuth, requireAdmin, async (req, res) => {
 
 app.get('/records', requireAuth, requirePlannerAccess, async (req, res) => {
   try {
+    const scopeFilter = buildPsrScopeWhere(req.user);
     const result = await pool.query(
       `SELECT id, record_date, client, city, street, jobsite, status, saved_by, data, created_at, updated_at
        FROM planner_records
-       ORDER BY LOWER(client), LOWER(city), LOWER(jobsite), record_date DESC, updated_at DESC`
+       WHERE ${scopeFilter.clause}
+       ORDER BY LOWER(client), LOWER(city), LOWER(jobsite), record_date DESC, updated_at DESC`,
+      scopeFilter.params
     );
     const records = result.rows.map(normalizeRecordRow);
     res.json({ success: true, records });
@@ -1416,6 +1764,7 @@ app.post('/records', requireAuth, requirePlannerAccess, async (req, res) => {
         sanitary: req.body?.createSanitary ? [] : []
       }
     };
+    if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
 
     const result = await pool.query(
       `INSERT INTO planner_records (record_date, client, city, street, jobsite, status, saved_by, data)
@@ -1479,6 +1828,7 @@ app.put('/records/:id', requireAuth, requirePlannerAccess, async (req, res) => {
   try {
     const record = await fetchRecordById(req.params.id);
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
+    if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
 
     record.record_date = cleanString(req.body?.record_date || req.body?.date || record.record_date);
     record.client = upperCleanString(req.body?.client || record.client);
@@ -1487,6 +1837,7 @@ app.put('/records/:id', requireAuth, requirePlannerAccess, async (req, res) => {
     record.jobsite = normalizeJobsiteName(req.body?.jobsite || record.jobsite, req.body?.street || record.street);
     record.status = cleanString(req.body?.status || record.status);
     record.saved_by = cleanString(req.body?.saved_by || req.body?.savedBy || req.user.displayName || req.user.username);
+    if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
 
     const saved = await persistRecord(record);
     res.json({ success: true, record: saved });
@@ -1556,6 +1907,7 @@ app.post('/records/:id/segments', requireAuth, requirePlannerAccess, async (req,
   try {
     const record = await fetchRecordById(req.params.id);
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
+    if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
     const system = cleanString(req.body?.system || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
     const segment = normalizeSegment({
       ...req.body,
@@ -1595,6 +1947,7 @@ app.post('/records/:id/segments/bulk', requireAuth, requirePlannerAccess, async 
   try {
     const record = await fetchRecordById(req.params.id);
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
+    if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
     const segments = Array.isArray(req.body?.segments) ? req.body.segments : [];
     for (const raw of segments) {
       const system = cleanString(raw.system || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
@@ -1627,6 +1980,7 @@ app.put('/records/:id/segments/:segmentId', requireAuth, requirePlannerAccess, a
   try {
     const record = await fetchRecordById(req.params.id);
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
+    if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
 
     let found = null;
     let systemKey = null;
@@ -1684,6 +2038,7 @@ app.put('/records/:id/segments/:segmentId', requireAuth, requirePlannerAccess, a
     }
 
     record.saved_by = req.user.displayName || req.user.username;
+    if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
     const saved = await persistRecord(record);
     res.json({ success: true, record: saved });
   } catch (error) {
@@ -1905,7 +2260,13 @@ app.delete('/daily-reports/:id', requireAuth, requireAdmin, async (req, res) => 
 
 app.get('/jobsite-assets', requireAuth, requireFootageAccess, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM jobsite_assets ORDER BY LOWER(client), LOWER(city), LOWER(jobsite), updated_at DESC');
+    const scopeFilter = buildPsrScopeWhere(req.user);
+    const result = await pool.query(
+      `SELECT * FROM jobsite_assets
+       WHERE ${scopeFilter.clause}
+       ORDER BY LOWER(client), LOWER(city), LOWER(jobsite), updated_at DESC`,
+      scopeFilter.params
+    );
     const assets = result.rows.map((row) => ({ ...row, files: Array.isArray(row.files) ? row.files : parseJsonObject(row.files, []) }));
     res.json({ success: true, assets });
   } catch (error) {
