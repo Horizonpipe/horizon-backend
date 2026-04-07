@@ -1565,7 +1565,7 @@ app.get('/data-auto-sync/access', requireAuth, requireDataAutoSyncEmployeeAccess
 });
 
 /** WinCan / desktop EXE pushes rows using the same session token as the web planner (not a static API key). */
-app.post('/auto-import-plugin/push', requireAuth, requireMike, async (req, res) => {
+app.post('/auto-import-plugin/push', requireAuth, requireDataAutoSyncEmployeeAccess, async (req, res) => {
   try {
     const body = req.body || {};
     const source = String(body.source || '').trim();
@@ -2606,7 +2606,7 @@ registerSignupRoutes(app, { pool, cleanString, normalizeRoles, issueSession, nor
 
 const autoImportPlugin = createAutoImportPlugin({
   pool,
-  requireMike,
+  requireMike: requireDataAutoSyncEmployeeAccess,
   requireAuth,
   writeSegment: async (jobsiteId, payload, savedBy) => {
     const record = await fetchRecordById(String(jobsiteId));
