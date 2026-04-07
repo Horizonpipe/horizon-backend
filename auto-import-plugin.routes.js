@@ -37,6 +37,16 @@ function createAutoImportPlugin(options = {}) {
   const upload = multer({ storage, limits: { fileSize: 60 * 1024 * 1024 } });
 
   const router = express.Router();
+  const desktopHeartbeatByUser = new Map();
+  const HEARTBEAT_TTL_MS = 95_000;
+
+  function heartbeatKey(req) {
+    const id = req?.user?.id;
+    const un = req?.user?.username;
+    if (id != null && String(id).trim()) return String(id).trim();
+    if (un != null && String(un).trim()) return String(un).trim().toLowerCase();
+    return 'anon';
+  }
 
   async function initSchema() {
     await pool.query(`
@@ -408,6 +418,43 @@ function createAutoImportPlugin(options = {}) {
       service: 'auto-import-plugin',
       connected: true,
       now: nowIso()
+    });
+  });
+
+  router.post('/desktop-heartbeat', requireMike, express.json(), async (req, res) => {
+    const key = heartbeatKey(req);
+    const nowMs = Date.now();
+    const state = clean(req.body?.state || 'connected').toLowerCase() || 'connected';
+    desktopHeartbeatByUser.set(key, {
+      atMs: nowMs,
+      state,
+      source: clean(req.body?.source || 'desktop') || 'desktop',
+      detail: clean(req.body?.detail || ''),
+      username: clean(req.user?.username || ''),
+      displayName: clean(req.user?.displayName || '')
+    });
+    res.json({
+      success: true,
+      connected: true,
+      state,
+      lastSeenAt: new Date(nowMs).toISOString()
+    });
+  });
+
+  router.get('/desktop-heartbeat', requireMike, async (req, res) => {
+    const key = heartbeatKey(req);
+    const rec = desktopHeartbeatByUser.get(key) || null;
+    const nowMs = Date.now();
+    const ageMs = rec ? Math.max(0, nowMs - Number(rec.atMs || 0)) : Number.POSITIVE_INFINITY;
+    const connected = !!(rec && ageMs <= HEARTBEAT_TTL_MS);
+    res.json({
+      success: true,
+      connected,
+      state: connected ? rec.state || 'connected' : 'offline',
+      lastSeenAt: rec ? new Date(rec.atMs).toISOString() : null,
+      ageMs: Number.isFinite(ageMs) ? ageMs : null,
+      source: rec?.source || null,
+      detail: rec?.detail || ''
     });
   });
 
