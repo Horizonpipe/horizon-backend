@@ -122,7 +122,12 @@ function resolvePortalScope(req, source, options = {}) {
     source && typeof source === 'object' ? String(source.jobId || source.job_id || '').trim() : '';
   const clientId = rawClient || (isDataAutoSync ? pickUserDefaultClientId(req?.user) : '');
   const requireJob = options.requireJob !== false;
-  const jobId = isDataAutoSync ? DATA_AUTO_SYNC_JOB_ID : rawJob;
+  const adminCanOverrideDataAutoSyncJob = isDataAutoSync && req?.user?.isAdmin === true;
+  const jobId = isDataAutoSync
+    ? adminCanOverrideDataAutoSyncJob && rawJob
+      ? rawJob
+      : DATA_AUTO_SYNC_JOB_ID
+    : rawJob;
   if (!clientId || (requireJob && !jobId)) {
     return { error: 'clientId and jobId are required' };
   }
@@ -1346,7 +1351,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
     try {
       const body = req.body || {};
       const scope = resolvePortalScope(req, body);
-      const { fileId, folderPath, toParentPath } = body;
+      const { fileId, folderPath, toParentPath, toClientId: toClientIdRaw, toJobId: toJobIdRaw } = body;
       if (scope.error || toParentPath === undefined) {
         return res.status(400).json({ error: 'clientId, jobId, and toParentPath are required' });
       }
@@ -1357,7 +1362,26 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (!userCanPortalCapability(req.user, 'edit')) {
         return res.status(403).json({ error: 'Portal edit is not enabled for this account' });
       }
+      const targetClientId = String(toClientIdRaw || clientId || '').trim();
+      const targetJobId = String(toJobIdRaw || jobId || '').trim();
+      if (!targetClientId || !targetJobId) {
+        return res.status(400).json({ error: 'Destination client/job is required' });
+      }
+      const crossScope = String(targetClientId) !== String(clientId) || String(targetJobId) !== String(jobId);
+      if (crossScope && req.user?.isAdmin !== true) {
+        return res.status(403).json({ error: 'Only admins can move across folder roots/jobs' });
+      }
+      const mode = readPortalMode(req, body);
+      const allowClientWideDataAutoSync = mode === DATA_AUTO_SYNC_MODE;
+      if (
+        !(await assertPortalJobAccess(pool, req.user, String(targetClientId), String(targetJobId), {
+          allowClientWideDataAutoSync
+        }))
+      ) {
+        return res.status(403).json({ error: 'Forbidden destination scope' });
+      }
       const pref = jobPrefix(String(clientId), String(jobId));
+      const targetPref = jobPrefix(String(targetClientId), String(targetJobId));
       const destParent = normalizeRelPath(toParentPath);
 
       if (fileId) {
@@ -1371,10 +1395,10 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, oldRel, 'full'))) {
           return res.status(403).json({ error: 'Forbidden' });
         }
-        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, newRel, 'full'))) {
+        if (!(await assertPortalPathRel(pool, req.user, targetClientId, targetJobId, newRel, 'full'))) {
           return res.status(403).json({ error: 'Forbidden' });
         }
-        const newKey = `${pref}${newRel}`;
+        const newKey = `${targetPref}${newRel}`;
         if (oldKey === newKey) {
           return res.json({ id: keyToId(newKey), key: newKey, path: newRel });
         }
@@ -1394,8 +1418,19 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
           })
         );
         await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: oldKey }));
-        await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldRel, newRel);
-        return res.json({ id: keyToId(newKey), key: newKey, path: newRel, name });
+        if (crossScope) {
+          await removePortalPathGrantPrefixes(pool, clientId, jobId, oldRel);
+        } else {
+          await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldRel, newRel);
+        }
+        return res.json({
+          id: keyToId(newKey),
+          key: newKey,
+          path: newRel,
+          name,
+          clientId: targetClientId,
+          jobId: targetJobId
+        });
       }
 
       if (folderPath !== undefined && String(folderPath).trim() !== '') {
@@ -1411,7 +1446,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, oldFolderRel, 'full'))) {
           return res.status(403).json({ error: 'Forbidden' });
         }
-        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, newRel, 'full'))) {
+        if (!(await assertPortalPathRel(pool, req.user, targetClientId, targetJobId, newRel, 'full'))) {
           return res.status(403).json({ error: 'Forbidden' });
         }
         const oldPrefix = `${pref}${oldFolderRel}/`;
@@ -1419,14 +1454,14 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         if (keys.length === 0) {
           return res.status(404).json({ error: 'Folder not found' });
         }
-        const destProbe = await listAllKeys(s3, bucket, `${pref}${newRel}`);
+        const destProbe = await listAllKeys(s3, bucket, `${targetPref}${newRel}`);
         const destTaken = destProbe.some(
-          (o) => o.Key === `${pref}${newRel}` || o.Key.startsWith(`${pref}${newRel}/`)
+          (o) => o.Key === `${targetPref}${newRel}` || o.Key.startsWith(`${targetPref}${newRel}/`)
         );
         if (destTaken) {
           return res.status(409).json({ error: 'Destination path is occupied' });
         }
-        const newPrefix = `${pref}${newRel}/`;
+        const newPrefix = `${targetPref}${newRel}/`;
         const mapping = keys.map((o) => ({
           from: o.Key,
           to: `${newPrefix}${o.Key.slice(oldPrefix.length)}`
@@ -1444,8 +1479,18 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         for (const { from } of mapping) {
           await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: from }));
         }
-        await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldFolderRel, newRel);
-        return res.json({ path: newRel, parentPath: parentRelPath(newRel), name: seg });
+        if (crossScope) {
+          await removePortalPathGrantPrefixes(pool, clientId, jobId, oldFolderRel);
+        } else {
+          await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldFolderRel, newRel);
+        }
+        return res.json({
+          path: newRel,
+          parentPath: parentRelPath(newRel),
+          name: seg,
+          clientId: targetClientId,
+          jobId: targetJobId
+        });
       }
 
       return res.status(400).json({ error: 'Provide fileId or folderPath' });
