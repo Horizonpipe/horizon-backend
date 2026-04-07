@@ -885,12 +885,26 @@ async function ensureSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_portal_scopes (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL,
       client_id TEXT NOT NULL,
       job_id TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE (user_id, client_id, job_id)
     )
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = 'user_portal_scopes'
+          AND column_name = 'user_id'
+          AND data_type <> 'text'
+      ) THEN
+        EXECUTE 'ALTER TABLE user_portal_scopes ALTER COLUMN user_id TYPE TEXT USING user_id::text';
+      END IF;
+    END $$;
   `);
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_user_portal_scopes_user_id ON user_portal_scopes (user_id)`
@@ -900,7 +914,7 @@ async function ensureSchema() {
   );
   await pool.query(
     `INSERT INTO user_portal_scopes (user_id, client_id, job_id)
-     SELECT id, portal_files_client_id, portal_files_job_id
+     SELECT CAST(id AS text), portal_files_client_id, portal_files_job_id
      FROM users
      WHERE portal_files_access_granted = true
        AND portal_files_client_id IS NOT NULL
@@ -913,13 +927,27 @@ async function ensureSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_psr_scopes (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL,
       client TEXT NOT NULL,
       city TEXT NOT NULL,
       jobsite TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE (user_id, client, city, jobsite)
     )
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = 'user_psr_scopes'
+          AND column_name = 'user_id'
+          AND data_type <> 'text'
+      ) THEN
+        EXECUTE 'ALTER TABLE user_psr_scopes ALTER COLUMN user_id TYPE TEXT USING user_id::text';
+      END IF;
+    END $$;
   `);
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_user_psr_scopes_user_id ON user_psr_scopes (user_id)`
@@ -978,19 +1006,19 @@ async function ensureSchema() {
   await pool.query(`UPDATE planner_records SET data = '{}'::jsonb WHERE data IS NULL`);
   await pool.query(
     `INSERT INTO user_psr_scopes (user_id, client, city, jobsite)
-     SELECT DISTINCT u.id, pr.client, pr.city, pr.jobsite
+     SELECT DISTINCT CAST(u.id AS text), pr.client, pr.city, pr.jobsite
      FROM users u
      JOIN planner_records pr ON true
-     LEFT JOIN user_psr_scopes ups ON ups.user_id = u.id
+     LEFT JOIN user_psr_scopes ups ON ups.user_id = CAST(u.id AS text)
      WHERE ups.user_id IS NULL
        AND u.is_admin = false
        AND (
-         COALESCE((u.roles ->> 'psrPlanner')::boolean, false)
-         OR COALESCE((u.roles ->> 'camera')::boolean, false)
-         OR COALESCE((u.roles ->> 'vac')::boolean, false)
-         OR COALESCE((u.roles ->> 'simpleVac')::boolean, false)
-         OR COALESCE((u.roles ->> 'pricingView')::boolean, false)
-         OR COALESCE((u.roles ->> 'footageView')::boolean, false)
+         LOWER(COALESCE(u.roles ->> 'psrPlanner', 'false')) = 'true'
+         OR LOWER(COALESCE(u.roles ->> 'camera', 'false')) = 'true'
+         OR LOWER(COALESCE(u.roles ->> 'vac', 'false')) = 'true'
+         OR LOWER(COALESCE(u.roles ->> 'simpleVac', 'false')) = 'true'
+         OR LOWER(COALESCE(u.roles ->> 'pricingView', 'false')) = 'true'
+         OR LOWER(COALESCE(u.roles ->> 'footageView', 'false')) = 'true'
        )
      ON CONFLICT (user_id, client, city, jobsite) DO NOTHING`
   );
@@ -1652,25 +1680,25 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
     );
 
     if (hasPortalScopesPayload || hasPortalScopeInPayload) {
-      await pool.query('DELETE FROM user_portal_scopes WHERE user_id = $1::uuid', [id]);
+      await pool.query('DELETE FROM user_portal_scopes WHERE user_id = $1', [String(id)]);
       for (const scope of nextPortalScopes) {
         await pool.query(
           `INSERT INTO user_portal_scopes (user_id, client_id, job_id)
-           VALUES ($1::uuid, $2, $3)
+           VALUES ($1, $2, $3)
            ON CONFLICT (user_id, client_id, job_id) DO NOTHING`,
-          [id, scope.clientId, scope.jobId]
+          [String(id), scope.clientId, scope.jobId]
         );
       }
     }
 
     if (hasPsrScopesPayload) {
-      await pool.query('DELETE FROM user_psr_scopes WHERE user_id = $1::uuid', [id]);
+      await pool.query('DELETE FROM user_psr_scopes WHERE user_id = $1', [String(id)]);
       for (const scope of nextPsrScopes) {
         await pool.query(
           `INSERT INTO user_psr_scopes (user_id, client, city, jobsite)
-           VALUES ($1::uuid, $2, $3, $4)
+           VALUES ($1, $2, $3, $4)
            ON CONFLICT (user_id, client, city, jobsite) DO NOTHING`,
-          [id, scope.client, scope.city, scope.jobsite]
+          [String(id), scope.client, scope.city, scope.jobsite]
         );
       }
     }
