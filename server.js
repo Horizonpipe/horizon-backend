@@ -150,8 +150,14 @@ function emptyRoles() {
     simpleVac: false,
     email: false,
     psrPlanner: false,
+    psrViewer: false,
+    psrDataEntry: false,
     pricingView: false,
-    footageView: false
+    footageView: false,
+    portalUpload: false,
+    portalDownload: false,
+    portalEdit: false,
+    portalDelete: false
   };
 }
 
@@ -164,8 +170,14 @@ function normalizeRoles(value) {
       simpleVac: value.simpleVac === true || value.simple_vac === true,
       email: value.email === true,
       psrPlanner: value.psrPlanner === true || value.viewPsr === true,
+      psrViewer: value.psrViewer === true || value.psr_viewer === true,
+      psrDataEntry: value.psrDataEntry === true || value.psr_data_entry === true,
       pricingView: value.pricingView === true || value.pricing === true,
-      footageView: value.footageView === true || value.footage === true
+      footageView: value.footageView === true || value.footage === true,
+      portalUpload: value.portalUpload === true || value.portal_upload === true,
+      portalDownload: value.portalDownload === true || value.portal_download === true,
+      portalEdit: value.portalEdit === true || value.portal_edit === true,
+      portalDelete: value.portalDelete === true || value.portal_delete === true
     };
   }
   if (typeof value === 'string') {
@@ -644,8 +656,16 @@ function requireAnyRole(roleKeys, message = 'Access denied for this feature') {
 }
 
 const requirePlannerAccess = requireAnyRole(
-  ['psrPlanner', 'camera', 'vac', 'simpleVac', 'pricingView', 'footageView'],
+  ['psrPlanner', 'psrViewer', 'psrDataEntry', 'camera', 'vac', 'simpleVac', 'pricingView', 'footageView'],
   'Planner access is not enabled for this account'
+);
+const requirePsrViewerAccess = requireAnyRole(
+  ['psrViewer', 'psrDataEntry', 'psrPlanner', 'camera', 'vac', 'simpleVac', 'pricingView', 'footageView'],
+  'PSR viewer access is not enabled for this account'
+);
+const requirePsrDataEntryAccess = requireAnyRole(
+  ['psrDataEntry', 'psrPlanner', 'camera', 'vac', 'simpleVac'],
+  'PSR data entry access is not enabled for this account'
 );
 const requirePricingAccess = requireAnyRole(
   ['pricingView'],
@@ -831,7 +851,7 @@ async function ensureSchema() {
       is_admin BOOLEAN NOT NULL DEFAULT false,
       portal_files_client_id TEXT,
       portal_files_job_id TEXT,
-      roles JSONB NOT NULL DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "pricingView": false, "footageView": false}'::jsonb,
+      roles JSONB NOT NULL DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb,
       must_change_password BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -840,7 +860,7 @@ async function ensureSchema() {
 
   const userAlters = [
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "pricingView": false, "footageView": false}'::jsonb`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_client_id TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_job_id TEXT`,
@@ -880,17 +900,17 @@ async function ensureSchema() {
   `);
   await pool.query(`UPDATE users SET display_name = username WHERE display_name IS NULL OR btrim(display_name) = ''`);
   await pool.query(
-    `ALTER TABLE users ALTER COLUMN roles SET DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "pricingView": false, "footageView": false}'::jsonb`
+    `ALTER TABLE users ALTER COLUMN roles SET DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb`
   );
   await pool.query(`ALTER TABLE users ALTER COLUMN portal_files_access_granted SET DEFAULT false`);
   await pool.query(
     `UPDATE users
-     SET roles = '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "pricingView": false, "footageView": false}'::jsonb
+     SET roles = '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb
      WHERE roles IS NULL`
   );
   await pool.query(
     `UPDATE users
-     SET roles = '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "pricingView": false, "footageView": false}'::jsonb
+     SET roles = '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb
                  || COALESCE(roles, '{}'::jsonb)`
   );
   await pool.query(
@@ -1851,7 +1871,7 @@ app.delete('/users/:id', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-app.get('/records', requireAuth, requirePlannerAccess, async (req, res) => {
+app.get('/records', requireAuth, requirePsrViewerAccess, async (req, res) => {
   try {
     const scopeFilter = buildPsrScopeWhere(req.user);
     const result = await pool.query(
@@ -1869,7 +1889,7 @@ app.get('/records', requireAuth, requirePlannerAccess, async (req, res) => {
   }
 });
 
-app.post('/records', requireAuth, requirePlannerAccess, async (req, res) => {
+app.post('/records', requireAuth, requirePsrDataEntryAccess, async (req, res) => {
   try {
     const record = {
       record_date: cleanString(req.body?.record_date || req.body?.date || new Date().toISOString().slice(0, 10)),
@@ -1944,7 +1964,7 @@ async function persistRecord(record) {
   return normalizeRecordRow(result.rows[0]);
 }
 
-app.put('/records/:id', requireAuth, requirePlannerAccess, async (req, res) => {
+app.put('/records/:id', requireAuth, requirePsrDataEntryAccess, async (req, res) => {
   try {
     const record = await fetchRecordById(req.params.id);
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
@@ -2023,7 +2043,7 @@ app.delete('/clients/:client', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/records/:id/segments', requireAuth, requirePlannerAccess, async (req, res) => {
+app.post('/records/:id/segments', requireAuth, requirePsrDataEntryAccess, async (req, res) => {
   try {
     const record = await fetchRecordById(req.params.id);
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
@@ -2063,7 +2083,7 @@ app.post('/records/:id/segments', requireAuth, requirePlannerAccess, async (req,
   }
 });
 
-app.post('/records/:id/segments/bulk', requireAuth, requirePlannerAccess, async (req, res) => {
+app.post('/records/:id/segments/bulk', requireAuth, requirePsrDataEntryAccess, async (req, res) => {
   try {
     const record = await fetchRecordById(req.params.id);
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
@@ -2096,7 +2116,7 @@ app.post('/records/:id/segments/bulk', requireAuth, requirePlannerAccess, async 
   }
 });
 
-app.put('/records/:id/segments/:segmentId', requireAuth, requirePlannerAccess, async (req, res) => {
+app.put('/records/:id/segments/:segmentId', requireAuth, requirePsrDataEntryAccess, async (req, res) => {
   try {
     const record = await fetchRecordById(req.params.id);
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });

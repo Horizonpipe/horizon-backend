@@ -58,6 +58,22 @@ function userCanManagePortalExtras(user) {
   return portalPermissionsWhitelist().includes(u);
 }
 
+/**
+ * Fine-grained non-admin portal capabilities.
+ * @param {import('express').Request['user']} user
+ * @param {'upload'|'download'|'edit'|'delete'} capability
+ */
+function userCanPortalCapability(user, capability) {
+  if (!user) return false;
+  if (user.isAdmin) return true;
+  const roles = user.roles && typeof user.roles === 'object' ? user.roles : {};
+  if (capability === 'upload') return roles.portalUpload === true;
+  if (capability === 'download') return roles.portalDownload === true;
+  if (capability === 'edit') return roles.portalEdit === true;
+  if (capability === 'delete') return roles.portalDelete === true;
+  return false;
+}
+
 const portalUpload = multer({
   dest: os.tmpdir(),
   limits: { fileSize: 25 * 1024 * 1024 * 1024 }
@@ -1124,6 +1140,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
+      if (!userCanPortalCapability(req.user, 'edit')) {
+        return res.status(403).json({ error: 'Portal edit is not enabled for this account' });
+      }
       const pref = jobPrefix(String(clientId), String(jobId));
 
       if (body.fileId) {
@@ -1238,6 +1257,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
+      if (!userCanPortalCapability(req.user, 'edit')) {
+        return res.status(403).json({ error: 'Portal edit is not enabled for this account' });
+      }
       const pref = jobPrefix(String(clientId), String(jobId));
       const destParent = normalizeRelPath(toParentPath);
 
@@ -1345,6 +1367,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
+      if (!userCanPortalCapability(req.user, 'delete')) {
+        return res.status(403).json({ error: 'Portal delete is not enabled for this account' });
+      }
       const folderRel = normalizeRelPath(pathParam);
       if (!folderRel) {
         return res.status(400).json({ error: 'path must name a folder under the job (not the job root)' });
@@ -1387,6 +1412,10 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
         fs.unlink(f.path, () => {});
         return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (!userCanPortalCapability(req.user, 'upload')) {
+        fs.unlink(f.path, () => {});
+        return res.status(403).json({ error: 'Portal upload is not enabled for this account' });
       }
       const original = req.body.filename || f.originalname || 'upload';
       const fp = normalizeRelPath(folderPath || '');
@@ -1431,6 +1460,16 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
     if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
       for (const f of files) fs.unlink(f.path, () => {});
       return res.status(403).json({ error: 'Forbidden' });
+    }
+    if (!userCanPortalCapability(req.user, 'upload')) {
+      for (const f of files) {
+        try {
+          fs.unlink(f.path, () => {});
+        } catch {
+          /* ignore */
+        }
+      }
+      return res.status(403).json({ error: 'Portal upload is not enabled for this account' });
     }
 
     /** @type {string[]} */
@@ -1589,6 +1628,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
+      if (!userCanPortalCapability(req.user, 'upload')) {
+        return res.status(403).json({ error: 'Portal upload is not enabled for this account' });
+      }
       const original = String(fileName || '').trim();
       if (!original) return res.status(400).json({ error: 'fileName is required' });
       const expectedFileSha256 = normalizeSha256Hex(sha256);
@@ -1711,6 +1753,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       if (!(await assertPortalJobAccess(pool, req.user, sessionRow.client_id, sessionRow.job_id))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
+      if (!userCanPortalCapability(req.user, 'upload')) {
+        return res.status(403).json({ error: 'Portal upload is not enabled for this account' });
+      }
       const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id));
       const relForAcl = String(sessionRow.object_key || '').slice(pref.length);
       if (!(await assertPortalPathRel(pool, req.user, sessionRow.client_id, sessionRow.job_id, relForAcl, 'full'))) {
@@ -1781,6 +1826,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       }
       if (!(await assertPortalJobAccess(pool, req.user, sessionRow.client_id, sessionRow.job_id))) {
         return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (!userCanPortalCapability(req.user, 'upload')) {
+        return res.status(403).json({ error: 'Portal upload is not enabled for this account' });
       }
       const sessionSha256 = normalizeSha256Hex(sessionRow.sha256 || '');
       if (sessionSha256 && bodySha256 && sessionSha256 !== bodySha256) {
@@ -1870,6 +1918,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       );
       const sessionRow = sRes.rows[0];
       if (!sessionRow) return res.status(404).json({ error: 'Upload session not found' });
+      if (!userCanPortalCapability(req.user, 'upload')) {
+        return res.status(403).json({ error: 'Portal upload is not enabled for this account' });
+      }
       if (isUploadSessionOpen(sessionRow)) {
         try {
           await s3.send(
@@ -1995,6 +2046,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
 
   async function handlePortalFileDownload(req, res) {
     try {
+      if (!userCanPortalCapability(req.user, 'download')) {
+        return res.status(403).json({ error: 'Portal download is not enabled for this account' });
+      }
       const fileId = req.params.id;
       const Key = idToKey(fileId);
       if (!Key.startsWith('clients/')) {
@@ -2154,6 +2208,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
 
   r.get('/folders/download', async (req, res) => {
     try {
+      if (!userCanPortalCapability(req.user, 'download')) {
+        return res.status(403).json({ error: 'Portal download is not enabled for this account' });
+      }
       const { clientId, jobId, path: pathParam } = req.query || {};
       if (!clientId || !jobId || pathParam == null || String(pathParam).trim() === '') {
         return res.status(400).json({ error: 'clientId, jobId, and folder path are required' });
@@ -2228,6 +2285,9 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
 
   r.delete('/:id', async (req, res) => {
     try {
+      if (!userCanPortalCapability(req.user, 'delete')) {
+        return res.status(403).json({ error: 'Portal delete is not enabled for this account' });
+      }
       const Key = idToKey(req.params.id);
       if (!Key.startsWith('clients/')) {
         return res.status(400).json({ error: 'Invalid id' });
