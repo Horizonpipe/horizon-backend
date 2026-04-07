@@ -52,6 +52,7 @@ const corsOptions = {
     'Content-Type',
     'Authorization',
     'X-Session-Token',
+    'X-HP-Portal-Mode',
     'Range',
     'Accept',
     'If-None-Match',
