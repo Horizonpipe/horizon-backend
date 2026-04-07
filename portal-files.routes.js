@@ -2063,20 +2063,25 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       }
       const prefDl = jobPrefix(parsed.clientId, parsed.jobId);
       const relPathDl = Key.slice(prefDl.length);
-      const now = Date.now();
-      const authK = portalDlAuthCacheKey(req.user, fileId);
-      const authHit = portalDlAuthCache.get(authK);
       let pathOk = false;
-      if (authHit && authHit.exp > now) {
-        pathOk = authHit.allowed;
+      if (req.user?.isAdmin) {
+        const now = Date.now();
+        const authK = portalDlAuthCacheKey(req.user, fileId);
+        const authHit = portalDlAuthCache.get(authK);
+        if (authHit && authHit.exp > now) {
+          pathOk = authHit.allowed;
+        } else {
+          // Single check: includes job access (avoid duplicate assertPortalJobAccess vs older handler).
+          pathOk = await assertPortalPathRel(pool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
+          portalDlAuthCache.set(authK, {
+            allowed: pathOk,
+            exp: now + (pathOk ? PORTAL_DL_AUTH_TTL_MS : PORTAL_DL_AUTH_DENY_TTL_MS)
+          });
+          trimPortalDlMap(portalDlAuthCache);
+        }
       } else {
-        // Single check: includes job access (avoid duplicate assertPortalJobAccess vs older handler).
+        // Non-admin users re-check path grants every request so permission revokes apply immediately.
         pathOk = await assertPortalPathRel(pool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
-        portalDlAuthCache.set(authK, {
-          allowed: pathOk,
-          exp: now + (pathOk ? PORTAL_DL_AUTH_TTL_MS : PORTAL_DL_AUTH_DENY_TTL_MS)
-        });
-        trimPortalDlMap(portalDlAuthCache);
       }
       if (!pathOk) {
         return res.status(403).json({ error: 'Forbidden' });

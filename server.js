@@ -1828,6 +1828,12 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
       [id]
     );
 
+    // Force immediate permission revocation by rotating target user's sessions.
+    // Keep the currently logged-in admin session when editing their own account.
+    if (String(req.user?.id || '') !== String(id)) {
+      await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [String(id)]);
+    }
+
     const user = await attachScopesToUser(normalizeUser(updatedResult.rows[0]));
     res.json({ success: true, user });
   } catch (error) {
