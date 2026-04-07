@@ -299,6 +299,7 @@ function normalizeUser(row) {
     portalFilesJobId,
     portalScopes: [],
     psrScopes: [],
+    portalPermissionsAccessRaw: !!row.portal_permissions_access,
     portalPermissionsAccess:
       !!row.portal_permissions_access || portalPermissionsWhitelistHas(row.username)
   };
