@@ -38,12 +38,20 @@ const CATEGORIES = new Set(['videos', 'db3', 'pdf', 'photos']);
 const FOLDER_MARKER = '.hp-folder';
 const DATA_AUTO_SYNC_MODE = 'dataautosync';
 const DATA_AUTO_SYNC_JOB_ID = '1';
+const PORTAL_FOLDER_COPY_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_COPY_CONCURRENCY', 8, 1, 32);
+const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCURRENCY', 8, 1, 32);
 
 function portalPermissionsWhitelist() {
   return (process.env.PORTAL_PERMISSIONS_WHITELIST_USERS || '')
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
+}
+
+function clampIntEnv(name, fallback, min, max) {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(raw)));
 }
 
 /**
@@ -212,6 +220,37 @@ async function runPool(array, concurrency, fn) {
     }
   });
   await Promise.all(workers);
+}
+
+/**
+ * @template T
+ * @param {T[]} array
+ * @param {number} concurrency
+ * @param {(item: T, index: number) => Promise<void>} fn
+ * @returns {Promise<Array<{ index: number, error: unknown }>>}
+ */
+async function runPoolCollectErrors(array, concurrency, fn) {
+  const errors = [];
+  await runPool(array, concurrency, async (item, index) => {
+    try {
+      await fn(item, index);
+    } catch (error) {
+      errors.push({ index, error });
+    }
+  });
+  return errors;
+}
+
+function summarizePoolErrors(phase, errors, mapping) {
+  if (!errors || errors.length === 0) return null;
+  const first = errors[0];
+  const firstMsg =
+    first && first.error instanceof Error
+      ? first.error.message
+      : String(first && first.error ? first.error : 'Unknown error');
+  const firstFrom = mapping?.[first.index]?.from || '';
+  const firstTo = mapping?.[first.index]?.to || '';
+  return `${phase} failed (${errors.length} items). firstIndex=${first.index} firstFrom=${firstFrom} firstTo=${firstTo} firstError=${firstMsg}`;
 }
 
 let portalResumeSchemaReady = null;
@@ -969,6 +1008,35 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
   const r = express.Router();
   r.use(requireAuth);
 
+  r.get('/storage-health', async (req, res) => {
+    try {
+      if (req.user?.isAdmin !== true) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const endpoint = String(process.env.WASABI_ENDPOINT || '').trim() || null;
+      const region = String(process.env.WASABI_REGION || '').trim() || 'us-east-1';
+      const startedAt = Date.now();
+      const probe = await s3.send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          MaxKeys: 1
+        })
+      );
+      return res.json({
+        provider: 'wasabi-s3-compatible',
+        bucket,
+        endpoint,
+        region,
+        objectCountSample: Number(probe.KeyCount || 0),
+        listProbeMs: Date.now() - startedAt,
+        message: 'Wasabi bucket probe succeeded'
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg, provider: 'wasabi-s3-compatible', bucket });
+    }
+  });
+
   r.get('/', async (req, res) => {
     try {
       const scope = resolvePortalScope(req, req.query);
@@ -1286,6 +1354,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       }
 
       if (body.path !== undefined) {
+        const transferStartedAt = Date.now();
         const oldFolderRel = normalizeRelPath(body.path);
         if (!oldFolderRel) {
           return res.status(400).json({ error: 'Cannot rename the job root folder' });
@@ -1304,6 +1373,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
         }
 
         const oldPrefix = `${pref}${oldFolderRel}/`;
+        const listStartedAt = Date.now();
         const keys = await listAllKeys(s3, bucket, oldPrefix);
         if (keys.length === 0) {
           return res.status(404).json({ error: 'Folder not found' });
@@ -1322,8 +1392,8 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
           from: o.Key,
           to: `${newPrefix}${o.Key.slice(oldPrefix.length)}`
         }));
-
-        for (const { from, to } of mapping) {
+        const copyStartedAt = Date.now();
+        const copyErrors = await runPoolCollectErrors(mapping, PORTAL_FOLDER_COPY_CONCURRENCY, async ({ from, to }) => {
           await s3.send(
             new CopyObjectCommand({
               Bucket: bucket,
@@ -1332,11 +1402,55 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
               MetadataDirective: 'COPY'
             })
           );
+        });
+        if (copyErrors.length > 0) {
+          const summary = summarizePoolErrors('copy', copyErrors, mapping);
+          console.warn('[portal-files] folder rename copy error', {
+            clientId: String(clientId),
+            jobId: String(jobId),
+            oldFolderRel,
+            newRel,
+            itemCount: mapping.length,
+            summary
+          });
+          return res.status(502).json({ error: summary || 'Folder copy failed' });
         }
-        for (const { from } of mapping) {
-          await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: from }));
+        const deleteStartedAt = Date.now();
+        const deleteErrors = await runPoolCollectErrors(
+          mapping,
+          PORTAL_FOLDER_DELETE_CONCURRENCY,
+          async ({ from }) => {
+            await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: from }));
+          }
+        );
+        if (deleteErrors.length > 0) {
+          const summary = summarizePoolErrors('delete', deleteErrors, mapping);
+          console.warn('[portal-files] folder rename delete error', {
+            clientId: String(clientId),
+            jobId: String(jobId),
+            oldFolderRel,
+            newRel,
+            itemCount: mapping.length,
+            summary
+          });
+          return res.status(502).json({ error: summary || 'Folder delete failed after copy' });
         }
+        const grantsStartedAt = Date.now();
         await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldFolderRel, newRel);
+        console.info('[portal-files] folder-rename stats', {
+          clientId: String(clientId),
+          jobId: String(jobId),
+          oldFolderRel,
+          newRel,
+          itemCount: mapping.length,
+          listMs: copyStartedAt - listStartedAt,
+          copyMs: deleteStartedAt - copyStartedAt,
+          deleteMs: grantsStartedAt - deleteStartedAt,
+          grantsMs: Date.now() - grantsStartedAt,
+          totalMs: Date.now() - transferStartedAt,
+          copyConcurrency: PORTAL_FOLDER_COPY_CONCURRENCY,
+          deleteConcurrency: PORTAL_FOLDER_DELETE_CONCURRENCY
+        });
         return res.json({ path: newRel, parentPath: parentRelPath(newRel), name: seg });
       }
 
@@ -1434,6 +1548,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
       }
 
       if (folderPath !== undefined && String(folderPath).trim() !== '') {
+        const transferStartedAt = Date.now();
         const oldFolderRel = normalizeRelPath(folderPath);
         if (!oldFolderRel) {
           return res.status(400).json({ error: 'Invalid folder path' });
@@ -1450,6 +1565,7 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
           return res.status(403).json({ error: 'Forbidden' });
         }
         const oldPrefix = `${pref}${oldFolderRel}/`;
+        const listStartedAt = Date.now();
         const keys = await listAllKeys(s3, bucket, oldPrefix);
         if (keys.length === 0) {
           return res.status(404).json({ error: 'Folder not found' });
@@ -1466,7 +1582,8 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
           from: o.Key,
           to: `${newPrefix}${o.Key.slice(oldPrefix.length)}`
         }));
-        for (const { from, to } of mapping) {
+        const copyStartedAt = Date.now();
+        const copyErrors = await runPoolCollectErrors(mapping, PORTAL_FOLDER_COPY_CONCURRENCY, async ({ from, to }) => {
           await s3.send(
             new CopyObjectCommand({
               Bucket: bucket,
@@ -1475,15 +1592,66 @@ function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
               MetadataDirective: 'COPY'
             })
           );
+        });
+        if (copyErrors.length > 0) {
+          const summary = summarizePoolErrors('copy', copyErrors, mapping);
+          console.warn('[portal-files] folder move copy error', {
+            clientId: String(clientId),
+            jobId: String(jobId),
+            targetClientId: String(targetClientId),
+            targetJobId: String(targetJobId),
+            oldFolderRel,
+            newRel,
+            itemCount: mapping.length,
+            summary
+          });
+          return res.status(502).json({ error: summary || 'Folder copy failed' });
         }
-        for (const { from } of mapping) {
-          await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: from }));
+        const deleteStartedAt = Date.now();
+        const deleteErrors = await runPoolCollectErrors(
+          mapping,
+          PORTAL_FOLDER_DELETE_CONCURRENCY,
+          async ({ from }) => {
+            await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: from }));
+          }
+        );
+        if (deleteErrors.length > 0) {
+          const summary = summarizePoolErrors('delete', deleteErrors, mapping);
+          console.warn('[portal-files] folder move delete error', {
+            clientId: String(clientId),
+            jobId: String(jobId),
+            targetClientId: String(targetClientId),
+            targetJobId: String(targetJobId),
+            oldFolderRel,
+            newRel,
+            itemCount: mapping.length,
+            summary
+          });
+          return res.status(502).json({ error: summary || 'Folder delete failed after copy' });
         }
+        const grantsStartedAt = Date.now();
         if (crossScope) {
           await removePortalPathGrantPrefixes(pool, clientId, jobId, oldFolderRel);
         } else {
           await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldFolderRel, newRel);
         }
+        console.info('[portal-files] folder-move stats', {
+          clientId: String(clientId),
+          jobId: String(jobId),
+          targetClientId: String(targetClientId),
+          targetJobId: String(targetJobId),
+          oldFolderRel,
+          newRel,
+          crossScope,
+          itemCount: mapping.length,
+          listMs: copyStartedAt - listStartedAt,
+          copyMs: deleteStartedAt - copyStartedAt,
+          deleteMs: grantsStartedAt - deleteStartedAt,
+          grantsMs: Date.now() - grantsStartedAt,
+          totalMs: Date.now() - transferStartedAt,
+          copyConcurrency: PORTAL_FOLDER_COPY_CONCURRENCY,
+          deleteConcurrency: PORTAL_FOLDER_DELETE_CONCURRENCY
+        });
         return res.json({
           path: newRel,
           parentPath: parentRelPath(newRel),
