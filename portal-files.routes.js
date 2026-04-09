@@ -37,7 +37,7 @@ const { NodeHttpHandler } = require('@smithy/node-http-handler');
 const CATEGORIES = new Set(['videos', 'db3', 'pdf', 'photos']);
 const FOLDER_MARKER = '.hp-folder';
 const DATA_AUTO_SYNC_MODE = 'dataautosync';
-const DATA_AUTO_SYNC_JOB_ID = '3';
+const DATA_AUTO_SYNC_JOB_ID = '1';
 const PORTAL_FOLDER_COPY_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_COPY_CONCURRENCY', 8, 1, 32);
 const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCURRENCY', 8, 1, 32);
 

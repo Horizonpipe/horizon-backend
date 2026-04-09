@@ -2211,7 +2211,10 @@ async function readSessionFromPostgres(token) {
 
 async function readSession(token) {
   if (!token) return null;
+  let wasabiPrimaryIssue = '';
+  let triedWasabiPrimary = false;
   if (WASABI_AUTH_PRIMARY_ENABLED) {
+    triedWasabiPrimary = true;
     try {
       const snapshot = await loadWasabiLatestStateSnapshot();
       if (snapshotLooksFresh(snapshot)) {
@@ -2224,16 +2227,30 @@ async function readSession(token) {
           }
           return sessionHit.user;
         }
+        wasabiPrimaryIssue = 'snapshot_miss';
+      } else {
+        wasabiPrimaryIssue = 'snapshot_stale';
       }
-      if (WASABI_AUTH_PRIMARY_STRICT) return null;
     } catch (error) {
-      if (WASABI_AUTH_PRIMARY_STRICT) throw error;
+      wasabiPrimaryIssue = `snapshot_error:${error?.message || error}`;
+    }
+    if (WASABI_AUTH_PRIMARY_STRICT && wasabiPrimaryIssue) {
+      console.warn(
+        `[auth] strict Wasabi primary miss (${wasabiPrimaryIssue}); falling back to Postgres lookup for session token`
+      );
     }
   }
   try {
     const sessionHit = await readSessionFromPostgres(token);
-    return sessionHit ? sessionHit.user : null;
+    if (sessionHit) {
+      if (triedWasabiPrimary && wasabiPrimaryIssue) {
+        console.warn(`[auth] session resolved via Postgres fallback after Wasabi primary ${wasabiPrimaryIssue}`);
+      }
+      return sessionHit.user;
+    }
+    return null;
   } catch (error) {
+    console.warn(`[auth] Postgres session lookup failed: ${error?.message || error}`);
     if (!WASABI_AUTH_FALLBACK_ENABLED) throw error;
     try {
       const fallback = await readSessionFromWasabiSnapshot(token);
@@ -2252,8 +2269,12 @@ async function readSession(token) {
 async function requireAuth(req, res, next) {
   try {
     const token = currentToken(req);
+    const tokenHint = token ? `${String(token).slice(0, 8)}...` : 'none';
     const user = await readSession(token);
     if (!user) {
+      console.warn(
+        `[auth] reject ${req.method || 'GET'} ${req.originalUrl || req.url || ''}: no session for token=${tokenHint}`
+      );
       return res.status(401).json({ success: false, error: 'Authentication required' });
     }
     req.user = user;
