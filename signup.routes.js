@@ -118,10 +118,17 @@ async function sendApprovalRequestEmail(payload) {
 
 /**
  * @param {import('express').Express} app
- * @param {{ pool: import('pg').Pool, cleanString: (v: unknown) => string, normalizeRoles: (v: unknown) => object, normalizeUser: (row: object) => object }} deps
+ * @param {{ pool: import('pg').Pool, query?: (text: string, params?: unknown[]) => Promise<{rows: unknown[], rowCount?: number}>, verifySignupWithWasabi?: (payload: {email: string, pin: string}) => Promise<{status: number, body: Record<string, unknown>} | null>, cleanString: (v: unknown) => string, normalizeRoles: (v: unknown) => object, normalizeUser: (row: object) => object }} deps
  */
 function registerSignupRoutes(app, deps) {
-  const { pool, cleanString, normalizeRoles, normalizeUser } = deps;
+  const { pool, query, verifySignupWithWasabi, cleanString, normalizeRoles, normalizeUser } = deps;
+  const dbQuery =
+    typeof query === 'function'
+      ? query
+      : (pool && typeof pool.query === 'function' ? pool.query.bind(pool) : null);
+  if (typeof dbQuery !== 'function') {
+    throw new Error('registerSignupRoutes requires either pool.query or deps.query.');
+  }
 
   app.post('/account/request-approval', async (req, res) => {
     const identifierRaw = cleanString(req.body?.emailOrUsername || req.body?.email || req.body?.username);
@@ -131,7 +138,7 @@ function registerSignupRoutes(app, deps) {
     }
 
     try {
-      const q = await pool.query(
+      const q = await dbQuery(
         `SELECT id, username, display_name, email, is_admin, roles, portal_files_access_granted, portal_permissions_access
            FROM users
           WHERE LOWER(TRIM(username)) = LOWER(TRIM($1))
@@ -215,7 +222,7 @@ function registerSignupRoutes(app, deps) {
     }
 
     try {
-      const dup = await pool.query(
+      const dup = await dbQuery(
         `SELECT id FROM users
          WHERE LOWER(TRIM(username)) = $1
             OR (email IS NOT NULL AND BTRIM(email) <> '' AND LOWER(TRIM(email)) = $1)
@@ -226,7 +233,7 @@ function registerSignupRoutes(app, deps) {
         return res.status(409).json({ success: false, error: 'An account with this email already exists' });
       }
 
-      const existing = await pool.query(
+      const existing = await dbQuery(
         `SELECT created_at FROM signup_verifications WHERE email_normalized = $1 LIMIT 1`,
         [email]
       );
@@ -244,8 +251,8 @@ function registerSignupRoutes(app, deps) {
       const pinHash = await bcrypt.hash(pin, 10);
       const passwordHash = await bcrypt.hash(password, 10);
 
-      await pool.query(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
-      await pool.query(
+      await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
+      await dbQuery(
         `INSERT INTO signup_verifications (
            email_normalized, pin_hash, password_hash, first_name, last_name, company, title, phone, expires_at
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + ($9::int * INTERVAL '1 minute'))`,
@@ -267,7 +274,7 @@ function registerSignupRoutes(app, deps) {
         String(process.env.SIGNUP_DEV_RETURN_PIN || '').trim() === '1' ? pin : undefined;
 
       if (!sendResult.ok && !devPin) {
-        await pool.query(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
+        await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
         if (sendResult.reason === 'not_configured') {
           return res.status(503).json({
             success: false,
@@ -305,27 +312,34 @@ function registerSignupRoutes(app, deps) {
       return res.status(400).json({ success: false, error: 'Enter the 6-digit code from your email' });
     }
 
-    const client = await pool.connect();
+    if (typeof verifySignupWithWasabi === 'function') {
+      try {
+        const wasabiResult = await verifySignupWithWasabi({ email, pin });
+        if (wasabiResult && typeof wasabiResult === 'object') {
+          return res.status(Number(wasabiResult.status || 200)).json(wasabiResult.body || {});
+        }
+      } catch (error) {
+        console.error('SIGNUP VERIFY WASABI PATH ERROR:', error);
+        return res.status(500).json({ success: false, error: error.message });
+      }
+    }
+
     try {
-      await client.query('BEGIN');
-      const v = await client.query(
+      const v = await dbQuery(
         `SELECT * FROM signup_verifications WHERE email_normalized = $1 LIMIT 1 FOR UPDATE`,
         [email]
       );
       if (!v.rows.length) {
-        await client.query('ROLLBACK');
         return res.status(400).json({ success: false, error: 'No pending sign-up for this email. Start again.' });
       }
       const row = v.rows[0];
       if (new Date(row.expires_at).getTime() < Date.now()) {
-        await client.query(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
-        await client.query('COMMIT');
+        await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
         return res.status(400).json({ success: false, error: 'That code has expired. Request a new one.' });
       }
 
       const pinOk = await bcrypt.compare(pin, row.pin_hash);
       if (!pinOk) {
-        await client.query('ROLLBACK');
         return res.status(400).json({ success: false, error: 'Invalid verification code' });
       }
 
@@ -343,7 +357,7 @@ function registerSignupRoutes(app, deps) {
 
       let inserted;
       try {
-        inserted = await client.query(
+        inserted = await dbQuery(
           `INSERT INTO users (
              username, display_name, password, is_admin, roles, must_change_password,
              portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup,
@@ -367,15 +381,13 @@ function registerSignupRoutes(app, deps) {
           ]
         );
       } catch (e) {
-        await client.query('ROLLBACK');
         if (e.code === '23505') {
           return res.status(409).json({ success: false, error: 'An account with this email already exists' });
         }
         throw e;
       }
 
-      await client.query(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
-      await client.query('COMMIT');
+      await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
 
       const userRow = inserted.rows[0];
       const user = normalizeUser(userRow);
@@ -386,15 +398,8 @@ function registerSignupRoutes(app, deps) {
         message: 'Account created. An administrator must grant access before you can sign in.'
       });
     } catch (error) {
-      try {
-        await client.query('ROLLBACK');
-      } catch {
-        /* ignore */
-      }
       console.error('SIGNUP VERIFY ERROR:', error);
       res.status(500).json({ success: false, error: error.message });
-    } finally {
-      client.release();
     }
   });
 }

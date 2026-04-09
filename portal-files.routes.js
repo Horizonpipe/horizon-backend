@@ -914,7 +914,15 @@ function filterTreeByPathGrants(tree, grants, jobHasAnyGrant) {
  * DB-only share link creation + access log. Mounted before Wasabi check so POST /api/files/shares
  * works whenever Postgres is configured (even if object storage env is missing).
  */
-function registerPortalShareLinkRoutes(app, { pool, requireAuth, requireAdmin }) {
+function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAuth, requireAdmin }) {
+  const dbQuery =
+    typeof query === 'function'
+      ? query
+      : (poolOption && typeof poolOption.query === 'function' ? poolOption.query.bind(poolOption) : null);
+  if (typeof dbQuery !== 'function') {
+    throw new Error('registerPortalShareLinkRoutes requires either pool.query or options.query.');
+  }
+  const pool = { query: dbQuery };
   const r = express.Router();
   r.use(requireAuth);
   r.use((req, res, next) => {
@@ -989,8 +997,16 @@ function registerPortalShareLinkRoutes(app, { pool, requireAuth, requireAdmin })
   app.use('/api/files', r);
 }
 
-function registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin }) {
-  registerPortalShareLinkRoutes(app, { pool, requireAuth, requireAdmin });
+function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, requireAdmin }) {
+  const dbQuery =
+    typeof query === 'function'
+      ? query
+      : (poolOption && typeof poolOption.query === 'function' ? poolOption.query.bind(poolOption) : null);
+  if (typeof dbQuery !== 'function') {
+    throw new Error('registerPortalFilesRoutes requires either pool.query or options.query.');
+  }
+  const pool = { query: dbQuery };
+  registerPortalShareLinkRoutes(app, { pool, query: dbQuery, requireAuth, requireAdmin });
 
   const s3 = createWasabiClient();
   const bucket = bucketName();

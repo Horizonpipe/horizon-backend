@@ -156,6 +156,10 @@ const WASABI_STATE_WRITE_DEBOUNCE_MS = Math.max(
   1000,
   Math.min(60000, Number(process.env.WASABI_STATE_WRITE_DEBOUNCE_MS || 5000))
 );
+const WASABI_WRITES_PRIMARY_ENABLED =
+  String(process.env.WASABI_WRITES_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_WRITES_PRIMARY_STRICT =
+  String(process.env.WASABI_WRITES_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
 const WASABI_ALL_READS_PRIMARY_ENABLED =
   String(process.env.WASABI_ALL_READS_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
 const WASABI_ALL_READS_PRIMARY_STRICT =
@@ -285,6 +289,54 @@ const WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
   5000,
   Math.min(15 * 60 * 1000, Number(process.env.WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
 );
+const WASABI_AUTO_IMPORT_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED ||
+  WASABI_WRITES_PRIMARY_ENABLED ||
+  String(process.env.WASABI_AUTO_IMPORT_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_AUTO_IMPORT_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT ||
+  WASABI_WRITES_PRIMARY_STRICT ||
+  String(process.env.WASABI_AUTO_IMPORT_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_AUTO_IMPORT_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_AUTO_IMPORT_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_PORTAL_DATA_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED ||
+  WASABI_WRITES_PRIMARY_ENABLED ||
+  String(process.env.WASABI_PORTAL_DATA_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_PORTAL_DATA_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT ||
+  WASABI_WRITES_PRIMARY_STRICT ||
+  String(process.env.WASABI_PORTAL_DATA_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_PORTAL_DATA_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_PORTAL_DATA_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_OUTLOOK_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED ||
+  WASABI_WRITES_PRIMARY_ENABLED ||
+  String(process.env.WASABI_OUTLOOK_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_OUTLOOK_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT ||
+  WASABI_WRITES_PRIMARY_STRICT ||
+  String(process.env.WASABI_OUTLOOK_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_OUTLOOK_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_OUTLOOK_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_SIGNUP_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED ||
+  WASABI_WRITES_PRIMARY_ENABLED ||
+  String(process.env.WASABI_SIGNUP_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_SIGNUP_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT ||
+  WASABI_WRITES_PRIMARY_STRICT ||
+  String(process.env.WASABI_SIGNUP_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_SIGNUP_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_SIGNUP_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
 const WASABI_STATE_INCLUDE_ALL_TABLES =
   String(process.env.WASABI_STATE_INCLUDE_ALL_TABLES || '1').trim().toLowerCase() !== '0';
 const WASABI_STATE_EXCLUDE_TABLES = new Set(
@@ -307,6 +359,27 @@ let wasabiSqlMirrorTotalFlushed = 0;
 let wasabiSqlMirrorLastError = '';
 let wasabiLatestStateCache = null;
 let wasabiLatestStateCacheAt = 0;
+let wasabiStateWriteQueue = Promise.resolve();
+let wasabiAutoImportHandledByWasabi = 0;
+let wasabiAutoImportFallbackToPostgres = 0;
+let wasabiAutoImportLastErrorAt = 0;
+let wasabiAutoImportLastError = '';
+let wasabiAutoImportFallbackSamples = [];
+let wasabiPortalDataHandledByWasabi = 0;
+let wasabiPortalDataFallbackToPostgres = 0;
+let wasabiPortalDataLastErrorAt = 0;
+let wasabiPortalDataLastError = '';
+let wasabiPortalDataFallbackSamples = [];
+let wasabiOutlookHandledByWasabi = 0;
+let wasabiOutlookFallbackToPostgres = 0;
+let wasabiOutlookLastErrorAt = 0;
+let wasabiOutlookLastError = '';
+let wasabiOutlookFallbackSamples = [];
+let wasabiSignupHandledByWasabi = 0;
+let wasabiSignupFallbackToPostgres = 0;
+let wasabiSignupLastErrorAt = 0;
+let wasabiSignupLastError = '';
+let wasabiSignupFallbackSamples = [];
 
 async function bodyToBuffer(body) {
   if (!body) return Buffer.alloc(0);
@@ -338,6 +411,86 @@ async function loadWasabiLatestStateSnapshot(force = false) {
   wasabiLatestStateCache = parsed;
   wasabiLatestStateCacheAt = now;
   return parsed;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+async function putWasabiStateObject(stateObject) {
+  if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+    throw new Error('Wasabi state client is not configured');
+  }
+  const stamp = nowIso().replace(/[:.]/g, '-');
+  const payload = Buffer.from(JSON.stringify(stateObject, null, 2), 'utf8');
+  const latestKey = `${WASABI_STATE_PREFIX}/latest.json`;
+  const archiveKey = `${WASABI_STATE_PREFIX}/history/snapshot-${stamp}.json`;
+  await wasabiStateClient.send(
+    new PutObjectCommand({
+      Bucket: WASABI_STATE_BUCKET,
+      Key: latestKey,
+      Body: payload,
+      ContentType: 'application/json'
+    })
+  );
+  await wasabiStateClient.send(
+    new PutObjectCommand({
+      Bucket: WASABI_STATE_BUCKET,
+      Key: archiveKey,
+      Body: payload,
+      ContentType: 'application/json'
+    })
+  );
+  wasabiLatestStateCache = stateObject;
+  wasabiLatestStateCacheAt = Date.now();
+}
+
+function snapshotStateShape(snapshot) {
+  const data = snapshot && snapshot.data && typeof snapshot.data === 'object' ? snapshot.data : {};
+  return {
+    generatedAt: nowIso(),
+    source: 'horizon-backend',
+    scope: { clientId: 'portal-users', jobId: '3' },
+    data
+  };
+}
+
+function ensureSnapshotTable(data, tableName) {
+  if (!data[tableName] || !Array.isArray(data[tableName])) data[tableName] = [];
+  return data[tableName];
+}
+
+async function runWasabiStateWrite(reason, mutator) {
+  if (!WASABI_WRITES_PRIMARY_ENABLED) {
+    throw new Error('WASABI_WRITES_PRIMARY_ENABLED is off');
+  }
+  if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+    throw new Error('Wasabi state client is not configured');
+  }
+  const task = async () => {
+    const snapshot = await loadWasabiLatestStateSnapshot(true);
+    const next = snapshotStateShape(snapshot || {});
+    await mutator(next.data);
+    next.generatedAt = nowIso();
+    next.reason = String(reason || 'mutation');
+    await putWasabiStateObject(next);
+    return next;
+  };
+  const run = wasabiStateWriteQueue.then(task, task);
+  wasabiStateWriteQueue = run.catch(() => {});
+  return run;
+}
+
+async function tryWasabiStateWrite(reason, mutator) {
+  if (!WASABI_WRITES_PRIMARY_ENABLED) return false;
+  try {
+    await runWasabiStateWrite(reason, mutator);
+    return true;
+  } catch (error) {
+    if (WASABI_WRITES_PRIMARY_STRICT) throw error;
+    console.warn(`[wasabi-write] ${reason} failed, falling back to postgres:`, error?.message || error);
+    return false;
+  }
 }
 
 function snapshotMeta(snapshot) {
@@ -379,6 +532,26 @@ function wasabiReadDomains() {
       name: 'plannerScopeLookup',
       enabled: WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_ENABLED,
       maxAgeMs: WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_MAX_SNAPSHOT_AGE_MS
+    },
+    {
+      name: 'autoImport',
+      enabled: WASABI_AUTO_IMPORT_PRIMARY_ENABLED,
+      maxAgeMs: WASABI_AUTO_IMPORT_PRIMARY_MAX_SNAPSHOT_AGE_MS
+    },
+    {
+      name: 'portalData',
+      enabled: WASABI_PORTAL_DATA_PRIMARY_ENABLED,
+      maxAgeMs: WASABI_PORTAL_DATA_PRIMARY_MAX_SNAPSHOT_AGE_MS
+    },
+    {
+      name: 'outlook',
+      enabled: WASABI_OUTLOOK_PRIMARY_ENABLED,
+      maxAgeMs: WASABI_OUTLOOK_PRIMARY_MAX_SNAPSHOT_AGE_MS
+    },
+    {
+      name: 'signup',
+      enabled: WASABI_SIGNUP_PRIMARY_ENABLED,
+      maxAgeMs: WASABI_SIGNUP_PRIMARY_MAX_SNAPSHOT_AGE_MS
     }
   ];
 }
@@ -409,7 +582,20 @@ function evaluateWasabiRuntimeReadiness(snapshot) {
     'planner_records',
     'pricing_rates',
     'daily_reports',
-    'jobsite_assets'
+    'jobsite_assets',
+    'auto_import_projects',
+    'auto_import_runs',
+    'auto_import_row_cache',
+    'auto_import_bindings',
+    'auto_import_logs',
+    'portal_path_grants',
+    'portal_share_links',
+    'portal_share_access_log',
+    'portal_share_guest_sessions',
+    'portal_upload_sessions',
+    'portal_upload_session_parts',
+    'user_outlook_tokens',
+    'signup_verifications'
   ];
   const missingRequiredTables = requiredTables.filter((table) => !Array.isArray(data[table]));
   const readyForAllReadsPrimary = !!(
@@ -437,6 +623,11 @@ async function listSnapshotTables() {
     'portal_path_grants',
     'portal_share_links',
     'portal_share_access_log',
+    'portal_share_guest_sessions',
+    'portal_upload_sessions',
+    'portal_upload_session_parts',
+    'user_outlook_tokens',
+    'signup_verifications',
     'auto_import_projects',
     'auto_import_runs',
     'auto_import_row_cache',
@@ -478,46 +669,13 @@ async function runWasabiStateSnapshot() {
         data[tableName] = { error: String(err?.message || err) };
       }
     }
-    const now = new Date();
-    const stamp = now.toISOString().replace(/[:.]/g, '-');
-    const payload = Buffer.from(
-      JSON.stringify(
-        {
-          generatedAt: now.toISOString(),
-          source: 'horizon-backend',
-          scope: { clientId: 'portal-users', jobId: '3' },
-          data
-        },
-        null,
-        2
-      ),
-      'utf8'
-    );
-    const latestKey = `${WASABI_STATE_PREFIX}/latest.json`;
-    const archiveKey = `${WASABI_STATE_PREFIX}/history/snapshot-${stamp}.json`;
-    await wasabiStateClient.send(
-      new PutObjectCommand({
-        Bucket: WASABI_STATE_BUCKET,
-        Key: latestKey,
-        Body: payload,
-        ContentType: 'application/json'
-      })
-    );
-    await wasabiStateClient.send(
-      new PutObjectCommand({
-        Bucket: WASABI_STATE_BUCKET,
-        Key: archiveKey,
-        Body: payload,
-        ContentType: 'application/json'
-      })
-    );
-    wasabiLatestStateCache = {
-      generatedAt: now.toISOString(),
+    const next = {
+      generatedAt: nowIso(),
       source: 'horizon-backend',
       scope: { clientId: 'portal-users', jobId: '3' },
       data
     };
-    wasabiLatestStateCacheAt = Date.now();
+    await putWasabiStateObject(next);
   } catch (err) {
     console.warn('[wasabi-state] snapshot failed:', err && err.message ? err.message : err);
   } finally {
@@ -534,7 +692,11 @@ async function syncWasabiNow(reason = 'manual') {
     reason: String(reason || 'manual'),
     ...readiness,
     state: currentWasabiStateStatus(),
-    sqlMirror: currentWasabiSqlMirrorStatus()
+    sqlMirror: currentWasabiSqlMirrorStatus(),
+    autoImport: currentWasabiAutoImportStatus(),
+    portalData: currentWasabiPortalDataStatus(),
+    outlook: currentWasabiOutlookStatus(),
+    signup: currentWasabiSignupStatus()
   };
 }
 
@@ -560,6 +722,8 @@ function currentWasabiStateStatus() {
     writeDebounceMs: WASABI_STATE_WRITE_DEBOUNCE_MS,
     includeAllTables: WASABI_STATE_INCLUDE_ALL_TABLES,
     excludedTables: Array.from(WASABI_STATE_EXCLUDE_TABLES),
+    writesPrimaryEnabled: WASABI_WRITES_PRIMARY_ENABLED,
+    writesPrimaryStrict: WASABI_WRITES_PRIMARY_STRICT,
     allReadsPrimaryEnabled: WASABI_ALL_READS_PRIMARY_ENABLED,
     allReadsPrimaryStrict: WASABI_ALL_READS_PRIMARY_STRICT,
     authFallbackEnabled: WASABI_AUTH_FALLBACK_ENABLED,
@@ -599,6 +763,18 @@ function currentWasabiStateStatus() {
     plannerScopeLookupPrimaryEnabled: WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_ENABLED,
     plannerScopeLookupPrimaryStrict: WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_STRICT,
     plannerScopeLookupPrimaryMaxSnapshotAgeMs: WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    autoImportPrimaryEnabled: WASABI_AUTO_IMPORT_PRIMARY_ENABLED,
+    autoImportPrimaryStrict: WASABI_AUTO_IMPORT_PRIMARY_STRICT,
+    autoImportPrimaryMaxSnapshotAgeMs: WASABI_AUTO_IMPORT_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    portalDataPrimaryEnabled: WASABI_PORTAL_DATA_PRIMARY_ENABLED,
+    portalDataPrimaryStrict: WASABI_PORTAL_DATA_PRIMARY_STRICT,
+    portalDataPrimaryMaxSnapshotAgeMs: WASABI_PORTAL_DATA_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    outlookPrimaryEnabled: WASABI_OUTLOOK_PRIMARY_ENABLED,
+    outlookPrimaryStrict: WASABI_OUTLOOK_PRIMARY_STRICT,
+    outlookPrimaryMaxSnapshotAgeMs: WASABI_OUTLOOK_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    signupPrimaryEnabled: WASABI_SIGNUP_PRIMARY_ENABLED,
+    signupPrimaryStrict: WASABI_SIGNUP_PRIMARY_STRICT,
+    signupPrimaryMaxSnapshotAgeMs: WASABI_SIGNUP_PRIMARY_MAX_SNAPSHOT_AGE_MS,
     queuedAt: wasabiStateLastQueuedAt ? new Date(wasabiStateLastQueuedAt).toISOString() : null,
     lastRunAt: wasabiStateLastRunAt ? new Date(wasabiStateLastRunAt).toISOString() : null,
     lastReason: wasabiStateLastReason,
@@ -725,6 +901,58 @@ function currentWasabiSqlMirrorStatus() {
     totalFlushed: wasabiSqlMirrorTotalFlushed,
     lastFlushAt: wasabiSqlMirrorLastFlushAt ? new Date(wasabiSqlMirrorLastFlushAt).toISOString() : null,
     lastError: wasabiSqlMirrorLastError || null
+  };
+}
+
+function currentWasabiAutoImportStatus() {
+  return {
+    enabled: WASABI_AUTO_IMPORT_PRIMARY_ENABLED,
+    strict: WASABI_AUTO_IMPORT_PRIMARY_STRICT,
+    maxSnapshotAgeMs: WASABI_AUTO_IMPORT_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    handledByWasabi: wasabiAutoImportHandledByWasabi,
+    fallbackToPostgres: wasabiAutoImportFallbackToPostgres,
+    lastErrorAt: wasabiAutoImportLastErrorAt ? new Date(wasabiAutoImportLastErrorAt).toISOString() : null,
+    lastError: wasabiAutoImportLastError || null,
+    fallbackSamples: wasabiAutoImportFallbackSamples.slice(-20)
+  };
+}
+
+function currentWasabiPortalDataStatus() {
+  return {
+    enabled: WASABI_PORTAL_DATA_PRIMARY_ENABLED,
+    strict: WASABI_PORTAL_DATA_PRIMARY_STRICT,
+    maxSnapshotAgeMs: WASABI_PORTAL_DATA_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    handledByWasabi: wasabiPortalDataHandledByWasabi,
+    fallbackToPostgres: wasabiPortalDataFallbackToPostgres,
+    lastErrorAt: wasabiPortalDataLastErrorAt ? new Date(wasabiPortalDataLastErrorAt).toISOString() : null,
+    lastError: wasabiPortalDataLastError || null,
+    fallbackSamples: wasabiPortalDataFallbackSamples.slice(-20)
+  };
+}
+
+function currentWasabiOutlookStatus() {
+  return {
+    enabled: WASABI_OUTLOOK_PRIMARY_ENABLED,
+    strict: WASABI_OUTLOOK_PRIMARY_STRICT,
+    maxSnapshotAgeMs: WASABI_OUTLOOK_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    handledByWasabi: wasabiOutlookHandledByWasabi,
+    fallbackToPostgres: wasabiOutlookFallbackToPostgres,
+    lastErrorAt: wasabiOutlookLastErrorAt ? new Date(wasabiOutlookLastErrorAt).toISOString() : null,
+    lastError: wasabiOutlookLastError || null,
+    fallbackSamples: wasabiOutlookFallbackSamples.slice(-20)
+  };
+}
+
+function currentWasabiSignupStatus() {
+  return {
+    enabled: WASABI_SIGNUP_PRIMARY_ENABLED,
+    strict: WASABI_SIGNUP_PRIMARY_STRICT,
+    maxSnapshotAgeMs: WASABI_SIGNUP_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    handledByWasabi: wasabiSignupHandledByWasabi,
+    fallbackToPostgres: wasabiSignupFallbackToPostgres,
+    lastErrorAt: wasabiSignupLastErrorAt ? new Date(wasabiSignupLastErrorAt).toISOString() : null,
+    lastError: wasabiSignupLastError || null,
+    fallbackSamples: wasabiSignupFallbackSamples.slice(-20)
   };
 }
 
@@ -1406,6 +1634,205 @@ async function readDailyReportByIdFromWasabiSnapshot(id) {
   return reports.find((row) => String(row.id || '') === String(id || '')) || null;
 }
 
+function nextNumericId(rows) {
+  const numericIds = (Array.isArray(rows) ? rows : [])
+    .map((row) => Number(row?.id))
+    .filter((n) => Number.isFinite(n));
+  return numericIds.length ? Math.max(...numericIds) + 1 : 1;
+}
+
+async function upsertPricingRate(dia, rate) {
+  let out = null;
+  const wrote = await tryWasabiStateWrite('upsert-pricing-rate', async (data) => {
+    const rows = ensureSnapshotTable(data, 'pricing_rates');
+    const key = String(dia || '').trim().toUpperCase();
+    const idx = rows.findIndex((row) => String(row.dia || '').trim().toUpperCase() === key);
+    const next = {
+      dia: key,
+      rate: Number(rate),
+      updated_at: nowIso()
+    };
+    if (idx >= 0) rows[idx] = { ...rows[idx], ...next };
+    else rows.push(next);
+    out = next;
+  });
+  if (wrote && out) return out;
+  const result = await pool.query(
+    `INSERT INTO pricing_rates (dia, rate, updated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (dia)
+     DO UPDATE SET rate = EXCLUDED.rate, updated_at = NOW()
+     RETURNING dia, rate, updated_at`,
+    [dia, Number(rate)]
+  );
+  return result.rows[0];
+}
+
+async function deletePricingRate(dia) {
+  let deletedDia = null;
+  const wrote = await tryWasabiStateWrite('delete-pricing-rate', async (data) => {
+    const rows = ensureSnapshotTable(data, 'pricing_rates');
+    const key = String(dia || '').trim().toUpperCase();
+    data.pricing_rates = rows.filter((row) => {
+      const keep = String(row.dia || '').trim().toUpperCase() !== key;
+      if (!keep) deletedDia = row.dia;
+      return keep;
+    });
+  });
+  if (wrote) return deletedDia;
+  const result = await pool.query('DELETE FROM pricing_rates WHERE dia = $1 RETURNING dia', [dia]);
+  return result.rows.length ? result.rows[0].dia : null;
+}
+
+async function createDailyReport(reportInput) {
+  let created = null;
+  const wrote = await tryWasabiStateWrite('create-daily-report', async (data) => {
+    const rows = ensureSnapshotTable(data, 'daily_reports');
+    const now = nowIso();
+    created = {
+      id: nextNumericId(rows),
+      title: cleanString(reportInput.title),
+      report_date: cleanString(reportInput.report_date || new Date().toISOString().slice(0, 10)),
+      notes: cleanString(reportInput.notes),
+      files: Array.isArray(reportInput.files) ? reportInput.files : [],
+      created_by: cleanString(reportInput.created_by),
+      created_at: now,
+      updated_at: now
+    };
+    rows.push(created);
+  });
+  if (wrote && created) return created;
+  const result = await pool.query(
+    `INSERT INTO daily_reports (title, report_date, notes, files, created_by)
+     VALUES ($1, $2, $3, $4::jsonb, $5)
+     RETURNING *`,
+    [
+      cleanString(reportInput.title),
+      cleanString(reportInput.report_date || new Date().toISOString().slice(0, 10)),
+      cleanString(reportInput.notes),
+      JSON.stringify(Array.isArray(reportInput.files) ? reportInput.files : []),
+      cleanString(reportInput.created_by)
+    ]
+  );
+  return result.rows[0];
+}
+
+async function updateDailyReportById(id, patch) {
+  let updated = null;
+  const wrote = await tryWasabiStateWrite('update-daily-report', async (data) => {
+    const rows = ensureSnapshotTable(data, 'daily_reports');
+    const idx = rows.findIndex((row) => String(row.id || '') === String(id || ''));
+    if (idx < 0) throw new Error('Daily report not found');
+    updated = {
+      ...rows[idx],
+      title: cleanString(patch.title),
+      report_date: cleanString(patch.report_date || rows[idx].report_date),
+      notes: cleanString(patch.notes),
+      files: Array.isArray(patch.files) ? patch.files : [],
+      updated_at: nowIso()
+    };
+    rows[idx] = updated;
+  });
+  if (wrote && updated) return updated;
+  const result = await pool.query(
+    `UPDATE daily_reports
+     SET title = $1,
+         report_date = $2,
+         notes = $3,
+         files = $4::jsonb,
+         updated_at = NOW()
+     WHERE id = $5
+     RETURNING *`,
+    [cleanString(patch.title), cleanString(patch.report_date), cleanString(patch.notes), JSON.stringify(patch.files || []), id]
+  );
+  if (!result.rows.length) throw new Error('Daily report not found');
+  return result.rows[0];
+}
+
+async function deleteDailyReportById(id) {
+  let deleted = false;
+  const wrote = await tryWasabiStateWrite('delete-daily-report', async (data) => {
+    const rows = ensureSnapshotTable(data, 'daily_reports');
+    const next = rows.filter((row) => String(row.id || '') !== String(id || ''));
+    deleted = next.length !== rows.length;
+    data.daily_reports = next;
+  });
+  if (wrote) return deleted;
+  const result = await pool.query('DELETE FROM daily_reports WHERE id = $1 RETURNING id', [id]);
+  return result.rows.length > 0;
+}
+
+async function createJobsiteAsset(assetInput) {
+  let created = null;
+  const wrote = await tryWasabiStateWrite('create-jobsite-asset', async (data) => {
+    const rows = ensureSnapshotTable(data, 'jobsite_assets');
+    const now = nowIso();
+    created = {
+      id: nextNumericId(rows),
+      client: upperCleanString(assetInput.client),
+      city: upperCleanString(assetInput.city),
+      jobsite: normalizeJobsiteName(assetInput.jobsite),
+      contact_name: cleanString(assetInput.contact_name),
+      contact_phone: cleanString(assetInput.contact_phone),
+      contact_email: cleanString(assetInput.contact_email),
+      notes: cleanString(assetInput.notes),
+      drive_url: cleanString(assetInput.drive_url),
+      files: Array.isArray(assetInput.files) ? assetInput.files : [],
+      created_by: cleanString(assetInput.created_by),
+      created_at: now,
+      updated_at: now
+    };
+    rows.push(created);
+  });
+  if (wrote && created) return created;
+  const result = await pool.query(
+    `INSERT INTO jobsite_assets
+     (client, city, jobsite, contact_name, contact_phone, contact_email, notes, drive_url, files, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
+     RETURNING *`,
+    [
+      upperCleanString(assetInput.client),
+      upperCleanString(assetInput.city),
+      normalizeJobsiteName(assetInput.jobsite),
+      cleanString(assetInput.contact_name),
+      cleanString(assetInput.contact_phone),
+      cleanString(assetInput.contact_email),
+      cleanString(assetInput.notes),
+      cleanString(assetInput.drive_url),
+      JSON.stringify(Array.isArray(assetInput.files) ? assetInput.files : []),
+      cleanString(assetInput.created_by)
+    ]
+  );
+  return result.rows[0];
+}
+
+async function deleteJobsiteAssetById(id) {
+  let deleted = false;
+  const wrote = await tryWasabiStateWrite('delete-jobsite-asset', async (data) => {
+    const rows = ensureSnapshotTable(data, 'jobsite_assets');
+    const next = rows.filter((row) => String(row.id || '') !== String(id || ''));
+    deleted = next.length !== rows.length;
+    data.jobsite_assets = next;
+  });
+  if (wrote) return deleted;
+  const result = await pool.query('DELETE FROM jobsite_assets WHERE id = $1 RETURNING id', [id]);
+  return result.rows.length > 0;
+}
+
+async function deleteJobsiteAssetsByClient(client) {
+  let deletedCount = 0;
+  const wrote = await tryWasabiStateWrite('delete-jobsite-assets-by-client', async (data) => {
+    const rows = ensureSnapshotTable(data, 'jobsite_assets');
+    const target = String(client || '').toLowerCase();
+    const next = rows.filter((row) => String(row.client || '').toLowerCase() !== target);
+    deletedCount = rows.length - next.length;
+    data.jobsite_assets = next;
+  });
+  if (wrote) return deletedCount;
+  const result = await pool.query('DELETE FROM jobsite_assets WHERE client = $1 RETURNING id', [client]);
+  return Number(result.rowCount || 0);
+}
+
 async function readJobsiteAssetsFromWasabiSnapshotForUser(user) {
   const snapshot = await loadWasabiLatestStateSnapshot();
   if (!snapshotLooksFresh(snapshot, WASABI_ASSETS_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
@@ -1670,6 +2097,21 @@ function serializeRecordData(record) {
 
 async function issueSession(userId) {
   const token = crypto.randomBytes(32).toString('hex');
+  const expiresAtIso = new Date(Date.now() + SESSION_TTL_MINUTES * 60 * 1000).toISOString();
+  const wasabiWrote = await tryWasabiStateWrite('issue-session', async (data) => {
+    const sessions = ensureSnapshotTable(data, 'auth_sessions');
+    const now = nowIso();
+    sessions.push({
+      token,
+      user_id: String(userId),
+      expires_at: expiresAtIso,
+      created_at: now,
+      updated_at: now
+    });
+  });
+  if (wasabiWrote) {
+    return token;
+  }
   await pool.query(
     `INSERT INTO auth_sessions (token, user_id, expires_at)
      VALUES ($1, $2, NOW() + ($3 || ' minutes')::interval)`,
@@ -1695,6 +2137,28 @@ async function readSessionFromWasabiSnapshot(token) {
     expires_at: hit.expires_at
   });
   return attachScopesToUserFromSnapshot(normalized, snapshot);
+}
+
+async function extendWasabiSessionExpiry(token) {
+  const wrote = await tryWasabiStateWrite('extend-session', async (data) => {
+      const sessions = ensureSnapshotTable(data, 'auth_sessions');
+    const idx = sessions.findIndex((s) => String(s.token || '') === String(token || ''));
+    if (idx < 0) return;
+    sessions[idx] = {
+      ...sessions[idx],
+      expires_at: new Date(Date.now() + SESSION_TTL_MINUTES * 60 * 1000).toISOString(),
+      updated_at: nowIso()
+    };
+  });
+  if (!wrote) {
+    await pool.query(
+      `UPDATE auth_sessions
+       SET expires_at = NOW() + ($2 || ' minutes')::interval,
+           updated_at = NOW()
+       WHERE token = $1`,
+      [token, SESSION_TTL_MINUTES]
+    );
+  }
 }
 
 async function readSessionFromPostgres(token) {
@@ -1732,7 +2196,14 @@ async function readSession(token) {
       const snapshot = await loadWasabiLatestStateSnapshot();
       if (snapshotLooksFresh(snapshot)) {
         const session = await readSessionFromWasabiSnapshot(token);
-        if (session) return session;
+        if (session) {
+          try {
+            await extendWasabiSessionExpiry(token);
+          } catch (error) {
+            if (WASABI_WRITES_PRIMARY_STRICT) throw error;
+          }
+          return session;
+        }
       }
       if (WASABI_AUTH_PRIMARY_STRICT) return null;
     } catch (error) {
@@ -2365,7 +2836,7 @@ async function ensureSchema() {
     console.warn('[schema] portal_share_links kind constraint migrate:', e instanceof Error ? e.message : e);
   }
 
-  await ensureOutlookSchema(pool);
+  await ensureOutlookSchema({ pool, query: queryOutlookDataWithWasabiFallback });
 
   const countResult = await pool.query('SELECT COUNT(*)::int AS count FROM users');
   if (countResult.rows[0].count === 0) {
@@ -2462,12 +2933,20 @@ app.post('/admin/wasabi-state-snapshot', requireAuth, requireAdmin, async (req, 
     await runWasabiStateSnapshot();
     res.json({
       success: true,
-      ...currentWasabiStateStatus()
+      ...currentWasabiStateStatus(),
+      autoImport: currentWasabiAutoImportStatus(),
+      portalData: currentWasabiPortalDataStatus(),
+      outlook: currentWasabiOutlookStatus(),
+      signup: currentWasabiSignupStatus()
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      error: error && error.message ? error.message : String(error)
+      error: error && error.message ? error.message : String(error),
+      autoImport: currentWasabiAutoImportStatus(),
+      portalData: currentWasabiPortalDataStatus(),
+      outlook: currentWasabiOutlookStatus(),
+      signup: currentWasabiSignupStatus()
     });
   }
 });
@@ -2475,7 +2954,11 @@ app.post('/admin/wasabi-state-snapshot', requireAuth, requireAdmin, async (req, 
 app.get('/admin/wasabi-state-status', requireAuth, requireAdmin, async (req, res) => {
   res.json({
     success: true,
-    ...currentWasabiStateStatus()
+    ...currentWasabiStateStatus(),
+    autoImport: currentWasabiAutoImportStatus(),
+    portalData: currentWasabiPortalDataStatus(),
+    outlook: currentWasabiOutlookStatus(),
+    signup: currentWasabiSignupStatus()
   });
 });
 
@@ -2483,6 +2966,34 @@ app.get('/admin/wasabi-sql-mirror-status', requireAuth, requireAdmin, async (req
   res.json({
     success: true,
     ...currentWasabiSqlMirrorStatus()
+  });
+});
+
+app.get('/admin/wasabi-auto-import-status', requireAuth, requireAdmin, async (req, res) => {
+  res.json({
+    success: true,
+    ...currentWasabiAutoImportStatus()
+  });
+});
+
+app.get('/admin/wasabi-portal-data-status', requireAuth, requireAdmin, async (req, res) => {
+  res.json({
+    success: true,
+    ...currentWasabiPortalDataStatus()
+  });
+});
+
+app.get('/admin/wasabi-outlook-status', requireAuth, requireAdmin, async (req, res) => {
+  res.json({
+    success: true,
+    ...currentWasabiOutlookStatus()
+  });
+});
+
+app.get('/admin/wasabi-signup-status', requireAuth, requireAdmin, async (req, res) => {
+  res.json({
+    success: true,
+    ...currentWasabiSignupStatus()
   });
 });
 
@@ -2499,14 +3010,22 @@ app.get('/admin/wasabi-runtime-readiness', requireAuth, requireAdmin, async (req
       allReadsPrimaryEnabled: WASABI_ALL_READS_PRIMARY_ENABLED,
       allReadsPrimaryStrict: WASABI_ALL_READS_PRIMARY_STRICT,
       ...readiness,
-      sqlMirror: currentWasabiSqlMirrorStatus()
+      sqlMirror: currentWasabiSqlMirrorStatus(),
+      autoImport: currentWasabiAutoImportStatus(),
+      portalData: currentWasabiPortalDataStatus(),
+      outlook: currentWasabiOutlookStatus(),
+      signup: currentWasabiSignupStatus()
     });
   } catch (error) {
     res.status(500).json({
       success: false,
       error: error && error.message ? error.message : String(error),
       bucket: WASABI_STATE_BUCKET || null,
-      prefix: WASABI_STATE_PREFIX
+      prefix: WASABI_STATE_PREFIX,
+      autoImport: currentWasabiAutoImportStatus(),
+      portalData: currentWasabiPortalDataStatus(),
+      outlook: currentWasabiOutlookStatus(),
+      signup: currentWasabiSignupStatus()
     });
   }
 });
@@ -2540,7 +3059,11 @@ app.post('/admin/wasabi-sync-now', requireAuth, requireAdmin, async (req, res) =
       success: false,
       error: error && error.message ? error.message : String(error),
       state: currentWasabiStateStatus(),
-      sqlMirror: currentWasabiSqlMirrorStatus()
+      sqlMirror: currentWasabiSqlMirrorStatus(),
+      autoImport: currentWasabiAutoImportStatus(),
+      portalData: currentWasabiPortalDataStatus(),
+      outlook: currentWasabiOutlookStatus(),
+      signup: currentWasabiSignupStatus()
     });
   }
 });
@@ -2776,7 +3299,19 @@ app.post('/login', async (req, res) => {
 
     if (needsRehash && !userRowFromWasabi) {
       const hash = await bcrypt.hash(submittedPassword, 10);
-      await pool.query('UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2', [hash, row.id]);
+      const wasabiWrote = await tryWasabiStateWrite('login-rehash-password', async (data) => {
+        const users = ensureSnapshotTable(data, 'users');
+        const idx = users.findIndex((u) => String(u.id || '') === String(row.id || ''));
+        if (idx < 0) return;
+        users[idx] = {
+          ...users[idx],
+          password: hash,
+          updated_at: nowIso()
+        };
+      });
+      if (!wasabiWrote) {
+        await pool.query('UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2', [hash, row.id]);
+      }
     }
 
     const user = await attachScopesToUser(normalizeUser(row));
@@ -2821,6 +3356,13 @@ app.post('/auto-import-plugin/push', requireAuth, requireDataAutoSyncEmployeeAcc
 
 app.post('/logout', requireAuth, async (req, res) => {
   try {
+    const wasabiWrote = await tryWasabiStateWrite('logout', async (data) => {
+      const sessions = ensureSnapshotTable(data, 'auth_sessions');
+      data.auth_sessions = sessions.filter((row) => String(row.token || '') !== String(req.sessionToken || ''));
+    });
+    if (wasabiWrote) {
+      return res.json({ success: true });
+    }
     await pool.query('DELETE FROM auth_sessions WHERE token = $1', [req.sessionToken]);
     res.json({ success: true });
   } catch (error) {
@@ -2879,10 +3421,25 @@ app.post('/change-password', requireAuth, async (req, res) => {
     }
 
     const hash = await bcrypt.hash(newPassword, 10);
-    await pool.query(
-      'UPDATE users SET password = $1, must_change_password = false, updated_at = NOW() WHERE id = $2',
-      [hash, req.user.id]
-    );
+    const wasabiWrote = await tryWasabiStateWrite('change-password', async (data) => {
+      const users = ensureSnapshotTable(data, 'users');
+      const idx = users.findIndex((u) => String(u.id || '') === String(req.user.id || ''));
+      if (idx < 0) {
+        throw new Error('User not found in Wasabi state');
+      }
+      users[idx] = {
+        ...users[idx],
+        password: hash,
+        must_change_password: false,
+        updated_at: nowIso()
+      };
+    });
+    if (!wasabiWrote) {
+      await pool.query(
+        'UPDATE users SET password = $1, must_change_password = false, updated_at = NOW() WHERE id = $2',
+        [hash, req.user.id]
+      );
+    }
 
     res.json({
       success: true,
@@ -2919,6 +3476,50 @@ app.post('/create-user', requireAuth, requireAdmin, async (req, res) => {
 
   try {
     const hash = await bcrypt.hash(password, 10);
+    if (WASABI_WRITES_PRIMARY_ENABLED) {
+      let createdRow = null;
+      const wrote = await tryWasabiStateWrite('create-user', async (data) => {
+        const users = ensureSnapshotTable(data, 'users');
+        const usernameLower = String(username).trim().toLowerCase();
+        const duplicate = users.some((u) => String(u.username || '').trim().toLowerCase() === usernameLower);
+        if (duplicate) {
+          const err = new Error('Username already exists');
+          err.code = '23505';
+          throw err;
+        }
+        const numericIds = users
+          .map((u) => Number(u.id))
+          .filter((n) => Number.isFinite(n))
+          .sort((a, b) => b - a);
+        const nextId = numericIds.length ? numericIds[0] + 1 : 1;
+        createdRow = {
+          id: nextId,
+          username,
+          display_name: displayName,
+          password: hash,
+          is_admin: isAdmin === true,
+          roles: normalizeRoles(roles),
+          must_change_password: true,
+          portal_files_client_id: null,
+          portal_files_job_id: null,
+          portal_files_access_granted: false,
+          self_signup: false,
+          portal_permissions_access: false,
+          email_verified: true,
+          created_at: nowIso(),
+          updated_at: nowIso()
+        };
+        users.push(createdRow);
+      });
+      if (wrote) {
+        const user = await attachScopesToUser(normalizeUser(createdRow));
+        return res.status(201).json({
+          success: true,
+          user,
+          message: 'User created with no access. Assign roles/portal scope to enable.'
+        });
+      }
+    }
     const result = await pool.query(
       `INSERT INTO users (
          username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup
@@ -3056,74 +3657,141 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
       ? !!req.body.portalPermissionsAccess
       : current.portal_permissions_access === true;
 
-    const updatedCoreResult = await pool.query(
-      `UPDATE users
-       SET display_name = $1,
-           is_admin = $2,
-           roles = $3::jsonb,
-           portal_files_client_id = $4,
-           portal_files_job_id = $5,
-           portal_files_access_granted = $6,
-           self_signup = $7,
-           portal_permissions_access = $8,
-           updated_at = NOW()
-       WHERE id = $9
-       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup`,
-      [
-        nextDisplayName,
-        nextIsAdmin,
-        JSON.stringify(nextRoles),
-        nextPortalFilesClientId,
-        nextPortalFilesJobId,
-        nextPortalFilesAccessGranted,
-        nextSelfSignup,
-        nextPortalPermissionsAccess,
-        id
-      ]
-    );
+    const passwordHash = password ? await bcrypt.hash(password, 10) : null;
+    let updatedResult = null;
+    if (WASABI_WRITES_PRIMARY_ENABLED) {
+      let updatedUserRow = null;
+      await runWasabiStateWrite('update-user', async (data) => {
+        const users = ensureSnapshotTable(data, 'users');
+        const idx = users.findIndex((u) => String(u.id || '') === String(id || ''));
+        if (idx < 0) throw new Error('User not found');
+        const currentUserRow = users[idx];
+        users[idx] = {
+          ...currentUserRow,
+          display_name: nextDisplayName,
+          is_admin: nextIsAdmin === true,
+          roles: normalizeRoles(nextRoles),
+          portal_files_client_id: nextPortalFilesClientId || null,
+          portal_files_job_id: nextPortalFilesJobId || null,
+          portal_files_access_granted: nextPortalFilesAccessGranted === true,
+          self_signup: nextSelfSignup === true,
+          portal_permissions_access: nextPortalPermissionsAccess === true,
+          updated_at: nowIso()
+        };
 
-    if (hasPortalScopesPayload || hasPortalScopeInPayload) {
-      await pool.query('DELETE FROM user_portal_scopes WHERE user_id = $1', [String(id)]);
-      for (const scope of nextPortalScopes) {
-        await pool.query(
-          `INSERT INTO user_portal_scopes (user_id, client_id, job_id)
-           VALUES ($1, $2, $3)
-           ON CONFLICT (user_id, client_id, job_id) DO NOTHING`,
-          [String(id), scope.clientId, scope.jobId]
-        );
-      }
-    }
+        if (passwordHash) {
+          users[idx] = {
+            ...users[idx],
+            password: passwordHash,
+            must_change_password: false,
+            updated_at: nowIso()
+          };
+        }
 
-    if (hasPsrScopesPayload) {
-      await pool.query('DELETE FROM user_psr_scopes WHERE user_id = $1', [String(id)]);
-      for (const scope of nextPsrScopes) {
-        await pool.query(
-          `INSERT INTO user_psr_scopes (user_id, client, city, jobsite, psr_record_id)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (user_id, client, city, jobsite) DO NOTHING`,
-          [String(id), scope.client, scope.city, scope.jobsite, cleanString(scope.recordId || '') || null]
-        );
-      }
-    }
+        if (hasPortalScopesPayload || hasPortalScopeInPayload) {
+          const portalScopes = ensureSnapshotTable(data, 'user_portal_scopes');
+          data.user_portal_scopes = portalScopes.filter((row) => String(row.user_id || '') !== String(id || ''));
+          for (const scope of nextPortalScopes) {
+            data.user_portal_scopes.push({
+              user_id: String(id),
+              client_id: scope.clientId,
+              job_id: scope.jobId
+            });
+          }
+        }
 
-    let updatedResult = { rows: [updatedCoreResult.rows[0]] };
-    if (password) {
-      const hash = await bcrypt.hash(password, 10);
-      updatedResult = await pool.query(
+        if (hasPsrScopesPayload) {
+          const psrScopes = ensureSnapshotTable(data, 'user_psr_scopes');
+          data.user_psr_scopes = psrScopes.filter((row) => String(row.user_id || '') !== String(id || ''));
+          for (const scope of nextPsrScopes) {
+            data.user_psr_scopes.push({
+              user_id: String(id),
+              client: scope.client,
+              city: scope.city,
+              jobsite: scope.jobsite,
+              psr_record_id: cleanString(scope.recordId || '') || null
+            });
+          }
+        }
+
+        // Force immediate permission revocation by rotating target user's sessions.
+        // Keep the currently logged-in admin session when editing their own account.
+        if (String(req.user?.id || '') !== String(id)) {
+          const sessions = ensureSnapshotTable(data, 'auth_sessions');
+          data.auth_sessions = sessions.filter((row) => String(row.user_id || '') !== String(id || ''));
+        }
+        updatedUserRow = users[idx];
+      });
+      updatedResult = { rows: [updatedUserRow] };
+    } else {
+      const updatedCoreResult = await pool.query(
         `UPDATE users
-         SET password = $1,
-             must_change_password = false,
+         SET display_name = $1,
+             is_admin = $2,
+             roles = $3::jsonb,
+             portal_files_client_id = $4,
+             portal_files_job_id = $5,
+             portal_files_access_granted = $6,
+             self_signup = $7,
+             portal_permissions_access = $8,
              updated_at = NOW()
-         WHERE id = $2
+         WHERE id = $9
          RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup`,
-        [hash, id]
+        [
+          nextDisplayName,
+          nextIsAdmin,
+          JSON.stringify(nextRoles),
+          nextPortalFilesClientId,
+          nextPortalFilesJobId,
+          nextPortalFilesAccessGranted,
+          nextSelfSignup,
+          nextPortalPermissionsAccess,
+          id
+        ]
       );
-    }
 
-    // Force immediate permission revocation by rotating target user's sessions.
-    // Keep the currently logged-in admin session when editing their own account.
-    if (String(req.user?.id || '') !== String(id)) {
-      await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [String(id)]);
+      if (hasPortalScopesPayload || hasPortalScopeInPayload) {
+        await pool.query('DELETE FROM user_portal_scopes WHERE user_id = $1', [String(id)]);
+        for (const scope of nextPortalScopes) {
+          await pool.query(
+            `INSERT INTO user_portal_scopes (user_id, client_id, job_id)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (user_id, client_id, job_id) DO NOTHING`,
+            [String(id), scope.clientId, scope.jobId]
+          );
+        }
+      }
+
+      if (hasPsrScopesPayload) {
+        await pool.query('DELETE FROM user_psr_scopes WHERE user_id = $1', [String(id)]);
+        for (const scope of nextPsrScopes) {
+          await pool.query(
+            `INSERT INTO user_psr_scopes (user_id, client, city, jobsite, psr_record_id)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (user_id, client, city, jobsite) DO NOTHING`,
+            [String(id), scope.client, scope.city, scope.jobsite, cleanString(scope.recordId || '') || null]
+          );
+        }
+      }
+
+      updatedResult = { rows: [updatedCoreResult.rows[0]] };
+      if (passwordHash) {
+        updatedResult = await pool.query(
+          `UPDATE users
+           SET password = $1,
+               must_change_password = false,
+               updated_at = NOW()
+           WHERE id = $2
+           RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup`,
+          [passwordHash, id]
+        );
+      }
+
+      // Force immediate permission revocation by rotating target user's sessions.
+      // Keep the currently logged-in admin session when editing their own account.
+      if (String(req.user?.id || '') !== String(id)) {
+        await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [String(id)]);
+      }
     }
 
     const user = await attachScopesToUser(normalizeUser(updatedResult.rows[0]));
@@ -3191,8 +3859,24 @@ app.delete('/users/:id', requireAuth, requireAdmin, async (req, res) => {
           .json({ success: false, error: 'Cannot delete the last admin account.' });
       }
     }
-    await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [id]);
-    await pool.query('DELETE FROM users WHERE id = $1', [id]);
+    if (WASABI_WRITES_PRIMARY_ENABLED) {
+      await runWasabiStateWrite('delete-user', async (data) => {
+        const sessions = ensureSnapshotTable(data, 'auth_sessions');
+        data.auth_sessions = sessions.filter((row) => String(row.user_id || '') !== String(id || ''));
+
+        const portalScopes = ensureSnapshotTable(data, 'user_portal_scopes');
+        data.user_portal_scopes = portalScopes.filter((row) => String(row.user_id || '') !== String(id || ''));
+
+        const psrScopes = ensureSnapshotTable(data, 'user_psr_scopes');
+        data.user_psr_scopes = psrScopes.filter((row) => String(row.user_id || '') !== String(id || ''));
+
+        const users = ensureSnapshotTable(data, 'users');
+        data.users = users.filter((row) => String(row.id || '') !== String(id || ''));
+      });
+    } else {
+      await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [id]);
+      await pool.query('DELETE FROM users WHERE id = $1', [id]);
+    }
     return res.json({ success: true, deletedUserId: id, username: target.username });
   } catch (error) {
     console.error('DELETE USER ERROR:', error);
@@ -3249,23 +3933,8 @@ app.post('/records', requireAuth, requirePsrDataEntryAccess, async (req, res) =>
     };
     if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
 
-    const result = await pool.query(
-      `INSERT INTO planner_records (record_date, client, city, street, jobsite, status, saved_by, data)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
-       RETURNING *`,
-      [
-        record.record_date,
-        record.client,
-        record.city,
-        record.street,
-        record.jobsite,
-        '',
-        record.saved_by,
-        JSON.stringify(serializeRecordData(record))
-      ]
-    );
-
-    res.status(201).json({ success: true, record: normalizeRecordRow(result.rows[0]) });
+    const saved = await createPlannerRecord(record);
+    res.status(201).json({ success: true, record: saved });
   } catch (error) {
     console.error('CREATE RECORD ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -3288,6 +3957,28 @@ async function fetchRecordById(id) {
 }
 
 async function persistRecord(record) {
+  let savedRow = null;
+  const wasabiWrote = await tryWasabiStateWrite('persist-record', async (data) => {
+    const rows = ensureSnapshotTable(data, 'planner_records');
+    const idx = rows.findIndex((row) => String(row.id || '') === String(record.id || ''));
+    if (idx < 0) throw new Error('Record not found');
+    savedRow = {
+      ...rows[idx],
+      record_date: cleanString(record.record_date),
+      client: upperCleanString(record.client),
+      city: upperCleanString(record.city),
+      street: upperCleanString(record.street),
+      jobsite: normalizeJobsiteName(record.jobsite, record.street),
+      status: cleanString(record.status || ''),
+      saved_by: cleanString(record.saved_by || ''),
+      data: serializeRecordData(record),
+      updated_at: nowIso()
+    };
+    rows[idx] = savedRow;
+  });
+  if (wasabiWrote && savedRow) {
+    return normalizeRecordRow(savedRow);
+  }
   const result = await pool.query(
     `UPDATE planner_records
      SET record_date = $1,
@@ -3316,6 +4007,79 @@ async function persistRecord(record) {
   return normalizeRecordRow(result.rows[0]);
 }
 
+async function createPlannerRecord(record) {
+  let createdRow = null;
+  const wasabiWrote = await tryWasabiStateWrite('create-planner-record', async (data) => {
+    const rows = ensureSnapshotTable(data, 'planner_records');
+    const numericIds = rows.map((r) => Number(r.id)).filter((n) => Number.isFinite(n));
+    const nextId = numericIds.length ? Math.max(...numericIds) + 1 : 1;
+    const now = nowIso();
+    createdRow = {
+      id: nextId,
+      record_date: cleanString(record.record_date),
+      client: upperCleanString(record.client),
+      city: upperCleanString(record.city),
+      street: upperCleanString(record.street),
+      jobsite: normalizeJobsiteName(record.jobsite, record.street),
+      status: cleanString(record.status || ''),
+      saved_by: cleanString(record.saved_by || ''),
+      data: serializeRecordData(record),
+      created_at: now,
+      updated_at: now
+    };
+    rows.push(createdRow);
+  });
+  if (wasabiWrote && createdRow) {
+    return normalizeRecordRow(createdRow);
+  }
+  const result = await pool.query(
+    `INSERT INTO planner_records (record_date, client, city, street, jobsite, status, saved_by, data)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+     RETURNING *`,
+    [
+      cleanString(record.record_date),
+      upperCleanString(record.client),
+      upperCleanString(record.city),
+      upperCleanString(record.street),
+      normalizeJobsiteName(record.jobsite, record.street),
+      cleanString(record.status || ''),
+      cleanString(record.saved_by || ''),
+      JSON.stringify(serializeRecordData(record))
+    ]
+  );
+  return normalizeRecordRow(result.rows[0]);
+}
+
+async function deletePlannerRecordById(id) {
+  let deletedId = null;
+  const wasabiWrote = await tryWasabiStateWrite('delete-planner-record-by-id', async (data) => {
+    const rows = ensureSnapshotTable(data, 'planner_records');
+    const next = rows.filter((row) => {
+      const keep = String(row.id || '') !== String(id || '');
+      if (!keep) deletedId = row.id;
+      return keep;
+    });
+    data.planner_records = next;
+  });
+  if (wasabiWrote) return deletedId;
+  const result = await pool.query('DELETE FROM planner_records WHERE CAST(id AS text) = $1 RETURNING id', [String(id)]);
+  return result.rows.length ? result.rows[0].id : null;
+}
+
+async function deletePlannerRecordsByClient(client) {
+  let deletedCount = 0;
+  const wasabiWrote = await tryWasabiStateWrite('delete-planner-records-by-client', async (data) => {
+    const rows = ensureSnapshotTable(data, 'planner_records');
+    const target = String(client || '').toLowerCase();
+    const next = rows.filter((row) => String(row.client || '').toLowerCase() !== target);
+    deletedCount = rows.length - next.length;
+    data.planner_records = next;
+  });
+  if (wasabiWrote) return deletedCount;
+  const result = await pool.query('DELETE FROM planner_records WHERE client = $1 RETURNING id', [client]);
+  return Number(result.rowCount || 0);
+}
+
 app.put('/records/:id', requireAuth, requirePsrDataEntryAccess, async (req, res) => {
   try {
     const record = await fetchRecordById(req.params.id);
@@ -3341,11 +4105,11 @@ app.put('/records/:id', requireAuth, requirePsrDataEntryAccess, async (req, res)
 
 app.delete('/records/:id', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query('DELETE FROM planner_records WHERE CAST(id AS text) = $1 RETURNING id', [String(req.params.id)]);
-    if (!result.rows.length) {
+    const deletedId = await deletePlannerRecordById(req.params.id);
+    if (!deletedId) {
       return res.status(404).json({ success: false, error: 'Record not found' });
     }
-    res.json({ success: true, deletedId: result.rows[0].id });
+    res.json({ success: true, deletedId });
   } catch (error) {
     console.error('DELETE RECORD ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -3360,23 +4124,17 @@ app.post('/clients', requireAuth, requireAdmin, async (req, res) => {
     const street = upperCleanString(req.body?.street || '');
     if (!client) return res.status(400).json({ success: false, error: 'Client name is required' });
 
-    const result = await pool.query(
-      `INSERT INTO planner_records (record_date, client, city, street, jobsite, status, saved_by, data)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
-       RETURNING *`,
-      [
-        new Date().toISOString().slice(0, 10),
-        client,
-        city,
-        street,
-        jobsite,
-        '',
-        req.user.displayName || req.user.username,
-        JSON.stringify(serializeRecordData({ systems: { storm: [], sanitary: [] }, saved_by: req.user.displayName || req.user.username }))
-      ]
-    );
-
-    res.status(201).json({ success: true, record: normalizeRecordRow(result.rows[0]) });
+    const saved = await createPlannerRecord({
+      record_date: new Date().toISOString().slice(0, 10),
+      client,
+      city,
+      street,
+      jobsite,
+      status: '',
+      saved_by: req.user.displayName || req.user.username,
+      systems: { storm: [], sanitary: [] }
+    });
+    res.status(201).json({ success: true, record: saved });
   } catch (error) {
     console.error('CREATE CLIENT ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -3386,9 +4144,9 @@ app.post('/clients', requireAuth, requireAdmin, async (req, res) => {
 app.delete('/clients/:client', requireAuth, requireAdmin, async (req, res) => {
   try {
     const client = upperCleanString(req.params.client);
-    await pool.query('DELETE FROM jobsite_assets WHERE client = $1', [client]);
-    const result = await pool.query('DELETE FROM planner_records WHERE client = $1 RETURNING id', [client]);
-    res.json({ success: true, deletedCount: result.rowCount });
+    await deleteJobsiteAssetsByClient(client);
+    const deletedCount = await deletePlannerRecordsByClient(client);
+    res.json({ success: true, deletedCount });
   } catch (error) {
     console.error('DELETE CLIENT ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -3596,22 +4354,7 @@ app.post('/records/:id/segments/:segmentId/move', requireAuth, requireAdmin, asy
         saved_by: req.user.displayName || req.user.username,
         systems: { storm: [], sanitary: [] }
       };
-      const inserted = await pool.query(
-        `INSERT INTO planner_records (record_date, client, city, street, jobsite, status, saved_by, data)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
-         RETURNING *`,
-        [
-          target.record_date,
-          target.client,
-          target.city,
-          target.street,
-          target.jobsite,
-          '',
-          target.saved_by,
-          JSON.stringify(serializeRecordData(target))
-        ]
-      );
-      target = normalizeRecordRow(inserted.rows[0]);
+      target = await createPlannerRecord(target);
     }
 
     movingSegment.system = targetSystem;
@@ -3656,17 +4399,8 @@ app.put('/pricing-rates/:dia', requireAuth, requireAdmin, async (req, res) => {
     const rate = Number(req.body?.rate);
     if (!dia) return res.status(400).json({ success: false, error: 'DIA is required' });
     if (!Number.isFinite(rate)) return res.status(400).json({ success: false, error: 'Rate must be numeric' });
-
-    const result = await pool.query(
-      `INSERT INTO pricing_rates (dia, rate, updated_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (dia)
-       DO UPDATE SET rate = EXCLUDED.rate, updated_at = NOW()
-       RETURNING dia, rate, updated_at`,
-      [dia, Number(rate.toFixed(2))]
-    );
-
-    res.json({ success: true, rate: result.rows[0] });
+    const saved = await upsertPricingRate(dia, Number(rate.toFixed(2)));
+    res.json({ success: true, rate: saved });
   } catch (error) {
     console.error('UPSERT PRICING RATE ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -3675,9 +4409,9 @@ app.put('/pricing-rates/:dia', requireAuth, requireAdmin, async (req, res) => {
 
 app.delete('/pricing-rates/:dia', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query('DELETE FROM pricing_rates WHERE dia = $1 RETURNING dia', [req.params.dia]);
-    if (!result.rows.length) return res.status(404).json({ success: false, error: 'DIA rate not found' });
-    res.json({ success: true, deletedDia: result.rows[0].dia });
+    const deletedDia = await deletePricingRate(req.params.dia);
+    if (!deletedDia) return res.status(404).json({ success: false, error: 'DIA rate not found' });
+    res.json({ success: true, deletedDia });
   } catch (error) {
     console.error('DELETE PRICING RATE ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -3712,19 +4446,14 @@ app.get('/daily-reports', requireAuth, requireAdmin, async (req, res) => {
 app.post('/daily-reports', requireAuth, requireAdmin, upload.array('files'), async (req, res) => {
   try {
     const files = (req.files || []).map(fileToStoredJson);
-    const result = await pool.query(
-      `INSERT INTO daily_reports (title, report_date, notes, files, created_by)
-       VALUES ($1, $2, $3, $4::jsonb, $5)
-       RETURNING *`,
-      [
-        cleanString(req.body?.title),
-        cleanString(req.body?.report_date || new Date().toISOString().slice(0, 10)),
-        cleanString(req.body?.notes),
-        JSON.stringify(files),
-        req.user.displayName || req.user.username
-      ]
-    );
-    res.status(201).json({ success: true, report: result.rows[0] });
+    const created = await createDailyReport({
+      title: cleanString(req.body?.title),
+      report_date: cleanString(req.body?.report_date || new Date().toISOString().slice(0, 10)),
+      notes: cleanString(req.body?.notes),
+      files,
+      created_by: req.user.displayName || req.user.username
+    });
+    res.status(201).json({ success: true, report: created });
   } catch (error) {
     console.error('CREATE DAILY REPORT ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -3756,18 +4485,13 @@ app.put('/daily-reports/:id', requireAuth, requireAdmin, upload.array('files'), 
     const keptFiles = keepIds.size ? currentFiles.filter((file) => keepIds.has(file.id)) : currentFiles;
     const addedFiles = (req.files || []).map(fileToStoredJson);
     const nextFiles = [...keptFiles, ...addedFiles];
-    const result = await pool.query(
-      `UPDATE daily_reports
-       SET title = $1,
-           report_date = $2,
-           notes = $3,
-           files = $4::jsonb,
-           updated_at = NOW()
-       WHERE id = $5
-       RETURNING *`,
-      [cleanString(req.body?.title), cleanString(req.body?.report_date || current.report_date), cleanString(req.body?.notes), JSON.stringify(nextFiles), req.params.id]
-    );
-    res.json({ success: true, report: result.rows[0] });
+    const updated = await updateDailyReportById(req.params.id, {
+      title: cleanString(req.body?.title),
+      report_date: cleanString(req.body?.report_date || current.report_date),
+      notes: cleanString(req.body?.notes),
+      files: nextFiles
+    });
+    res.json({ success: true, report: updated });
   } catch (error) {
     console.error('UPDATE DAILY REPORT ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -3776,7 +4500,7 @@ app.put('/daily-reports/:id', requireAuth, requireAdmin, upload.array('files'), 
 
 app.delete('/daily-reports/:id', requireAuth, requireAdmin, async (req, res) => {
   try {
-    await pool.query('DELETE FROM daily_reports WHERE id = $1', [req.params.id]);
+    await deleteDailyReportById(req.params.id);
     res.json({ success: true });
   } catch (error) {
     console.error('DELETE DAILY REPORT ERROR:', error);
@@ -3818,25 +4542,19 @@ app.get('/jobsite-assets', requireAuth, requireFootageAccess, async (req, res) =
 app.post('/jobsite-assets', requireAuth, requireAdmin, upload.array('files'), async (req, res) => {
   try {
     const files = (req.files || []).map(fileToStoredJson);
-    const result = await pool.query(
-      `INSERT INTO jobsite_assets
-       (client, city, jobsite, contact_name, contact_phone, contact_email, notes, drive_url, files, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
-       RETURNING *`,
-      [
-        upperCleanString(req.body?.assetClient || req.body?.client),
-        upperCleanString(req.body?.assetCity || req.body?.city),
-        normalizeJobsiteName(req.body?.assetJobsite || req.body?.jobsite),
-        cleanString(req.body?.assetContactName || req.body?.contactName),
-        cleanString(req.body?.assetContactPhone || req.body?.contactPhone),
-        cleanString(req.body?.assetContactEmail || req.body?.contactEmail),
-        cleanString(req.body?.assetNotes || req.body?.notes),
-        cleanString(req.body?.assetDriveUrl || req.body?.driveUrl),
-        JSON.stringify(files),
-        req.user.displayName || req.user.username
-      ]
-    );
-    res.status(201).json({ success: true, asset: result.rows[0] });
+    const created = await createJobsiteAsset({
+      client: req.body?.assetClient || req.body?.client,
+      city: req.body?.assetCity || req.body?.city,
+      jobsite: req.body?.assetJobsite || req.body?.jobsite,
+      contact_name: req.body?.assetContactName || req.body?.contactName,
+      contact_phone: req.body?.assetContactPhone || req.body?.contactPhone,
+      contact_email: req.body?.assetContactEmail || req.body?.contactEmail,
+      notes: req.body?.assetNotes || req.body?.notes,
+      drive_url: req.body?.assetDriveUrl || req.body?.driveUrl,
+      files,
+      created_by: req.user.displayName || req.user.username
+    });
+    res.status(201).json({ success: true, asset: created });
   } catch (error) {
     console.error('CREATE JOBSITE ASSET ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -3845,7 +4563,7 @@ app.post('/jobsite-assets', requireAuth, requireAdmin, upload.array('files'), as
 
 app.delete('/jobsite-assets/:id', requireAuth, requireAdmin, async (req, res) => {
   try {
-    await pool.query('DELETE FROM jobsite_assets WHERE id = $1', [req.params.id]);
+    await deleteJobsiteAssetById(req.params.id);
     res.json({ success: true });
   } catch (error) {
     console.error('DELETE JOBSITE ASSET ERROR:', error);
@@ -3916,22 +4634,7 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
         saved_by: req.user.displayName || req.user.username,
         systems: { storm: [], sanitary: [] }
       };
-      const inserted = await pool.query(
-        `INSERT INTO planner_records (record_date, client, city, street, jobsite, status, saved_by, data)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
-         RETURNING *`,
-        [
-          record.record_date,
-          record.client,
-          record.city,
-          record.street,
-          record.jobsite,
-          '',
-          record.saved_by,
-          JSON.stringify(serializeRecordData(record))
-        ]
-      );
-      record = normalizeRecordRow(inserted.rows[0]);
+      record = await createPlannerRecord(record);
     }
 
     const refSet = new Set((record.systems[targetSystem] || []).map((segment) => String(segment.reference || '').toLowerCase()));
@@ -3970,12 +4673,1433 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
   }
 });
 
-registerOutlookRoutes(app, { pool, requireAuth, currentToken, corsOrigins: CORS_ORIGINS });
-registerPortalFilesRoutes(app, { pool, requireAuth, requireAdmin });
-registerSignupRoutes(app, { pool, cleanString, normalizeRoles, issueSession, normalizeUser });
+function normalizeSqlForAutoImport(text) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function pgRows(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  return { rows: list, rowCount: list.length };
+}
+
+function safeJsonParse(value, fallback = {}) {
+  if (value == null) return fallback;
+  if (typeof value === 'object') return value;
+  try {
+    return JSON.parse(String(value));
+  } catch {
+    return fallback;
+  }
+}
+
+function tsMs(value) {
+  const ms = Date.parse(String(value || ''));
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function descByTimestamp(a, b) {
+  return tsMs(b?.updated_at || b?.created_at || b?.last_seen_at) - tsMs(a?.updated_at || a?.created_at || a?.last_seen_at);
+}
+
+function findAutoImportProjectByScope(snapshot, client, city, jobsite) {
+  const projects = snapshotRows(snapshot, 'planner_records')
+    .filter(
+      (row) =>
+        String(row.client || '').toLowerCase() === String(client || '').toLowerCase() &&
+        String(row.city || '').toLowerCase() === String(city || '').toLowerCase() &&
+        String(row.jobsite || '').toLowerCase() === String(jobsite || '').toLowerCase()
+    )
+    .sort(descByTimestamp);
+  return projects[0] || null;
+}
+
+async function runAutoImportWasabiQuery(text, params = []) {
+  const sql = normalizeSqlForAutoImport(text);
+  if (!sql) return null;
+
+  // Schema calls are no-ops in Wasabi mode.
+  if (sql.startsWith('create table if not exists auto_import_') || sql.startsWith('create index if not exists idx_auto_import_')) {
+    return pgRows([]);
+  }
+
+  let snapshotCache = null;
+  async function requireFreshSnapshot() {
+    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot();
+    if (!snapshotLooksFresh(snapshotCache, WASABI_AUTO_IMPORT_PRIMARY_MAX_SNAPSHOT_AGE_MS)) {
+      throw new Error('Auto import snapshot is missing or stale');
+    }
+    return snapshotCache;
+  }
+
+  if (sql.startsWith('select * from auto_import_projects where source_key = $1')) {
+    const snapshot = await requireFreshSnapshot();
+    const sourceKey = String(params[0] || '');
+    const rows = snapshotRows(snapshot, 'auto_import_projects').filter((row) => String(row.source_key || '') === sourceKey).slice(0, 1);
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select * from auto_import_projects where id = $1')) {
+    const snapshot = await requireFreshSnapshot();
+    const id = String(params[0] || '');
+    const rows = snapshotRows(snapshot, 'auto_import_projects').filter((row) => String(row.id || '') === id).slice(0, 1);
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select * from auto_import_projects order by coalesce(last_seen_at, created_at) desc')) {
+    const snapshot = await requireFreshSnapshot();
+    const rows = [...snapshotRows(snapshot, 'auto_import_projects')].sort((a, b) => {
+      const sortA = tsMs(a?.last_seen_at || a?.created_at);
+      const sortB = tsMs(b?.last_seen_at || b?.created_at);
+      if (sortB !== sortA) return sortB - sortA;
+      return String(a?.display_name || '').localeCompare(String(b?.display_name || ''), undefined, { sensitivity: 'base' });
+    });
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select id from auto_import_bindings where project_id = $1')) {
+    const snapshot = await requireFreshSnapshot();
+    const projectId = String(params[0] || '');
+    const rows = snapshotRows(snapshot, 'auto_import_bindings')
+      .filter((row) => String(row.project_id || '') === projectId)
+      .slice(0, 1)
+      .map((row) => ({ id: row.id }));
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select * from auto_import_bindings where project_id = $1')) {
+    const snapshot = await requireFreshSnapshot();
+    const projectId = String(params[0] || '');
+    const rows = snapshotRows(snapshot, 'auto_import_bindings').filter((row) => String(row.project_id || '') === projectId).slice(0, 1);
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select * from auto_import_bindings order by updated_at desc')) {
+    const snapshot = await requireFreshSnapshot();
+    const rows = [...snapshotRows(snapshot, 'auto_import_bindings')].sort((a, b) => tsMs(b?.updated_at) - tsMs(a?.updated_at));
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select id, row_hash from auto_import_row_cache where project_id = $1 and row_key = $2')) {
+    const snapshot = await requireFreshSnapshot();
+    const projectId = String(params[0] || '');
+    const rowKey = String(params[1] || '');
+    const rows = snapshotRows(snapshot, 'auto_import_row_cache')
+      .filter((row) => String(row.project_id || '') === projectId && String(row.row_key || '') === rowKey)
+      .slice(0, 1)
+      .map((row) => ({ id: row.id, row_hash: row.row_hash }));
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select * from auto_import_runs where project_id = $1 order by started_at desc limit 1')) {
+    const snapshot = await requireFreshSnapshot();
+    const projectId = String(params[0] || '');
+    const rows = [...snapshotRows(snapshot, 'auto_import_runs')]
+      .filter((row) => String(row.project_id || '') === projectId)
+      .sort((a, b) => tsMs(b?.started_at || b?.created_at) - tsMs(a?.started_at || a?.created_at))
+      .slice(0, 1);
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select * from auto_import_runs where project_id = $1 order by started_at desc limit 100')) {
+    const snapshot = await requireFreshSnapshot();
+    const projectId = String(params[0] || '');
+    const rows = [...snapshotRows(snapshot, 'auto_import_runs')]
+      .filter((row) => String(row.project_id || '') === projectId)
+      .sort((a, b) => tsMs(b?.started_at || b?.created_at) - tsMs(a?.started_at || a?.created_at))
+      .slice(0, 100);
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select * from auto_import_logs where project_id = $1 or project_id is null')) {
+    const snapshot = await requireFreshSnapshot();
+    const projectId = String(params[0] || '');
+    const limit = Math.max(1, Number(params[1] || 200));
+    const rows = [...snapshotRows(snapshot, 'auto_import_logs')]
+      .filter((row) => String(row.project_id || '') === projectId || row.project_id == null)
+      .sort((a, b) => tsMs(b?.created_at) - tsMs(a?.created_at))
+      .slice(0, limit);
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select id from planner_records where lower(client) = lower($1) and lower(city) = lower($2) and lower(jobsite) = lower($3)')) {
+    const snapshot = await requireFreshSnapshot();
+    const hit = findAutoImportProjectByScope(snapshot, params[0], params[1], params[2]);
+    return pgRows(hit ? [{ id: hit.id }] : []);
+  }
+  if (sql.startsWith('select id, client, city, jobsite from planner_records order by lower(client), lower(city), lower(jobsite)')) {
+    const snapshot = await requireFreshSnapshot();
+    const rows = snapshotRows(snapshot, 'planner_records')
+      .map((row) => ({
+        id: row.id,
+        client: row.client,
+        city: row.city,
+        jobsite: row.jobsite
+      }))
+      .sort((a, b) => {
+        const c = String(a.client || '').localeCompare(String(b.client || ''), undefined, { sensitivity: 'base' });
+        if (c !== 0) return c;
+        const d = String(a.city || '').localeCompare(String(b.city || ''), undefined, { sensitivity: 'base' });
+        if (d !== 0) return d;
+        return String(a.jobsite || '').localeCompare(String(b.jobsite || ''), undefined, { sensitivity: 'base' });
+      });
+    return pgRows(rows);
+  }
+
+  let outRows = null;
+  const wrote = await tryWasabiStateWrite('auto-import-plugin-query', async (data) => {
+    const now = nowIso();
+    const projects = ensureSnapshotTable(data, 'auto_import_projects');
+    const bindings = ensureSnapshotTable(data, 'auto_import_bindings');
+    const rowCache = ensureSnapshotTable(data, 'auto_import_row_cache');
+    const runs = ensureSnapshotTable(data, 'auto_import_runs');
+    const logs = ensureSnapshotTable(data, 'auto_import_logs');
+
+    if (sql.startsWith('update auto_import_projects set display_name = $2')) {
+      const sourceKey = String(params[0] || '');
+      const idx = projects.findIndex((row) => String(row.source_key || '') === sourceKey);
+      if (idx >= 0) {
+        projects[idx] = {
+          ...projects[idx],
+          display_name: params[1],
+          db3_path: params[2],
+          last_seen_at: now,
+          updated_at: now
+        };
+        outRows = [projects[idx]];
+      } else {
+        outRows = [];
+      }
+      return;
+    }
+    if (sql.startsWith('insert into auto_import_projects')) {
+      const row = {
+        id: params[0],
+        source_key: params[1],
+        display_name: params[2],
+        db3_path: params[3],
+        status: 'idle',
+        detection_mode: 'auto',
+        detected_job_client: '',
+        detected_job_city: '',
+        detected_jobsite: '',
+        last_seen_at: now,
+        last_scan_at: null,
+        last_switch_at: null,
+        last_error: '',
+        metadata: {},
+        created_at: now,
+        updated_at: now
+      };
+      projects.push(row);
+      outRows = [row];
+      return;
+    }
+    if (sql.startsWith('update auto_import_projects set detected_job_city = $2')) {
+      const id = String(params[0] || '');
+      const idx = projects.findIndex((row) => String(row.id || '') === id);
+      if (idx >= 0) {
+        projects[idx] = {
+          ...projects[idx],
+          detected_job_city: cleanString(params[1]),
+          detected_jobsite: cleanString(params[2]),
+          metadata: safeJsonParse(params[3], {}),
+          last_scan_at: now,
+          status: 'discovered',
+          updated_at: now
+        };
+      }
+      outRows = [];
+      return;
+    }
+    if (sql.startsWith('update auto_import_projects set status = \'running\'')) {
+      const id = String(params[0] || '');
+      const idx = projects.findIndex((row) => String(row.id || '') === id);
+      if (idx >= 0) {
+        projects[idx] = { ...projects[idx], status: 'running', last_error: '', updated_at: now };
+        outRows = [projects[idx]];
+      } else outRows = [];
+      return;
+    }
+    if (sql.startsWith('update auto_import_projects set status = \'idle\'')) {
+      const id = String(params[0] || '');
+      const idx = projects.findIndex((row) => String(row.id || '') === id);
+      if (idx >= 0) {
+        projects[idx] = { ...projects[idx], status: 'idle', updated_at: now };
+        outRows = [projects[idx]];
+      } else outRows = [];
+      return;
+    }
+    if (sql.startsWith('update auto_import_projects set detection_mode = $2')) {
+      const id = String(params[0] || '');
+      const idx = projects.findIndex((row) => String(row.id || '') === id);
+      if (idx >= 0) {
+        projects[idx] = { ...projects[idx], detection_mode: cleanString(params[1]) || 'auto', updated_at: now };
+        outRows = [projects[idx]];
+      } else outRows = [];
+      return;
+    }
+    if (sql.startsWith('update auto_import_projects set status = \'synced\'')) {
+      const id = String(params[0] || '');
+      const idx = projects.findIndex((row) => String(row.id || '') === id);
+      if (idx >= 0) {
+        projects[idx] = { ...projects[idx], status: 'synced', last_scan_at: now, last_error: '', updated_at: now };
+      }
+      outRows = [];
+      return;
+    }
+    if (sql.startsWith('update auto_import_projects set status = \'error\'')) {
+      const id = String(params[0] || '');
+      const idx = projects.findIndex((row) => String(row.id || '') === id);
+      if (idx >= 0) {
+        projects[idx] = { ...projects[idx], status: 'error', last_error: String(params[1] || ''), updated_at: now };
+      }
+      outRows = [];
+      return;
+    }
+    if (sql.startsWith('update auto_import_bindings set client = $2')) {
+      const projectId = String(params[0] || '');
+      const idx = bindings.findIndex((row) => String(row.project_id || '') === projectId);
+      if (idx >= 0) {
+        bindings[idx] = {
+          ...bindings[idx],
+          client: cleanString(params[1]),
+          city: cleanString(params[2]),
+          jobsite: cleanString(params[3]),
+          system_type: cleanString(params[4]) || 'storm',
+          pinned: !!params[5],
+          created_by: cleanString(bindings[idx].created_by || '') || cleanString(params[6]) || 'System',
+          updated_at: now
+        };
+        outRows = [bindings[idx]];
+      } else outRows = [];
+      return;
+    }
+    if (sql.startsWith('insert into auto_import_bindings')) {
+      const row = {
+        id: params[0],
+        project_id: params[1],
+        client: cleanString(params[2]),
+        city: cleanString(params[3]),
+        jobsite: cleanString(params[4]),
+        system_type: cleanString(params[5]) || 'storm',
+        pinned: !!params[6],
+        created_by: cleanString(params[7]) || 'System',
+        created_at: now,
+        updated_at: now
+      };
+      const existingIdx = bindings.findIndex((item) => String(item.project_id || '') === String(row.project_id || ''));
+      if (existingIdx >= 0) bindings[existingIdx] = { ...bindings[existingIdx], ...row, created_at: bindings[existingIdx].created_at || now };
+      else bindings.push(row);
+      outRows = [existingIdx >= 0 ? bindings[existingIdx] : row];
+      return;
+    }
+    if (sql.startsWith('update auto_import_row_cache set last_seen_at = now() where id = $1')) {
+      const id = String(params[0] || '');
+      const idx = rowCache.findIndex((row) => String(row.id || '') === id);
+      if (idx >= 0) rowCache[idx] = { ...rowCache[idx], last_seen_at: now };
+      outRows = [];
+      return;
+    }
+    if (sql.startsWith('update auto_import_row_cache set row_hash = $3')) {
+      const projectId = String(params[0] || '');
+      const rowKey = String(params[1] || '');
+      const idx = rowCache.findIndex(
+        (row) => String(row.project_id || '') === projectId && String(row.row_key || '') === rowKey
+      );
+      if (idx >= 0) {
+        rowCache[idx] = {
+          ...rowCache[idx],
+          row_hash: params[2],
+          system_type: cleanString(params[3]) || 'storm',
+          reference: cleanString(params[4]),
+          upstream: cleanString(params[5]),
+          downstream: cleanString(params[6]),
+          dia: cleanString(params[7]),
+          material: cleanString(params[8]),
+          length: Number(params[9] || 0),
+          footage: Number(params[10] || 0),
+          source_payload: safeJsonParse(params[11], {}),
+          last_seen_at: now
+        };
+      }
+      outRows = [];
+      return;
+    }
+    if (sql.startsWith('insert into auto_import_row_cache')) {
+      rowCache.push({
+        id: params[0],
+        project_id: params[1],
+        row_key: params[2],
+        row_hash: params[3],
+        system_type: cleanString(params[4]) || 'storm',
+        reference: cleanString(params[5]),
+        upstream: cleanString(params[6]),
+        downstream: cleanString(params[7]),
+        dia: cleanString(params[8]),
+        material: cleanString(params[9]),
+        length: Number(params[10] || 0),
+        footage: Number(params[11] || 0),
+        source_payload: safeJsonParse(params[12], {}),
+        first_seen_at: now,
+        last_seen_at: now
+      });
+      outRows = [];
+      return;
+    }
+    if (sql.startsWith('insert into auto_import_runs')) {
+      runs.push({
+        id: params[0],
+        project_id: params[1],
+        started_at: now,
+        completed_at: now,
+        active_db3_path: cleanString(params[2]),
+        switch_reason: cleanString(params[3]),
+        rows_found: Number(params[4] || 0),
+        rows_changed: Number(params[5] || 0),
+        rows_inserted: Number(params[6] || 0),
+        rows_updated: Number(params[7] || 0),
+        notes: '',
+        payload: safeJsonParse(params[8], {})
+      });
+      outRows = [];
+      return;
+    }
+    if (sql.startsWith('insert into auto_import_logs')) {
+      logs.push({
+        id: params[0],
+        project_id: params[1] || null,
+        source: cleanString(params[2] || 'server') || 'server',
+        level: cleanString(params[3] || 'info') || 'info',
+        message: cleanString(params[4]),
+        payload: safeJsonParse(params[5], {}),
+        created_at: now
+      });
+      outRows = [];
+      return;
+    }
+
+    outRows = null;
+  });
+
+  if (!wrote) return null;
+  if (outRows === null) return null;
+  return pgRows(outRows);
+}
+
+async function queryAutoImportWithWasabiFallback(text, params = []) {
+  const normalizedSql = normalizeSqlForAutoImport(text);
+  if (!WASABI_AUTO_IMPORT_PRIMARY_ENABLED) {
+    return pool.query(text, params);
+  }
+  try {
+    const result = await runAutoImportWasabiQuery(text, params);
+    if (result) {
+      wasabiAutoImportHandledByWasabi += 1;
+      return result;
+    }
+    if (WASABI_AUTO_IMPORT_PRIMARY_STRICT) {
+      wasabiAutoImportLastErrorAt = Date.now();
+      wasabiAutoImportLastError = 'Auto import Wasabi adapter does not support this query shape';
+      throw new Error('Auto import Wasabi adapter does not support this query shape');
+    }
+    wasabiAutoImportFallbackToPostgres += 1;
+    wasabiAutoImportFallbackSamples.push({
+      at: new Date().toISOString(),
+      reason: 'unsupported-query-shape',
+      sql: normalizedSql.slice(0, 260)
+    });
+    if (wasabiAutoImportFallbackSamples.length > 50) {
+      wasabiAutoImportFallbackSamples = wasabiAutoImportFallbackSamples.slice(-50);
+    }
+  } catch (error) {
+    wasabiAutoImportLastErrorAt = Date.now();
+    wasabiAutoImportLastError = String(error?.message || error || '');
+    if (WASABI_AUTO_IMPORT_PRIMARY_STRICT) throw error;
+    console.warn('[wasabi-auto-import] query failed, falling back to postgres:', error?.message || error);
+    wasabiAutoImportFallbackToPostgres += 1;
+    wasabiAutoImportFallbackSamples.push({
+      at: new Date().toISOString(),
+      reason: 'adapter-error',
+      sql: normalizedSql.slice(0, 260),
+      error: String(error?.message || error || '')
+    });
+    if (wasabiAutoImportFallbackSamples.length > 50) {
+      wasabiAutoImportFallbackSamples = wasabiAutoImportFallbackSamples.slice(-50);
+    }
+  }
+  return pool.query(text, params);
+}
+
+function normalizeSqlForPortalData(text) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+async function runPortalDataWasabiQuery(text, params = []) {
+  const sql = normalizeSqlForPortalData(text);
+  if (!sql) return null;
+  if (sql === 'begin' || sql === 'commit' || sql === 'rollback') {
+    return pgRows([]);
+  }
+  if (
+    sql.startsWith('create table if not exists portal_upload_sessions') ||
+    sql.startsWith('create table if not exists portal_upload_session_parts') ||
+    sql.startsWith('create index if not exists idx_portal_upload_sessions_user_status') ||
+    sql.startsWith('create index if not exists idx_portal_upload_sessions_scope') ||
+    sql.startsWith('alter table portal_upload_session_parts add column if not exists sha256 text')
+  ) {
+    return pgRows([]);
+  }
+
+  let snapshotCache = null;
+  async function requireFreshSnapshot() {
+    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot();
+    if (!snapshotLooksFresh(snapshotCache, WASABI_PORTAL_DATA_PRIMARY_MAX_SNAPSHOT_AGE_MS)) {
+      throw new Error('Portal data snapshot is missing or stale');
+    }
+    return snapshotCache;
+  }
+
+  if (sql.startsWith('select 1 from portal_path_grants where client_id = $1 and job_id = $2 limit 1')) {
+    const snapshot = await requireFreshSnapshot();
+    const clientId = String(params[0] || '');
+    const jobId = String(params[1] || '');
+    const hasGrant = snapshotRows(snapshot, 'portal_path_grants').some(
+      (row) => String(row.client_id || '') === clientId && String(row.job_id || '') === jobId
+    );
+    return pgRows(hasGrant ? [{ '?column?': 1 }] : []);
+  }
+  if (
+    sql.startsWith(
+      'select path_prefix, coalesce(recursive, true) as recursive, coalesce(access_mode, \'full\') as access_mode from portal_path_grants where client_id = $1 and job_id = $2 and lower(trim(username)) = lower(trim($3))'
+    )
+  ) {
+    const snapshot = await requireFreshSnapshot();
+    const clientId = String(params[0] || '');
+    const jobId = String(params[1] || '');
+    const username = String(params[2] || '').trim().toLowerCase();
+    const rows = snapshotRows(snapshot, 'portal_path_grants')
+      .filter(
+        (row) =>
+          String(row.client_id || '') === clientId &&
+          String(row.job_id || '') === jobId &&
+          String(row.username || '').trim().toLowerCase() === username
+      )
+      .map((row) => ({
+        path_prefix: String(row.path_prefix || ''),
+        recursive: row.recursive !== false,
+        access_mode: String(row.access_mode || 'full') || 'full'
+      }));
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select id, path_prefix from portal_path_grants where client_id = $1 and job_id = $2')) {
+    const snapshot = await requireFreshSnapshot();
+    const clientId = String(params[0] || '');
+    const jobId = String(params[1] || '');
+    const rows = snapshotRows(snapshot, 'portal_path_grants')
+      .filter((row) => String(row.client_id || '') === clientId && String(row.job_id || '') === jobId)
+      .map((row) => ({ id: row.id, path_prefix: row.path_prefix }));
+    return pgRows(rows);
+  }
+  if (
+    sql.startsWith(
+      'select id, username, path_prefix as "pathprefix", recursive, coalesce(access_mode, \'full\') as "accessmode", created_at as "createdat" from portal_path_grants where client_id = $1 and job_id = $2 order by lower(username), path_prefix'
+    )
+  ) {
+    const snapshot = await requireFreshSnapshot();
+    const clientId = String(params[0] || '');
+    const jobId = String(params[1] || '');
+    const rows = snapshotRows(snapshot, 'portal_path_grants')
+      .filter((row) => String(row.client_id || '') === clientId && String(row.job_id || '') === jobId)
+      .map((row) => ({
+        id: row.id,
+        username: row.username,
+        pathPrefix: row.path_prefix,
+        recursive: row.recursive !== false,
+        accessMode: String(row.access_mode || 'full') || 'full',
+        createdAt: row.created_at || null
+      }))
+      .sort((a, b) => {
+        const c = String(a.username || '').localeCompare(String(b.username || ''), undefined, { sensitivity: 'base' });
+        if (c !== 0) return c;
+        return String(a.pathPrefix || '').localeCompare(String(b.pathPrefix || ''), undefined, { sensitivity: 'base' });
+      });
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select * from portal_share_links where token = $1')) {
+    const snapshot = await requireFreshSnapshot();
+    const token = String(params[0] || '');
+    const rows = snapshotRows(snapshot, 'portal_share_links').filter((row) => String(row.token || '') === token).slice(0, 1);
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select 1 from portal_share_guest_sessions where guest_token = $1 and share_link_id = $2')) {
+    const snapshot = await requireFreshSnapshot();
+    const guestToken = String(params[0] || '');
+    const shareLinkId = String(params[1] || '');
+    const exists = snapshotRows(snapshot, 'portal_share_guest_sessions').some(
+      (row) => String(row.guest_token || '') === guestToken && String(row.share_link_id || '') === shareLinkId
+    );
+    return pgRows(exists ? [{ '?column?': 1 }] : []);
+  }
+  if (
+    sql.startsWith(
+      'select a.id, a.email, a.first_name as "firstname", a.last_name as "lastname", a.role, a.company, a.accessed_at as "accessedat", l.kind, l.token, l.created_at as "linkcreatedat" from portal_share_access_log a join portal_share_links l on l.id = a.share_link_id where l.client_id = $1 and l.job_id = $2 order by a.accessed_at desc limit 500'
+    )
+  ) {
+    const snapshot = await requireFreshSnapshot();
+    const clientId = String(params[0] || '');
+    const jobId = String(params[1] || '');
+    const links = snapshotRows(snapshot, 'portal_share_links').filter(
+      (row) => String(row.client_id || '') === clientId && String(row.job_id || '') === jobId
+    );
+    const linkById = new Map(links.map((row) => [String(row.id || ''), row]));
+    const rows = snapshotRows(snapshot, 'portal_share_access_log')
+      .filter((row) => linkById.has(String(row.share_link_id || '')))
+      .map((row) => {
+        const link = linkById.get(String(row.share_link_id || '')) || {};
+        return {
+          id: row.id,
+          email: row.email,
+          firstName: row.first_name || '',
+          lastName: row.last_name || '',
+          role: row.role || '',
+          company: row.company || '',
+          accessedAt: row.accessed_at || null,
+          kind: link.kind || null,
+          token: link.token || null,
+          linkCreatedAt: link.created_at || null
+        };
+      })
+      .sort((a, b) => tsMs(b.accessedAt) - tsMs(a.accessedAt))
+      .slice(0, 500);
+    return pgRows(rows);
+  }
+  if (
+    sql.startsWith(
+      'select id, client_id, job_id, folder_path, file_name, file_size, mime_type, object_key, chunk_size, updated_at from portal_upload_sessions where '
+    ) &&
+    sql.includes("status = 'uploading'") &&
+    sql.endsWith('order by updated_at desc limit 500')
+  ) {
+    const snapshot = await requireFreshSnapshot();
+    const userId = String(params[0] || '');
+    const clientId = params.length >= 2 ? String(params[1] || '') : '';
+    const jobId = params.length >= 3 ? String(params[2] || '') : '';
+    const rows = snapshotRows(snapshot, 'portal_upload_sessions')
+      .filter((row) => String(row.user_id || '') === userId)
+      .filter((row) => String(row.status || '') === 'uploading')
+      .filter((row) => (!clientId ? true : String(row.client_id || '') === clientId))
+      .filter((row) => (!jobId ? true : String(row.job_id || '') === jobId))
+      .sort((a, b) => tsMs(b.updated_at || b.created_at) - tsMs(a.updated_at || a.created_at))
+      .slice(0, 500)
+      .map((row) => ({
+        id: row.id,
+        client_id: row.client_id,
+        job_id: row.job_id,
+        folder_path: row.folder_path || '',
+        file_name: row.file_name,
+        file_size: row.file_size,
+        mime_type: row.mime_type,
+        object_key: row.object_key,
+        chunk_size: row.chunk_size,
+        updated_at: row.updated_at || null
+      }));
+    return pgRows(rows);
+  }
+  if (
+    sql.startsWith(
+      'select id, multipart_upload_id, chunk_size, object_key, file_size, file_name, mime_type, sha256 from portal_upload_sessions where user_id = $1 and client_id = $2 and job_id = $3 and folder_path = $4 and file_name = $5 and file_size = $6 and status = \'uploading\' order by updated_at desc limit 1'
+    )
+  ) {
+    const snapshot = await requireFreshSnapshot();
+    const userId = String(params[0] || '');
+    const clientId = String(params[1] || '');
+    const jobId = String(params[2] || '');
+    const folderPath = String(params[3] || '');
+    const fileName = String(params[4] || '');
+    const fileSize = Number(params[5] || 0);
+    const hit = snapshotRows(snapshot, 'portal_upload_sessions')
+      .filter(
+        (row) =>
+          String(row.user_id || '') === userId &&
+          String(row.client_id || '') === clientId &&
+          String(row.job_id || '') === jobId &&
+          String(row.folder_path || '') === folderPath &&
+          String(row.file_name || '') === fileName &&
+          Number(row.file_size || 0) === fileSize &&
+          String(row.status || '') === 'uploading'
+      )
+      .sort((a, b) => tsMs(b.updated_at || b.created_at) - tsMs(a.updated_at || a.created_at))[0];
+    if (!hit) return pgRows([]);
+    return pgRows([
+      {
+        id: hit.id,
+        multipart_upload_id: hit.multipart_upload_id,
+        chunk_size: hit.chunk_size,
+        object_key: hit.object_key,
+        file_size: hit.file_size,
+        file_name: hit.file_name,
+        mime_type: hit.mime_type,
+        sha256: hit.sha256 || null
+      }
+    ]);
+  }
+  if (sql.startsWith('select * from portal_upload_sessions where id = $1 and user_id = $2 limit 1')) {
+    const snapshot = await requireFreshSnapshot();
+    const sessionId = String(params[0] || '');
+    const userId = String(params[1] || '');
+    const rows = snapshotRows(snapshot, 'portal_upload_sessions')
+      .filter((row) => String(row.id || '') === sessionId && String(row.user_id || '') === userId)
+      .slice(0, 1);
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select part_number, size from portal_upload_session_parts where session_id = $1 order by part_number')) {
+    const snapshot = await requireFreshSnapshot();
+    const sessionId = String(params[0] || '');
+    const rows = snapshotRows(snapshot, 'portal_upload_session_parts')
+      .filter((row) => String(row.session_id || '') === sessionId)
+      .map((row) => ({
+        part_number: Number(row.part_number || 0),
+        size: Number(row.size || 0)
+      }))
+      .sort((a, b) => Number(a.part_number || 0) - Number(b.part_number || 0));
+    return pgRows(rows);
+  }
+  if (
+    sql.startsWith(
+      'select part_number, etag, size from portal_upload_session_parts where session_id = $1 order by part_number'
+    )
+  ) {
+    const snapshot = await requireFreshSnapshot();
+    const sessionId = String(params[0] || '');
+    const rows = snapshotRows(snapshot, 'portal_upload_session_parts')
+      .filter((row) => String(row.session_id || '') === sessionId)
+      .map((row) => ({
+        part_number: Number(row.part_number || 0),
+        etag: row.etag || '',
+        size: Number(row.size || 0)
+      }))
+      .sort((a, b) => Number(a.part_number || 0) - Number(b.part_number || 0));
+    return pgRows(rows);
+  }
+
+  let outRows = null;
+  const wrote = await tryWasabiStateWrite('portal-data-query', async (data) => {
+    const rows = ensureSnapshotTable(data, 'portal_path_grants');
+    const shareLinks = ensureSnapshotTable(data, 'portal_share_links');
+    const shareAccessLog = ensureSnapshotTable(data, 'portal_share_access_log');
+    const guestSessions = ensureSnapshotTable(data, 'portal_share_guest_sessions');
+    const uploadSessions = ensureSnapshotTable(data, 'portal_upload_sessions');
+    const uploadParts = ensureSnapshotTable(data, 'portal_upload_session_parts');
+    const now = nowIso();
+
+    if (sql.startsWith('update portal_path_grants set path_prefix = $1 where id = $2')) {
+      const pathPrefix = String(params[0] || '');
+      const id = String(params[1] || '');
+      const idx = rows.findIndex((row) => String(row.id || '') === id);
+      if (idx >= 0) {
+        rows[idx] = {
+          ...rows[idx],
+          path_prefix: pathPrefix
+        };
+      }
+      outRows = [];
+      return;
+    }
+    if (
+      sql.startsWith(
+        'delete from portal_path_grants where client_id = $1 and job_id = $2 and (path_prefix = $3 or path_prefix like $4)'
+      )
+    ) {
+      const clientId = String(params[0] || '');
+      const jobId = String(params[1] || '');
+      const root = String(params[2] || '');
+      data.portal_path_grants = rows.filter((row) => {
+        if (String(row.client_id || '') !== clientId || String(row.job_id || '') !== jobId) return true;
+        const p = String(row.path_prefix || '');
+        return !(p === root || p.startsWith(`${root}/`));
+      });
+      outRows = [];
+      return;
+    }
+    if (sql.startsWith('delete from portal_path_grants where client_id = $1 and job_id = $2')) {
+      const clientId = String(params[0] || '');
+      const jobId = String(params[1] || '');
+      data.portal_path_grants = rows.filter(
+        (row) => String(row.client_id || '') !== clientId || String(row.job_id || '') !== jobId
+      );
+      outRows = [];
+      return;
+    }
+    if (sql.startsWith('insert into portal_path_grants (client_id, job_id, username, path_prefix, recursive, access_mode) values ($1,$2,$3,$4,$5,$6)')) {
+      rows.push({
+        id: crypto.randomUUID(),
+        client_id: String(params[0] || ''),
+        job_id: String(params[1] || ''),
+        username: String(params[2] || ''),
+        path_prefix: String(params[3] || ''),
+        recursive: params[4] !== false,
+        access_mode: String(params[5] || 'full') || 'full',
+        created_at: now
+      });
+      outRows = [];
+      return;
+    }
+    if (
+      sql.startsWith(
+        'insert into portal_share_links (id, token, client_id, job_id, kind, created_by_username, payload) values ($1,$2,$3,$4,$5,$6,$7::jsonb)'
+      )
+    ) {
+      shareLinks.push({
+        id: String(params[0] || ''),
+        token: String(params[1] || ''),
+        client_id: String(params[2] || ''),
+        job_id: String(params[3] || ''),
+        kind: String(params[4] || ''),
+        created_by_username: String(params[5] || ''),
+        payload: safeJsonParse(params[6], {}),
+        created_at: now
+      });
+      outRows = [];
+      return;
+    }
+    if (
+      sql.startsWith(
+        'insert into portal_share_access_log (share_link_id, email, first_name, last_name, role, company, ip_inet, user_agent) values ($1,$2,$3,$4,$5,$6,$7,$8)'
+      )
+    ) {
+      shareAccessLog.push({
+        id: crypto.randomUUID(),
+        share_link_id: String(params[0] || ''),
+        email: String(params[1] || ''),
+        first_name: String(params[2] || ''),
+        last_name: String(params[3] || ''),
+        role: String(params[4] || ''),
+        company: String(params[5] || ''),
+        ip_inet: params[6] == null ? null : String(params[6]),
+        user_agent: params[7] == null ? null : String(params[7]),
+        accessed_at: now
+      });
+      outRows = [];
+      return;
+    }
+    if (
+      sql.startsWith(
+        'insert into portal_share_guest_sessions (guest_token, share_link_id, email, first_name, last_name, role, company) values ($1,$2,$3,$4,$5,$6,$7)'
+      )
+    ) {
+      guestSessions.push({
+        guest_token: String(params[0] || ''),
+        share_link_id: String(params[1] || ''),
+        email: String(params[2] || ''),
+        first_name: String(params[3] || ''),
+        last_name: String(params[4] || ''),
+        role: String(params[5] || ''),
+        company: String(params[6] || ''),
+        created_at: now
+      });
+      outRows = [];
+      return;
+    }
+    if (
+      sql.startsWith(
+        'insert into portal_upload_sessions (user_id, client_id, job_id, folder_path, file_name, file_size, mime_type, object_key, multipart_upload_id, chunk_size, sha256, status) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,\'uploading\') returning id'
+      )
+    ) {
+      const id = crypto.randomUUID();
+      uploadSessions.push({
+        id,
+        user_id: String(params[0] || ''),
+        client_id: String(params[1] || ''),
+        job_id: String(params[2] || ''),
+        folder_path: String(params[3] || ''),
+        file_name: String(params[4] || ''),
+        file_size: Number(params[5] || 0),
+        mime_type: String(params[6] || ''),
+        object_key: String(params[7] || ''),
+        multipart_upload_id: String(params[8] || ''),
+        chunk_size: Number(params[9] || 0),
+        sha256: params[10] == null ? null : String(params[10]),
+        status: 'uploading',
+        created_at: now,
+        updated_at: now,
+        completed_at: null
+      });
+      outRows = [{ id }];
+      return;
+    }
+    if (
+      sql.startsWith(
+        'insert into portal_upload_session_parts (session_id, part_number, etag, sha256, size) values ($1,$2,$3,$4,$5) on conflict (session_id, part_number) do update set etag = excluded.etag, sha256 = excluded.sha256, size = excluded.size, created_at = now()'
+      )
+    ) {
+      const sessionId = String(params[0] || '');
+      const partNumber = Number(params[1] || 0);
+      const idx = uploadParts.findIndex(
+        (row) => String(row.session_id || '') === sessionId && Number(row.part_number || 0) === partNumber
+      );
+      const next = {
+        session_id: sessionId,
+        part_number: partNumber,
+        etag: String(params[2] || ''),
+        sha256: params[3] == null ? null : String(params[3]),
+        size: Number(params[4] || 0),
+        created_at: now
+      };
+      if (idx >= 0) uploadParts[idx] = { ...uploadParts[idx], ...next };
+      else uploadParts.push(next);
+      outRows = [];
+      return;
+    }
+    if (sql.startsWith('update portal_upload_sessions set updated_at = now() where id = $1')) {
+      const sessionId = String(params[0] || '');
+      const idx = uploadSessions.findIndex((row) => String(row.id || '') === sessionId);
+      if (idx >= 0) uploadSessions[idx] = { ...uploadSessions[idx], updated_at: now };
+      outRows = [];
+      return;
+    }
+    if (
+      sql.startsWith(
+        'update portal_upload_sessions set status = \'failed\', sha256 = $2, updated_at = now() where id = $1'
+      )
+    ) {
+      const sessionId = String(params[0] || '');
+      const idx = uploadSessions.findIndex((row) => String(row.id || '') === sessionId);
+      if (idx >= 0) {
+        uploadSessions[idx] = {
+          ...uploadSessions[idx],
+          status: 'failed',
+          sha256: String(params[1] || ''),
+          updated_at: now
+        };
+      }
+      outRows = [];
+      return;
+    }
+    if (
+      sql.startsWith(
+        'update portal_upload_sessions set status = \'completed\', sha256 = $2, completed_at = now(), updated_at = now() where id = $1'
+      )
+    ) {
+      const sessionId = String(params[0] || '');
+      const idx = uploadSessions.findIndex((row) => String(row.id || '') === sessionId);
+      if (idx >= 0) {
+        uploadSessions[idx] = {
+          ...uploadSessions[idx],
+          status: 'completed',
+          sha256: String(params[1] || ''),
+          completed_at: now,
+          updated_at: now
+        };
+      }
+      outRows = [];
+      return;
+    }
+    if (sql.startsWith('update portal_upload_sessions set status = \'aborted\', updated_at = now() where id = $1')) {
+      const sessionId = String(params[0] || '');
+      const idx = uploadSessions.findIndex((row) => String(row.id || '') === sessionId);
+      if (idx >= 0) {
+        uploadSessions[idx] = {
+          ...uploadSessions[idx],
+          status: 'aborted',
+          updated_at: now
+        };
+      }
+      outRows = [];
+      return;
+    }
+
+    outRows = null;
+  });
+
+  if (!wrote) return null;
+  if (outRows === null) return null;
+  return pgRows(outRows);
+}
+
+async function queryPortalDataWithWasabiFallback(text, params = []) {
+  const normalizedSql = normalizeSqlForPortalData(text);
+  if (!WASABI_PORTAL_DATA_PRIMARY_ENABLED) {
+    return pool.query(text, params);
+  }
+  try {
+    const result = await runPortalDataWasabiQuery(text, params);
+    if (result) {
+      wasabiPortalDataHandledByWasabi += 1;
+      return result;
+    }
+    if (WASABI_PORTAL_DATA_PRIMARY_STRICT) {
+      wasabiPortalDataLastErrorAt = Date.now();
+      wasabiPortalDataLastError = 'Portal Wasabi adapter does not support this query shape';
+      throw new Error('Portal Wasabi adapter does not support this query shape');
+    }
+    wasabiPortalDataFallbackToPostgres += 1;
+    wasabiPortalDataFallbackSamples.push({
+      at: new Date().toISOString(),
+      reason: 'unsupported-query-shape',
+      sql: normalizedSql.slice(0, 260)
+    });
+    if (wasabiPortalDataFallbackSamples.length > 50) {
+      wasabiPortalDataFallbackSamples = wasabiPortalDataFallbackSamples.slice(-50);
+    }
+  } catch (error) {
+    wasabiPortalDataLastErrorAt = Date.now();
+    wasabiPortalDataLastError = String(error?.message || error || '');
+    if (WASABI_PORTAL_DATA_PRIMARY_STRICT) throw error;
+    console.warn('[wasabi-portal-data] query failed, falling back to postgres:', error?.message || error);
+    wasabiPortalDataFallbackToPostgres += 1;
+    wasabiPortalDataFallbackSamples.push({
+      at: new Date().toISOString(),
+      reason: 'adapter-error',
+      sql: normalizedSql.slice(0, 260),
+      error: String(error?.message || error || '')
+    });
+    if (wasabiPortalDataFallbackSamples.length > 50) {
+      wasabiPortalDataFallbackSamples = wasabiPortalDataFallbackSamples.slice(-50);
+    }
+  }
+  return pool.query(text, params);
+}
+
+function normalizeSqlForOutlookData(text) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+async function runOutlookDataWasabiQuery(text, params = []) {
+  const sql = normalizeSqlForOutlookData(text);
+  if (!sql) return null;
+  if (sql.startsWith('create table if not exists user_outlook_tokens')) {
+    return pgRows([]);
+  }
+
+  let snapshotCache = null;
+  async function requireFreshSnapshot() {
+    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot();
+    if (!snapshotLooksFresh(snapshotCache, WASABI_OUTLOOK_PRIMARY_MAX_SNAPSHOT_AGE_MS)) {
+      throw new Error('Outlook snapshot is missing or stale');
+    }
+    return snapshotCache;
+  }
+
+  if (sql.startsWith('select * from user_outlook_tokens where user_id = $1 limit 1')) {
+    const snapshot = await requireFreshSnapshot();
+    const userId = String(params[0] || '');
+    const rows = snapshotRows(snapshot, 'user_outlook_tokens').filter((row) => String(row.user_id || '') === userId).slice(0, 1);
+    return pgRows(rows);
+  }
+
+  let outRows = null;
+  const wrote = await tryWasabiStateWrite('outlook-data-query', async (data) => {
+    const rows = ensureSnapshotTable(data, 'user_outlook_tokens');
+    const now = nowIso();
+
+    if (
+      sql.startsWith(
+        'insert into user_outlook_tokens (user_id, email_address, display_name, access_token, refresh_token, token_type, scope, expires_at, updated_at) values ($1,$2,$3,$4,$5,$6,$7,$8,now()) on conflict (user_id) do update set'
+      )
+    ) {
+      const userId = String(params[0] || '');
+      const next = {
+        user_id: userId,
+        email_address: String(params[1] || ''),
+        display_name: String(params[2] || ''),
+        access_token: String(params[3] || ''),
+        refresh_token: String(params[4] || ''),
+        token_type: String(params[5] || 'Bearer'),
+        scope: String(params[6] || ''),
+        expires_at: params[7] || null,
+        updated_at: now
+      };
+      const idx = rows.findIndex((row) => String(row.user_id || '') === userId);
+      if (idx >= 0) {
+        rows[idx] = {
+          ...rows[idx],
+          ...next,
+          refresh_token: next.refresh_token === '' ? String(rows[idx].refresh_token || '') : next.refresh_token
+        };
+      } else {
+        rows.push({
+          ...next,
+          created_at: now
+        });
+      }
+      outRows = [];
+      return;
+    }
+    if (sql.startsWith('delete from user_outlook_tokens where user_id = $1')) {
+      const userId = String(params[0] || '');
+      data.user_outlook_tokens = rows.filter((row) => String(row.user_id || '') !== userId);
+      outRows = [];
+      return;
+    }
+
+    outRows = null;
+  });
+
+  if (!wrote) return null;
+  if (outRows === null) return null;
+  return pgRows(outRows);
+}
+
+async function queryOutlookDataWithWasabiFallback(text, params = []) {
+  const normalizedSql = normalizeSqlForOutlookData(text);
+  if (!WASABI_OUTLOOK_PRIMARY_ENABLED) {
+    return pool.query(text, params);
+  }
+  try {
+    const result = await runOutlookDataWasabiQuery(text, params);
+    if (result) {
+      wasabiOutlookHandledByWasabi += 1;
+      return result;
+    }
+    if (WASABI_OUTLOOK_PRIMARY_STRICT) {
+      wasabiOutlookLastErrorAt = Date.now();
+      wasabiOutlookLastError = 'Outlook Wasabi adapter does not support this query shape';
+      throw new Error('Outlook Wasabi adapter does not support this query shape');
+    }
+    wasabiOutlookFallbackToPostgres += 1;
+    wasabiOutlookFallbackSamples.push({
+      at: new Date().toISOString(),
+      reason: 'unsupported-query-shape',
+      sql: normalizedSql.slice(0, 260)
+    });
+    if (wasabiOutlookFallbackSamples.length > 50) {
+      wasabiOutlookFallbackSamples = wasabiOutlookFallbackSamples.slice(-50);
+    }
+  } catch (error) {
+    wasabiOutlookLastErrorAt = Date.now();
+    wasabiOutlookLastError = String(error?.message || error || '');
+    if (WASABI_OUTLOOK_PRIMARY_STRICT) throw error;
+    console.warn('[wasabi-outlook] query failed, falling back to postgres:', error?.message || error);
+    wasabiOutlookFallbackToPostgres += 1;
+    wasabiOutlookFallbackSamples.push({
+      at: new Date().toISOString(),
+      reason: 'adapter-error',
+      sql: normalizedSql.slice(0, 260),
+      error: String(error?.message || error || '')
+    });
+    if (wasabiOutlookFallbackSamples.length > 50) {
+      wasabiOutlookFallbackSamples = wasabiOutlookFallbackSamples.slice(-50);
+    }
+  }
+  return pool.query(text, params);
+}
+
+function normalizeSqlForSignupData(text) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+async function runSignupDataWasabiQuery(text, params = []) {
+  const sql = normalizeSqlForSignupData(text);
+  if (!sql) return null;
+
+  let snapshotCache = null;
+  async function requireFreshSnapshot() {
+    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot();
+    if (!snapshotLooksFresh(snapshotCache, WASABI_SIGNUP_PRIMARY_MAX_SNAPSHOT_AGE_MS)) {
+      throw new Error('Signup snapshot is missing or stale');
+    }
+    return snapshotCache;
+  }
+
+  if (
+    sql.startsWith(
+      'select id, username, display_name, email, is_admin, roles, portal_files_access_granted, portal_permissions_access from users where lower(trim(username)) = lower(trim($1)) or (email is not null and btrim(email) <> \'\' and lower(trim(email)) = lower(trim($1))) limit 1'
+    )
+  ) {
+    const snapshot = await requireFreshSnapshot();
+    const identifier = String(params[0] || '').trim().toLowerCase();
+    const hit = snapshotRows(snapshot, 'users').find((row) => {
+      const username = String(row.username || '').trim().toLowerCase();
+      const email = String(row.email || '').trim().toLowerCase();
+      return username === identifier || (!!email && email === identifier);
+    });
+    return pgRows(hit ? [hit] : []);
+  }
+  if (
+    sql.startsWith(
+      'select id from users where lower(trim(username)) = $1 or (email is not null and btrim(email) <> \'\' and lower(trim(email)) = $1) limit 1'
+    )
+  ) {
+    const snapshot = await requireFreshSnapshot();
+    const identifier = String(params[0] || '').trim().toLowerCase();
+    const hit = snapshotRows(snapshot, 'users').find((row) => {
+      const username = String(row.username || '').trim().toLowerCase();
+      const email = String(row.email || '').trim().toLowerCase();
+      return username === identifier || (!!email && email === identifier);
+    });
+    return pgRows(hit ? [{ id: hit.id }] : []);
+  }
+  if (sql.startsWith('select created_at from signup_verifications where email_normalized = $1 limit 1')) {
+    const snapshot = await requireFreshSnapshot();
+    const email = String(params[0] || '');
+    const hit = snapshotRows(snapshot, 'signup_verifications').find(
+      (row) => String(row.email_normalized || '') === email
+    );
+    return pgRows(hit ? [{ created_at: hit.created_at || null }] : []);
+  }
+  if (sql.startsWith('select * from signup_verifications where email_normalized = $1 limit 1 for update')) {
+    const snapshot = await requireFreshSnapshot();
+    const email = String(params[0] || '');
+    const hit = snapshotRows(snapshot, 'signup_verifications').find(
+      (row) => String(row.email_normalized || '') === email
+    );
+    return pgRows(hit ? [hit] : []);
+  }
+
+  let outRows = null;
+  const wrote = await tryWasabiStateWrite('signup-data-query', async (data) => {
+    const rows = ensureSnapshotTable(data, 'signup_verifications');
+    const now = nowIso();
+
+    if (sql.startsWith('delete from signup_verifications where email_normalized = $1')) {
+      const email = String(params[0] || '');
+      data.signup_verifications = rows.filter((row) => String(row.email_normalized || '') !== email);
+      outRows = [];
+      return;
+    }
+    if (
+      sql.startsWith(
+        'insert into signup_verifications ( email_normalized, pin_hash, password_hash, first_name, last_name, company, title, phone, expires_at ) values ($1, $2, $3, $4, $5, $6, $7, $8, now() + ($9::int * interval \'1 minute\'))'
+      )
+    ) {
+      const ttlMin = Math.max(1, Number(params[8] || 30));
+      rows.push({
+        email_normalized: String(params[0] || ''),
+        pin_hash: String(params[1] || ''),
+        password_hash: String(params[2] || ''),
+        first_name: String(params[3] || ''),
+        last_name: String(params[4] || ''),
+        company: String(params[5] || ''),
+        title: params[6] == null ? null : String(params[6]),
+        phone: params[7] == null ? null : String(params[7]),
+        expires_at: new Date(Date.now() + ttlMin * 60 * 1000).toISOString(),
+        created_at: now
+      });
+      outRows = [];
+      return;
+    }
+    if (
+      sql.startsWith(
+        'insert into users ( username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified ) values ($1, $2, $3, false, $4::jsonb, false, null, null, false, true, $5, $6, $7, $8, $9, $10, true) returning id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified'
+      )
+    ) {
+      const username = String(params[0] || '').trim().toLowerCase();
+      const userEmail = String(params[4] || '').trim().toLowerCase();
+      const users = ensureSnapshotTable(data, 'users');
+      const duplicate = users.some((row) => {
+        const u = String(row.username || '').trim().toLowerCase();
+        const e = String(row.email || '').trim().toLowerCase();
+        return u === username || (!!userEmail && e === userEmail);
+      });
+      if (duplicate) {
+        const err = new Error('duplicate key value violates unique constraint');
+        err.code = '23505';
+        throw err;
+      }
+      const id = nextNumericId(users);
+      const user = {
+        id,
+        username,
+        display_name: String(params[1] || ''),
+        password: String(params[2] || ''),
+        is_admin: false,
+        roles: parseJsonObject(params[3], {}),
+        must_change_password: false,
+        portal_files_client_id: null,
+        portal_files_job_id: null,
+        portal_files_access_granted: false,
+        self_signup: true,
+        email: String(params[4] || ''),
+        first_name: String(params[5] || ''),
+        last_name: String(params[6] || ''),
+        company: String(params[7] || ''),
+        title: params[8] == null ? null : String(params[8]),
+        phone: params[9] == null ? null : String(params[9]),
+        email_verified: true,
+        portal_permissions_access: false,
+        created_at: now,
+        updated_at: now
+      };
+      users.push(user);
+      outRows = [user];
+      return;
+    }
+
+    outRows = null;
+  });
+
+  if (!wrote) return null;
+  if (outRows === null) return null;
+  return pgRows(outRows);
+}
+
+async function querySignupDataWithWasabiFallback(text, params = []) {
+  const normalizedSql = normalizeSqlForSignupData(text);
+  if (!WASABI_SIGNUP_PRIMARY_ENABLED) {
+    return pool.query(text, params);
+  }
+  try {
+    const result = await runSignupDataWasabiQuery(text, params);
+    if (result) {
+      wasabiSignupHandledByWasabi += 1;
+      return result;
+    }
+    if (WASABI_SIGNUP_PRIMARY_STRICT) {
+      wasabiSignupLastErrorAt = Date.now();
+      wasabiSignupLastError = 'Signup Wasabi adapter does not support this query shape';
+      throw new Error('Signup Wasabi adapter does not support this query shape');
+    }
+    wasabiSignupFallbackToPostgres += 1;
+    wasabiSignupFallbackSamples.push({
+      at: new Date().toISOString(),
+      reason: 'unsupported-query-shape',
+      sql: normalizedSql.slice(0, 260)
+    });
+    if (wasabiSignupFallbackSamples.length > 50) {
+      wasabiSignupFallbackSamples = wasabiSignupFallbackSamples.slice(-50);
+    }
+  } catch (error) {
+    wasabiSignupLastErrorAt = Date.now();
+    wasabiSignupLastError = String(error?.message || error || '');
+    if (WASABI_SIGNUP_PRIMARY_STRICT) throw error;
+    console.warn('[wasabi-signup] query failed, falling back to postgres:', error?.message || error);
+    wasabiSignupFallbackToPostgres += 1;
+    wasabiSignupFallbackSamples.push({
+      at: new Date().toISOString(),
+      reason: 'adapter-error',
+      sql: normalizedSql.slice(0, 260),
+      error: String(error?.message || error || '')
+    });
+    if (wasabiSignupFallbackSamples.length > 50) {
+      wasabiSignupFallbackSamples = wasabiSignupFallbackSamples.slice(-50);
+    }
+  }
+  return pool.query(text, params);
+}
+
+async function verifySignupWithWasabi({ email, pin }) {
+  if (!WASABI_SIGNUP_PRIMARY_ENABLED) return null;
+  let response = null;
+  const wrote = await tryWasabiStateWrite('signup-verify', async (data) => {
+    const verifications = ensureSnapshotTable(data, 'signup_verifications');
+    const users = ensureSnapshotTable(data, 'users');
+    const emailNeedle = String(email || '').trim().toLowerCase();
+    const idx = verifications.findIndex(
+      (row) => String(row.email_normalized || '').trim().toLowerCase() === emailNeedle
+    );
+    if (idx < 0) {
+      response = {
+        status: 400,
+        body: { success: false, error: 'No pending sign-up for this email. Start again.' }
+      };
+      return;
+    }
+    const row = verifications[idx];
+    if (new Date(String(row.expires_at || '')).getTime() < Date.now()) {
+      verifications.splice(idx, 1);
+      response = {
+        status: 400,
+        body: { success: false, error: 'That code has expired. Request a new one.' }
+      };
+      return;
+    }
+
+    const pinOk = await bcrypt.compare(String(pin || ''), String(row.pin_hash || ''));
+    if (!pinOk) {
+      response = {
+        status: 400,
+        body: { success: false, error: 'Invalid verification code' }
+      };
+      return;
+    }
+
+    const duplicate = users.some((user) => {
+      const username = String(user.username || '').trim().toLowerCase();
+      const userEmail = String(user.email || '').trim().toLowerCase();
+      return username === emailNeedle || (!!userEmail && userEmail === emailNeedle);
+    });
+    if (duplicate) {
+      response = {
+        status: 409,
+        body: { success: false, error: 'An account with this email already exists' }
+      };
+      return;
+    }
+
+    const roles = normalizeRoles({
+      camera: false,
+      vac: false,
+      simpleVac: false,
+      email: false,
+      psrPlanner: false,
+      pricingView: false,
+      footageView: false
+    });
+    const displayName = `${String(row.first_name || '')} ${String(row.last_name || '')}`.trim() || emailNeedle;
+    const now = nowIso();
+    const id = nextNumericId(users);
+    const userRow = {
+      id,
+      username: emailNeedle,
+      display_name: displayName,
+      password: String(row.password_hash || ''),
+      is_admin: false,
+      roles,
+      must_change_password: false,
+      portal_files_client_id: null,
+      portal_files_job_id: null,
+      portal_files_access_granted: false,
+      self_signup: true,
+      portal_permissions_access: false,
+      email: emailNeedle,
+      first_name: String(row.first_name || ''),
+      last_name: String(row.last_name || ''),
+      company: String(row.company || ''),
+      title: row.title == null ? null : String(row.title),
+      phone: row.phone == null ? null : String(row.phone),
+      email_verified: true,
+      created_at: now,
+      updated_at: now
+    };
+    users.push(userRow);
+    verifications.splice(idx, 1);
+    response = {
+      status: 200,
+      body: {
+        success: true,
+        user: normalizeUser(userRow),
+        requiresApproval: true,
+        message: 'Account created. An administrator must grant access before you can sign in.'
+      }
+    };
+  });
+  if (wrote && response) return response;
+  return null;
+}
+
+registerOutlookRoutes(app, {
+  pool,
+  query: queryOutlookDataWithWasabiFallback,
+  requireAuth,
+  currentToken,
+  corsOrigins: CORS_ORIGINS
+});
+registerPortalFilesRoutes(app, { pool, query: queryPortalDataWithWasabiFallback, requireAuth, requireAdmin });
+registerSignupRoutes(app, {
+  pool,
+  query: querySignupDataWithWasabiFallback,
+  verifySignupWithWasabi,
+  cleanString,
+  normalizeRoles,
+  issueSession,
+  normalizeUser
+});
 
 const autoImportPlugin = createAutoImportPlugin({
   pool,
+  query: queryAutoImportWithWasabiFallback,
   requireMike: requireDataAutoSyncEmployeeAccess,
   requireAuth,
   writeSegment: async (jobsiteId, payload, savedBy) => {

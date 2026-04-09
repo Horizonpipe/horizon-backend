@@ -8,7 +8,8 @@ const initSqlJs = require('sql.js');
 
 function createAutoImportPlugin(options = {}) {
   const {
-    pool,
+    pool: poolOption,
+    query,
     requireMike,
     requireAuth,
     writeSegment,
@@ -19,7 +20,14 @@ function createAutoImportPlugin(options = {}) {
     logger = console
   } = options;
 
-  if (!pool) throw new Error('createAutoImportPlugin requires a pg pool.');
+  const dbQuery =
+    typeof query === 'function'
+      ? query
+      : (poolOption && typeof poolOption.query === 'function' ? poolOption.query.bind(poolOption) : null);
+  if (typeof dbQuery !== 'function') {
+    throw new Error('createAutoImportPlugin requires either pool.query or options.query.');
+  }
+  const pool = { query: dbQuery };
   if (typeof requireMike !== 'function') throw new Error('createAutoImportPlugin requires requireMike middleware.');
   if (typeof requireAuth !== 'function') throw new Error('createAutoImportPlugin requires requireAuth middleware.');
   if (typeof writeSegment !== 'function') throw new Error('createAutoImportPlugin requires writeSegment(jobsiteId, payload, savedBy).');

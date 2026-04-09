@@ -183,8 +183,26 @@ async function resolveFolderId(accessToken, folderName) {
   return clean(folder?.id);
 }
 
-async function ensureOutlookSchema(pool) {
-  await pool.query(`
+function resolveDbQueryClient(options = {}) {
+  const normalized =
+    options && typeof options.query === 'function'
+      ? { query: options.query, pool: options.pool }
+      : (options && typeof options.pool === 'object' ? options : { pool: options });
+  const query =
+    typeof normalized.query === 'function'
+      ? normalized.query
+      : (normalized.pool && typeof normalized.pool.query === 'function'
+        ? normalized.pool.query.bind(normalized.pool)
+        : null);
+  if (typeof query !== 'function') {
+    throw new Error('Outlook routes require either pool.query or options.query.');
+  }
+  return { query };
+}
+
+async function ensureOutlookSchema(options = {}) {
+  const db = resolveDbQueryClient(options);
+  await db.query(`
     CREATE TABLE IF NOT EXISTS user_outlook_tokens (
       user_id TEXT PRIMARY KEY,
       email_address TEXT NOT NULL DEFAULT '',
@@ -200,14 +218,14 @@ async function ensureOutlookSchema(pool) {
   `);
 }
 
-async function readStoredToken(pool, userId) {
-  const result = await pool.query('SELECT * FROM user_outlook_tokens WHERE user_id = $1 LIMIT 1', [String(userId)]);
+async function readStoredToken(db, userId) {
+  const result = await db.query('SELECT * FROM user_outlook_tokens WHERE user_id = $1 LIMIT 1', [String(userId)]);
   return result.rows[0] || null;
 }
 
-async function saveTokenRecord(pool, userId, tokenData, profile = {}) {
+async function saveTokenRecord(db, userId, tokenData, profile = {}) {
   const expiresAt = new Date(Date.now() + ((Number(tokenData.expires_in) || 3600) - 60) * 1000).toISOString();
-  await pool.query(
+  await db.query(
     `INSERT INTO user_outlook_tokens
       (user_id, email_address, display_name, access_token, refresh_token, token_type, scope, expires_at, updated_at)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
@@ -234,15 +252,15 @@ async function saveTokenRecord(pool, userId, tokenData, profile = {}) {
   );
 }
 
-async function getValidAccessToken(pool, userId) {
-  const row = await readStoredToken(pool, userId);
+async function getValidAccessToken(db, userId) {
+  const row = await readStoredToken(db, userId);
   if (!row) return null;
   const expiresAt = row.expires_at ? new Date(row.expires_at).getTime() : 0;
   if (expiresAt > Date.now() + 30 * 1000 && row.access_token) return row.access_token;
   if (!row.refresh_token) return null;
   const refreshed = await refreshAccessToken(row.refresh_token);
   const profile = { mail: row.email_address, userPrincipalName: row.email_address, displayName: row.display_name };
-  await saveTokenRecord(pool, userId, refreshed, profile);
+  await saveTokenRecord(db, userId, refreshed, profile);
   return clean(refreshed.access_token);
 }
 
@@ -265,7 +283,8 @@ function buildAuthUrl(user) {
   return url.toString();
 }
 
-function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
+function registerOutlookRoutes(app, { pool, query, requireAuth, corsOrigins = [] }) {
+  const db = resolveDbQueryClient({ pool, query });
   const prefixes = ['/outlook', '/api/outlook'];
   const mountGet = (path, ...handlers) => prefixes.forEach((prefix) => app.get(`${prefix}${path}`, ...handlers));
   const mountPost = (path, ...handlers) => prefixes.forEach((prefix) => app.post(`${prefix}${path}`, ...handlers));
@@ -275,7 +294,7 @@ function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
   mountGet('/status', requireAuth, async (req, res) => {
     try {
       if (!configured()) return res.json({ success: true, configured: false, connected: false });
-      const row = await readStoredToken(pool, req.user.id);
+      const row = await readStoredToken(db, req.user.id);
       res.json({
         success: true,
         configured: true,
@@ -302,7 +321,7 @@ function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
       if (!code || !state?.userId) return res.status(400).send('Invalid Outlook callback state.');
       const tokenData = await exchangeCodeForToken(code);
       const profile = await graphRequest(tokenData.access_token, '/me');
-      await saveTokenRecord(pool, state.userId, tokenData, profile || {});
+      await saveTokenRecord(db, state.userId, tokenData, profile || {});
       const redirectUrl = postConnectRedirect(corsOrigins);
       if (redirectUrl) {
         const safeRedirect = JSON.stringify(redirectUrl);
@@ -327,7 +346,7 @@ function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
   mountGet('/messages', requireAuth, async (req, res) => {
     try {
       if (!configured()) return res.status(400).json({ success: false, error: 'Outlook integration is not configured' });
-      const token = await getValidAccessToken(pool, req.user.id);
+      const token = await getValidAccessToken(db, req.user.id);
       if (!token) return res.status(401).json({ success: false, error: 'Outlook is not connected for this user' });
       const folder = normalizeFolder(req.query.folder);
       const data = await graphRequest(token, `/me/mailFolders/${encodeURIComponent(folder)}/messages?$top=50&$orderby=receivedDateTime desc&$select=id,subject,receivedDateTime,bodyPreview,from,toRecipients,isRead,hasAttachments,importance`);
@@ -341,7 +360,7 @@ function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
 
   mountGet('/messages/:id', requireAuth, async (req, res) => {
     try {
-      const token = await getValidAccessToken(pool, req.user.id);
+      const token = await getValidAccessToken(db, req.user.id);
       if (!token) return res.status(401).json({ success: false, error: 'Outlook is not connected for this user' });
       const item = await graphRequest(token, `/me/messages/${encodeURIComponent(req.params.id)}?$select=id,subject,receivedDateTime,body,bodyPreview,from,toRecipients,ccRecipients,bccRecipients,isRead,hasAttachments,importance`);
       res.json({ success: true, message: normalizeMessageDetail(item) });
@@ -353,7 +372,7 @@ function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
 
   mountPatch('/messages/:id/read', requireAuth, async (req, res) => {
     try {
-      const token = await getValidAccessToken(pool, req.user.id);
+      const token = await getValidAccessToken(db, req.user.id);
       if (!token) return res.status(401).json({ success: false, error: 'Outlook is not connected for this user' });
       await graphRequest(token, `/me/messages/${encodeURIComponent(req.params.id)}`, {
         method: 'PATCH',
@@ -368,7 +387,7 @@ function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
 
   mountPost('/messages/:id/move', requireAuth, async (req, res) => {
     try {
-      const token = await getValidAccessToken(pool, req.user.id);
+      const token = await getValidAccessToken(db, req.user.id);
       if (!token) return res.status(401).json({ success: false, error: 'Outlook is not connected for this user' });
       const destination = normalizeFolder(req.body?.destination);
       const destinationId = await resolveFolderId(token, destination);
@@ -386,7 +405,7 @@ function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
 
   mountDelete('/messages/:id', requireAuth, async (req, res) => {
     try {
-      const token = await getValidAccessToken(pool, req.user.id);
+      const token = await getValidAccessToken(db, req.user.id);
       if (!token) return res.status(401).json({ success: false, error: 'Outlook is not connected for this user' });
       await graphRequest(token, `/me/messages/${encodeURIComponent(req.params.id)}`, { method: 'DELETE' });
       res.json({ success: true });
@@ -398,7 +417,7 @@ function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
 
   mountPost('/send', requireAuth, async (req, res) => {
     try {
-      const token = await getValidAccessToken(pool, req.user.id);
+      const token = await getValidAccessToken(db, req.user.id);
       if (!token) return res.status(401).json({ success: false, error: 'Outlook is not connected for this user' });
       const to = clean(req.body?.to);
       const subject = clean(req.body?.subject);
@@ -426,7 +445,7 @@ function registerOutlookRoutes(app, { pool, requireAuth, corsOrigins = [] }) {
 
   mountDelete('/disconnect', requireAuth, async (req, res) => {
     try {
-      await pool.query('DELETE FROM user_outlook_tokens WHERE user_id = $1', [String(req.user.id)]);
+      await db.query('DELETE FROM user_outlook_tokens WHERE user_id = $1', [String(req.user.id)]);
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
