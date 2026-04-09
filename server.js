@@ -1002,7 +1002,15 @@ pool.query = function patchedPoolQuery(text, values, callback) {
     });
 };
 
-const SESSION_TTL_MINUTES = 15;
+const SESSION_TTL_MINUTES = Math.max(5, Math.min(7 * 24 * 60, Number(process.env.SESSION_TTL_MINUTES || 15)));
+const SESSION_KEEP_TTL_MINUTES = Math.max(
+  SESSION_TTL_MINUTES,
+  Math.min(90 * 24 * 60, Number(process.env.SESSION_KEEP_TTL_MINUTES || 7 * 24 * 60))
+);
+
+function resolveSessionTtlMinutes(keepSession) {
+  return keepSession ? SESSION_KEEP_TTL_MINUTES : SESSION_TTL_MINUTES;
+}
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024, files: 20 }
@@ -2095,15 +2103,18 @@ function serializeRecordData(record) {
   };
 }
 
-async function issueSession(userId) {
+async function issueSession(userId, options = {}) {
+  const keepSession = options?.keepSession === true;
+  const ttlMinutes = resolveSessionTtlMinutes(keepSession);
   const token = crypto.randomBytes(32).toString('hex');
-  const expiresAtIso = new Date(Date.now() + SESSION_TTL_MINUTES * 60 * 1000).toISOString();
+  const expiresAtIso = new Date(Date.now() + ttlMinutes * 60 * 1000).toISOString();
   const wasabiWrote = await tryWasabiStateWrite('issue-session', async (data) => {
     const sessions = ensureSnapshotTable(data, 'auth_sessions');
     const now = nowIso();
     sessions.push({
       token,
       user_id: String(userId),
+      keep_session: keepSession,
       expires_at: expiresAtIso,
       created_at: now,
       updated_at: now
@@ -2113,9 +2124,9 @@ async function issueSession(userId) {
     return token;
   }
   await pool.query(
-    `INSERT INTO auth_sessions (token, user_id, expires_at)
-     VALUES ($1, $2, NOW() + ($3 || ' minutes')::interval)`,
-    [token, String(userId), SESSION_TTL_MINUTES]
+    `INSERT INTO auth_sessions (token, user_id, keep_session, expires_at)
+     VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::interval)`,
+    [token, String(userId), keepSession, ttlMinutes]
   );
   return token;
 }
@@ -2136,17 +2147,21 @@ async function readSessionFromWasabiSnapshot(token) {
     user_id: hit.user_id,
     expires_at: hit.expires_at
   });
-  return attachScopesToUserFromSnapshot(normalized, snapshot);
+  return {
+    user: attachScopesToUserFromSnapshot(normalized, snapshot),
+    keepSession: hit.keep_session === true
+  };
 }
 
-async function extendWasabiSessionExpiry(token) {
+async function extendWasabiSessionExpiry(token, keepSession = false) {
+  const ttlMinutes = resolveSessionTtlMinutes(keepSession);
   const wrote = await tryWasabiStateWrite('extend-session', async (data) => {
-      const sessions = ensureSnapshotTable(data, 'auth_sessions');
+    const sessions = ensureSnapshotTable(data, 'auth_sessions');
     const idx = sessions.findIndex((s) => String(s.token || '') === String(token || ''));
     if (idx < 0) return;
     sessions[idx] = {
       ...sessions[idx],
-      expires_at: new Date(Date.now() + SESSION_TTL_MINUTES * 60 * 1000).toISOString(),
+      expires_at: new Date(Date.now() + ttlMinutes * 60 * 1000).toISOString(),
       updated_at: nowIso()
     };
   });
@@ -2156,7 +2171,7 @@ async function extendWasabiSessionExpiry(token) {
        SET expires_at = NOW() + ($2 || ' minutes')::interval,
            updated_at = NOW()
        WHERE token = $1`,
-      [token, SESSION_TTL_MINUTES]
+      [token, ttlMinutes]
     );
   }
 }
@@ -2164,7 +2179,7 @@ async function extendWasabiSessionExpiry(token) {
 async function readSessionFromPostgres(token) {
   await pool.query(`DELETE FROM auth_sessions WHERE expires_at < NOW()`);
   const result = await pool.query(
-    `SELECT s.token, s.user_id, s.expires_at, u.id, u.username, u.display_name, u.password,
+    `SELECT s.token, s.user_id, s.keep_session, s.expires_at, u.id, u.username, u.display_name, u.password,
             u.is_admin, u.roles, u.must_change_password, u.portal_files_client_id, u.portal_files_job_id,
             u.portal_permissions_access, u.portal_files_access_granted, u.self_signup, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified
      FROM auth_sessions s
@@ -2179,14 +2194,19 @@ async function readSessionFromPostgres(token) {
     await pool.query('DELETE FROM auth_sessions WHERE token = $1', [token]);
     return null;
   }
+  const keepSession = row.keep_session === true;
+  const ttlMinutes = resolveSessionTtlMinutes(keepSession);
   await pool.query(
     `UPDATE auth_sessions
      SET expires_at = NOW() + ($2 || ' minutes')::interval,
          updated_at = NOW()
      WHERE token = $1`,
-    [token, SESSION_TTL_MINUTES]
+    [token, ttlMinutes]
   );
-  return attachScopesToUser(normalizeUser(row));
+  return {
+    user: attachScopesToUser(normalizeUser(row)),
+    keepSession
+  };
 }
 
 async function readSession(token) {
@@ -2195,14 +2215,14 @@ async function readSession(token) {
     try {
       const snapshot = await loadWasabiLatestStateSnapshot();
       if (snapshotLooksFresh(snapshot)) {
-        const session = await readSessionFromWasabiSnapshot(token);
-        if (session) {
+        const sessionHit = await readSessionFromWasabiSnapshot(token);
+        if (sessionHit) {
           try {
-            await extendWasabiSessionExpiry(token);
+            await extendWasabiSessionExpiry(token, sessionHit.keepSession);
           } catch (error) {
             if (WASABI_WRITES_PRIMARY_STRICT) throw error;
           }
-          return session;
+          return sessionHit.user;
         }
       }
       if (WASABI_AUTH_PRIMARY_STRICT) return null;
@@ -2211,7 +2231,8 @@ async function readSession(token) {
     }
   }
   try {
-    return await readSessionFromPostgres(token);
+    const sessionHit = await readSessionFromPostgres(token);
+    return sessionHit ? sessionHit.user : null;
   } catch (error) {
     if (!WASABI_AUTH_FALLBACK_ENABLED) throw error;
     try {
@@ -2219,7 +2240,7 @@ async function readSession(token) {
       if (fallback) {
         console.warn('[auth] using Wasabi session fallback for token lookup');
       }
-      return fallback;
+      return fallback ? fallback.user : null;
     } catch (fallbackError) {
       throw error && fallbackError
         ? new Error(`${error?.message || error} | wasabi fallback failed: ${fallbackError?.message || fallbackError}`)
@@ -2621,16 +2642,19 @@ async function ensureSchema() {
     `CREATE INDEX IF NOT EXISTS idx_user_psr_scopes_record_id ON user_psr_scopes (psr_record_id)`
   );
 
-  await pool.query(`DROP TABLE IF EXISTS auth_sessions`);
   await pool.query(`
-    CREATE TABLE auth_sessions (
+    CREATE TABLE IF NOT EXISTS auth_sessions (
       token TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
+      keep_session BOOLEAN NOT NULL DEFAULT false,
       expires_at TIMESTAMPTZ NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS keep_session BOOLEAN NOT NULL DEFAULT false`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id ON auth_sessions (user_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires_at ON auth_sessions (expires_at)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS planner_records (
@@ -3315,7 +3339,9 @@ app.post('/login', async (req, res) => {
     }
 
     const user = await attachScopesToUser(normalizeUser(row));
-    const token = await issueSession(row.id);
+    const keepRaw = req.body?.keepSession;
+    const keepSession = keepRaw === true || keepRaw === 1 || String(keepRaw || '').trim().toLowerCase() === 'true';
+    const token = await issueSession(row.id, { keepSession });
     res.json({ success: true, user, token });
   } catch (error) {
     console.error('LOGIN ERROR:', error);
