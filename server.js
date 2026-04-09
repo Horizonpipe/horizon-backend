@@ -2103,6 +2103,20 @@ function serializeRecordData(record) {
   };
 }
 
+async function mirrorSessionToPostgres(token, userId, keepSession) {
+  const ttlMinutes = resolveSessionTtlMinutes(keepSession);
+  await pool.query(
+    `INSERT INTO auth_sessions (token, user_id, keep_session, expires_at)
+     VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::interval)
+     ON CONFLICT (token) DO UPDATE
+       SET user_id = EXCLUDED.user_id,
+           keep_session = EXCLUDED.keep_session,
+           expires_at = EXCLUDED.expires_at,
+           updated_at = NOW()`,
+    [token, String(userId), keepSession, ttlMinutes]
+  );
+}
+
 async function issueSession(userId, options = {}) {
   const keepSession = options?.keepSession === true;
   const ttlMinutes = resolveSessionTtlMinutes(keepSession);
@@ -2121,18 +2135,19 @@ async function issueSession(userId, options = {}) {
     });
   });
   if (wasabiWrote) {
+    try {
+      await mirrorSessionToPostgres(token, userId, keepSession);
+    } catch (error) {
+      console.warn(`[auth] postgres mirror write failed after Wasabi issue-session: ${error?.message || error}`);
+    }
     return token;
   }
-  await pool.query(
-    `INSERT INTO auth_sessions (token, user_id, keep_session, expires_at)
-     VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::interval)`,
-    [token, String(userId), keepSession, ttlMinutes]
-  );
+  await mirrorSessionToPostgres(token, userId, keepSession);
   return token;
 }
 
-async function readSessionFromWasabiSnapshot(token) {
-  const snapshot = await loadWasabiLatestStateSnapshot();
+async function readSessionFromWasabiSnapshot(token, snapshotOverride = null) {
+  const snapshot = snapshotOverride || (await loadWasabiLatestStateSnapshot());
   if (!snapshot || !snapshot.data) return null;
   const sessions = snapshotRows(snapshot, 'auth_sessions');
   const users = snapshotRows(snapshot, 'users');
@@ -2173,6 +2188,18 @@ async function extendWasabiSessionExpiry(token, keepSession = false) {
        WHERE token = $1`,
       [token, ttlMinutes]
     );
+  } else {
+    try {
+      await pool.query(
+        `UPDATE auth_sessions
+         SET expires_at = NOW() + ($2 || ' minutes')::interval,
+             updated_at = NOW()
+         WHERE token = $1`,
+        [token, ttlMinutes]
+      );
+    } catch (error) {
+      console.warn(`[auth] postgres mirror expiry update failed: ${error?.message || error}`);
+    }
   }
 }
 
@@ -2217,9 +2244,13 @@ async function readSession(token) {
     triedWasabiPrimary = true;
     try {
       const snapshot = await loadWasabiLatestStateSnapshot();
-      if (snapshotLooksFresh(snapshot)) {
-        const sessionHit = await readSessionFromWasabiSnapshot(token);
+      const fresh = snapshotLooksFresh(snapshot);
+      if (snapshot && snapshot.data) {
+        const sessionHit = await readSessionFromWasabiSnapshot(token, snapshot);
         if (sessionHit) {
+          if (!fresh) {
+            console.warn('[auth] using stale Wasabi snapshot for session resolution');
+          }
           try {
             await extendWasabiSessionExpiry(token, sessionHit.keepSession);
           } catch (error) {
@@ -2227,9 +2258,9 @@ async function readSession(token) {
           }
           return sessionHit.user;
         }
-        wasabiPrimaryIssue = 'snapshot_miss';
+        wasabiPrimaryIssue = fresh ? 'snapshot_miss' : 'snapshot_stale_miss';
       } else {
-        wasabiPrimaryIssue = 'snapshot_stale';
+        wasabiPrimaryIssue = fresh ? 'snapshot_empty' : 'snapshot_stale';
       }
     } catch (error) {
       wasabiPrimaryIssue = `snapshot_error:${error?.message || error}`;
