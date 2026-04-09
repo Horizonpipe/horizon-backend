@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const initSqlJs = require('sql.js');
 const { Pool } = require('pg');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { ensureOutlookSchema, registerOutlookRoutes } = require('./outlook');
 const { registerPortalFilesRoutes } = require('./portal-files.routes');
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
@@ -71,6 +72,16 @@ app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true }));
+app.use((req, res, next) => {
+  res.on('finish', () => {
+    const method = String(req.method || '').toUpperCase();
+    const writable = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
+    if (!writable) return;
+    if (res.statusCode >= 500) return;
+    queueWasabiStateSnapshot(`${method} ${req.originalUrl || req.url || ''}`);
+  });
+  next();
+});
 
 const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -116,6 +127,652 @@ pool.on('error', (err) => {
 console.log(
   `[pg] Pool ready: max=${PG_POOL_MAX}, idleTimeout=${PG_IDLE_TIMEOUT_MS}ms, connectTimeout=${PG_CONNECT_TIMEOUT_MS}ms, ssl=${sslDisabledByEnv || databaseUrlLooksLocal ? 'off' : 'on'}`
 );
+
+function createWasabiStateClient() {
+  const accessKeyId = String(process.env.WASABI_ACCESS_KEY_ID || process.env.WASABI_ACCESS_KEY || '').trim();
+  const secretAccessKey = String(process.env.WASABI_SECRET_ACCESS_KEY || process.env.WASABI_SECRET_KEY || '').trim();
+  const region = String(process.env.WASABI_REGION || 'us-east-1').trim();
+  const endpoint = String(process.env.WASABI_ENDPOINT || '').trim();
+  if (!accessKeyId || !secretAccessKey) return null;
+  return new S3Client({
+    region,
+    endpoint: endpoint || undefined,
+    forcePathStyle: !!endpoint,
+    credentials: { accessKeyId, secretAccessKey }
+  });
+}
+
+const WASABI_STATE_BUCKET = String(process.env.WASABI_BUCKET || '').trim();
+const WASABI_STATE_PREFIX = String(process.env.WASABI_PIPESYNC_STATE_PREFIX || 'clients/portal-users/jobs/3/system-state')
+  .trim()
+  .replace(/\/+$/, '');
+const WASABI_STATE_SNAPSHOT_MS = Math.max(
+  10000,
+  Math.min(300000, Number(process.env.WASABI_STATE_SNAPSHOT_MS || 60000))
+);
+const WASABI_STATE_SNAPSHOT_ON_WRITE =
+  String(process.env.WASABI_STATE_SNAPSHOT_ON_WRITE || '1').trim().toLowerCase() !== '0';
+const WASABI_STATE_WRITE_DEBOUNCE_MS = Math.max(
+  1000,
+  Math.min(60000, Number(process.env.WASABI_STATE_WRITE_DEBOUNCE_MS || 5000))
+);
+const WASABI_ALL_READS_PRIMARY_ENABLED =
+  String(process.env.WASABI_ALL_READS_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_ALL_READS_PRIMARY_STRICT =
+  String(process.env.WASABI_ALL_READS_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_SQL_MIRROR_ENABLED =
+  String(process.env.WASABI_SQL_MIRROR_ENABLED || '1').trim().toLowerCase() !== '0';
+const WASABI_SQL_MIRROR_INCLUDE_PARAMS =
+  String(process.env.WASABI_SQL_MIRROR_INCLUDE_PARAMS || '0').trim().toLowerCase() === '1';
+const WASABI_SQL_MIRROR_PREFIX = String(
+  process.env.WASABI_SQL_MIRROR_PREFIX || 'clients/portal-users/jobs/3/sql-mirror'
+)
+  .trim()
+  .replace(/\/+$/, '');
+const WASABI_SQL_MIRROR_FLUSH_MS = Math.max(
+  500,
+  Math.min(15000, Number(process.env.WASABI_SQL_MIRROR_FLUSH_MS || 2000))
+);
+const WASABI_SQL_MIRROR_MAX_BUFFER = Math.max(
+  10,
+  Math.min(500, Number(process.env.WASABI_SQL_MIRROR_MAX_BUFFER || 100))
+);
+const WASABI_AUTH_FALLBACK_ENABLED =
+  String(process.env.WASABI_AUTH_FALLBACK_ENABLED || '1').trim().toLowerCase() !== '0';
+const WASABI_AUTH_FALLBACK_CACHE_MS = Math.max(
+  1000,
+  Math.min(60000, Number(process.env.WASABI_AUTH_FALLBACK_CACHE_MS || 5000))
+);
+const WASABI_AUTH_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED || String(process.env.WASABI_AUTH_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_AUTH_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT || String(process.env.WASABI_AUTH_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_AUTH_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_AUTH_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_SCOPES_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED || String(process.env.WASABI_SCOPES_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_SCOPES_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT || String(process.env.WASABI_SCOPES_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_SCOPES_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_SCOPES_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_PERMISSIONS_TREE_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED ||
+  String(process.env.WASABI_PERMISSIONS_TREE_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_PERMISSIONS_TREE_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT ||
+  String(process.env.WASABI_PERMISSIONS_TREE_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_PERMISSIONS_TREE_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_PERMISSIONS_TREE_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_LOGIN_FALLBACK_ENABLED =
+  String(process.env.WASABI_LOGIN_FALLBACK_ENABLED || '1').trim().toLowerCase() !== '0';
+const WASABI_LOGIN_FALLBACK_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_LOGIN_FALLBACK_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_RECORDS_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED || String(process.env.WASABI_RECORDS_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_RECORDS_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT || String(process.env.WASABI_RECORDS_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_RECORDS_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_RECORDS_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_RECORD_DETAIL_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED ||
+  String(process.env.WASABI_RECORD_DETAIL_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_RECORD_DETAIL_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT ||
+  String(process.env.WASABI_RECORD_DETAIL_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_RECORD_DETAIL_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_RECORD_DETAIL_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_PRICING_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED || String(process.env.WASABI_PRICING_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_PRICING_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT || String(process.env.WASABI_PRICING_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_PRICING_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_PRICING_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_REPORTS_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED || String(process.env.WASABI_REPORTS_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_REPORTS_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT || String(process.env.WASABI_REPORTS_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_REPORTS_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_REPORTS_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_ASSETS_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED || String(process.env.WASABI_ASSETS_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_ASSETS_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT || String(process.env.WASABI_ASSETS_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_ASSETS_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_ASSETS_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_SYNC_STATE_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED ||
+  String(process.env.WASABI_SYNC_STATE_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_SYNC_STATE_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT ||
+  String(process.env.WASABI_SYNC_STATE_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_SYNC_STATE_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_SYNC_STATE_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_USERS_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED || String(process.env.WASABI_USERS_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_USERS_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT || String(process.env.WASABI_USERS_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_USERS_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_USERS_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_ENABLED =
+  WASABI_ALL_READS_PRIMARY_ENABLED ||
+  String(process.env.WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+const WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_STRICT =
+  WASABI_ALL_READS_PRIMARY_STRICT ||
+  String(process.env.WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+const WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
+  5000,
+  Math.min(15 * 60 * 1000, Number(process.env.WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
+);
+const WASABI_STATE_INCLUDE_ALL_TABLES =
+  String(process.env.WASABI_STATE_INCLUDE_ALL_TABLES || '1').trim().toLowerCase() !== '0';
+const WASABI_STATE_EXCLUDE_TABLES = new Set(
+  String(process.env.WASABI_STATE_EXCLUDE_TABLES || '')
+    .split(',')
+    .map((v) => String(v || '').trim())
+    .filter(Boolean)
+);
+const wasabiStateClient = createWasabiStateClient();
+let wasabiStateSnapshotBusy = false;
+let wasabiStateSnapshotTimer = null;
+let wasabiStateLastQueuedAt = 0;
+let wasabiStateLastRunAt = 0;
+let wasabiStateLastReason = 'startup';
+let wasabiSqlMirrorTimer = null;
+let wasabiSqlMirrorBusy = false;
+let wasabiSqlMirrorEvents = [];
+let wasabiSqlMirrorLastFlushAt = 0;
+let wasabiSqlMirrorTotalFlushed = 0;
+let wasabiSqlMirrorLastError = '';
+let wasabiLatestStateCache = null;
+let wasabiLatestStateCacheAt = 0;
+
+async function bodyToBuffer(body) {
+  if (!body) return Buffer.alloc(0);
+  if (Buffer.isBuffer(body)) return body;
+  if (typeof body.transformToByteArray === 'function') {
+    return Buffer.from(await body.transformToByteArray());
+  }
+  const chunks = [];
+  for await (const chunk of body) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+async function loadWasabiLatestStateSnapshot(force = false) {
+  if (!wasabiStateClient || !WASABI_STATE_BUCKET) return null;
+  const now = Date.now();
+  if (!force && wasabiLatestStateCache && now - wasabiLatestStateCacheAt <= WASABI_AUTH_FALLBACK_CACHE_MS) {
+    return wasabiLatestStateCache;
+  }
+  const out = await wasabiStateClient.send(
+    new GetObjectCommand({
+      Bucket: WASABI_STATE_BUCKET,
+      Key: `${WASABI_STATE_PREFIX}/latest.json`
+    })
+  );
+  const raw = await bodyToBuffer(out.Body);
+  const parsed = JSON.parse(raw.toString('utf8'));
+  wasabiLatestStateCache = parsed;
+  wasabiLatestStateCacheAt = now;
+  return parsed;
+}
+
+function snapshotMeta(snapshot) {
+  const generatedAtIso = String(snapshot?.generatedAt || '');
+  const generatedAtMs = Date.parse(generatedAtIso);
+  const ageMs = Number.isFinite(generatedAtMs) ? Math.max(0, Date.now() - generatedAtMs) : null;
+  return {
+    generatedAt: Number.isFinite(generatedAtMs) ? new Date(generatedAtMs).toISOString() : null,
+    ageMs,
+    hasData: !!(snapshot && snapshot.data && typeof snapshot.data === 'object')
+  };
+}
+
+function wasabiReadDomains() {
+  return [
+    { name: 'auth', enabled: WASABI_AUTH_PRIMARY_ENABLED, maxAgeMs: WASABI_AUTH_PRIMARY_MAX_SNAPSHOT_AGE_MS },
+    { name: 'scopes', enabled: WASABI_SCOPES_PRIMARY_ENABLED, maxAgeMs: WASABI_SCOPES_PRIMARY_MAX_SNAPSHOT_AGE_MS },
+    {
+      name: 'permissionsTree',
+      enabled: WASABI_PERMISSIONS_TREE_PRIMARY_ENABLED,
+      maxAgeMs: WASABI_PERMISSIONS_TREE_PRIMARY_MAX_SNAPSHOT_AGE_MS
+    },
+    { name: 'records', enabled: WASABI_RECORDS_PRIMARY_ENABLED, maxAgeMs: WASABI_RECORDS_PRIMARY_MAX_SNAPSHOT_AGE_MS },
+    {
+      name: 'recordDetail',
+      enabled: WASABI_RECORD_DETAIL_PRIMARY_ENABLED,
+      maxAgeMs: WASABI_RECORD_DETAIL_PRIMARY_MAX_SNAPSHOT_AGE_MS
+    },
+    { name: 'pricing', enabled: WASABI_PRICING_PRIMARY_ENABLED, maxAgeMs: WASABI_PRICING_PRIMARY_MAX_SNAPSHOT_AGE_MS },
+    { name: 'reports', enabled: WASABI_REPORTS_PRIMARY_ENABLED, maxAgeMs: WASABI_REPORTS_PRIMARY_MAX_SNAPSHOT_AGE_MS },
+    { name: 'assets', enabled: WASABI_ASSETS_PRIMARY_ENABLED, maxAgeMs: WASABI_ASSETS_PRIMARY_MAX_SNAPSHOT_AGE_MS },
+    {
+      name: 'syncState',
+      enabled: WASABI_SYNC_STATE_PRIMARY_ENABLED,
+      maxAgeMs: WASABI_SYNC_STATE_PRIMARY_MAX_SNAPSHOT_AGE_MS
+    },
+    { name: 'users', enabled: WASABI_USERS_PRIMARY_ENABLED, maxAgeMs: WASABI_USERS_PRIMARY_MAX_SNAPSHOT_AGE_MS },
+    {
+      name: 'plannerScopeLookup',
+      enabled: WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_ENABLED,
+      maxAgeMs: WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_MAX_SNAPSHOT_AGE_MS
+    }
+  ];
+}
+
+function evaluateWasabiRuntimeReadiness(snapshot) {
+  const meta = snapshotMeta(snapshot);
+  const data = snapshot && snapshot.data && typeof snapshot.data === 'object' ? snapshot.data : {};
+  const tableCounts = Object.fromEntries(
+    Object.entries(data)
+      .filter(([, value]) => Array.isArray(value))
+      .map(([name, value]) => [name, value.length])
+  );
+  const domains = wasabiReadDomains();
+  const freshnessByDomain = Object.fromEntries(
+    domains.map((domain) => [
+      domain.name,
+      meta.ageMs != null && meta.ageMs <= Math.max(1000, Number(domain.maxAgeMs || 0))
+    ])
+  );
+  const allEnabledDomainsFresh = domains
+    .filter((domain) => domain.enabled)
+    .every((domain) => freshnessByDomain[domain.name] === true);
+  const requiredTables = [
+    'users',
+    'auth_sessions',
+    'user_portal_scopes',
+    'user_psr_scopes',
+    'planner_records',
+    'pricing_rates',
+    'daily_reports',
+    'jobsite_assets'
+  ];
+  const missingRequiredTables = requiredTables.filter((table) => !Array.isArray(data[table]));
+  const readyForAllReadsPrimary = !!(
+    wasabiStateClient &&
+    WASABI_STATE_BUCKET &&
+    meta.hasData &&
+    allEnabledDomainsFresh &&
+    missingRequiredTables.length === 0
+  );
+  return {
+    snapshot: meta,
+    tableCounts,
+    freshnessByDomain,
+    missingRequiredTables,
+    readyForAllReadsPrimary
+  };
+}
+
+async function listSnapshotTables() {
+  const fallback = [
+    'planner_records',
+    'planner_changes',
+    'users',
+    'sessions',
+    'portal_path_grants',
+    'portal_share_links',
+    'portal_share_access_log',
+    'auto_import_projects',
+    'auto_import_runs',
+    'auto_import_row_cache',
+    'auto_import_bindings',
+    'auto_import_logs'
+  ];
+  if (!WASABI_STATE_INCLUDE_ALL_TABLES) {
+    return fallback.filter((name) => !WASABI_STATE_EXCLUDE_TABLES.has(name));
+  }
+  try {
+    const q = await pool.query(
+      `SELECT table_name
+         FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_type = 'BASE TABLE'
+        ORDER BY table_name ASC`
+    );
+    const all = q.rows.map((row) => String(row.table_name || '').trim()).filter(Boolean);
+    return all.filter((name) => !WASABI_STATE_EXCLUDE_TABLES.has(name));
+  } catch (error) {
+    console.warn('[wasabi-state] failed to list all tables, using fallback:', error?.message || error);
+    return fallback.filter((name) => !WASABI_STATE_EXCLUDE_TABLES.has(name));
+  }
+}
+
+async function runWasabiStateSnapshot() {
+  if (!wasabiStateClient || !WASABI_STATE_BUCKET) return;
+  if (wasabiStateSnapshotBusy) return;
+  wasabiStateSnapshotBusy = true;
+  wasabiStateLastRunAt = Date.now();
+  try {
+    const tables = await listSnapshotTables();
+    const data = {};
+    for (const tableName of tables) {
+      try {
+        const q = await pool.query(`SELECT * FROM ${tableName}`);
+        data[tableName] = q.rows;
+      } catch (err) {
+        data[tableName] = { error: String(err?.message || err) };
+      }
+    }
+    const now = new Date();
+    const stamp = now.toISOString().replace(/[:.]/g, '-');
+    const payload = Buffer.from(
+      JSON.stringify(
+        {
+          generatedAt: now.toISOString(),
+          source: 'horizon-backend',
+          scope: { clientId: 'portal-users', jobId: '3' },
+          data
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+    const latestKey = `${WASABI_STATE_PREFIX}/latest.json`;
+    const archiveKey = `${WASABI_STATE_PREFIX}/history/snapshot-${stamp}.json`;
+    await wasabiStateClient.send(
+      new PutObjectCommand({
+        Bucket: WASABI_STATE_BUCKET,
+        Key: latestKey,
+        Body: payload,
+        ContentType: 'application/json'
+      })
+    );
+    await wasabiStateClient.send(
+      new PutObjectCommand({
+        Bucket: WASABI_STATE_BUCKET,
+        Key: archiveKey,
+        Body: payload,
+        ContentType: 'application/json'
+      })
+    );
+    wasabiLatestStateCache = {
+      generatedAt: now.toISOString(),
+      source: 'horizon-backend',
+      scope: { clientId: 'portal-users', jobId: '3' },
+      data
+    };
+    wasabiLatestStateCacheAt = Date.now();
+  } catch (err) {
+    console.warn('[wasabi-state] snapshot failed:', err && err.message ? err.message : err);
+  } finally {
+    wasabiStateSnapshotBusy = false;
+  }
+}
+
+async function syncWasabiNow(reason = 'manual') {
+  await flushWasabiSqlMirrorQueue();
+  await runWasabiStateSnapshot();
+  const latest = await loadWasabiLatestStateSnapshot(true);
+  const readiness = evaluateWasabiRuntimeReadiness(latest);
+  return {
+    reason: String(reason || 'manual'),
+    ...readiness,
+    state: currentWasabiStateStatus(),
+    sqlMirror: currentWasabiSqlMirrorStatus()
+  };
+}
+
+function queueWasabiStateSnapshot(reason) {
+  if (!WASABI_STATE_SNAPSHOT_ON_WRITE) return;
+  if (!wasabiStateClient || !WASABI_STATE_BUCKET) return;
+  wasabiStateLastQueuedAt = Date.now();
+  wasabiStateLastReason = String(reason || '').trim() || 'mutation';
+  if (wasabiStateSnapshotTimer) return;
+  wasabiStateSnapshotTimer = setTimeout(async () => {
+    wasabiStateSnapshotTimer = null;
+    await runWasabiStateSnapshot();
+  }, WASABI_STATE_WRITE_DEBOUNCE_MS);
+}
+
+function currentWasabiStateStatus() {
+  return {
+    enabled: !!(wasabiStateClient && WASABI_STATE_BUCKET),
+    onWrite: WASABI_STATE_SNAPSHOT_ON_WRITE,
+    bucket: WASABI_STATE_BUCKET || null,
+    prefix: WASABI_STATE_PREFIX,
+    intervalMs: WASABI_STATE_SNAPSHOT_MS,
+    writeDebounceMs: WASABI_STATE_WRITE_DEBOUNCE_MS,
+    includeAllTables: WASABI_STATE_INCLUDE_ALL_TABLES,
+    excludedTables: Array.from(WASABI_STATE_EXCLUDE_TABLES),
+    allReadsPrimaryEnabled: WASABI_ALL_READS_PRIMARY_ENABLED,
+    allReadsPrimaryStrict: WASABI_ALL_READS_PRIMARY_STRICT,
+    authFallbackEnabled: WASABI_AUTH_FALLBACK_ENABLED,
+    authFallbackCacheMs: WASABI_AUTH_FALLBACK_CACHE_MS,
+    authPrimaryEnabled: WASABI_AUTH_PRIMARY_ENABLED,
+    authPrimaryStrict: WASABI_AUTH_PRIMARY_STRICT,
+    authPrimaryMaxSnapshotAgeMs: WASABI_AUTH_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    scopesPrimaryEnabled: WASABI_SCOPES_PRIMARY_ENABLED,
+    scopesPrimaryStrict: WASABI_SCOPES_PRIMARY_STRICT,
+    scopesPrimaryMaxSnapshotAgeMs: WASABI_SCOPES_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    permissionsTreePrimaryEnabled: WASABI_PERMISSIONS_TREE_PRIMARY_ENABLED,
+    permissionsTreePrimaryStrict: WASABI_PERMISSIONS_TREE_PRIMARY_STRICT,
+    permissionsTreePrimaryMaxSnapshotAgeMs: WASABI_PERMISSIONS_TREE_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    loginFallbackEnabled: WASABI_LOGIN_FALLBACK_ENABLED,
+    loginFallbackMaxSnapshotAgeMs: WASABI_LOGIN_FALLBACK_MAX_SNAPSHOT_AGE_MS,
+    recordsPrimaryEnabled: WASABI_RECORDS_PRIMARY_ENABLED,
+    recordsPrimaryStrict: WASABI_RECORDS_PRIMARY_STRICT,
+    recordsPrimaryMaxSnapshotAgeMs: WASABI_RECORDS_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    recordDetailPrimaryEnabled: WASABI_RECORD_DETAIL_PRIMARY_ENABLED,
+    recordDetailPrimaryStrict: WASABI_RECORD_DETAIL_PRIMARY_STRICT,
+    recordDetailPrimaryMaxSnapshotAgeMs: WASABI_RECORD_DETAIL_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    pricingPrimaryEnabled: WASABI_PRICING_PRIMARY_ENABLED,
+    pricingPrimaryStrict: WASABI_PRICING_PRIMARY_STRICT,
+    pricingPrimaryMaxSnapshotAgeMs: WASABI_PRICING_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    reportsPrimaryEnabled: WASABI_REPORTS_PRIMARY_ENABLED,
+    reportsPrimaryStrict: WASABI_REPORTS_PRIMARY_STRICT,
+    reportsPrimaryMaxSnapshotAgeMs: WASABI_REPORTS_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    assetsPrimaryEnabled: WASABI_ASSETS_PRIMARY_ENABLED,
+    assetsPrimaryStrict: WASABI_ASSETS_PRIMARY_STRICT,
+    assetsPrimaryMaxSnapshotAgeMs: WASABI_ASSETS_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    syncStatePrimaryEnabled: WASABI_SYNC_STATE_PRIMARY_ENABLED,
+    syncStatePrimaryStrict: WASABI_SYNC_STATE_PRIMARY_STRICT,
+    syncStatePrimaryMaxSnapshotAgeMs: WASABI_SYNC_STATE_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    usersPrimaryEnabled: WASABI_USERS_PRIMARY_ENABLED,
+    usersPrimaryStrict: WASABI_USERS_PRIMARY_STRICT,
+    usersPrimaryMaxSnapshotAgeMs: WASABI_USERS_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    plannerScopeLookupPrimaryEnabled: WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_ENABLED,
+    plannerScopeLookupPrimaryStrict: WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_STRICT,
+    plannerScopeLookupPrimaryMaxSnapshotAgeMs: WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_MAX_SNAPSHOT_AGE_MS,
+    queuedAt: wasabiStateLastQueuedAt ? new Date(wasabiStateLastQueuedAt).toISOString() : null,
+    lastRunAt: wasabiStateLastRunAt ? new Date(wasabiStateLastRunAt).toISOString() : null,
+    lastReason: wasabiStateLastReason,
+    busy: wasabiStateSnapshotBusy
+  };
+}
+
+function detectSqlMutation(sqlText) {
+  const sql = String(sqlText || '').trim();
+  if (!sql) return null;
+  const opMatch = sql.match(/^(insert|update|delete)\b/i);
+  if (!opMatch) return null;
+  const operation = String(opMatch[1] || '').toUpperCase();
+  let table = null;
+  if (operation === 'INSERT') {
+    const m = sql.match(/^\s*insert\s+into\s+("?[\w.]+"?)/i);
+    table = m && m[1] ? m[1] : null;
+  } else if (operation === 'UPDATE') {
+    const m = sql.match(/^\s*update\s+("?[\w.]+"?)/i);
+    table = m && m[1] ? m[1] : null;
+  } else if (operation === 'DELETE') {
+    const m = sql.match(/^\s*delete\s+from\s+("?[\w.]+"?)/i);
+    table = m && m[1] ? m[1] : null;
+  }
+  if (table) table = table.replace(/"/g, '');
+  return { operation, table };
+}
+
+function normalizeMirrorParams(params) {
+  if (!Array.isArray(params) || !WASABI_SQL_MIRROR_INCLUDE_PARAMS) return undefined;
+  return params.slice(0, 100).map((value) => {
+    if (value == null) return value;
+    const t = typeof value;
+    if (t === 'string') return value.length > 200 ? `${value.slice(0, 200)}...` : value;
+    if (t === 'number' || t === 'boolean') return value;
+    if (value instanceof Date) return value.toISOString();
+    try {
+      const json = JSON.stringify(value);
+      return json.length > 300 ? `${json.slice(0, 300)}...` : json;
+    } catch {
+      return String(value);
+    }
+  });
+}
+
+async function flushWasabiSqlMirrorQueue() {
+  if (!WASABI_SQL_MIRROR_ENABLED) return;
+  if (!wasabiStateClient || !WASABI_STATE_BUCKET) return;
+  if (wasabiSqlMirrorBusy) return;
+  if (!wasabiSqlMirrorEvents.length) return;
+  wasabiSqlMirrorBusy = true;
+  const batch = wasabiSqlMirrorEvents.splice(0, wasabiSqlMirrorEvents.length);
+  try {
+    const now = new Date();
+    const yyyy = String(now.getUTCFullYear());
+    const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(now.getUTCDate()).padStart(2, '0');
+    const hh = String(now.getUTCHours()).padStart(2, '0');
+    const mi = String(now.getUTCMinutes()).padStart(2, '0');
+    const stamp = now.toISOString().replace(/[:.]/g, '-');
+    const key = `${WASABI_SQL_MIRROR_PREFIX}/events/${yyyy}/${mm}/${dd}/${hh}/${mi}/batch-${stamp}-${crypto.randomUUID()}.json`;
+    const payload = Buffer.from(
+      JSON.stringify(
+        {
+          generatedAt: now.toISOString(),
+          source: 'horizon-backend',
+          scope: { clientId: 'portal-users', jobId: '3' },
+          count: batch.length,
+          events: batch
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+    await wasabiStateClient.send(
+      new PutObjectCommand({
+        Bucket: WASABI_STATE_BUCKET,
+        Key: key,
+        Body: payload,
+        ContentType: 'application/json'
+      })
+    );
+    wasabiSqlMirrorLastError = '';
+    wasabiSqlMirrorTotalFlushed += batch.length;
+    wasabiSqlMirrorLastFlushAt = Date.now();
+  } catch (err) {
+    wasabiSqlMirrorLastError = String(err?.message || err);
+    console.warn('[wasabi-sql-mirror] flush failed:', wasabiSqlMirrorLastError);
+    wasabiSqlMirrorEvents = batch.concat(wasabiSqlMirrorEvents).slice(0, WASABI_SQL_MIRROR_MAX_BUFFER);
+  } finally {
+    wasabiSqlMirrorBusy = false;
+  }
+}
+
+function queueWasabiSqlMirrorEvent(event) {
+  if (!WASABI_SQL_MIRROR_ENABLED) return;
+  if (!wasabiStateClient || !WASABI_STATE_BUCKET) return;
+  wasabiSqlMirrorEvents.push(event);
+  if (wasabiSqlMirrorEvents.length > WASABI_SQL_MIRROR_MAX_BUFFER) {
+    wasabiSqlMirrorEvents = wasabiSqlMirrorEvents.slice(-WASABI_SQL_MIRROR_MAX_BUFFER);
+  }
+  if (wasabiSqlMirrorEvents.length >= 25) {
+    void flushWasabiSqlMirrorQueue();
+    return;
+  }
+  if (wasabiSqlMirrorTimer) return;
+  wasabiSqlMirrorTimer = setTimeout(async () => {
+    wasabiSqlMirrorTimer = null;
+    await flushWasabiSqlMirrorQueue();
+  }, WASABI_SQL_MIRROR_FLUSH_MS);
+}
+
+function currentWasabiSqlMirrorStatus() {
+  return {
+    enabled: !!(WASABI_SQL_MIRROR_ENABLED && wasabiStateClient && WASABI_STATE_BUCKET),
+    includeParams: WASABI_SQL_MIRROR_INCLUDE_PARAMS,
+    bucket: WASABI_STATE_BUCKET || null,
+    prefix: WASABI_SQL_MIRROR_PREFIX,
+    flushMs: WASABI_SQL_MIRROR_FLUSH_MS,
+    maxBuffer: WASABI_SQL_MIRROR_MAX_BUFFER,
+    buffered: wasabiSqlMirrorEvents.length,
+    busy: wasabiSqlMirrorBusy,
+    totalFlushed: wasabiSqlMirrorTotalFlushed,
+    lastFlushAt: wasabiSqlMirrorLastFlushAt ? new Date(wasabiSqlMirrorLastFlushAt).toISOString() : null,
+    lastError: wasabiSqlMirrorLastError || null
+  };
+}
+
+const rawPoolQuery = pool.query.bind(pool);
+pool.query = function patchedPoolQuery(text, values, callback) {
+  if (typeof values === 'function' || typeof callback === 'function') {
+    return rawPoolQuery(text, values, callback);
+  }
+  const sqlText = typeof text === 'string' ? text : text && typeof text.text === 'string' ? text.text : '';
+  const mutation = detectSqlMutation(sqlText);
+  const startedAt = Date.now();
+  return rawPoolQuery(text, values)
+    .then((result) => {
+      if (mutation) {
+        queueWasabiSqlMirrorEvent({
+          id: crypto.randomUUID(),
+          at: new Date().toISOString(),
+          ok: true,
+          operation: mutation.operation,
+          table: mutation.table,
+          rowCount: Number(result?.rowCount || 0),
+          durationMs: Date.now() - startedAt,
+          sql: String(sqlText || '').slice(0, 500),
+          valuesCount: Array.isArray(values) ? values.length : 0,
+          values: normalizeMirrorParams(values)
+        });
+      }
+      return result;
+    })
+    .catch((error) => {
+      if (mutation) {
+        queueWasabiSqlMirrorEvent({
+          id: crypto.randomUUID(),
+          at: new Date().toISOString(),
+          ok: false,
+          operation: mutation.operation,
+          table: mutation.table,
+          rowCount: 0,
+          durationMs: Date.now() - startedAt,
+          sql: String(sqlText || '').slice(0, 500),
+          valuesCount: Array.isArray(values) ? values.length : 0,
+          values: normalizeMirrorParams(values),
+          error: String(error?.message || error)
+        });
+      }
+      throw error;
+    });
+};
 
 const SESSION_TTL_MINUTES = 15;
 const upload = multer({
@@ -221,10 +878,10 @@ const PORTAL_FORCE_JOB_ID = (process.env.PORTAL_FORCE_JOB_ID || '').trim();
 const PORTAL_FORCE_JOB_SCOPE = PORTAL_FORCE_CLIENT_ID && PORTAL_FORCE_JOB_ID;
 /**
  * Shared default portal scope for all users when no explicit user mapping exists.
- * Defaults to `portal-users/8` per current production bucket layout.
+ * Defaults to `portal-users/4` per current production bucket layout.
  */
 const PORTAL_SHARED_DEFAULT_CLIENT_ID = (process.env.PORTAL_SHARED_DEFAULT_CLIENT_ID || 'portal-users').trim();
-const PORTAL_SHARED_DEFAULT_JOB_ID = (process.env.PORTAL_SHARED_DEFAULT_JOB_ID || '8').trim();
+const PORTAL_SHARED_DEFAULT_JOB_ID = (process.env.PORTAL_SHARED_DEFAULT_JOB_ID || '4').trim();
 const PORTAL_SHARED_DEFAULT_SCOPE = PORTAL_SHARED_DEFAULT_CLIENT_ID && PORTAL_SHARED_DEFAULT_JOB_ID;
 /** Backward-compat toggle: set `PORTAL_USER_SCOPED_DEFAULTS=1` to restore `portal-users/{userId}` defaults. */
 const PORTAL_USER_SCOPED_DEFAULTS =
@@ -389,40 +1046,79 @@ async function readScopesForUserIds(userIds) {
   for (const id of ids) byUser.set(id, { portalScopes: [], psrScopes: [] });
   if (!ids.length) return byUser;
 
-  const portalRes = await pool.query(
-    `SELECT user_id::text AS user_id, client_id, job_id
-     FROM user_portal_scopes
-     WHERE user_id::text = ANY($1::text[])
-     ORDER BY client_id, job_id`,
-    [ids]
-  );
-  for (const row of portalRes.rows) {
-    const key = String(row.user_id);
-    if (!byUser.has(key)) byUser.set(key, { portalScopes: [], psrScopes: [] });
-    byUser.get(key).portalScopes.push({ clientId: String(row.client_id), jobId: String(row.job_id) });
-  }
-
-  const psrRes = await pool.query(
-    `SELECT user_id::text AS user_id, client, city, jobsite, psr_record_id
-     FROM user_psr_scopes
-     WHERE user_id::text = ANY($1::text[])
-     ORDER BY client, city, jobsite`,
-    [ids]
-  );
-  for (const row of psrRes.rows) {
-    const key = String(row.user_id);
-    if (!byUser.has(key)) byUser.set(key, { portalScopes: [], psrScopes: [] });
-    byUser
-      .get(key)
-      .psrScopes.push({
+  async function fromSnapshot() {
+    const snapshot = await loadWasabiLatestStateSnapshot();
+    if (!snapshotLooksFresh(snapshot, WASABI_SCOPES_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+    const portalRows = snapshotRows(snapshot, 'user_portal_scopes');
+    for (const row of portalRows) {
+      const key = String(row.user_id || '').trim();
+      if (!key || !byUser.has(key)) continue;
+      byUser.get(key).portalScopes.push({
+        clientId: String(row.client_id || ''),
+        jobId: String(row.job_id || '')
+      });
+    }
+    const psrRows = snapshotRows(snapshot, 'user_psr_scopes');
+    for (const row of psrRows) {
+      const key = String(row.user_id || '').trim();
+      if (!key || !byUser.has(key)) continue;
+      byUser.get(key).psrScopes.push({
         recordId: cleanString(row.psr_record_id || '') || null,
         client: String(row.client || ''),
         city: String(row.city || ''),
         jobsite: String(row.jobsite || '')
       });
+    }
+    return byUser;
   }
 
-  return byUser;
+  async function fromPostgres() {
+    const portalRes = await pool.query(
+      `SELECT user_id::text AS user_id, client_id, job_id
+       FROM user_portal_scopes
+       WHERE user_id::text = ANY($1::text[])
+       ORDER BY client_id, job_id`,
+      [ids]
+    );
+    for (const row of portalRes.rows) {
+      const key = String(row.user_id);
+      if (!byUser.has(key)) byUser.set(key, { portalScopes: [], psrScopes: [] });
+      byUser.get(key).portalScopes.push({ clientId: String(row.client_id), jobId: String(row.job_id) });
+    }
+
+    const psrRes = await pool.query(
+      `SELECT user_id::text AS user_id, client, city, jobsite, psr_record_id
+       FROM user_psr_scopes
+       WHERE user_id::text = ANY($1::text[])
+       ORDER BY client, city, jobsite`,
+      [ids]
+    );
+    for (const row of psrRes.rows) {
+      const key = String(row.user_id);
+      if (!byUser.has(key)) byUser.set(key, { portalScopes: [], psrScopes: [] });
+      byUser
+        .get(key)
+        .psrScopes.push({
+          recordId: cleanString(row.psr_record_id || '') || null,
+          client: String(row.client || ''),
+          city: String(row.city || ''),
+          jobsite: String(row.jobsite || '')
+        });
+    }
+    return byUser;
+  }
+
+  if (WASABI_SCOPES_PRIMARY_ENABLED) {
+    try {
+      const snapshotResult = await fromSnapshot();
+      if (snapshotResult) return snapshotResult;
+      if (WASABI_SCOPES_PRIMARY_STRICT) return byUser;
+    } catch (error) {
+      if (WASABI_SCOPES_PRIMARY_STRICT) throw error;
+    }
+  }
+
+  return fromPostgres();
 }
 
 async function attachScopesToUsers(users) {
@@ -442,6 +1138,400 @@ async function attachScopesToUser(user) {
   if (!user?.id) return { ...user, portalScopes: [], psrScopes: [] };
   const [withScopes] = await attachScopesToUsers([user]);
   return withScopes;
+}
+
+function snapshotRows(snapshot, tableName) {
+  const rows = snapshot && snapshot.data ? snapshot.data[tableName] : null;
+  return Array.isArray(rows) ? rows : [];
+}
+
+function attachScopesToUserFromSnapshot(user, snapshot) {
+  if (!user?.id) return { ...user, portalScopes: [], psrScopes: [] };
+  const uid = String(user.id || '');
+  const portalScopes = snapshotRows(snapshot, 'user_portal_scopes')
+    .filter((row) => String(row.user_id || '') === uid)
+    .map((row) => ({
+      clientId: String(row.client_id || ''),
+      jobId: String(row.job_id || '')
+    }));
+  const psrScopes = snapshotRows(snapshot, 'user_psr_scopes')
+    .filter((row) => String(row.user_id || '') === uid)
+    .map((row) => ({
+      recordId: cleanString(row.psr_record_id || '') || null,
+      client: String(row.client || ''),
+      city: String(row.city || ''),
+      jobsite: String(row.jobsite || '')
+    }));
+  return {
+    ...user,
+    portalScopes: dedupePortalScopes(portalScopes),
+    psrScopes: dedupePsrScopes(psrScopes)
+  };
+}
+
+function snapshotLooksFresh(snapshot, maxAgeMs = WASABI_AUTH_PRIMARY_MAX_SNAPSHOT_AGE_MS) {
+  const generatedAt = Date.parse(String(snapshot?.generatedAt || ''));
+  if (!Number.isFinite(generatedAt)) return false;
+  return Date.now() - generatedAt <= Math.max(1000, Number(maxAgeMs || 0));
+}
+
+function buildPermissionsTreesFromRows({ portalRows = [], portalPathRows = [], psrRows = [] }) {
+  const pathMap = new Map();
+  for (const row of portalPathRows) {
+    const clientId = String(row.client_id || '').trim();
+    const jobId = String(row.job_id || '').trim();
+    if (!clientId || !jobId) continue;
+    const key = `${clientId}|||${jobId}`;
+    if (!pathMap.has(key)) pathMap.set(key, new Set());
+    const p = String(row.path_prefix || '')
+      .replace(/\\/g, '/')
+      .replace(/^\/+|\/+$/g, '')
+      .replace(/\/+/g, '/');
+    pathMap.get(key).add(p || '/');
+  }
+
+  const portalMap = new Map();
+  for (const row of portalRows) {
+    const clientId = String(row.client_id || '').trim();
+    const jobId = String(row.job_id || '').trim();
+    if (!clientId || !jobId) continue;
+    const displayClient = upperCleanString(row.label_client || clientId);
+    const displayCity = upperCleanString(row.label_city || 'NOT SET');
+    const displayJobsite = normalizeJobsiteName(row.label_jobsite || jobId);
+    if (!portalMap.has(displayClient)) portalMap.set(displayClient, new Map());
+    const cityMap = portalMap.get(displayClient);
+    if (!cityMap.has(displayCity)) cityMap.set(displayCity, []);
+    cityMap.get(displayCity).push({
+      clientId,
+      jobId,
+      jobsite: displayJobsite,
+      paths: [...(pathMap.get(`${clientId}|||${jobId}`) || new Set(['/']))]
+    });
+  }
+  const portalTree = [...portalMap.entries()].map(([client, cityMap]) => ({
+    client,
+    cities: [...cityMap.entries()].map(([city, jobs]) => ({
+      city,
+      jobs: jobs
+        .filter((j, idx, arr) => arr.findIndex((x) => x.clientId === j.clientId && x.jobId === j.jobId) === idx)
+        .sort((a, b) => a.jobsite.localeCompare(b.jobsite, undefined, { sensitivity: 'base' }))
+    }))
+  }));
+
+  const psrMap = new Map();
+  for (const row of psrRows) {
+    const client = upperCleanString(row.client);
+    const city = upperCleanString(row.city);
+    const jobsite = normalizeJobsiteName(row.jobsite, row.street);
+    const recordId = cleanString(row.id || '');
+    if (!client || !city || !jobsite) continue;
+    if (!psrMap.has(client)) psrMap.set(client, new Map());
+    const cityMap = psrMap.get(client);
+    if (!cityMap.has(city)) cityMap.set(city, []);
+    cityMap.get(city).push({ recordId, jobsite });
+  }
+  const psrTree = [...psrMap.entries()].map(([client, cityMap]) => ({
+    client,
+    cities: [...cityMap.entries()].map(([city, jobsites]) => ({
+      city,
+      jobsites: jobsites
+        .filter((item, idx, arr) => arr.findIndex((x) => x.recordId === item.recordId) === idx)
+        .sort((a, b) => String(a.jobsite || '').localeCompare(String(b.jobsite || ''), undefined, { sensitivity: 'base' }))
+    }))
+  }));
+
+  return { portalTree, psrTree };
+}
+
+async function buildPermissionsTreesFromSnapshot() {
+  const snapshot = await loadWasabiLatestStateSnapshot();
+  if (!snapshotLooksFresh(snapshot, WASABI_PERMISSIONS_TREE_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  const users = snapshotRows(snapshot, 'users');
+  const userPortalScopes = snapshotRows(snapshot, 'user_portal_scopes');
+  const portalPathGrants = snapshotRows(snapshot, 'portal_path_grants');
+  const plannerRecords = snapshotRows(snapshot, 'planner_records');
+
+  const scopeSet = new Map();
+  const addScope = (clientIdValue, jobIdValue) => {
+    const clientId = String(clientIdValue || '').trim();
+    const jobId = String(jobIdValue || '').trim();
+    if (!clientId || !jobId) return;
+    scopeSet.set(`${clientId}|||${jobId}`, { client_id: clientId, job_id: jobId });
+  };
+
+  for (const row of userPortalScopes) addScope(row.client_id, row.job_id);
+  for (const row of users) addScope(row.portal_files_client_id, row.portal_files_job_id);
+  for (const row of portalPathGrants) addScope(row.client_id, row.job_id);
+
+  const plannerByClient = new Map();
+  for (const row of plannerRecords) {
+    const client = String(row.client || '').trim().toLowerCase();
+    if (!client) continue;
+    if (!plannerByClient.has(client)) plannerByClient.set(client, []);
+    plannerByClient.get(client).push(row);
+  }
+
+  const portalRows = [];
+  for (const row of scopeSet.values()) {
+    const c = String(row.client_id || '').trim();
+    const j = String(row.job_id || '').trim();
+    const candidates = plannerByClient.get(c.toLowerCase()) || [];
+    let best = null;
+    for (const candidate of candidates) {
+      const jobsite = String(candidate.jobsite || '').trim();
+      const recId = String(candidate.id || '').trim();
+      if (!jobsite && !recId) continue;
+      if (jobsite.toLowerCase() === j.toLowerCase() || recId === j) {
+        if (!best) {
+          best = candidate;
+          continue;
+        }
+        const bestTs = Date.parse(String(best.updated_at || best.created_at || '')) || 0;
+        const candidateTs = Date.parse(String(candidate.updated_at || candidate.created_at || '')) || 0;
+        if (candidateTs > bestTs) best = candidate;
+      }
+    }
+    portalRows.push({
+      client_id: c,
+      job_id: j,
+      label_client: best ? best.client : c,
+      label_city: best ? best.city : 'NOT SET',
+      label_jobsite: best ? best.jobsite : j
+    });
+  }
+
+  const psrRows = plannerRecords
+    .map((row) => ({
+      id: row.id,
+      client: row.client,
+      city: row.city,
+      jobsite: row.jobsite
+    }))
+    .filter(
+      (row) =>
+        String(row.client || '').trim() &&
+        String(row.city || '').trim() &&
+        String(row.jobsite || '').trim()
+    );
+
+  return buildPermissionsTreesFromRows({
+    portalRows,
+    portalPathRows: portalPathGrants,
+    psrRows
+  });
+}
+
+function snapshotUserMatchesLogin(user, submittedUsername) {
+  const needle = String(submittedUsername || '').trim().toLowerCase();
+  if (!needle) return false;
+  const username = String(user?.username || '').trim().toLowerCase();
+  const displayName = String(user?.display_name || user?.username || '').trim().toLowerCase();
+  const email = String(user?.email || '').trim().toLowerCase();
+  return username === needle || displayName === needle || (!!email && email === needle);
+}
+
+async function readLoginUserFromWasabiSnapshot(submittedUsername) {
+  const snapshot = await loadWasabiLatestStateSnapshot();
+  if (!snapshotLooksFresh(snapshot, WASABI_LOGIN_FALLBACK_MAX_SNAPSHOT_AGE_MS)) return null;
+  const users = snapshotRows(snapshot, 'users');
+  return users.find((row) => snapshotUserMatchesLogin(row, submittedUsername)) || null;
+}
+
+async function readRecordsFromWasabiSnapshotForUser(user) {
+  const snapshot = await loadWasabiLatestStateSnapshot();
+  if (!snapshotLooksFresh(snapshot, WASABI_RECORDS_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  const rows = snapshotRows(snapshot, 'planner_records');
+  const normalized = rows.map((row) => normalizeRecordRow(row));
+  const filtered = normalized.filter((record) => userCanAccessPsrScope(user, record));
+  filtered.sort((a, b) => {
+    const c = String(a.client || '').localeCompare(String(b.client || ''), undefined, { sensitivity: 'base' });
+    if (c !== 0) return c;
+    const d = String(a.city || '').localeCompare(String(b.city || ''), undefined, { sensitivity: 'base' });
+    if (d !== 0) return d;
+    const e = String(a.jobsite || '').localeCompare(String(b.jobsite || ''), undefined, { sensitivity: 'base' });
+    if (e !== 0) return e;
+    const r = String(b.record_date || '').localeCompare(String(a.record_date || ''));
+    if (r !== 0) return r;
+    const au = Date.parse(String(a.updated_at || '')) || 0;
+    const bu = Date.parse(String(b.updated_at || '')) || 0;
+    return bu - au;
+  });
+  return filtered;
+}
+
+async function fetchRecordByIdFromWasabiSnapshot(id) {
+  const snapshot = await loadWasabiLatestStateSnapshot();
+  if (!snapshotLooksFresh(snapshot, WASABI_RECORD_DETAIL_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  const rows = snapshotRows(snapshot, 'planner_records');
+  const hit = rows.find((row) => String(row.id || '') === String(id || ''));
+  if (!hit) return null;
+  return normalizeRecordRow(hit);
+}
+
+async function readPricingRatesFromWasabiSnapshot() {
+  const snapshot = await loadWasabiLatestStateSnapshot();
+  if (!snapshotLooksFresh(snapshot, WASABI_PRICING_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  const rows = snapshotRows(snapshot, 'pricing_rates')
+    .map((row) => ({
+      dia: upperCleanString(row.dia || ''),
+      rate: Number(row.rate),
+      updated_at: row.updated_at || null
+    }))
+    .filter((row) => row.dia && Number.isFinite(row.rate))
+    .sort((a, b) => String(a.dia).localeCompare(String(b.dia), undefined, { sensitivity: 'base' }));
+  return rows;
+}
+
+async function readDailyReportsFromWasabiSnapshot() {
+  const snapshot = await loadWasabiLatestStateSnapshot();
+  if (!snapshotLooksFresh(snapshot, WASABI_REPORTS_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  const rows = snapshotRows(snapshot, 'daily_reports')
+    .map((row) => ({
+      ...row,
+      files: Array.isArray(row.files) ? row.files : parseJsonObject(row.files, [])
+    }))
+    .sort((a, b) => {
+      const ra = String(b.report_date || '').localeCompare(String(a.report_date || ''));
+      if (ra !== 0) return ra;
+      const au = Date.parse(String(a.updated_at || '')) || 0;
+      const bu = Date.parse(String(b.updated_at || '')) || 0;
+      return bu - au;
+    });
+  return rows;
+}
+
+async function readDailyReportByIdFromWasabiSnapshot(id) {
+  const reports = await readDailyReportsFromWasabiSnapshot();
+  if (!reports) return null;
+  return reports.find((row) => String(row.id || '') === String(id || '')) || null;
+}
+
+async function readJobsiteAssetsFromWasabiSnapshotForUser(user) {
+  const snapshot = await loadWasabiLatestStateSnapshot();
+  if (!snapshotLooksFresh(snapshot, WASABI_ASSETS_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  const rows = snapshotRows(snapshot, 'jobsite_assets')
+    .map((row) => ({
+      ...row,
+      files: Array.isArray(row.files) ? row.files : parseJsonObject(row.files, [])
+    }))
+    .filter((row) => userCanAccessPsrScope(user, row))
+    .sort((a, b) => {
+      const c = String(a.client || '').localeCompare(String(b.client || ''), undefined, { sensitivity: 'base' });
+      if (c !== 0) return c;
+      const d = String(a.city || '').localeCompare(String(b.city || ''), undefined, { sensitivity: 'base' });
+      if (d !== 0) return d;
+      const e = String(a.jobsite || '').localeCompare(String(b.jobsite || ''), undefined, { sensitivity: 'base' });
+      if (e !== 0) return e;
+      const au = Date.parse(String(a.updated_at || '')) || 0;
+      const bu = Date.parse(String(b.updated_at || '')) || 0;
+      return bu - au;
+    });
+  return rows;
+}
+
+function summarizeRowsForSyncState(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  let latestMs = 0;
+  for (const row of list) {
+    const ms = Date.parse(String(row?.updated_at || row?.created_at || '')) || 0;
+    if (ms > latestMs) latestMs = ms;
+  }
+  return {
+    count: list.length,
+    updated_at: latestMs ? new Date(latestMs).toISOString() : new Date(0).toISOString()
+  };
+}
+
+async function readSyncStateFromWasabiSnapshot() {
+  const snapshot = await loadWasabiLatestStateSnapshot();
+  if (!snapshotLooksFresh(snapshot, WASABI_SYNC_STATE_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  const payload = {
+    records: summarizeRowsForSyncState(snapshotRows(snapshot, 'planner_records')),
+    pricing: summarizeRowsForSyncState(snapshotRows(snapshot, 'pricing_rates')),
+    reports: summarizeRowsForSyncState(snapshotRows(snapshot, 'daily_reports')),
+    assets: summarizeRowsForSyncState(snapshotRows(snapshot, 'jobsite_assets')),
+    users: summarizeRowsForSyncState(snapshotRows(snapshot, 'users')),
+    emails: summarizeRowsForSyncState(snapshotRows(snapshot, 'user_outlook_tokens'))
+  };
+  return payload;
+}
+
+async function readUsersFromWasabiSnapshot() {
+  const snapshot = await loadWasabiLatestStateSnapshot();
+  if (!snapshotLooksFresh(snapshot, WASABI_USERS_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  const rows = snapshotRows(snapshot, 'users').map((row) => normalizeUser(row));
+  rows.sort((a, b) => {
+    const da = String(a.displayName || a.username || '').toLowerCase();
+    const db = String(b.displayName || b.username || '').toLowerCase();
+    const c = da.localeCompare(db);
+    if (c !== 0) return c;
+    return String(a.username || '').toLowerCase().localeCompare(String(b.username || '').toLowerCase());
+  });
+  return rows;
+}
+
+async function readUserByIdFromWasabiSnapshot(id) {
+  const users = await readUsersFromWasabiSnapshot();
+  if (!users) return null;
+  return users.find((u) => String(u.id || '') === String(id || '')) || null;
+}
+
+async function countAdminsFromWasabiSnapshot() {
+  const users = await readUsersFromWasabiSnapshot();
+  if (!users) return null;
+  return users.filter((u) => u.isAdmin === true).length;
+}
+
+function plannerScopeMatch(row, client, city, jobsite) {
+  return (
+    String(row?.client || '').trim().toLowerCase() === String(client || '').trim().toLowerCase() &&
+    String(row?.city || '').trim().toLowerCase() === String(city || '').trim().toLowerCase() &&
+    String(row?.jobsite || '').trim().toLowerCase() === String(jobsite || '').trim().toLowerCase()
+  );
+}
+
+function sortRecordsByUpdatedDesc(records) {
+  const list = Array.isArray(records) ? records.slice() : [];
+  list.sort((a, b) => {
+    const au = Date.parse(String(a?.updated_at || a?.created_at || '')) || 0;
+    const bu = Date.parse(String(b?.updated_at || b?.created_at || '')) || 0;
+    return bu - au;
+  });
+  return list;
+}
+
+async function findPlannerRecordsByScopeFromWasabiSnapshot(client, city, jobsite) {
+  const snapshot = await loadWasabiLatestStateSnapshot();
+  if (!snapshotLooksFresh(snapshot, WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  const rows = snapshotRows(snapshot, 'planner_records');
+  const matched = rows.filter((row) => plannerScopeMatch(row, client, city, jobsite)).map((row) => normalizeRecordRow(row));
+  return sortRecordsByUpdatedDesc(matched);
+}
+
+async function findPlannerRecordsByScope(client, city, jobsite, options = {}) {
+  const latestOnly = options && options.latestOnly === true;
+  if (WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_ENABLED) {
+    try {
+      const snapshotRecords = await findPlannerRecordsByScopeFromWasabiSnapshot(client, city, jobsite);
+      if (snapshotRecords) return latestOnly ? snapshotRecords.slice(0, 1) : snapshotRecords;
+      if (WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_STRICT) return [];
+    } catch (error) {
+      if (WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_STRICT) throw error;
+    }
+  }
+  const sql = latestOnly
+    ? `SELECT * FROM planner_records
+       WHERE LOWER(client) = LOWER($1)
+         AND LOWER(city) = LOWER($2)
+         AND LOWER(jobsite) = LOWER($3)
+       ORDER BY updated_at DESC
+       LIMIT 1`
+    : `SELECT * FROM planner_records
+       WHERE LOWER(client) = LOWER($1)
+         AND LOWER(city) = LOWER($2)
+         AND LOWER(jobsite) = LOWER($3)`;
+  const result = await pool.query(sql, [client, city, jobsite]);
+  return result.rows.map(normalizeRecordRow);
 }
 
 function parseJsonObject(value, fallback = {}) {
@@ -588,8 +1678,26 @@ async function issueSession(userId) {
   return token;
 }
 
-async function readSession(token) {
-  if (!token) return null;
+async function readSessionFromWasabiSnapshot(token) {
+  const snapshot = await loadWasabiLatestStateSnapshot();
+  if (!snapshot || !snapshot.data) return null;
+  const sessions = snapshotRows(snapshot, 'auth_sessions');
+  const users = snapshotRows(snapshot, 'users');
+  const hit = sessions.find((s) => String(s.token || '') === String(token || ''));
+  if (!hit) return null;
+  if (new Date(hit.expires_at).getTime() < Date.now()) return null;
+  const user = users.find((u) => String(u.id || '') === String(hit.user_id || ''));
+  if (!user) return null;
+  const normalized = normalizeUser({
+    ...user,
+    token: hit.token,
+    user_id: hit.user_id,
+    expires_at: hit.expires_at
+  });
+  return attachScopesToUserFromSnapshot(normalized, snapshot);
+}
+
+async function readSessionFromPostgres(token) {
   await pool.query(`DELETE FROM auth_sessions WHERE expires_at < NOW()`);
   const result = await pool.query(
     `SELECT s.token, s.user_id, s.expires_at, u.id, u.username, u.display_name, u.password,
@@ -615,6 +1723,38 @@ async function readSession(token) {
     [token, SESSION_TTL_MINUTES]
   );
   return attachScopesToUser(normalizeUser(row));
+}
+
+async function readSession(token) {
+  if (!token) return null;
+  if (WASABI_AUTH_PRIMARY_ENABLED) {
+    try {
+      const snapshot = await loadWasabiLatestStateSnapshot();
+      if (snapshotLooksFresh(snapshot)) {
+        const session = await readSessionFromWasabiSnapshot(token);
+        if (session) return session;
+      }
+      if (WASABI_AUTH_PRIMARY_STRICT) return null;
+    } catch (error) {
+      if (WASABI_AUTH_PRIMARY_STRICT) throw error;
+    }
+  }
+  try {
+    return await readSessionFromPostgres(token);
+  } catch (error) {
+    if (!WASABI_AUTH_FALLBACK_ENABLED) throw error;
+    try {
+      const fallback = await readSessionFromWasabiSnapshot(token);
+      if (fallback) {
+        console.warn('[auth] using Wasabi session fallback for token lookup');
+      }
+      return fallback;
+    } catch (fallbackError) {
+      throw error && fallbackError
+        ? new Error(`${error?.message || error} | wasabi fallback failed: ${fallbackError?.message || fallbackError}`)
+        : error;
+    }
+  }
 }
 
 async function requireAuth(req, res, next) {
@@ -1317,8 +2457,120 @@ app.get('/health', async (req, res) => {
   }
 });
 
+app.post('/admin/wasabi-state-snapshot', requireAdmin, async (req, res) => {
+  try {
+    await runWasabiStateSnapshot();
+    res.json({
+      success: true,
+      ...currentWasabiStateStatus()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error && error.message ? error.message : String(error)
+    });
+  }
+});
+
+app.get('/admin/wasabi-state-status', requireAdmin, async (req, res) => {
+  res.json({
+    success: true,
+    ...currentWasabiStateStatus()
+  });
+});
+
+app.get('/admin/wasabi-sql-mirror-status', requireAdmin, async (req, res) => {
+  res.json({
+    success: true,
+    ...currentWasabiSqlMirrorStatus()
+  });
+});
+
+app.get('/admin/wasabi-runtime-readiness', requireAdmin, async (req, res) => {
+  try {
+    const forceRefresh = String(req.query?.force || '').trim() === '1';
+    const snapshot = await loadWasabiLatestStateSnapshot(forceRefresh);
+    const readiness = evaluateWasabiRuntimeReadiness(snapshot);
+    res.json({
+      success: true,
+      bucket: WASABI_STATE_BUCKET || null,
+      prefix: WASABI_STATE_PREFIX,
+      forceRefresh,
+      allReadsPrimaryEnabled: WASABI_ALL_READS_PRIMARY_ENABLED,
+      allReadsPrimaryStrict: WASABI_ALL_READS_PRIMARY_STRICT,
+      ...readiness,
+      sqlMirror: currentWasabiSqlMirrorStatus()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error && error.message ? error.message : String(error),
+      bucket: WASABI_STATE_BUCKET || null,
+      prefix: WASABI_STATE_PREFIX
+    });
+  }
+});
+
+app.post('/admin/wasabi-sql-mirror-flush', requireAdmin, async (req, res) => {
+  try {
+    await flushWasabiSqlMirrorQueue();
+    res.json({
+      success: true,
+      ...currentWasabiSqlMirrorStatus()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error && error.message ? error.message : String(error),
+      ...currentWasabiSqlMirrorStatus()
+    });
+  }
+});
+
+app.post('/admin/wasabi-sync-now', requireAdmin, async (req, res) => {
+  try {
+    const reason = cleanString(req.body?.reason || 'manual-sync');
+    const result = await syncWasabiNow(reason);
+    res.json({
+      success: true,
+      ...result
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error && error.message ? error.message : String(error),
+      state: currentWasabiStateStatus(),
+      sqlMirror: currentWasabiSqlMirrorStatus()
+    });
+  }
+});
+
 app.get('/sync-state', requireAuth, async (req, res) => {
   try {
+    if (WASABI_SYNC_STATE_PRIMARY_ENABLED) {
+      try {
+        const snapshotState = await readSyncStateFromWasabiSnapshot();
+        if (snapshotState) {
+          const signature = crypto.createHash('sha256').update(JSON.stringify(snapshotState)).digest('hex');
+          return res.json({ success: true, signature, state: snapshotState });
+        }
+        if (WASABI_SYNC_STATE_PRIMARY_STRICT) {
+          const empty = {
+            records: { count: 0, updated_at: new Date(0).toISOString() },
+            pricing: { count: 0, updated_at: new Date(0).toISOString() },
+            reports: { count: 0, updated_at: new Date(0).toISOString() },
+            assets: { count: 0, updated_at: new Date(0).toISOString() },
+            users: { count: 0, updated_at: new Date(0).toISOString() },
+            emails: { count: 0, updated_at: new Date(0).toISOString() }
+          };
+          const signature = crypto.createHash('sha256').update(JSON.stringify(empty)).digest('hex');
+          return res.json({ success: true, signature, state: empty });
+        }
+      } catch (error) {
+        if (WASABI_SYNC_STATE_PRIMARY_STRICT) throw error;
+      }
+    }
+
     const [records, pricing, reports, assets, users, emails] = await Promise.all([
       pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM planner_records`),
       pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM pricing_rates`),
@@ -1338,13 +2590,28 @@ app.get('/sync-state', requireAuth, async (req, res) => {
 
 app.get('/users', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup
-       FROM users
-       ORDER BY LOWER(COALESCE(display_name, username)), LOWER(username)`
-    );
     const currentUser = req.user;
-    const normalizedRows = await attachScopesToUsers(result.rows.map((row) => normalizeUser(row)));
+    let normalizedRows = null;
+    if (WASABI_USERS_PRIMARY_ENABLED) {
+      try {
+        const snapshotUsers = await readUsersFromWasabiSnapshot();
+        if (snapshotUsers) {
+          normalizedRows = await attachScopesToUsers(snapshotUsers);
+        } else if (WASABI_USERS_PRIMARY_STRICT) {
+          normalizedRows = [];
+        }
+      } catch (error) {
+        if (WASABI_USERS_PRIMARY_STRICT) throw error;
+      }
+    }
+    if (!normalizedRows) {
+      const result = await pool.query(
+        `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup
+         FROM users
+         ORDER BY LOWER(COALESCE(display_name, username)), LOWER(username)`
+      );
+      normalizedRows = await attachScopesToUsers(result.rows.map((row) => normalizeUser(row)));
+    }
     const users = normalizedRows.map((normalized) => {
       if (!currentUser?.isAdmin) {
         return {
@@ -1364,6 +2631,20 @@ app.get('/users', requireAuth, async (req, res) => {
 
 app.get('/permissions/tree', requireAuth, requireAdmin, async (req, res) => {
   try {
+    if (WASABI_PERMISSIONS_TREE_PRIMARY_ENABLED) {
+      try {
+        const snapshotTrees = await buildPermissionsTreesFromSnapshot();
+        if (snapshotTrees) {
+          return res.json({ success: true, ...snapshotTrees });
+        }
+        if (WASABI_PERMISSIONS_TREE_PRIMARY_STRICT) {
+          return res.json({ success: true, portalTree: [], psrTree: [] });
+        }
+      } catch (error) {
+        if (WASABI_PERMISSIONS_TREE_PRIMARY_STRICT) throw error;
+      }
+    }
+
     const [portalRows, portalPathRows, psrRows] = await Promise.all([
       pool.query(
         `WITH scope_pairs AS (
@@ -1418,72 +2699,12 @@ app.get('/permissions/tree', requireAuth, requireAdmin, async (req, res) => {
          ORDER BY client, city, jobsite`
       )
     ]);
-
-    const pathMap = new Map();
-    for (const row of portalPathRows.rows) {
-      const clientId = String(row.client_id || '').trim();
-      const jobId = String(row.job_id || '').trim();
-      if (!clientId || !jobId) continue;
-      const key = `${clientId}|||${jobId}`;
-      if (!pathMap.has(key)) pathMap.set(key, new Set());
-      const p = String(row.path_prefix || '')
-        .replace(/\\/g, '/')
-        .replace(/^\/+|\/+$/g, '')
-        .replace(/\/+/g, '/');
-      pathMap.get(key).add(p || '/');
-    }
-
-    const portalMap = new Map();
-    for (const row of portalRows.rows) {
-      const clientId = String(row.client_id || '').trim();
-      const jobId = String(row.job_id || '').trim();
-      if (!clientId || !jobId) continue;
-      const displayClient = upperCleanString(row.label_client || clientId);
-      const displayCity = upperCleanString(row.label_city || 'NOT SET');
-      const displayJobsite = normalizeJobsiteName(row.label_jobsite || jobId);
-      if (!portalMap.has(displayClient)) portalMap.set(displayClient, new Map());
-      const cityMap = portalMap.get(displayClient);
-      if (!cityMap.has(displayCity)) cityMap.set(displayCity, []);
-      cityMap.get(displayCity).push({
-        clientId,
-        jobId,
-        jobsite: displayJobsite,
-        paths: [...(pathMap.get(`${clientId}|||${jobId}`) || new Set(['/']))]
-      });
-    }
-    const portalTree = [...portalMap.entries()].map(([client, cityMap]) => ({
-      client,
-      cities: [...cityMap.entries()].map(([city, jobs]) => ({
-        city,
-        jobs: jobs
-          .filter((j, idx, arr) => arr.findIndex((x) => x.clientId === j.clientId && x.jobId === j.jobId) === idx)
-          .sort((a, b) => a.jobsite.localeCompare(b.jobsite, undefined, { sensitivity: 'base' }))
-      }))
-    }));
-
-    const psrMap = new Map();
-    for (const row of psrRows.rows) {
-      const client = upperCleanString(row.client);
-      const city = upperCleanString(row.city);
-      const jobsite = normalizeJobsiteName(row.jobsite, row.street);
-      const recordId = cleanString(row.id || '');
-      if (!client || !city || !jobsite) continue;
-      if (!psrMap.has(client)) psrMap.set(client, new Map());
-      const cityMap = psrMap.get(client);
-      if (!cityMap.has(city)) cityMap.set(city, []);
-      cityMap.get(city).push({ recordId, jobsite });
-    }
-    const psrTree = [...psrMap.entries()].map(([client, cityMap]) => ({
-      client,
-      cities: [...cityMap.entries()].map(([city, jobsites]) => ({
-        city,
-        jobsites: jobsites
-          .filter((item, idx, arr) => arr.findIndex((x) => x.recordId === item.recordId) === idx)
-          .sort((a, b) => String(a.jobsite || '').localeCompare(String(b.jobsite || ''), undefined, { sensitivity: 'base' }))
-      }))
-    }));
-
-    res.json({ success: true, portalTree, psrTree });
+    const trees = buildPermissionsTreesFromRows({
+      portalRows: portalRows.rows,
+      portalPathRows: portalPathRows.rows,
+      psrRows: psrRows.rows
+    });
+    res.json({ success: true, ...trees });
   } catch (error) {
     console.error('PERMISSIONS TREE ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -1499,22 +2720,32 @@ app.post('/login', async (req, res) => {
   }
 
   try {
-    const result = await pool.query(
-      `SELECT id, username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-              email, email_verified, portal_files_access_granted, portal_permissions_access, self_signup
-       FROM users u
-       WHERE LOWER(TRIM(u.username)) = LOWER(TRIM($1))
-          OR LOWER(TRIM(COALESCE(u.display_name, u.username))) = LOWER(TRIM($1))
-          OR (u.email IS NOT NULL AND BTRIM(u.email) <> '' AND LOWER(TRIM(u.email)) = LOWER(TRIM($1)))
-       LIMIT 1`,
-      [submittedUsername]
-    );
+    let row = null;
+    let userRowFromWasabi = false;
+    try {
+      const result = await pool.query(
+        `SELECT id, username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
+                email, email_verified, portal_files_access_granted, portal_permissions_access, self_signup
+         FROM users u
+         WHERE LOWER(TRIM(u.username)) = LOWER(TRIM($1))
+            OR LOWER(TRIM(COALESCE(u.display_name, u.username))) = LOWER(TRIM($1))
+            OR (u.email IS NOT NULL AND BTRIM(u.email) <> '' AND LOWER(TRIM(u.email)) = LOWER(TRIM($1)))
+         LIMIT 1`,
+        [submittedUsername]
+      );
+      row = result.rows[0] || null;
+    } catch (queryError) {
+      if (!WASABI_LOGIN_FALLBACK_ENABLED) throw queryError;
+      row = await readLoginUserFromWasabiSnapshot(submittedUsername);
+      userRowFromWasabi = !!row;
+      if (!row) throw queryError;
+      console.warn('[login] using Wasabi user lookup fallback');
+    }
 
-    if (!result.rows.length) {
+    if (!row) {
       return res.status(401).json({ success: false, error: 'Invalid email or password' });
     }
 
-    const row = result.rows[0];
     if (row.email_verified === false) {
       return res.status(403).json({
         success: false,
@@ -1543,7 +2774,7 @@ app.post('/login', async (req, res) => {
       });
     }
 
-    if (needsRehash) {
+    if (needsRehash && !userRowFromWasabi) {
       const hash = await bcrypt.hash(submittedPassword, 10);
       await pool.query('UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2', [hash, row.id]);
     }
@@ -1607,16 +2838,33 @@ app.post('/change-password', requireAuth, async (req, res) => {
   }
 
   try {
-    const result = await pool.query(
-      'SELECT id, password, must_change_password FROM users WHERE id = $1 LIMIT 1',
-      [req.user.id]
-    );
-
-    if (!result.rows.length) {
-      return res.status(404).json({ success: false, error: 'User not found' });
+    let row = null;
+    if (WASABI_USERS_PRIMARY_ENABLED) {
+      try {
+        const snapshotUser = await readUserByIdFromWasabiSnapshot(req.user.id);
+        if (snapshotUser) {
+          row = {
+            id: snapshotUser.id,
+            password: snapshotUser.password,
+            must_change_password: snapshotUser.mustChangePassword
+          };
+        } else if (WASABI_USERS_PRIMARY_STRICT) {
+          return res.status(404).json({ success: false, error: 'User not found' });
+        }
+      } catch (error) {
+        if (WASABI_USERS_PRIMARY_STRICT) throw error;
+      }
     }
-
-    const row = result.rows[0];
+    if (!row) {
+      const result = await pool.query(
+        'SELECT id, password, must_change_password FROM users WHERE id = $1 LIMIT 1',
+        [req.user.id]
+      );
+      if (!result.rows.length) {
+        return res.status(404).json({ success: false, error: 'User not found' });
+      }
+      row = result.rows[0];
+    }
     let currentOk = false;
     if (!currentPassword && row.must_change_password) {
       currentOk = true;
@@ -1718,14 +2966,41 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
   const hasPsrScopesPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'psrScopes');
 
   try {
-    const currentResult = await pool.query(
-      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup FROM users WHERE id = $1 LIMIT 1',
-      [id]
-    );
-    if (!currentResult.rows.length) {
-      return res.status(404).json({ success: false, error: 'User not found' });
+    let current = null;
+    if (WASABI_USERS_PRIMARY_ENABLED) {
+      try {
+        const snapshotUser = await readUserByIdFromWasabiSnapshot(id);
+        if (snapshotUser) {
+          current = {
+            id: snapshotUser.id,
+            username: snapshotUser.username,
+            display_name: snapshotUser.displayName,
+            is_admin: snapshotUser.isAdmin,
+            roles: snapshotUser.roles,
+            must_change_password: snapshotUser.mustChangePassword,
+            portal_files_client_id: snapshotUser.portalFilesClientId,
+            portal_files_job_id: snapshotUser.portalFilesJobId,
+            portal_files_access_granted: snapshotUser.portalFilesAccessGranted,
+            portal_permissions_access: snapshotUser.portalPermissionsAccess,
+            self_signup: snapshotUser.selfSignup
+          };
+        } else if (WASABI_USERS_PRIMARY_STRICT) {
+          return res.status(404).json({ success: false, error: 'User not found' });
+        }
+      } catch (error) {
+        if (WASABI_USERS_PRIMARY_STRICT) throw error;
+      }
     }
-    const current = currentResult.rows[0];
+    if (!current) {
+      const currentResult = await pool.query(
+        'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup FROM users WHERE id = $1 LIMIT 1',
+        [id]
+      );
+      if (!currentResult.rows.length) {
+        return res.status(404).json({ success: false, error: 'User not found' });
+      }
+      current = currentResult.rows[0];
+    }
     const scopeMap = await readScopesForUserIds([id]);
     const currentScopes = scopeMap.get(String(id)) || { portalScopes: [], psrScopes: [] };
 
@@ -1781,7 +3056,7 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
       ? !!req.body.portalPermissionsAccess
       : current.portal_permissions_access === true;
 
-    await pool.query(
+    const updatedCoreResult = await pool.query(
       `UPDATE users
        SET display_name = $1,
            is_admin = $2,
@@ -1792,7 +3067,8 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
            self_signup = $7,
            portal_permissions_access = $8,
            updated_at = NOW()
-       WHERE id = $9`,
+       WHERE id = $9
+       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup`,
       [
         nextDisplayName,
         nextIsAdmin,
@@ -1830,18 +3106,19 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
       }
     }
 
+    let updatedResult = { rows: [updatedCoreResult.rows[0]] };
     if (password) {
       const hash = await bcrypt.hash(password, 10);
-      await pool.query(
-        'UPDATE users SET password = $1, must_change_password = false, updated_at = NOW() WHERE id = $2',
+      updatedResult = await pool.query(
+        `UPDATE users
+         SET password = $1,
+             must_change_password = false,
+             updated_at = NOW()
+         WHERE id = $2
+         RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup`,
         [hash, id]
       );
     }
-
-    const updatedResult = await pool.query(
-      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup FROM users WHERE id = $1 LIMIT 1',
-      [id]
-    );
 
     // Force immediate permission revocation by rotating target user's sessions.
     // Keep the currently logged-in admin session when editing their own account.
@@ -1866,17 +3143,48 @@ app.delete('/users/:id', requireAuth, requireAdmin, async (req, res) => {
     return res.status(400).json({ success: false, error: 'You cannot delete your own account.' });
   }
   try {
-    const targetResult = await pool.query(
-      'SELECT id, username, is_admin FROM users WHERE id = $1 LIMIT 1',
-      [id]
-    );
-    if (!targetResult.rows.length) {
-      return res.status(404).json({ success: false, error: 'User not found' });
+    let target = null;
+    if (WASABI_USERS_PRIMARY_ENABLED) {
+      try {
+        const snapshotUser = await readUserByIdFromWasabiSnapshot(id);
+        if (snapshotUser) {
+          target = {
+            id: snapshotUser.id,
+            username: snapshotUser.username,
+            is_admin: snapshotUser.isAdmin
+          };
+        } else if (WASABI_USERS_PRIMARY_STRICT) {
+          return res.status(404).json({ success: false, error: 'User not found' });
+        }
+      } catch (error) {
+        if (WASABI_USERS_PRIMARY_STRICT) throw error;
+      }
     }
-    const target = targetResult.rows[0];
+    if (!target) {
+      const targetResult = await pool.query(
+        'SELECT id, username, is_admin FROM users WHERE id = $1 LIMIT 1',
+        [id]
+      );
+      if (!targetResult.rows.length) {
+        return res.status(404).json({ success: false, error: 'User not found' });
+      }
+      target = targetResult.rows[0];
+    }
     if (target.is_admin) {
-      const admins = await pool.query('SELECT COUNT(*)::int AS count FROM users WHERE is_admin = true');
-      const adminCount = Number(admins.rows?.[0]?.count || 0);
+      let adminCount = null;
+      if (WASABI_USERS_PRIMARY_ENABLED) {
+        try {
+          const snapshotCount = await countAdminsFromWasabiSnapshot();
+          if (Number.isFinite(snapshotCount)) adminCount = Number(snapshotCount);
+          else if (WASABI_USERS_PRIMARY_STRICT) adminCount = 0;
+        } catch (error) {
+          if (WASABI_USERS_PRIMARY_STRICT) throw error;
+        }
+      }
+      if (adminCount == null) {
+        const admins = await pool.query('SELECT COUNT(*)::int AS count FROM users WHERE is_admin = true');
+        adminCount = Number(admins.rows?.[0]?.count || 0);
+      }
       if (adminCount <= 1) {
         return res
           .status(400)
@@ -1894,6 +3202,20 @@ app.delete('/users/:id', requireAuth, requireAdmin, async (req, res) => {
 
 app.get('/records', requireAuth, requirePsrViewerAccess, async (req, res) => {
   try {
+    if (WASABI_RECORDS_PRIMARY_ENABLED) {
+      try {
+        const snapshotRecords = await readRecordsFromWasabiSnapshotForUser(req.user);
+        if (snapshotRecords) {
+          return res.json({ success: true, records: snapshotRecords });
+        }
+        if (WASABI_RECORDS_PRIMARY_STRICT) {
+          return res.json({ success: true, records: [] });
+        }
+      } catch (error) {
+        if (WASABI_RECORDS_PRIMARY_STRICT) throw error;
+      }
+    }
+
     const scopeFilter = buildPsrScopeWhere(req.user);
     const result = await pool.query(
       `SELECT id, record_date, client, city, street, jobsite, status, saved_by, data, created_at, updated_at
@@ -1951,6 +3273,15 @@ app.post('/records', requireAuth, requirePsrDataEntryAccess, async (req, res) =>
 });
 
 async function fetchRecordById(id) {
+  if (WASABI_RECORD_DETAIL_PRIMARY_ENABLED) {
+    try {
+      const snapshotRecord = await fetchRecordByIdFromWasabiSnapshot(id);
+      if (snapshotRecord) return snapshotRecord;
+      if (WASABI_RECORD_DETAIL_PRIMARY_STRICT) return null;
+    } catch (error) {
+      if (WASABI_RECORD_DETAIL_PRIMARY_STRICT) throw error;
+    }
+  }
   const result = await pool.query('SELECT * FROM planner_records WHERE CAST(id AS text) = $1 LIMIT 1', [String(id)]);
   if (!result.rows.length) return null;
   return normalizeRecordRow(result.rows[0]);
@@ -2242,7 +3573,7 @@ app.post('/records/:id/segments/:segmentId/move', requireAuth, requireAdmin, asy
 
     const targetClient = cleanString(req.body?.targetClient);
     const targetCity = cleanString(req.body?.targetCity);
-    const inferredProject = cleanString(rows[0]?.project || 'NOT SET');
+    const inferredProject = cleanString(source?.jobsite || 'NOT SET');
     const targetJobsite = normalizeJobsiteName(req.body?.targetJobsite || inferredProject || 'NOT SET');
     const targetSystem = cleanString(req.body?.targetSystem || movingSegment.system || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
 
@@ -2251,17 +3582,9 @@ app.post('/records/:id/segments/:segmentId/move', requireAuth, requireAdmin, asy
     }
 
     let target = null;
-    const targetResult = await pool.query(
-      `SELECT * FROM planner_records
-       WHERE LOWER(client) = LOWER($1)
-         AND LOWER(city) = LOWER($2)
-         AND LOWER(jobsite) = LOWER($3)
-       ORDER BY updated_at DESC
-       LIMIT 1`,
-      [targetClient, targetCity, targetJobsite]
-    );
-    if (targetResult.rows.length) {
-      target = normalizeRecordRow(targetResult.rows[0]);
+    const targetMatches = await findPlannerRecordsByScope(targetClient, targetCity, targetJobsite, { latestOnly: true });
+    if (targetMatches.length) {
+      target = targetMatches[0];
     } else {
       target = {
         record_date: source.record_date,
@@ -2306,6 +3629,19 @@ app.post('/records/:id/segments/:segmentId/move', requireAuth, requireAdmin, asy
 
 app.get('/pricing-rates', requireAuth, requirePricingAccess, async (req, res) => {
   try {
+    if (WASABI_PRICING_PRIMARY_ENABLED) {
+      try {
+        const snapshotRates = await readPricingRatesFromWasabiSnapshot();
+        if (snapshotRates) {
+          return res.json({ success: true, rates: snapshotRates });
+        }
+        if (WASABI_PRICING_PRIMARY_STRICT) {
+          return res.json({ success: true, rates: [] });
+        }
+      } catch (error) {
+        if (WASABI_PRICING_PRIMARY_STRICT) throw error;
+      }
+    }
     const result = await pool.query('SELECT dia, rate, updated_at FROM pricing_rates ORDER BY dia');
     res.json({ success: true, rates: result.rows });
   } catch (error) {
@@ -2350,6 +3686,20 @@ app.delete('/pricing-rates/:dia', requireAuth, requireAdmin, async (req, res) =>
 
 app.get('/daily-reports', requireAuth, requireAdmin, async (req, res) => {
   try {
+    if (WASABI_REPORTS_PRIMARY_ENABLED) {
+      try {
+        const snapshotReports = await readDailyReportsFromWasabiSnapshot();
+        if (snapshotReports) {
+          return res.json({ success: true, reports: snapshotReports });
+        }
+        if (WASABI_REPORTS_PRIMARY_STRICT) {
+          return res.json({ success: true, reports: [] });
+        }
+      } catch (error) {
+        if (WASABI_REPORTS_PRIMARY_STRICT) throw error;
+      }
+    }
+
     const result = await pool.query('SELECT * FROM daily_reports ORDER BY report_date DESC, updated_at DESC');
     const reports = result.rows.map((row) => ({ ...row, files: Array.isArray(row.files) ? row.files : parseJsonObject(row.files, []) }));
     res.json({ success: true, reports });
@@ -2383,9 +3733,24 @@ app.post('/daily-reports', requireAuth, requireAdmin, upload.array('files'), asy
 
 app.put('/daily-reports/:id', requireAuth, requireAdmin, upload.array('files'), async (req, res) => {
   try {
-    const existingResult = await pool.query('SELECT * FROM daily_reports WHERE id = $1 LIMIT 1', [req.params.id]);
-    if (!existingResult.rows.length) return res.status(404).json({ success: false, error: 'Daily report not found' });
-    const current = existingResult.rows[0];
+    let current = null;
+    if (WASABI_REPORTS_PRIMARY_ENABLED) {
+      try {
+        const snapshotReport = await readDailyReportByIdFromWasabiSnapshot(req.params.id);
+        if (snapshotReport) {
+          current = snapshotReport;
+        } else if (WASABI_REPORTS_PRIMARY_STRICT) {
+          return res.status(404).json({ success: false, error: 'Daily report not found' });
+        }
+      } catch (error) {
+        if (WASABI_REPORTS_PRIMARY_STRICT) throw error;
+      }
+    }
+    if (!current) {
+      const existingResult = await pool.query('SELECT * FROM daily_reports WHERE id = $1 LIMIT 1', [req.params.id]);
+      if (!existingResult.rows.length) return res.status(404).json({ success: false, error: 'Daily report not found' });
+      current = existingResult.rows[0];
+    }
     const currentFiles = Array.isArray(current.files) ? current.files : parseJsonObject(current.files, []);
     const keepIds = new Set([].concat(req.body?.keepFileIds || []).filter(Boolean));
     const keptFiles = keepIds.size ? currentFiles.filter((file) => keepIds.has(file.id)) : currentFiles;
@@ -2421,6 +3786,20 @@ app.delete('/daily-reports/:id', requireAuth, requireAdmin, async (req, res) => 
 
 app.get('/jobsite-assets', requireAuth, requireFootageAccess, async (req, res) => {
   try {
+    if (WASABI_ASSETS_PRIMARY_ENABLED) {
+      try {
+        const snapshotAssets = await readJobsiteAssetsFromWasabiSnapshotForUser(req.user);
+        if (snapshotAssets) {
+          return res.json({ success: true, assets: snapshotAssets });
+        }
+        if (WASABI_ASSETS_PRIMARY_STRICT) {
+          return res.json({ success: true, assets: [] });
+        }
+      } catch (error) {
+        if (WASABI_ASSETS_PRIMARY_STRICT) throw error;
+      }
+    }
+
     const scopeFilter = buildPsrScopeWhere(req.user);
     const result = await pool.query(
       `SELECT * FROM jobsite_assets
@@ -2488,14 +3867,12 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
     const targetJobsite = normalizeJobsiteName(req.body?.targetJobsite || 'NOT SET');
     const targetSystem = cleanString(req.body?.targetSystem || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
 
-    const existingResult = await pool.query(
-      `SELECT * FROM planner_records
-       WHERE LOWER(client) = LOWER($1)
-         AND LOWER(city) = LOWER($2)
-         AND LOWER(jobsite) = LOWER($3)`,
-      [targetClient || '', targetCity || '', targetJobsite || 'NOT SET']
+    const existingRecords = await findPlannerRecordsByScope(
+      targetClient || '',
+      targetCity || '',
+      targetJobsite || 'NOT SET',
+      { latestOnly: false }
     );
-    const existingRecords = existingResult.rows.map(normalizeRecordRow);
     const existingRefs = new Set();
     existingRecords.forEach((record) => {
       (record.systems[targetSystem] || []).forEach((segment) => existingRefs.add(String(segment.reference || '').toLowerCase()));
@@ -2524,18 +3901,10 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
       return res.status(400).json({ success: false, error: 'Target client, city, and jobsite are required' });
     }
 
-    const existingResult = await pool.query(
-      `SELECT * FROM planner_records
-       WHERE LOWER(client) = LOWER($1)
-         AND LOWER(city) = LOWER($2)
-         AND LOWER(jobsite) = LOWER($3)
-       ORDER BY updated_at DESC
-       LIMIT 1`,
-      [targetClient, targetCity, targetJobsite]
-    );
     let record;
-    if (existingResult.rows.length) {
-      record = normalizeRecordRow(existingResult.rows[0]);
+    const existingMatches = await findPlannerRecordsByScope(targetClient, targetCity, targetJobsite, { latestOnly: true });
+    if (existingMatches.length) {
+      record = existingMatches[0];
     } else {
       record = {
         record_date: new Date().toISOString().slice(0, 10),
@@ -2650,9 +4019,63 @@ app.use((error, req, res, next) => {
   res.status(500).json({ success: false, error: error.message || 'Server error' });
 });
 
+let shutdownInProgress = false;
+async function flushWasabiStateOnShutdown(signal) {
+  if (shutdownInProgress) return;
+  shutdownInProgress = true;
+  try {
+    console.log(`[shutdown] ${signal}: flushing Wasabi mirror/state buffers...`);
+    await flushWasabiSqlMirrorQueue();
+    await runWasabiStateSnapshot();
+  } catch (error) {
+    console.warn('[shutdown] flush failed:', error?.message || error);
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.on('SIGINT', () => {
+  void flushWasabiStateOnShutdown('SIGINT');
+});
+
+process.on('SIGTERM', () => {
+  void flushWasabiStateOnShutdown('SIGTERM');
+});
+
 ensureSchema()
   .then(async () => {
     await autoImportPlugin.initSchema();
+    if (wasabiStateClient && WASABI_STATE_BUCKET) {
+      await runWasabiStateSnapshot();
+      try {
+        const readiness = evaluateWasabiRuntimeReadiness(await loadWasabiLatestStateSnapshot(true));
+        if (WASABI_ALL_READS_PRIMARY_ENABLED && !readiness.readyForAllReadsPrimary) {
+          console.warn(
+            `[wasabi-readiness] all-reads-primary enabled but not ready; missingTables=${readiness.missingRequiredTables.join(',') || 'none'}`
+          );
+        } else {
+          console.log(
+            `[wasabi-readiness] ready=${readiness.readyForAllReadsPrimary ? 'yes' : 'no'} snapshotAgeMs=${readiness.snapshot.ageMs ?? 'n/a'}`
+          );
+        }
+      } catch (error) {
+        console.warn('[wasabi-readiness] boot readiness check failed:', error?.message || error);
+      }
+      setInterval(() => {
+        void runWasabiStateSnapshot();
+      }, WASABI_STATE_SNAPSHOT_MS);
+      setInterval(() => {
+        void flushWasabiSqlMirrorQueue();
+      }, WASABI_SQL_MIRROR_FLUSH_MS);
+      console.log(
+        `[wasabi-state] snapshots enabled: bucket=${WASABI_STATE_BUCKET} prefix=${WASABI_STATE_PREFIX} every=${WASABI_STATE_SNAPSHOT_MS}ms`
+      );
+      console.log(
+        `[wasabi-sql-mirror] enabled=${WASABI_SQL_MIRROR_ENABLED ? 'yes' : 'no'} prefix=${WASABI_SQL_MIRROR_PREFIX} flush=${WASABI_SQL_MIRROR_FLUSH_MS}ms buffer=${WASABI_SQL_MIRROR_MAX_BUFFER}`
+      );
+    } else {
+      console.warn('[wasabi-state] snapshots disabled: configure WASABI_* and WASABI_BUCKET');
+    }
     app.listen(PORT, () => {
       console.log(`Horizon backend listening on port ${PORT}`);
     });
