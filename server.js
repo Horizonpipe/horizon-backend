@@ -2457,7 +2457,7 @@ app.get('/health', async (req, res) => {
   }
 });
 
-app.post('/admin/wasabi-state-snapshot', requireAdmin, async (req, res) => {
+app.post('/admin/wasabi-state-snapshot', requireAuth, requireAdmin, async (req, res) => {
   try {
     await runWasabiStateSnapshot();
     res.json({
@@ -2472,21 +2472,21 @@ app.post('/admin/wasabi-state-snapshot', requireAdmin, async (req, res) => {
   }
 });
 
-app.get('/admin/wasabi-state-status', requireAdmin, async (req, res) => {
+app.get('/admin/wasabi-state-status', requireAuth, requireAdmin, async (req, res) => {
   res.json({
     success: true,
     ...currentWasabiStateStatus()
   });
 });
 
-app.get('/admin/wasabi-sql-mirror-status', requireAdmin, async (req, res) => {
+app.get('/admin/wasabi-sql-mirror-status', requireAuth, requireAdmin, async (req, res) => {
   res.json({
     success: true,
     ...currentWasabiSqlMirrorStatus()
   });
 });
 
-app.get('/admin/wasabi-runtime-readiness', requireAdmin, async (req, res) => {
+app.get('/admin/wasabi-runtime-readiness', requireAuth, requireAdmin, async (req, res) => {
   try {
     const forceRefresh = String(req.query?.force || '').trim() === '1';
     const snapshot = await loadWasabiLatestStateSnapshot(forceRefresh);
@@ -2511,7 +2511,7 @@ app.get('/admin/wasabi-runtime-readiness', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/admin/wasabi-sql-mirror-flush', requireAdmin, async (req, res) => {
+app.post('/admin/wasabi-sql-mirror-flush', requireAuth, requireAdmin, async (req, res) => {
   try {
     await flushWasabiSqlMirrorQueue();
     res.json({
@@ -2527,7 +2527,7 @@ app.post('/admin/wasabi-sql-mirror-flush', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/admin/wasabi-sync-now', requireAdmin, async (req, res) => {
+app.post('/admin/wasabi-sync-now', requireAuth, requireAdmin, async (req, res) => {
   try {
     const reason = cleanString(req.body?.reason || 'manual-sync');
     const result = await syncWasabiNow(reason);
