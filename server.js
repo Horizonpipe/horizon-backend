@@ -3217,6 +3217,57 @@ async function ensureSchema() {
   await pool.query(`UPDATE planner_records SET status = '' WHERE status IS NULL`);
   await pool.query(`UPDATE planner_records SET saved_by = '' WHERE saved_by IS NULL`);
   await pool.query(`UPDATE planner_records SET data = '{}'::jsonb WHERE data IS NULL`);
+
+  /** Legacy DBs may still have planner_records.id as int4/int8; app inserts use UUID. */
+  await pool.query(`
+    DO $$
+    DECLARE
+      pkname TEXT;
+      relid oid;
+    BEGIN
+      SELECT c.oid INTO relid
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relname = 'planner_records' AND c.relkind = 'r';
+      IF relid IS NULL THEN
+        RETURN;
+      END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'planner_records'
+          AND column_name = 'id' AND udt_name IN ('int4', 'int8')
+      ) THEN
+        RETURN;
+      END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'planner_records' AND column_name = 'id_uuid'
+      ) THEN
+        ALTER TABLE planner_records ADD COLUMN id_uuid uuid;
+      END IF;
+      UPDATE planner_records SET id_uuid = gen_random_uuid() WHERE id_uuid IS NULL;
+      UPDATE user_psr_scopes ups
+      SET psr_record_id = pr.id_uuid::text
+      FROM planner_records pr
+      WHERE pr.id_uuid IS NOT NULL
+        AND ups.psr_record_id IS NOT NULL
+        AND BTRIM(ups.psr_record_id) <> ''
+        AND ups.psr_record_id = pr.id::text;
+      SELECT c.conname INTO pkname
+      FROM pg_constraint c
+      WHERE c.conrelid = relid AND c.contype = 'p'
+      LIMIT 1;
+      IF pkname IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE planner_records DROP CONSTRAINT %I', pkname);
+      END IF;
+      ALTER TABLE planner_records DROP COLUMN id;
+      ALTER TABLE planner_records RENAME COLUMN id_uuid TO id;
+      ALTER TABLE planner_records ADD PRIMARY KEY (id);
+      ALTER TABLE planner_records ALTER COLUMN id SET DEFAULT gen_random_uuid();
+      RAISE NOTICE 'planner_records.id migrated from integer to uuid';
+    END $$;
+  `);
+
   await pool.query(
     `INSERT INTO user_psr_scopes (user_id, client, city, jobsite, psr_record_id)
      SELECT DISTINCT CAST(u.id AS text), pr.client, pr.city, pr.jobsite, CAST(pr.id AS text)
