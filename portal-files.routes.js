@@ -1321,24 +1321,6 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           [String(clientId), String(jobId), u, pp, rec, accessMode]
         );
       }
-      // #region agent log
-      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-        body: JSON.stringify({
-          sessionId: '2228ee',
-          hypothesisId: 'H-pg-grants',
-          location: 'portal-files.routes.js:PUT /api/files/permissions',
-          message: 'path grants saved to Postgres aclPool',
-          data: {
-            clientId: String(clientId),
-            jobId: String(jobId),
-            grantRows: grants.filter((g) => String(g.username || '').trim()).length
-          },
-          timestamp: Date.now()
-        })
-      }).catch(() => {});
-      // #endregion
       return res.json({ success: true });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
