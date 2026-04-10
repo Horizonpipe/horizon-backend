@@ -850,8 +850,8 @@ async function assertPortalJobAccessForRequest(pool, req, clientId, jobId) {
   });
 }
 
-async function portalJobHasPathGrants(pool, clientId, jobId) {
-  const r = await pool.query(
+async function portalJobHasPathGrants(grantPool, clientId, jobId) {
+  const r = await grantPool.query(
     `SELECT 1 FROM portal_path_grants WHERE client_id = $1 AND job_id = $2 LIMIT 1`,
     [String(clientId), String(jobId)]
   );
@@ -862,10 +862,10 @@ async function portalJobHasPathGrants(pool, clientId, jobId) {
  * Grants for the signed-in user. Match DB `username` column to session username or email (some admins store email in grants).
  * @param {import('express').Request['user'] | null | undefined} user
  */
-async function loadUserPathGrants(pool, clientId, jobId, user) {
+async function loadUserPathGrants(grantPool, clientId, jobId, user) {
   const u = String(user?.username || '').trim();
   const em = String(user?.email || '').trim();
-  const r = await pool.query(
+  const r = await grantPool.query(
     `SELECT path_prefix, COALESCE(recursive, true) AS recursive, COALESCE(access_mode, 'full') AS access_mode
      FROM portal_path_grants
      WHERE client_id = $1 AND job_id = $2
@@ -886,11 +886,11 @@ function readPermissionsEditorQuery(req) {
   return v === '1' || v === 'true' || v === 'yes';
 }
 
-async function remapPortalPathGrantPrefixes(pool, clientId, jobId, fromRelPath, toRelPath) {
+async function remapPortalPathGrantPrefixes(grantPool, clientId, jobId, fromRelPath, toRelPath) {
   const from = normalizeRelPath(fromRelPath || '');
   const to = normalizeRelPath(toRelPath || '');
   if (!from || !to || from === to) return;
-  const rows = await pool.query(
+  const rows = await grantPool.query(
     `SELECT id, path_prefix
      FROM portal_path_grants
      WHERE client_id = $1 AND job_id = $2`,
@@ -899,20 +899,20 @@ async function remapPortalPathGrantPrefixes(pool, clientId, jobId, fromRelPath, 
   for (const row of rows.rows) {
     const current = normalizeRelPath(row.path_prefix || '');
     if (current === from) {
-      await pool.query(`UPDATE portal_path_grants SET path_prefix = $1 WHERE id = $2`, [to, row.id]);
+      await grantPool.query(`UPDATE portal_path_grants SET path_prefix = $1 WHERE id = $2`, [to, row.id]);
       continue;
     }
     if (current.startsWith(`${from}/`)) {
       const suffix = current.slice(from.length);
-      await pool.query(`UPDATE portal_path_grants SET path_prefix = $1 WHERE id = $2`, [`${to}${suffix}`, row.id]);
+      await grantPool.query(`UPDATE portal_path_grants SET path_prefix = $1 WHERE id = $2`, [`${to}${suffix}`, row.id]);
     }
   }
 }
 
-async function removePortalPathGrantPrefixes(pool, clientId, jobId, rootRelPath) {
+async function removePortalPathGrantPrefixes(grantPool, clientId, jobId, rootRelPath) {
   const root = normalizeRelPath(rootRelPath || '');
   if (!root) return;
-  await pool.query(
+  await grantPool.query(
     `DELETE FROM portal_path_grants
      WHERE client_id = $1 AND job_id = $2
        AND (path_prefix = $3 OR path_prefix LIKE $4)`,
@@ -957,14 +957,14 @@ function grantModeAllows(mode, required) {
   return m === 'full';
 }
 
-async function assertPortalPathRel(pool, user, clientId, jobId, relPath, required = 'view') {
+async function assertPortalPathRel(grantPool, user, clientId, jobId, relPath, required = 'view') {
   if (!user) return false;
   if (userIsPortalAdmin(user)) return true;
-  const jobOk = await assertPortalJobAccess(pool, user, String(clientId), String(jobId));
+  const jobOk = await assertPortalJobAccess(grantPool, user, String(clientId), String(jobId));
   if (!jobOk) return false;
-  const anyGrants = await portalJobHasPathGrants(pool, clientId, jobId);
+  const anyGrants = await portalJobHasPathGrants(grantPool, clientId, jobId);
   if (!anyGrants) return true;
-  const grants = await loadUserPathGrants(pool, clientId, jobId, user);
+  const grants = await loadUserPathGrants(grantPool, clientId, jobId, user);
   if (!grants.length) {
     return bypassPathGrantsForLenientPortalClient(user, grants);
   }
@@ -1100,6 +1100,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     throw new Error('registerPortalFilesRoutes requires either pool.query or options.query.');
   }
   const pool = { query: dbQuery };
+  /** Path grants must match `GET /permissions/tree` (Postgres). Wasabi portal-data-primary must not shadow them. */
+  const aclPool =
+    poolOption && typeof poolOption.query === 'function'
+      ? { query: (text, params) => poolOption.query(text, params) }
+      : pool;
   registerPortalShareLinkRoutes(app, { pool, query: dbQuery, requireAuth, requireAdmin });
 
   const s3 = createWasabiClient();
@@ -1158,12 +1163,12 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
-      const jobHasPathGrants = await portalJobHasPathGrants(pool, clientId, jobId);
+      const jobHasPathGrants = await portalJobHasPathGrants(aclPool, clientId, jobId);
       const permEditorList =
         readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
       let userGrants = null;
       if (jobHasPathGrants && !permEditorList) {
-        const loaded = await loadUserPathGrants(pool, clientId, jobId, req.user);
+        const loaded = await loadUserPathGrants(aclPool, clientId, jobId, req.user);
         if (!bypassPathGrantsForLenientPortalClient(req.user, loaded)) {
           userGrants = loaded;
         }
@@ -1204,14 +1209,14 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const prefix = jobPrefix(String(clientId), String(jobId));
       const keys = await listAllKeys(s3, bucket, prefix);
       let tree = buildTreeFromKeys(prefix, keys);
-      const jobHasPathGrantsTree = await portalJobHasPathGrants(pool, clientId, jobId);
+      const jobHasPathGrantsTree = await portalJobHasPathGrants(aclPool, clientId, jobId);
       const permEditorTree =
         readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
       /** @type {Array<{ path_prefix: string, recursive: boolean, access_mode: string }>} */
       let treeUserGrants = [];
       let appliedPathGrantFilter = false;
       if (jobHasPathGrantsTree && !permEditorTree) {
-        treeUserGrants = await loadUserPathGrants(pool, clientId, jobId, req.user);
+        treeUserGrants = await loadUserPathGrants(aclPool, clientId, jobId, req.user);
         if (!bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) {
           tree = filterTreeByPathGrants(tree, treeUserGrants, true);
           appliedPathGrantFilter = true;
@@ -1285,7 +1290,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
-      const r2 = await pool.query(
+      const r2 = await aclPool.query(
         `SELECT id, username, path_prefix AS "pathPrefix", recursive, COALESCE(access_mode, 'full') AS "accessMode", created_at AS "createdAt"
          FROM portal_path_grants
          WHERE client_id = $1 AND job_id = $2
@@ -1314,7 +1319,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
-      await pool.query(`DELETE FROM portal_path_grants WHERE client_id = $1 AND job_id = $2`, [
+      await aclPool.query(`DELETE FROM portal_path_grants WHERE client_id = $1 AND job_id = $2`, [
         String(clientId),
         String(jobId)
       ]);
@@ -1333,11 +1338,29 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           return res.status(400).json({ error: 'Invalid accessMode. Allowed: full, view, view_download' });
         }
         const accessMode = normalizeGrantAccessMode(g.accessMode || g.access_mode || 'full');
-        await pool.query(
+        await aclPool.query(
           `INSERT INTO portal_path_grants (client_id, job_id, username, path_prefix, recursive, access_mode) VALUES ($1,$2,$3,$4,$5,$6)`,
           [String(clientId), String(jobId), u, pp, rec, accessMode]
         );
       }
+      // #region agent log
+      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+        body: JSON.stringify({
+          sessionId: '2228ee',
+          hypothesisId: 'H-pg-grants',
+          location: 'portal-files.routes.js:PUT /api/files/permissions',
+          message: 'path grants saved to Postgres aclPool',
+          data: {
+            clientId: String(clientId),
+            jobId: String(jobId),
+            grantRows: grants.filter((g) => String(g.username || '').trim()).length
+          },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
       return res.json({ success: true });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -1429,7 +1452,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(403).json({ error: 'Forbidden' });
       }
       const rel = joinRel(parentPath || '', name);
-      if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, rel, 'view'))) {
+      if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, rel, 'view'))) {
         return res.status(403).json({ error: 'Forbidden for this path' });
       }
       const pref = jobPrefix(String(clientId), String(jobId));
@@ -1498,10 +1521,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         if (oldKey === newKey) {
           return res.json({ id: keyToId(newKey), key: newKey, path: newRel });
         }
-        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, oldRel, 'full'))) {
+        if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, oldRel, 'full'))) {
           return res.status(403).json({ error: 'Forbidden' });
         }
-        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, newRel, 'full'))) {
+        if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, newRel, 'full'))) {
           return res.status(403).json({ error: 'Forbidden' });
         }
         try {
@@ -1522,7 +1545,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           })
         );
         await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: oldKey }));
-        await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldRel, newRel);
+        await remapPortalPathGrantPrefixes(aclPool, clientId, jobId, oldRel, newRel);
         return res.json({ id: keyToId(newKey), key: newKey, path: newRel, name: sanitized });
       }
 
@@ -1538,10 +1561,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         if (oldFolderRel === newRel) {
           return res.json({ path: newRel });
         }
-        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, oldFolderRel, 'full'))) {
+        if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, oldFolderRel, 'full'))) {
           return res.status(403).json({ error: 'Forbidden' });
         }
-        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, newRel, 'full'))) {
+        if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, newRel, 'full'))) {
           return res.status(403).json({ error: 'Forbidden' });
         }
 
@@ -1609,7 +1632,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           return res.status(502).json({ error: summary || 'Folder delete failed after copy' });
         }
         const grantsStartedAt = Date.now();
-        await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldFolderRel, newRel);
+        await remapPortalPathGrantPrefixes(aclPool, clientId, jobId, oldFolderRel, newRel);
         console.info('[portal-files] folder-rename stats', {
           clientId: String(clientId),
           jobId: String(jobId),
@@ -1679,10 +1702,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         const oldRel = oldKey.slice(pref.length);
         const name = basenameRel(oldRel);
         const newRel = destParent ? `${destParent}/${name}` : name;
-        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, oldRel, 'full'))) {
+        if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, oldRel, 'full'))) {
           return res.status(403).json({ error: 'Forbidden' });
         }
-        if (!(await assertPortalPathRel(pool, req.user, targetClientId, targetJobId, newRel, 'full'))) {
+        if (!(await assertPortalPathRel(aclPool, req.user, targetClientId, targetJobId, newRel, 'full'))) {
           return res.status(403).json({ error: 'Forbidden' });
         }
         const newKey = `${targetPref}${newRel}`;
@@ -1706,9 +1729,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         );
         await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: oldKey }));
         if (crossScope) {
-          await removePortalPathGrantPrefixes(pool, clientId, jobId, oldRel);
+          await removePortalPathGrantPrefixes(aclPool, clientId, jobId, oldRel);
         } else {
-          await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldRel, newRel);
+          await remapPortalPathGrantPrefixes(aclPool, clientId, jobId, oldRel, newRel);
         }
         return res.json({
           id: keyToId(newKey),
@@ -1731,10 +1754,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         if (oldFolderRel === newRel) {
           return res.json({ path: newRel });
         }
-        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, oldFolderRel, 'full'))) {
+        if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, oldFolderRel, 'full'))) {
           return res.status(403).json({ error: 'Forbidden' });
         }
-        if (!(await assertPortalPathRel(pool, req.user, targetClientId, targetJobId, newRel, 'full'))) {
+        if (!(await assertPortalPathRel(aclPool, req.user, targetClientId, targetJobId, newRel, 'full'))) {
           return res.status(403).json({ error: 'Forbidden' });
         }
         const oldPrefix = `${pref}${oldFolderRel}/`;
@@ -1804,9 +1827,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
         const grantsStartedAt = Date.now();
         if (crossScope) {
-          await removePortalPathGrantPrefixes(pool, clientId, jobId, oldFolderRel);
+          await removePortalPathGrantPrefixes(aclPool, clientId, jobId, oldFolderRel);
         } else {
-          await remapPortalPathGrantPrefixes(pool, clientId, jobId, oldFolderRel, newRel);
+          await remapPortalPathGrantPrefixes(aclPool, clientId, jobId, oldFolderRel, newRel);
         }
         console.info('[portal-files] folder-move stats', {
           clientId: String(clientId),
@@ -1859,7 +1882,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!folderRel) {
         return res.status(400).json({ error: 'path must name a folder under the job (not the job root)' });
       }
-      if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, folderRel, 'full'))) {
+      if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, folderRel, 'full'))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const pref = jobPrefix(String(clientId), String(jobId));
@@ -1875,7 +1898,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           if (err && err.name !== 'NoSuchKey') throw err;
         }
       }
-      await removePortalPathGrantPrefixes(pool, clientId, jobId, folderRel);
+      await removePortalPathGrantPrefixes(aclPool, clientId, jobId, folderRel);
       return res.status(204).send();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -1911,7 +1934,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const Key = portalUploadKey(clientId, jobId, fp || '', original, catExplicit);
       const pref = jobPrefix(String(clientId), String(jobId));
       const relForAcl = Key.slice(pref.length);
-      if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, relForAcl, 'full'))) {
+      if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, relForAcl, 'full'))) {
         fs.unlink(f.path, () => {});
         return res.status(403).json({ error: 'Forbidden for this path' });
       }
@@ -2003,7 +2026,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       try {
         const Key = portalUploadKey(clientId, jobId, pathsList[idx], original, null);
         const relForAcl = Key.slice(pref.length);
-        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, relForAcl, 'full'))) {
+        if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, relForAcl, 'full'))) {
           try {
             fs.unlink(f.path, () => {});
           } catch (_) {
@@ -2132,7 +2155,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const key = portalUploadKey(String(clientId), String(jobId), fp, original, fp ? null : null);
       const pref = jobPrefix(String(clientId), String(jobId));
       const relForAcl = key.slice(pref.length);
-      if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, relForAcl, 'full'))) {
+      if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, relForAcl, 'full'))) {
         return res.status(403).json({ error: 'Forbidden for this path' });
       }
 
@@ -2245,7 +2268,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id));
       const relForAcl = String(sessionRow.object_key || '').slice(pref.length);
-      if (!(await assertPortalPathRel(pool, req.user, sessionRow.client_id, sessionRow.job_id, relForAcl, 'full'))) {
+      if (!(await assertPortalPathRel(aclPool, req.user, sessionRow.client_id, sessionRow.job_id, relForAcl, 'full'))) {
         return res.status(403).json({ error: 'Forbidden for this path' });
       }
 
@@ -2559,7 +2582,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           pathOk = authHit.allowed;
         } else {
           // Single check: includes job access (avoid duplicate assertPortalJobAccess vs older handler).
-          pathOk = await assertPortalPathRel(pool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
+          pathOk = await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
           portalDlAuthCache.set(authK, {
             allowed: pathOk,
             exp: now + (pathOk ? PORTAL_DL_AUTH_TTL_MS : PORTAL_DL_AUTH_DENY_TTL_MS)
@@ -2568,7 +2591,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
       } else {
         // Non-admin users re-check path grants every request so permission revokes apply immediately.
-        pathOk = await assertPortalPathRel(pool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
+        pathOk = await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
       }
       if (!pathOk) {
         return res.status(403).json({ error: 'Forbidden' });
@@ -2716,7 +2739,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!folderRel) {
         return res.status(400).json({ error: 'Folder path must be non-empty' });
       }
-      if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, folderRel, 'download'))) {
+      if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, folderRel, 'download'))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
 
@@ -2732,7 +2755,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       for (const entry of keys) {
         const rel = entry.Key.slice(pref.length);
         if (!rel || isFolderMarkerKey(rel)) continue;
-        if (!(await assertPortalPathRel(pool, req.user, clientId, jobId, rel, 'download'))) continue;
+        if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, rel, 'download'))) continue;
         const subRel = rel.slice(folderRel.length + 1);
         const zipRel = safeZipEntryPath(subRel);
         if (!zipRel) continue;
@@ -2795,7 +2818,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const prefDel = jobPrefix(parsed.clientId, parsed.jobId);
       const relPathDel = Key.slice(prefDel.length);
-      if (!(await assertPortalPathRel(pool, req.user, parsed.clientId, parsed.jobId, relPathDel, 'full'))) {
+      if (!(await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDel, 'full'))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key }));
