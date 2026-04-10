@@ -3681,7 +3681,10 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
 });
 
 app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => {
-  const id = req.params.id;
+  const id = cleanString(req.params.id);
+  if (!id) {
+    return res.status(400).json({ success: false, error: 'User id is required' });
+  }
   const displayName = cleanString(req.body?.displayName || req.body?.name);
   const isAdmin = req.body?.isAdmin === undefined ? null : !!req.body.isAdmin;
   const roles = req.body?.roles === undefined ? null : normalizeRoles(req.body.roles);
@@ -3809,9 +3812,90 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
     }
 
     const passwordHash = password ? await bcrypt.hash(password, 10) : null;
-    let updatedResult = null;
+
+    /**
+     * GET /users always reads Postgres (permissions UI). When WASABI_WRITES_PRIMARY_ENABLED, the snapshot
+     * is updated separately — without mirroring here, the next refresh would show stale toggles.
+     */
+    async function persistUserUpdateToPostgres() {
+      const updatedCoreResult = await pool.query(
+        `UPDATE users
+         SET display_name = $1,
+             is_admin = $2,
+             roles = $3::jsonb,
+             portal_files_client_id = $4,
+             portal_files_job_id = $5,
+             portal_files_access_granted = $6,
+             self_signup = $7,
+             portal_permissions_access = $8,
+             updated_at = NOW()
+         WHERE id = $9
+         RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup`,
+        [
+          nextDisplayName,
+          nextIsAdmin,
+          JSON.stringify(nextRoles),
+          nextPortalFilesClientId,
+          nextPortalFilesJobId,
+          nextPortalFilesAccessGranted,
+          nextSelfSignup,
+          nextPortalPermissionsAccess,
+          id
+        ]
+      );
+
+      if (!updatedCoreResult.rowCount) {
+        console.error('[update-user] Postgres UPDATE matched 0 rows — permissions UI reads pool; check user id / replica.', {
+          id
+        });
+        throw new Error(
+          'Could not update user in database (no matching row). Permissions list may not reflect this account until the database is in sync.'
+        );
+      }
+
+      if (hasPortalScopesPayload || hasPortalScopeInPayload) {
+        await pool.query('DELETE FROM user_portal_scopes WHERE user_id = $1', [String(id)]);
+        for (const scope of nextPortalScopes) {
+          await pool.query(
+            `INSERT INTO user_portal_scopes (user_id, client_id, job_id)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (user_id, client_id, job_id) DO NOTHING`,
+            [String(id), scope.clientId, scope.jobId]
+          );
+        }
+      }
+
+      if (hasPsrScopesPayload) {
+        await pool.query('DELETE FROM user_psr_scopes WHERE user_id = $1', [String(id)]);
+        for (const scope of nextPsrScopes) {
+          await pool.query(
+            `INSERT INTO user_psr_scopes (user_id, client, city, jobsite, psr_record_id)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (user_id, client, city, jobsite) DO NOTHING`,
+            [String(id), scope.client, scope.city, scope.jobsite, cleanString(scope.recordId || '') || null]
+          );
+        }
+      }
+
+      let updatedRow = updatedCoreResult.rows[0];
+      if (passwordHash) {
+        const pwResult = await pool.query(
+          `UPDATE users
+           SET password = $1,
+               must_change_password = false,
+               updated_at = NOW()
+           WHERE id = $2
+           RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup`,
+          [passwordHash, id]
+        );
+        updatedRow = pwResult.rows[0];
+      }
+
+      await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [String(id)]);
+      return updatedRow;
+    }
+
     if (WASABI_WRITES_PRIMARY_ENABLED) {
-      let updatedUserRow = null;
       await runWasabiStateWrite('update-user', async (data) => {
         const users = ensureSnapshotTable(data, 'users');
         const idx = users.findIndex((u) => String(u.id || '') === String(id || ''));
@@ -3865,79 +3949,13 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
           }
         }
 
-        // Force immediate permission revocation by rotating target user's sessions (including self-updates).
         const sessions = ensureSnapshotTable(data, 'auth_sessions');
         data.auth_sessions = sessions.filter((row) => String(row.user_id || '') !== String(id || ''));
-        updatedUserRow = users[idx];
       });
-      updatedResult = { rows: [updatedUserRow] };
-    } else {
-      const updatedCoreResult = await pool.query(
-        `UPDATE users
-         SET display_name = $1,
-             is_admin = $2,
-             roles = $3::jsonb,
-             portal_files_client_id = $4,
-             portal_files_job_id = $5,
-             portal_files_access_granted = $6,
-             self_signup = $7,
-             portal_permissions_access = $8,
-             updated_at = NOW()
-         WHERE id = $9
-         RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup`,
-        [
-          nextDisplayName,
-          nextIsAdmin,
-          JSON.stringify(nextRoles),
-          nextPortalFilesClientId,
-          nextPortalFilesJobId,
-          nextPortalFilesAccessGranted,
-          nextSelfSignup,
-          nextPortalPermissionsAccess,
-          id
-        ]
-      );
-
-      if (hasPortalScopesPayload || hasPortalScopeInPayload) {
-        await pool.query('DELETE FROM user_portal_scopes WHERE user_id = $1', [String(id)]);
-        for (const scope of nextPortalScopes) {
-          await pool.query(
-            `INSERT INTO user_portal_scopes (user_id, client_id, job_id)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (user_id, client_id, job_id) DO NOTHING`,
-            [String(id), scope.clientId, scope.jobId]
-          );
-        }
-      }
-
-      if (hasPsrScopesPayload) {
-        await pool.query('DELETE FROM user_psr_scopes WHERE user_id = $1', [String(id)]);
-        for (const scope of nextPsrScopes) {
-          await pool.query(
-            `INSERT INTO user_psr_scopes (user_id, client, city, jobsite, psr_record_id)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (user_id, client, city, jobsite) DO NOTHING`,
-            [String(id), scope.client, scope.city, scope.jobsite, cleanString(scope.recordId || '') || null]
-          );
-        }
-      }
-
-      updatedResult = { rows: [updatedCoreResult.rows[0]] };
-      if (passwordHash) {
-        updatedResult = await pool.query(
-          `UPDATE users
-           SET password = $1,
-               must_change_password = false,
-               updated_at = NOW()
-           WHERE id = $2
-           RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup`,
-          [passwordHash, id]
-        );
-      }
-
-      // Force immediate permission revocation by rotating target user's sessions (including self-updates).
-      await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [String(id)]);
     }
+
+    const pgRow = await persistUserUpdateToPostgres();
+    const updatedResult = { rows: [pgRow] };
 
     const user = await attachScopesToUser(normalizeUser(updatedResult.rows[0]));
     res.json({ success: true, user });
