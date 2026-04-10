@@ -4114,13 +4114,45 @@ async function fetchRecordById(id) {
   if (WASABI_RECORD_DETAIL_PRIMARY_ENABLED) {
     try {
       const snapshotRecord = await fetchRecordByIdFromWasabiSnapshot(id);
+      // #region agent log
+      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+        body: JSON.stringify({
+          sessionId: '2228ee',
+          hypothesisId: 'H1',
+          location: 'server.js:fetchRecordById',
+          message: 'wasabi snapshot lookup',
+          data: {
+            id: String(id),
+            strict: WASABI_RECORD_DETAIL_PRIMARY_STRICT,
+            snapshotHit: !!snapshotRecord
+          },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
       if (snapshotRecord) return snapshotRecord;
-      if (WASABI_RECORD_DETAIL_PRIMARY_STRICT) return null;
+      // Snapshot miss: always fall through to Postgres so new / out-of-sync rows still resolve.
     } catch (error) {
       if (WASABI_RECORD_DETAIL_PRIMARY_STRICT) throw error;
     }
   }
   const result = await pool.query('SELECT * FROM planner_records WHERE CAST(id AS text) = $1 LIMIT 1', [String(id)]);
+  // #region agent log
+  fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+    body: JSON.stringify({
+      sessionId: '2228ee',
+      hypothesisId: 'H1',
+      location: 'server.js:fetchRecordById:pg',
+      message: 'postgres planner_records lookup',
+      data: { id: String(id), rowCount: result.rows.length },
+      timestamp: Date.now()
+    })
+  }).catch(() => {});
+  // #endregion
   if (!result.rows.length) return null;
   return normalizeRecordRow(result.rows[0]);
 }
@@ -4130,20 +4162,52 @@ async function persistRecord(record) {
   const wasabiWrote = await tryWasabiStateWrite('persist-record', async (data) => {
     const rows = ensureSnapshotTable(data, 'planner_records');
     const idx = rows.findIndex((row) => String(row.id || '') === String(record.id || ''));
-    if (idx < 0) throw new Error('Record not found');
-    savedRow = {
-      ...rows[idx],
-      record_date: cleanString(record.record_date),
-      client: upperCleanString(record.client),
-      city: upperCleanString(record.city),
-      street: upperCleanString(record.street),
-      jobsite: normalizeJobsiteName(record.jobsite, record.street),
-      status: cleanString(record.status || ''),
-      saved_by: cleanString(record.saved_by || ''),
-      data: serializeRecordData(record),
-      updated_at: nowIso()
-    };
-    rows[idx] = savedRow;
+    const now = nowIso();
+    if (idx < 0) {
+      // Row exists in Postgres but not yet in Wasabi snapshot — append instead of failing.
+      savedRow = {
+        id: record.id,
+        record_date: cleanString(record.record_date),
+        client: upperCleanString(record.client),
+        city: upperCleanString(record.city),
+        street: upperCleanString(record.street),
+        jobsite: normalizeJobsiteName(record.jobsite, record.street),
+        status: cleanString(record.status || ''),
+        saved_by: cleanString(record.saved_by || ''),
+        data: serializeRecordData(record),
+        created_at: now,
+        updated_at: now
+      };
+      rows.push(savedRow);
+      // #region agent log
+      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+        body: JSON.stringify({
+          sessionId: '2228ee',
+          hypothesisId: 'H2',
+          location: 'server.js:persistRecord',
+          message: 'wasabi snapshot append missing record',
+          data: { recordId: String(record.id || '') },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
+    } else {
+      savedRow = {
+        ...rows[idx],
+        record_date: cleanString(record.record_date),
+        client: upperCleanString(record.client),
+        city: upperCleanString(record.city),
+        street: upperCleanString(record.street),
+        jobsite: normalizeJobsiteName(record.jobsite, record.street),
+        status: cleanString(record.status || ''),
+        saved_by: cleanString(record.saved_by || ''),
+        data: serializeRecordData(record),
+        updated_at: nowIso()
+      };
+      rows[idx] = savedRow;
+    }
   });
   if (wasabiWrote && savedRow) {
     return normalizeRecordRow(savedRow);
@@ -4325,6 +4389,20 @@ app.delete('/clients/:client', requireAuth, requireAdmin, async (req, res) => {
 app.post('/records/:id/segments', requireAuth, requirePsrDataEntryAccess, async (req, res) => {
   try {
     const record = await fetchRecordById(req.params.id);
+    // #region agent log
+    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+      body: JSON.stringify({
+        sessionId: '2228ee',
+        hypothesisId: 'H3',
+        location: 'server.js:POST /records/:id/segments',
+        message: 'add segment fetchRecordById result',
+        data: { paramId: String(req.params.id || ''), found: !!record },
+        timestamp: Date.now()
+      })
+    }).catch(() => {});
+    // #endregion
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
     if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
     const system = cleanString(req.body?.system || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
