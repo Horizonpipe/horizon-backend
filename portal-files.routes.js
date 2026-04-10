@@ -49,16 +49,16 @@ const PORTAL_FOLDER_COPY_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_COPY_CONCURREN
 const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCURRENCY', 8, 1, 32);
 
 /**
- * When the job has path grants, users with **no** matching `portal_path_grants` rows normally see an empty tree.
- * If true (default): portal clients (`portalFilesAccessGranted`, not portal staff) with zero personal grants still
- * list/read/write the full job — use `PORTAL_LENIENT_PATH_GRANTS=0` for strict default-deny for those users.
+ * When the job has path grants, users with **no** matching `portal_path_grants` rows see an empty tree (strict).
+ * Set `PORTAL_LENIENT_PATH_GRANTS=1` to allow portal clients with zero personal grants to see the full job
+ * (legacy escape hatch only).
  */
 function portalLenientPathGrantsEnabled() {
   const raw = process.env.PORTAL_LENIENT_PATH_GRANTS;
-  if (raw === undefined || String(raw).trim() === '') return true;
+  if (raw === undefined || String(raw).trim() === '') return false;
   const v = String(raw).trim().toLowerCase();
-  if (v === '0' || v === 'false' || v === 'no' || v === 'off') return false;
-  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+  if (v === '1' || v === 'true' || v === 'yes' || v === 'on') return true;
+  return false;
 }
 
 /**
@@ -79,7 +79,7 @@ function clampIntEnv(name, fallback, min, max) {
 }
 
 /**
- * Portal ACL / path grants (aligned with `capabilities.canManagePortalExtras`: super-admin, portal perms, or env whitelist).
+ * Portal ACL / path grants (aligned with `capabilities.canManagePortalExtras`: global admin or env whitelist).
  * @param {import('express').Request['user']} user
  */
 function userCanManagePortalExtras(user) {
@@ -1217,35 +1217,6 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           appliedPathGrantFilter = true;
         }
       }
-      // #region agent log
-      try {
-        const fc = (tree.files || []).length;
-        const dc = (tree.folders || []).length;
-        if (jobHasPathGrantsTree && !permEditorTree && fc + dc === 0) {
-          fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-            body: JSON.stringify({
-              sessionId: '2228ee',
-              hypothesisId: 'H5',
-              location: 'portal-files.routes.js:GET/tree',
-              message: 'empty tree after path grants',
-              data: {
-                lenient: portalLenientPathGrantsEnabled(),
-                bypass: bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants),
-                appliedPathGrantFilter,
-                userGrantCount: treeUserGrants.length,
-                clientId: String(clientId),
-                jobId: String(jobId)
-              },
-              timestamp: Date.now()
-            })
-          }).catch(() => {});
-        }
-      } catch (_) {
-        /* ignore */
-      }
-      // #endregion
       return res.json(tree);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

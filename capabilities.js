@@ -18,21 +18,20 @@ function isSuperAdmin(user) {
 
 /**
  * Admin Panel: user CRUD, permission trees, account requests.
- * Replaces the old split between `is_admin` vs `portal_permissions_access` in UI.
+ * Horizon global admins only (`is_admin`); not `portal_permissions_access`.
  */
 function canAccessAdminPanel(user) {
   if (!user) return false;
-  return user.isAdmin === true || user.portalPermissionsAccess === true;
+  return user.isAdmin === true;
 }
 
 /**
  * Portal file ACL / path grants / share extras (PipeShare).
- * Super-admin always allowed so one "admin" story in the product.
+ * Global admin or env username whitelist only (not `portal_permissions_access`).
  */
 function canManagePortalExtras(user) {
   if (!user) return false;
   if (user.isAdmin === true) return true;
-  if (user.portalPermissionsAccess === true) return true;
   const u = String(user.username || '')
     .trim()
     .toLowerCase();
@@ -48,9 +47,9 @@ function resolveCapabilities(user) {
   return {
     version: 1,
     superAdmin: isSuperAdmin(user),
-    /** Prefer this over checking `isAdmin` + `portalPermissionsAccess` separately in UI */
+    /** User Manager / PipeSync admin panel — `is_admin` only */
     canAccessAdminPanel: canAccessAdminPanel(user),
-    /** Portal ACL management (files routes); includes super-admin */
+    /** PipeShare ACL / path grants — global admin or `PORTAL_PERMISSIONS_WHITELIST_USERS` */
     canManagePortalExtras: canManagePortalExtras(user),
     psrPlanner: !!roles.psrPlanner,
     psrViewer: !!roles.psrViewer,
