@@ -11,6 +11,7 @@ const { ensureOutlookSchema, registerOutlookRoutes } = require('./outlook');
 const { registerPortalFilesRoutes } = require('./portal-files.routes');
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
 const { registerSignupRoutes } = require('./signup.routes');
+const { resolveCapabilities, canAccessAdminPanel } = require('./capabilities');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -1117,7 +1118,7 @@ const PORTAL_FORCE_JOB_SCOPE = PORTAL_FORCE_CLIENT_ID && PORTAL_FORCE_JOB_ID;
  * Defaults to `portal-users/4` per current production bucket layout.
  */
 const PORTAL_SHARED_DEFAULT_CLIENT_ID = (process.env.PORTAL_SHARED_DEFAULT_CLIENT_ID || 'portal-users').trim();
-const PORTAL_SHARED_DEFAULT_JOB_ID = (process.env.PORTAL_SHARED_DEFAULT_JOB_ID || '4').trim();
+const PORTAL_SHARED_DEFAULT_JOB_ID = (process.env.PORTAL_SHARED_DEFAULT_JOB_ID || '8').trim();
 const PORTAL_SHARED_DEFAULT_SCOPE = PORTAL_SHARED_DEFAULT_CLIENT_ID && PORTAL_SHARED_DEFAULT_JOB_ID;
 /** Backward-compat toggle: set `PORTAL_USER_SCOPED_DEFAULTS=1` to restore `portal-users/{userId}` defaults. */
 const PORTAL_USER_SCOPED_DEFAULTS =
@@ -1134,6 +1135,11 @@ function portalPermissionsWhitelistHas(username) {
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
   return w.includes(u);
+}
+
+function enforcePortalScopePolicyForUser(user, portalScopes) {
+  if (!user || user.portalFilesAccessGranted !== true) return [];
+  return dedupePortalScopes(portalScopes);
 }
 
 function normalizeUser(row) {
@@ -1178,6 +1184,8 @@ function normalizeUser(row) {
     portalFilesJobId = undefined;
   }
 
+  const portalPermissionsAccessRaw = !!row.portal_permissions_access;
+  const portalPermissionsAccess = portalPermissionsAccessRaw || portalPermissionsWhitelistHas(row.username);
   return {
     id,
     username: row.username,
@@ -1198,9 +1206,8 @@ function normalizeUser(row) {
     portalFilesJobId,
     portalScopes: [],
     psrScopes: [],
-    portalPermissionsAccessRaw: !!row.portal_permissions_access,
-    portalPermissionsAccess:
-      !!row.portal_permissions_access || portalPermissionsWhitelistHas(row.username)
+    portalPermissionsAccessRaw,
+    portalPermissionsAccess
   };
 }
 
@@ -1364,7 +1371,7 @@ async function attachScopesToUsers(users) {
     const entry = map.get(String(u.id || '')) || { portalScopes: [], psrScopes: [] };
     return {
       ...u,
-      portalScopes: dedupePortalScopes(entry.portalScopes),
+      portalScopes: enforcePortalScopePolicyForUser(u, entry.portalScopes),
       psrScopes: dedupePsrScopes(entry.psrScopes)
     };
   });
@@ -1400,7 +1407,7 @@ function attachScopesToUserFromSnapshot(user, snapshot) {
     }));
   return {
     ...user,
-    portalScopes: dedupePortalScopes(portalScopes),
+    portalScopes: enforcePortalScopePolicyForUser(user, portalScopes),
     psrScopes: dedupePsrScopes(psrScopes)
   };
 }
@@ -2168,6 +2175,21 @@ async function readSessionFromWasabiSnapshot(token, snapshotOverride = null) {
   };
 }
 
+async function readFreshUserFromPostgresById(userId) {
+  const id = String(userId || '').trim();
+  if (!id) return null;
+  const result = await pool.query(
+    `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
+            portal_permissions_access, portal_files_access_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified
+     FROM users
+     WHERE CAST(id AS text) = $1
+     LIMIT 1`,
+    [id]
+  );
+  if (!result.rows.length) return null;
+  return attachScopesToUser(normalizeUser(result.rows[0]));
+}
+
 async function extendWasabiSessionExpiry(token, keepSession = false) {
   const ttlMinutes = resolveSessionTtlMinutes(keepSession);
   const wrote = await tryWasabiStateWrite('extend-session', async (data) => {
@@ -2236,6 +2258,30 @@ async function readSessionFromPostgres(token) {
   };
 }
 
+/**
+ * Remove a session token from Postgres and the Wasabi snapshot (best-effort).
+ * Used when the user row no longer exists or auth must fail closed.
+ */
+async function revokeSessionToken(token, reason = '') {
+  if (!token) return;
+  try {
+    await tryWasabiStateWrite('revoke-session', async (data) => {
+      const sessions = ensureSnapshotTable(data, 'auth_sessions');
+      data.auth_sessions = sessions.filter((row) => String(row.token || '') !== String(token));
+    });
+  } catch (error) {
+    console.warn(`[auth] Wasabi session revoke failed: ${error?.message || error}`);
+  }
+  try {
+    await pool.query('DELETE FROM auth_sessions WHERE token = $1', [token]);
+  } catch (error) {
+    console.warn(`[auth] Postgres session revoke failed: ${error?.message || error}`);
+  }
+  if (reason) {
+    console.warn(`[auth] session token revoked: ${reason}`);
+  }
+}
+
 async function readSession(token) {
   if (!token) return null;
   let wasabiPrimaryIssue = '';
@@ -2251,14 +2297,29 @@ async function readSession(token) {
           if (!fresh) {
             console.warn('[auth] using stale Wasabi snapshot for session resolution');
           }
+          let freshUser = null;
+          let pgRefreshError = null;
           try {
-            await extendWasabiSessionExpiry(token, sessionHit.keepSession);
+            freshUser = await readFreshUserFromPostgresById(sessionHit.user?.id);
           } catch (error) {
-            if (WASABI_WRITES_PRIMARY_STRICT) throw error;
+            pgRefreshError = error;
+            console.warn(`[auth] Postgres user refresh failed after Wasabi session hit: ${error?.message || error}`);
           }
-          return sessionHit.user;
+          if (freshUser) {
+            try {
+              await extendWasabiSessionExpiry(token, sessionHit.keepSession);
+            } catch (error) {
+              if (WASABI_WRITES_PRIMARY_STRICT) throw error;
+            }
+            return freshUser;
+          }
+          if (!pgRefreshError) {
+            await revokeSessionToken(token, 'postgres_user_missing_after_wasabi_hit');
+            return null;
+          }
+        } else {
+          wasabiPrimaryIssue = fresh ? 'snapshot_miss' : 'snapshot_stale_miss';
         }
-        wasabiPrimaryIssue = fresh ? 'snapshot_miss' : 'snapshot_stale_miss';
       } else {
         wasabiPrimaryIssue = fresh ? 'snapshot_empty' : 'snapshot_stale';
       }
@@ -2285,10 +2346,22 @@ async function readSession(token) {
     if (!WASABI_AUTH_FALLBACK_ENABLED) throw error;
     try {
       const fallback = await readSessionFromWasabiSnapshot(token);
-      if (fallback) {
-        console.warn('[auth] using Wasabi session fallback for token lookup');
+      if (!fallback) {
+        return null;
       }
-      return fallback ? fallback.user : null;
+      console.warn('[auth] using Wasabi session fallback for token lookup');
+      let freshUser = null;
+      try {
+        freshUser = await readFreshUserFromPostgresById(fallback.user?.id);
+      } catch (pgErr) {
+        console.warn(`[auth] Postgres user refresh failed in Wasabi fallback: ${pgErr?.message || pgErr}`);
+        return null;
+      }
+      if (freshUser) {
+        return freshUser;
+      }
+      await revokeSessionToken(token, 'postgres_user_missing_wasabi_pg_fallback');
+      return null;
     } catch (fallbackError) {
       throw error && fallbackError
         ? new Error(`${error?.message || error} | wasabi fallback failed: ${fallbackError?.message || fallbackError}`)
@@ -2322,6 +2395,16 @@ function requireAdmin(req, res, next) {
     return res.status(403).json({ success: false, error: 'Admin access required' });
   }
   return next();
+}
+
+/** Admin Panel + user/permission management (see `capabilities.canAccessAdminPanel`). */
+function requireAdminPanelAccess(req, res, next) {
+  const u = req.user;
+  if (!u) {
+    return res.status(401).json({ success: false, error: 'Authentication required' });
+  }
+  if (canAccessAdminPanel(u)) return next();
+  return res.status(403).json({ success: false, error: 'Admin access required' });
 }
 
 function userRoleEnabled(user, roleKey) {
@@ -3190,29 +3273,15 @@ app.get('/sync-state', requireAuth, async (req, res) => {
 app.get('/users', requireAuth, async (req, res) => {
   try {
     const currentUser = req.user;
-    let normalizedRows = null;
-    if (WASABI_USERS_PRIMARY_ENABLED) {
-      try {
-        const snapshotUsers = await readUsersFromWasabiSnapshot();
-        if (snapshotUsers) {
-          normalizedRows = await attachScopesToUsers(snapshotUsers);
-        } else if (WASABI_USERS_PRIMARY_STRICT) {
-          normalizedRows = [];
-        }
-      } catch (error) {
-        if (WASABI_USERS_PRIMARY_STRICT) throw error;
-      }
-    }
-    if (!normalizedRows) {
-      const result = await pool.query(
-        `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup
-         FROM users
-         ORDER BY LOWER(COALESCE(display_name, username)), LOWER(username)`
-      );
-      normalizedRows = await attachScopesToUsers(result.rows.map((row) => normalizeUser(row)));
-    }
+    /** Permissions UI must reflect Postgres immediately after saves — do not prefer stale Wasabi snapshots here. */
+    const result = await pool.query(
+      `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup
+       FROM users
+       ORDER BY LOWER(COALESCE(display_name, username)), LOWER(username)`
+    );
+    const normalizedRows = await attachScopesToUsers(result.rows.map((row) => normalizeUser(row)));
     const users = normalizedRows.map((normalized) => {
-      if (!currentUser?.isAdmin) {
+      if (!canAccessAdminPanel(currentUser)) {
         return {
           id: normalized.id,
           username: normalized.username,
@@ -3228,22 +3297,9 @@ app.get('/users', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/permissions/tree', requireAuth, requireAdmin, async (req, res) => {
+app.get('/permissions/tree', requireAuth, requireAdminPanelAccess, async (req, res) => {
   try {
-    if (WASABI_PERMISSIONS_TREE_PRIMARY_ENABLED) {
-      try {
-        const snapshotTrees = await buildPermissionsTreesFromSnapshot();
-        if (snapshotTrees) {
-          return res.json({ success: true, ...snapshotTrees });
-        }
-        if (WASABI_PERMISSIONS_TREE_PRIMARY_STRICT) {
-          return res.json({ success: true, portalTree: [], psrTree: [] });
-        }
-      } catch (error) {
-        if (WASABI_PERMISSIONS_TREE_PRIMARY_STRICT) throw error;
-      }
-    }
-
+    /** Same as GET /users: tree drives checkboxes — always build from live Postgres state. */
     const [portalRows, portalPathRows, psrRows] = await Promise.all([
       pool.query(
         `WITH scope_pairs AS (
@@ -3394,7 +3450,7 @@ app.post('/login', async (req, res) => {
     const keepRaw = req.body?.keepSession;
     const keepSession = keepRaw === true || keepRaw === 1 || String(keepRaw || '').trim().toLowerCase() === 'true';
     const token = await issueSession(row.id, { keepSession });
-    res.json({ success: true, user, token });
+    res.json({ success: true, user, token, capabilities: resolveCapabilities(user) });
   } catch (error) {
     console.error('LOGIN ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -3402,7 +3458,7 @@ app.post('/login', async (req, res) => {
 });
 
 app.get('/session', requireAuth, async (req, res) => {
-  res.json({ success: true, user: req.user });
+  res.json({ success: true, user: req.user, capabilities: resolveCapabilities(req.user) });
 });
 
 app.get('/data-auto-sync/access', requireAuth, requireDataAutoSyncEmployeeAccess, async (req, res) => {
@@ -3532,11 +3588,14 @@ app.post('/change-password', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/create-user', requireAuth, requireAdmin, async (req, res) => {
+app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) => {
   const username = cleanString(req.body?.username);
   const displayName = cleanString(req.body?.displayName || username);
   const password = cleanString(req.body?.password || '1234');
-  const isAdmin = !!req.body?.isAdmin;
+  let isAdmin = !!req.body?.isAdmin;
+  if (!req.user?.isAdmin) {
+    isAdmin = false;
+  }
   /** Planner-created accounts now default to no permissions until explicitly assigned by admin edit. */
   const roles = normalizeRoles({
     camera: false,
@@ -3621,7 +3680,7 @@ app.post('/create-user', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
+app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => {
   const id = req.params.id;
   const displayName = cleanString(req.body?.displayName || req.body?.name);
   const isAdmin = req.body?.isAdmin === undefined ? null : !!req.body.isAdmin;
@@ -3646,7 +3705,13 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
 
   try {
     let current = null;
-    if (WASABI_USERS_PRIMARY_ENABLED) {
+    const currentResult = await pool.query(
+      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup FROM users WHERE id = $1 LIMIT 1',
+      [id]
+    );
+    if (currentResult.rows.length) {
+      current = currentResult.rows[0];
+    } else if (WASABI_USERS_PRIMARY_ENABLED) {
       try {
         const snapshotUser = await readUserByIdFromWasabiSnapshot(id);
         if (snapshotUser) {
@@ -3660,7 +3725,7 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
             portal_files_client_id: snapshotUser.portalFilesClientId,
             portal_files_job_id: snapshotUser.portalFilesJobId,
             portal_files_access_granted: snapshotUser.portalFilesAccessGranted,
-            portal_permissions_access: snapshotUser.portalPermissionsAccess,
+            portal_permissions_access: snapshotUser.portalPermissionsAccessRaw ?? snapshotUser.portalPermissionsAccess,
             self_signup: snapshotUser.selfSignup
           };
         } else if (WASABI_USERS_PRIMARY_STRICT) {
@@ -3671,20 +3736,23 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
       }
     }
     if (!current) {
-      const currentResult = await pool.query(
-        'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup FROM users WHERE id = $1 LIMIT 1',
-        [id]
-      );
-      if (!currentResult.rows.length) {
-        return res.status(404).json({ success: false, error: 'User not found' });
-      }
-      current = currentResult.rows[0];
+      return res.status(404).json({ success: false, error: 'User not found' });
     }
     const scopeMap = await readScopesForUserIds([id]);
     const currentScopes = scopeMap.get(String(id)) || { portalScopes: [], psrScopes: [] };
 
     const nextDisplayName = displayName || current.display_name || current.username;
-    const nextIsAdmin = isAdmin === null ? current.is_admin : isAdmin;
+    let nextIsAdmin = isAdmin === null ? !!current.is_admin : !!isAdmin;
+    const actorIsGlobalAdmin = req.user?.isAdmin === true;
+    if (!actorIsGlobalAdmin && current.is_admin && String(req.user?.id || '') !== String(id)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only global admins can edit Horizon admin accounts.'
+      });
+    }
+    if (!actorIsGlobalAdmin) {
+      nextIsAdmin = !!current.is_admin;
+    }
     const nextRoles = roles === null ? normalizeRoles(current.roles) : roles;
     let nextPortalFilesClientId = current.portal_files_client_id || null;
     let nextPortalFilesJobId = current.portal_files_job_id || null;
@@ -3734,6 +3802,11 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
     const nextPortalPermissionsAccess = hasPortalPermissionsPayload
       ? !!req.body.portalPermissionsAccess
       : current.portal_permissions_access === true;
+    if (nextPortalFilesAccessGranted !== true) {
+      nextPortalScopes = [];
+      nextPortalFilesClientId = null;
+      nextPortalFilesJobId = null;
+    }
 
     const passwordHash = password ? await bcrypt.hash(password, 10) : null;
     let updatedResult = null;
@@ -3792,12 +3865,9 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
           }
         }
 
-        // Force immediate permission revocation by rotating target user's sessions.
-        // Keep the currently logged-in admin session when editing their own account.
-        if (String(req.user?.id || '') !== String(id)) {
-          const sessions = ensureSnapshotTable(data, 'auth_sessions');
-          data.auth_sessions = sessions.filter((row) => String(row.user_id || '') !== String(id || ''));
-        }
+        // Force immediate permission revocation by rotating target user's sessions (including self-updates).
+        const sessions = ensureSnapshotTable(data, 'auth_sessions');
+        data.auth_sessions = sessions.filter((row) => String(row.user_id || '') !== String(id || ''));
         updatedUserRow = users[idx];
       });
       updatedResult = { rows: [updatedUserRow] };
@@ -3865,11 +3935,8 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
         );
       }
 
-      // Force immediate permission revocation by rotating target user's sessions.
-      // Keep the currently logged-in admin session when editing their own account.
-      if (String(req.user?.id || '') !== String(id)) {
-        await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [String(id)]);
-      }
+      // Force immediate permission revocation by rotating target user's sessions (including self-updates).
+      await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [String(id)]);
     }
 
     const user = await attachScopesToUser(normalizeUser(updatedResult.rows[0]));
@@ -3880,7 +3947,7 @@ app.put('/users/:id', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-app.delete('/users/:id', requireAuth, requireAdmin, async (req, res) => {
+app.delete('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => {
   const id = cleanString(req.params.id);
   if (!id) {
     return res.status(400).json({ success: false, error: 'User id is required' });
@@ -3915,6 +3982,12 @@ app.delete('/users/:id', requireAuth, requireAdmin, async (req, res) => {
         return res.status(404).json({ success: false, error: 'User not found' });
       }
       target = targetResult.rows[0];
+    }
+    if (!req.user?.isAdmin && target.is_admin) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only global admins can delete Horizon admin accounts.'
+      });
     }
     if (target.is_admin) {
       let adminCount = null;

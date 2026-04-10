@@ -33,20 +33,17 @@ const {
 } = require('@aws-sdk/client-s3');
 const { Upload } = require('@aws-sdk/lib-storage');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
+const { canManagePortalExtras } = require('./capabilities');
 
 const CATEGORIES = new Set(['videos', 'db3', 'pdf', 'photos']);
 const FOLDER_MARKER = '.hp-folder';
 const DATA_AUTO_SYNC_MODE = 'dataautosync';
-const DATA_AUTO_SYNC_JOB_ID = '1';
+const DATA_AUTO_SYNC_JOB_ID = String(process.env.DATA_AUTO_SYNC_CLIENT_JOB_ID || '8').trim() || '8';
+/** When no explicit jobId is provided, everyone (including portal admins) starts on this folder. */
+const DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID =
+  String(process.env.DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID || '8').trim() || '8';
 const PORTAL_FOLDER_COPY_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_COPY_CONCURRENCY', 8, 1, 32);
 const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCURRENCY', 8, 1, 32);
-
-function portalPermissionsWhitelist() {
-  return (process.env.PORTAL_PERMISSIONS_WHITELIST_USERS || '')
-    .split(',')
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-}
 
 function clampIntEnv(name, fallback, min, max) {
   const raw = Number(process.env[name]);
@@ -55,17 +52,16 @@ function clampIntEnv(name, fallback, min, max) {
 }
 
 /**
- * Admin, explicit DB flag, or PORTAL_PERMISSIONS_WHITELIST_USERS.
+ * Portal ACL / path grants (aligned with `capabilities.canManagePortalExtras`: super-admin, portal perms, or env whitelist).
  * @param {import('express').Request['user']} user
  */
 function userCanManagePortalExtras(user) {
-  if (!user) return false;
-  if (user.isAdmin) return true;
-  if (user.portalPermissionsAccess === true) return true;
-  const u = String(user.username || '')
-    .trim()
-    .toLowerCase();
-  return portalPermissionsWhitelist().includes(u);
+  return canManagePortalExtras(user);
+}
+
+/** @param {import('express').Request['user']} user */
+function userIsPortalAdmin(user) {
+  return userCanManagePortalExtras(user);
 }
 
 /**
@@ -75,7 +71,7 @@ function userCanManagePortalExtras(user) {
  */
 function userCanPortalCapability(user, capability) {
   if (!user) return false;
-  if (user.isAdmin) return true;
+  if (userIsPortalAdmin(user)) return true;
   const roles = user.roles && typeof user.roles === 'object' ? user.roles : {};
   if (capability === 'upload') return roles.portalUpload === true;
   if (capability === 'download') return roles.portalDownload === true;
@@ -89,7 +85,7 @@ function userCanPortalCapability(user, capability) {
  */
 function userCanDataAutoSync(user) {
   if (!user) return false;
-  if (user.isAdmin) return true;
+  if (userIsPortalAdmin(user)) return true;
   const roles = user.roles && typeof user.roles === 'object' ? user.roles : {};
   return roles.dataAutoSyncEmployee === true;
 }
@@ -114,7 +110,8 @@ function readPortalMode(req, source) {
 
 /**
  * Resolve effective client/job for regular portal or DataAutoSync mode.
- * DataAutoSync mode always forces jobId=1 and requires employee role (or admin).
+ * DataAutoSync mode defaults non-admins to a fixed client folder (job id),
+ * while admins may pick any folder via explicit jobId override.
  */
 function resolvePortalScope(req, source, options = {}) {
   const mode = readPortalMode(req, source);
@@ -130,11 +127,13 @@ function resolvePortalScope(req, source, options = {}) {
     source && typeof source === 'object' ? String(source.jobId || source.job_id || '').trim() : '';
   const clientId = rawClient || (isDataAutoSync ? pickUserDefaultClientId(req?.user) : '');
   const requireJob = options.requireJob !== false;
-  const adminCanOverrideDataAutoSyncJob = isDataAutoSync && req?.user?.isAdmin === true;
+  const adminCanOverrideDataAutoSyncJob = isDataAutoSync && userIsPortalAdmin(req?.user);
   const jobId = isDataAutoSync
     ? adminCanOverrideDataAutoSyncJob && rawJob
       ? rawJob
-      : DATA_AUTO_SYNC_JOB_ID
+      : adminCanOverrideDataAutoSyncJob
+        ? DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID
+        : DATA_AUTO_SYNC_JOB_ID
     : rawJob;
   if (!clientId || (requireJob && !jobId)) {
     return { error: 'clientId and jobId are required' };
@@ -724,7 +723,7 @@ function portalForceJobScope() {
 
 function portalSharedDefaultScope() {
   const fc = (process.env.PORTAL_SHARED_DEFAULT_CLIENT_ID || 'portal-users').trim();
-  const fj = (process.env.PORTAL_SHARED_DEFAULT_JOB_ID || '4').trim();
+  const fj = (process.env.PORTAL_SHARED_DEFAULT_JOB_ID || '8').trim();
   return fc && fj ? { clientId: fc, jobId: fj } : null;
 }
 
@@ -735,7 +734,7 @@ function portalUsersPeerReadEnabled() {
 }
 
 async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) {
-  if (user && user.isAdmin) return true;
+  if (userIsPortalAdmin(user)) return true;
   if (!user || user.portalFilesAccessGranted !== true) return false;
   const c = String(clientId || '').trim();
   const j = String(jobId || '').trim();
@@ -867,7 +866,7 @@ function grantModeAllows(mode, required) {
 
 async function assertPortalPathRel(pool, user, clientId, jobId, relPath, required = 'view') {
   if (!user) return false;
-  if (user.isAdmin) return true;
+  if (userIsPortalAdmin(user)) return true;
   const jobOk = await assertPortalJobAccess(pool, user, String(clientId), String(jobId));
   if (!jobOk) return false;
   const anyGrants = await portalJobHasPathGrants(pool, clientId, jobId);
@@ -1026,7 +1025,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   r.get('/storage-health', async (req, res) => {
     try {
-      if (req.user?.isAdmin !== true) {
+      if (!userIsPortalAdmin(req.user)) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const endpoint = String(process.env.WASABI_ENDPOINT || '').trim() || null;
@@ -1065,7 +1064,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
       let userGrants = null;
-      if (!req.user?.isAdmin && (await portalJobHasPathGrants(pool, clientId, jobId))) {
+      if (!userIsPortalAdmin(req.user) && (await portalJobHasPathGrants(pool, clientId, jobId))) {
         userGrants = await loadUserPathGrants(pool, clientId, jobId, req.user.username);
       }
       const out = [];
@@ -1104,7 +1103,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const prefix = jobPrefix(String(clientId), String(jobId));
       const keys = await listAllKeys(s3, bucket, prefix);
       let tree = buildTreeFromKeys(prefix, keys);
-      if (!req.user?.isAdmin && (await portalJobHasPathGrants(pool, clientId, jobId))) {
+      if (!userIsPortalAdmin(req.user) && (await portalJobHasPathGrants(pool, clientId, jobId))) {
         const userGrants = await loadUserPathGrants(pool, clientId, jobId, req.user.username);
         tree = filterTreeByPathGrants(tree, userGrants, true);
       }
@@ -1112,6 +1111,54 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(400).json({ error: msg });
+    }
+  });
+
+  r.get('/jobs', async (req, res) => {
+    try {
+      if (!userIsPortalAdmin(req.user)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const scope = resolvePortalScope(req, req.query, { requireJob: false });
+      if (scope.error) {
+        return res.status(400).json({ error: 'clientId query param is required' });
+      }
+      const clientId = String(scope.clientId || '').trim();
+      if (!clientId) {
+        return res.status(400).json({ error: 'clientId query param is required' });
+      }
+      const probePrefix = jobPrefix(clientId, '__hp_jobs_probe__');
+      const prefix = probePrefix.replace(/__hp_jobs_probe__\/$/, '');
+      const keys = await listAllKeys(s3, bucket, prefix);
+      const set = new Set();
+      for (const obj of keys) {
+        const key = String(obj?.Key || '');
+        if (!key.startsWith(prefix)) continue;
+        const rel = key.slice(prefix.length);
+        const slash = rel.indexOf('/');
+        if (slash <= 0) continue;
+        const jobId = rel.slice(0, slash).trim();
+        if (jobId) set.add(jobId);
+      }
+      const scoped = Array.isArray(req.user?.portalScopes) ? req.user.portalScopes : [];
+      for (const s of scoped) {
+        if (String(s?.clientId || '').trim() !== clientId) continue;
+        const jid = String(s?.jobId || '').trim();
+        if (jid) set.add(jid);
+      }
+      const legacyJob = String(req.user?.portalFilesJobId || '').trim();
+      const legacyClient = String(req.user?.portalFilesClientId || '').trim();
+      if (legacyJob && legacyClient === clientId) set.add(legacyJob);
+      const jobs = [...set].sort((a, b) => {
+        const an = Number(a);
+        const bn = Number(b);
+        if (Number.isFinite(an) && Number.isFinite(bn)) return an - bn;
+        return a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true });
+      });
+      return res.json({ clientId, jobs });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
     }
   });
 
@@ -1498,7 +1545,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'Destination client/job is required' });
       }
       const crossScope = String(targetClientId) !== String(clientId) || String(targetJobId) !== String(jobId);
-      if (crossScope && req.user?.isAdmin !== true) {
+      if (crossScope && !userIsPortalAdmin(req.user)) {
         return res.status(403).json({ error: 'Only admins can move across folder roots/jobs' });
       }
       const mode = readPortalMode(req, body);
@@ -2328,7 +2375,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   }
 
   function portalDlAuthCacheKey(user, fileId) {
-    if (user && user.isAdmin) return `admin::${fileId}`;
+    if (userIsPortalAdmin(user)) return `admin::${fileId}`;
     const uid = user && user.id != null ? `id:${user.id}` : '';
     const un = user && user.username ? `u:${user.username}` : '';
     return `${uid || un || 'anon'}::${fileId}`;
@@ -2394,7 +2441,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const prefDl = jobPrefix(parsed.clientId, parsed.jobId);
       const relPathDl = Key.slice(prefDl.length);
       let pathOk = false;
-      if (req.user?.isAdmin) {
+      if (userIsPortalAdmin(req.user)) {
         const now = Date.now();
         const authK = portalDlAuthCacheKey(req.user, fileId);
         const authHit = portalDlAuthCache.get(authK);
