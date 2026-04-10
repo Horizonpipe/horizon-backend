@@ -1604,7 +1604,9 @@ async function readRecordsFromWasabiSnapshotForUser(user) {
 
 async function fetchRecordByIdFromWasabiSnapshot(id) {
   const snapshot = await loadWasabiLatestStateSnapshot();
-  if (!snapshotLooksFresh(snapshot, WASABI_RECORD_DETAIL_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  // Do not gate on snapshot age here: stale snapshot data beats a false 404 when Postgres was never
+  // mirrored (Wasabi-primary creates) or when clocks / generatedAt skew.
+  if (!snapshot || !snapshot.data) return null;
   const rows = snapshotRows(snapshot, 'planner_records');
   const hit = rows.find((row) => String(row.id || '') === String(id || ''));
   if (!hit) return null;
@@ -1654,6 +1656,11 @@ function nextNumericId(rows) {
     .map((row) => Number(row?.id))
     .filter((n) => Number.isFinite(n));
   return numericIds.length ? Math.max(...numericIds) + 1 : 1;
+}
+
+function isPlannerRecordUuid(id) {
+  const s = String(id || '').trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
 }
 
 async function upsertPricingRate(dia, rate) {
@@ -4212,6 +4219,17 @@ async function persistRecord(record) {
   if (wasabiWrote && savedRow) {
     return normalizeRecordRow(savedRow);
   }
+  const payload = [
+    record.record_date,
+    record.client,
+    record.city,
+    record.street,
+    normalizeJobsiteName(record.jobsite, record.street),
+    record.status || '',
+    record.saved_by || '',
+    JSON.stringify(serializeRecordData(record)),
+    String(record.id)
+  ];
   const result = await pool.query(
     `UPDATE planner_records
      SET record_date = $1,
@@ -4225,30 +4243,70 @@ async function persistRecord(record) {
          updated_at = NOW()
      WHERE CAST(id AS text) = $9
      RETURNING *`,
-    [
-      record.record_date,
-      record.client,
-      record.city,
-      record.street,
-      normalizeJobsiteName(record.jobsite, record.street),
-      record.status || '',
-      record.saved_by || '',
-      JSON.stringify(serializeRecordData(record)),
-      String(record.id)
-    ]
+    payload
   );
-  return normalizeRecordRow(result.rows[0]);
+  if (result.rows.length) {
+    return normalizeRecordRow(result.rows[0]);
+  }
+  // Wasabi-only or pre-migration row: no PG row to UPDATE — upsert when id is a UUID.
+  if (!isPlannerRecordUuid(record.id)) {
+    // #region agent log
+    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+      body: JSON.stringify({
+        sessionId: '2228ee',
+        hypothesisId: 'H4',
+        location: 'server.js:persistRecord:pg',
+        message: 'postgres update 0 rows, non-uuid id',
+        data: { recordId: String(record.id || '') },
+        timestamp: Date.now()
+      })
+    }).catch(() => {});
+    // #endregion
+    throw new Error('Record not found');
+  }
+  const ins = await pool.query(
+    `INSERT INTO planner_records (id, record_date, client, city, street, jobsite, status, saved_by, data, created_at, updated_at)
+     VALUES ($9::uuid, $1, $2, $3, $4, $5, $6, $7, $8::jsonb, NOW(), NOW())
+     ON CONFLICT (id) DO UPDATE SET
+       record_date = EXCLUDED.record_date,
+       client = EXCLUDED.client,
+       city = EXCLUDED.city,
+       street = EXCLUDED.street,
+       jobsite = EXCLUDED.jobsite,
+       status = EXCLUDED.status,
+       saved_by = EXCLUDED.saved_by,
+       data = EXCLUDED.data,
+       updated_at = NOW()
+     RETURNING *`,
+    payload
+  );
+  // #region agent log
+  fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+    body: JSON.stringify({
+      sessionId: '2228ee',
+      hypothesisId: 'H4',
+      location: 'server.js:persistRecord:pg-upsert',
+      message: 'postgres upsert after missing row',
+      data: { recordId: String(record.id || '') },
+      timestamp: Date.now()
+    })
+  }).catch(() => {});
+  // #endregion
+  return normalizeRecordRow(ins.rows[0]);
 }
 
 async function createPlannerRecord(record) {
+  const id = crypto.randomUUID();
   let createdRow = null;
   const wasabiWrote = await tryWasabiStateWrite('create-planner-record', async (data) => {
     const rows = ensureSnapshotTable(data, 'planner_records');
-    const numericIds = rows.map((r) => Number(r.id)).filter((n) => Number.isFinite(n));
-    const nextId = numericIds.length ? Math.max(...numericIds) + 1 : 1;
     const now = nowIso();
     createdRow = {
-      id: nextId,
+      id,
       record_date: cleanString(record.record_date),
       client: upperCleanString(record.client),
       city: upperCleanString(record.city),
@@ -4262,14 +4320,13 @@ async function createPlannerRecord(record) {
     };
     rows.push(createdRow);
   });
-  if (wasabiWrote && createdRow) {
-    return normalizeRecordRow(createdRow);
-  }
+  // Always persist to Postgres so Render/SQL paths (segments, scope, backups) see the same id as Wasabi.
   const result = await pool.query(
-    `INSERT INTO planner_records (record_date, client, city, street, jobsite, status, saved_by, data)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+    `INSERT INTO planner_records (id, record_date, client, city, street, jobsite, status, saved_by, data)
+     VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
      RETURNING *`,
     [
+      id,
       cleanString(record.record_date),
       upperCleanString(record.client),
       upperCleanString(record.city),
@@ -4280,6 +4337,20 @@ async function createPlannerRecord(record) {
       JSON.stringify(serializeRecordData(record))
     ]
   );
+  // #region agent log
+  fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+    body: JSON.stringify({
+      sessionId: '2228ee',
+      hypothesisId: 'H5',
+      location: 'server.js:createPlannerRecord',
+      message: 'planner record created',
+      data: { id, wasabiWrote: !!wasabiWrote },
+      timestamp: Date.now()
+    })
+  }).catch(() => {});
+  // #endregion
   return normalizeRecordRow(result.rows[0]);
 }
 
