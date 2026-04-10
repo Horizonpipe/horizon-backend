@@ -48,6 +48,30 @@ const DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID =
 const PORTAL_FOLDER_COPY_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_COPY_CONCURRENCY', 8, 1, 32);
 const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCURRENCY', 8, 1, 32);
 
+/**
+ * When the job has path grants, users with **no** matching `portal_path_grants` rows normally see an empty tree.
+ * If true (default): portal clients (`portalFilesAccessGranted`, not portal staff) with zero personal grants still
+ * list/read/write the full job — use `PORTAL_LENIENT_PATH_GRANTS=0` for strict default-deny for those users.
+ */
+function portalLenientPathGrantsEnabled() {
+  const raw = process.env.PORTAL_LENIENT_PATH_GRANTS;
+  if (raw === undefined || String(raw).trim() === '') return true;
+  const v = String(raw).trim().toLowerCase();
+  if (v === '0' || v === 'false' || v === 'no' || v === 'off') return false;
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
+
+/**
+ * @param {import('express').Request['user'] | null | undefined} user
+ * @param {Array<{ path_prefix: string, recursive: boolean, access_mode: string }>} userGrants
+ */
+function bypassPathGrantsForLenientPortalClient(user, userGrants) {
+  if (!portalLenientPathGrantsEnabled()) return false;
+  if (!user || user.portalFilesAccessGranted !== true) return false;
+  if (userCanManagePortalExtras(user)) return false;
+  return !userGrants.length;
+}
+
 function clampIntEnv(name, fallback, min, max) {
   const raw = Number(process.env[name]);
   if (!Number.isFinite(raw)) return fallback;
@@ -941,7 +965,9 @@ async function assertPortalPathRel(pool, user, clientId, jobId, relPath, require
   const anyGrants = await portalJobHasPathGrants(pool, clientId, jobId);
   if (!anyGrants) return true;
   const grants = await loadUserPathGrants(pool, clientId, jobId, user);
-  if (!grants.length) return false;
+  if (!grants.length) {
+    return bypassPathGrantsForLenientPortalClient(user, grants);
+  }
   const rp = normalizeRelPath(relPath);
   return grants.some(
     (g) => relPathMatchesGrant(rp, g.path_prefix, g.recursive) && grantModeAllows(g.access_mode, required)
@@ -1137,7 +1163,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
       let userGrants = null;
       if (jobHasPathGrants && !permEditorList) {
-        userGrants = await loadUserPathGrants(pool, clientId, jobId, req.user);
+        const loaded = await loadUserPathGrants(pool, clientId, jobId, req.user);
+        if (!bypassPathGrantsForLenientPortalClient(req.user, loaded)) {
+          userGrants = loaded;
+        }
       }
       const out = [];
       const keys = await listAllKeys(s3, bucket, prefix);
@@ -1178,10 +1207,45 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const jobHasPathGrantsTree = await portalJobHasPathGrants(pool, clientId, jobId);
       const permEditorTree =
         readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
+      /** @type {Array<{ path_prefix: string, recursive: boolean, access_mode: string }>} */
+      let treeUserGrants = [];
+      let appliedPathGrantFilter = false;
       if (jobHasPathGrantsTree && !permEditorTree) {
-        const userGrants = await loadUserPathGrants(pool, clientId, jobId, req.user);
-        tree = filterTreeByPathGrants(tree, userGrants, true);
+        treeUserGrants = await loadUserPathGrants(pool, clientId, jobId, req.user);
+        if (!bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) {
+          tree = filterTreeByPathGrants(tree, treeUserGrants, true);
+          appliedPathGrantFilter = true;
+        }
       }
+      // #region agent log
+      try {
+        const fc = (tree.files || []).length;
+        const dc = (tree.folders || []).length;
+        if (jobHasPathGrantsTree && !permEditorTree && fc + dc === 0) {
+          fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+            body: JSON.stringify({
+              sessionId: '2228ee',
+              hypothesisId: 'H5',
+              location: 'portal-files.routes.js:GET/tree',
+              message: 'empty tree after path grants',
+              data: {
+                lenient: portalLenientPathGrantsEnabled(),
+                bypass: bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants),
+                appliedPathGrantFilter,
+                userGrantCount: treeUserGrants.length,
+                clientId: String(clientId),
+                jobId: String(jobId)
+              },
+              timestamp: Date.now()
+            })
+          }).catch(() => {});
+        }
+      } catch (_) {
+        /* ignore */
+      }
+      // #endregion
       return res.json(tree);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
