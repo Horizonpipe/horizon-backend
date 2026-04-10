@@ -38,8 +38,11 @@ const { canManagePortalExtras } = require('./capabilities');
 const CATEGORIES = new Set(['videos', 'db3', 'pdf', 'photos']);
 const FOLDER_MARKER = '.hp-folder';
 const DATA_AUTO_SYNC_MODE = 'dataautosync';
+/** Client / non-employee AUTOSYNC accounts are pinned to this job folder (default 8). */
 const DATA_AUTO_SYNC_JOB_ID = String(process.env.DATA_AUTO_SYNC_CLIENT_JOB_ID || '8').trim() || '8';
-/** When no explicit jobId is provided, everyone (including portal admins) starts on this folder. */
+/** `roles.dataAutoSyncEmployee` users who are not portal admins are pinned to this folder (default 2). */
+const DATA_AUTO_SYNC_EMPLOYEE_JOB_ID = String(process.env.DATA_AUTO_SYNC_EMPLOYEE_JOB_ID || '2').trim() || '2';
+/** When no explicit jobId is provided, portal admins start on this folder. */
 const DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID =
   String(process.env.DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID || '8').trim() || '8';
 const PORTAL_FOLDER_COPY_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_COPY_CONCURRENCY', 8, 1, 32);
@@ -90,6 +93,11 @@ function userCanDataAutoSync(user) {
   return roles.dataAutoSyncEmployee === true;
 }
 
+/** AUTOSYNC line employee: `dataAutoSyncEmployee` role without portal-admin extras (folder 2 only). */
+function isDataAutoSyncLineEmployee(user) {
+  return userCanDataAutoSync(user) && !userIsPortalAdmin(user);
+}
+
 function pickUserDefaultClientId(user) {
   if (!user) return '';
   const scoped = Array.isArray(user.portalScopes) ? user.portalScopes : [];
@@ -116,8 +124,15 @@ function readPortalMode(req, source) {
 function resolvePortalScope(req, source, options = {}) {
   const mode = readPortalMode(req, source);
   const isDataAutoSync = mode === DATA_AUTO_SYNC_MODE;
-  if (isDataAutoSync && !userCanDataAutoSync(req?.user)) {
-    return { error: 'DataAutoSync employee access is not enabled for this account' };
+  if (isDataAutoSync) {
+    const u = req?.user;
+    const dasOk =
+      userCanDataAutoSync(u) ||
+      userIsPortalAdmin(u) ||
+      u?.portalFilesAccessGranted === true;
+    if (!dasOk) {
+      return { error: 'DataAutoSync access is not enabled for this account' };
+    }
   }
   const rawClient =
     source && typeof source === 'object'
@@ -133,7 +148,9 @@ function resolvePortalScope(req, source, options = {}) {
       ? rawJob
       : adminCanOverrideDataAutoSyncJob
         ? DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID
-        : DATA_AUTO_SYNC_JOB_ID
+        : isDataAutoSyncLineEmployee(req?.user)
+          ? DATA_AUTO_SYNC_EMPLOYEE_JOB_ID
+          : DATA_AUTO_SYNC_JOB_ID
     : rawJob;
   if (!clientId || (requireJob && !jobId)) {
     return { error: 'clientId and jobId are required' };
@@ -739,11 +756,44 @@ async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) 
   const c = String(clientId || '').trim();
   const j = String(jobId || '').trim();
   if (!c || !j) return false;
-  if (j === DATA_AUTO_SYNC_JOB_ID && !userCanDataAutoSync(user)) return false;
-  const allowClientWideDataAutoSync =
-    options.allowClientWideDataAutoSync !== false &&
-    j === DATA_AUTO_SYNC_JOB_ID &&
-    userCanDataAutoSync(user);
+
+  const optWide = options.allowClientWideDataAutoSync;
+  let allowClientWideDataAutoSync = false;
+  if (optWide === true) {
+    if (isDataAutoSyncLineEmployee(user)) {
+      allowClientWideDataAutoSync = j === DATA_AUTO_SYNC_EMPLOYEE_JOB_ID;
+    } else if (userCanDataAutoSync(user)) {
+      allowClientWideDataAutoSync = false;
+    } else {
+      allowClientWideDataAutoSync = j === DATA_AUTO_SYNC_JOB_ID;
+    }
+  } else if (optWide !== false) {
+    allowClientWideDataAutoSync =
+      userCanDataAutoSync(user) && j === DATA_AUTO_SYNC_JOB_ID && !isDataAutoSyncLineEmployee(user);
+  }
+
+  // #region agent log
+  if (optWide === true) {
+    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+      body: JSON.stringify({
+        sessionId: '2228ee',
+        hypothesisId: 'H3',
+        location: 'portal-files.routes.js:assertPortalJobAccess',
+        message: 'DAS allowClientWide',
+        data: {
+          j,
+          allowClientWideDataAutoSync,
+          lineEmp: isDataAutoSyncLineEmployee(user),
+          canDas: userCanDataAutoSync(user)
+        },
+        timestamp: Date.now()
+      })
+    }).catch(() => {});
+  }
+  // #endregion
+
   const scopeList = Array.isArray(user.portalScopes) ? user.portalScopes : [];
   if (scopeList.length) {
     if (
