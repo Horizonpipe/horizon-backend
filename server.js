@@ -290,6 +290,20 @@ const WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
   5000,
   Math.min(15 * 60 * 1000, Number(process.env.WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
 );
+/** Planner-only: PSR planner rows + per-user PSR scopes (`user_psr_scopes`) live only in Wasabi — not Postgres CRUD. */
+const _envPlannerStoreWasabiOnly =
+  String(process.env.WASABI_PLANNER_STORE_WASABI_ONLY || '0').trim().toLowerCase() === '1';
+/** Full app business data on Wasabi: planner + pricing + daily reports + jobsite assets (Postgres kept for auth/sessions/API checks). */
+const WASABI_APP_DATA_STORE_WASABI_ONLY =
+  String(process.env.WASABI_APP_DATA_STORE_WASABI_ONLY || '0').trim().toLowerCase() === '1';
+const PLANNER_STORE_WASABI_ONLY = _envPlannerStoreWasabiOnly || WASABI_APP_DATA_STORE_WASABI_ONLY;
+const WASABI_PLANNER_MIGRATE_FROM_POSTGRES_ON_BOOT =
+  String(process.env.WASABI_PLANNER_MIGRATE_FROM_POSTGRES_ON_BOOT || '0').trim().toLowerCase() === '1';
+const WASABI_APP_DATA_MIGRATE_FROM_POSTGRES_ON_BOOT =
+  String(process.env.WASABI_APP_DATA_MIGRATE_FROM_POSTGRES_ON_BOOT || '0').trim().toLowerCase() === '1';
+/** Boot one-shot: import Postgres app tables into snapshot (legacy planner flag OR explicit app-data flag). */
+const MIGRATE_APP_DATA_FROM_POSTGRES_ON_BOOT =
+  WASABI_APP_DATA_MIGRATE_FROM_POSTGRES_ON_BOOT || WASABI_PLANNER_MIGRATE_FROM_POSTGRES_ON_BOOT;
 const WASABI_AUTO_IMPORT_PRIMARY_ENABLED =
   WASABI_ALL_READS_PRIMARY_ENABLED ||
   WASABI_WRITES_PRIMARY_ENABLED ||
@@ -620,6 +634,8 @@ async function listSnapshotTables() {
     'planner_records',
     'planner_changes',
     'users',
+    'user_portal_scopes',
+    'user_psr_scopes',
     'sessions',
     'portal_path_grants',
     'portal_share_links',
@@ -654,6 +670,33 @@ async function listSnapshotTables() {
   }
 }
 
+function cloneSnapshotRows(rows) {
+  if (!Array.isArray(rows)) return [];
+  try {
+    return typeof globalThis.structuredClone === 'function'
+      ? globalThis.structuredClone(rows)
+      : JSON.parse(JSON.stringify(rows));
+  } catch {
+    return [...rows];
+  }
+}
+
+/** Tables whose canonical copy is Wasabi when in wasabi-only mode — never overwrite from (empty) Postgres during snapshot export. */
+function wasabiSnapshotTablesPreservedFromLatest() {
+  const set = new Set();
+  if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    set.add('planner_records');
+    set.add('pricing_rates');
+    set.add('daily_reports');
+    set.add('jobsite_assets');
+  }
+  if (PLANNER_STORE_WASABI_ONLY) {
+    set.add('planner_records');
+    set.add('user_psr_scopes');
+  }
+  return set;
+}
+
 async function runWasabiStateSnapshot() {
   if (!wasabiStateClient || !WASABI_STATE_BUCKET) return;
   if (wasabiStateSnapshotBusy) return;
@@ -661,8 +704,25 @@ async function runWasabiStateSnapshot() {
   wasabiStateLastRunAt = Date.now();
   try {
     const tables = await listSnapshotTables();
+    const preserveFromLatest = wasabiSnapshotTablesPreservedFromLatest();
+    let previousSnapshot = null;
+    if (preserveFromLatest.size > 0) {
+      try {
+        previousSnapshot = await loadWasabiLatestStateSnapshot(true);
+      } catch {
+        previousSnapshot = null;
+      }
+    }
     const data = {};
     for (const tableName of tables) {
+      if (preserveFromLatest.has(tableName)) {
+        const prevRows =
+          previousSnapshot && previousSnapshot.data && Array.isArray(previousSnapshot.data[tableName])
+            ? previousSnapshot.data[tableName]
+            : [];
+        data[tableName] = cloneSnapshotRows(prevRows);
+        continue;
+      }
       try {
         const q = await pool.query(`SELECT * FROM ${tableName}`);
         data[tableName] = q.rows;
@@ -725,6 +785,9 @@ function currentWasabiStateStatus() {
     excludedTables: Array.from(WASABI_STATE_EXCLUDE_TABLES),
     writesPrimaryEnabled: WASABI_WRITES_PRIMARY_ENABLED,
     writesPrimaryStrict: WASABI_WRITES_PRIMARY_STRICT,
+    plannerStoreWasabiOnly: PLANNER_STORE_WASABI_ONLY,
+    appDataStoreWasabiOnly: WASABI_APP_DATA_STORE_WASABI_ONLY,
+    migrateAppDataFromPostgresOnBoot: MIGRATE_APP_DATA_FROM_POSTGRES_ON_BOOT,
     allReadsPrimaryEnabled: WASABI_ALL_READS_PRIMARY_ENABLED,
     allReadsPrimaryStrict: WASABI_ALL_READS_PRIMARY_STRICT,
     authFallbackEnabled: WASABI_AUTH_FALLBACK_ENABLED,
@@ -1283,6 +1346,37 @@ function normalizePsrScopesPayload(value) {
   return [];
 }
 
+/** When planner/PSR is Wasabi-only, PSR scopes always come from the snapshot (never Postgres), using a forced reload. */
+async function mergePsrScopesFromWasabiWhenPlannerOnly(byUser, userIdList) {
+  if (!PLANNER_STORE_WASABI_ONLY) return;
+  const ids = new Set((userIdList || []).map((id) => String(id || '').trim()).filter(Boolean));
+  if (!ids.size) return;
+  for (const id of ids) {
+    const e = byUser.get(id);
+    if (e) e.psrScopes = [];
+  }
+  let snapshot = null;
+  try {
+    snapshot = await loadWasabiLatestStateSnapshot(true);
+  } catch {
+    snapshot = null;
+  }
+  for (const row of snapshotRows(snapshot, 'user_psr_scopes')) {
+    const key = String(row.user_id || '').trim();
+    if (!key || !byUser.has(key)) continue;
+    byUser.get(key).psrScopes.push({
+      recordId: cleanString(row.psr_record_id || '') || null,
+      client: String(row.client || ''),
+      city: String(row.city || ''),
+      jobsite: String(row.jobsite || '')
+    });
+  }
+  for (const id of ids) {
+    const e = byUser.get(id);
+    if (e) e.psrScopes = dedupePsrScopes(e.psrScopes);
+  }
+}
+
 async function readScopesForUserIds(userIds) {
   const ids = [...new Set((Array.isArray(userIds) ? userIds : []).map((id) => String(id || '').trim()).filter(Boolean))];
   const byUser = new Map();
@@ -1301,16 +1395,18 @@ async function readScopesForUserIds(userIds) {
         jobId: String(row.job_id || '')
       });
     }
-    const psrRows = snapshotRows(snapshot, 'user_psr_scopes');
-    for (const row of psrRows) {
-      const key = String(row.user_id || '').trim();
-      if (!key || !byUser.has(key)) continue;
-      byUser.get(key).psrScopes.push({
-        recordId: cleanString(row.psr_record_id || '') || null,
-        client: String(row.client || ''),
-        city: String(row.city || ''),
-        jobsite: String(row.jobsite || '')
-      });
+    if (!PLANNER_STORE_WASABI_ONLY) {
+      const psrRows = snapshotRows(snapshot, 'user_psr_scopes');
+      for (const row of psrRows) {
+        const key = String(row.user_id || '').trim();
+        if (!key || !byUser.has(key)) continue;
+        byUser.get(key).psrScopes.push({
+          recordId: cleanString(row.psr_record_id || '') || null,
+          client: String(row.client || ''),
+          city: String(row.city || ''),
+          jobsite: String(row.jobsite || '')
+        });
+      }
     }
     return byUser;
   }
@@ -1329,24 +1425,26 @@ async function readScopesForUserIds(userIds) {
       byUser.get(key).portalScopes.push({ clientId: String(row.client_id), jobId: String(row.job_id) });
     }
 
-    const psrRes = await pool.query(
-      `SELECT user_id::text AS user_id, client, city, jobsite, psr_record_id
-       FROM user_psr_scopes
-       WHERE user_id::text = ANY($1::text[])
-       ORDER BY client, city, jobsite`,
-      [ids]
-    );
-    for (const row of psrRes.rows) {
-      const key = String(row.user_id);
-      if (!byUser.has(key)) byUser.set(key, { portalScopes: [], psrScopes: [] });
-      byUser
-        .get(key)
-        .psrScopes.push({
-          recordId: cleanString(row.psr_record_id || '') || null,
-          client: String(row.client || ''),
-          city: String(row.city || ''),
-          jobsite: String(row.jobsite || '')
-        });
+    if (!PLANNER_STORE_WASABI_ONLY) {
+      const psrRes = await pool.query(
+        `SELECT user_id::text AS user_id, client, city, jobsite, psr_record_id
+         FROM user_psr_scopes
+         WHERE user_id::text = ANY($1::text[])
+         ORDER BY client, city, jobsite`,
+        [ids]
+      );
+      for (const row of psrRes.rows) {
+        const key = String(row.user_id);
+        if (!byUser.has(key)) byUser.set(key, { portalScopes: [], psrScopes: [] });
+        byUser
+          .get(key)
+          .psrScopes.push({
+            recordId: cleanString(row.psr_record_id || '') || null,
+            client: String(row.client || ''),
+            city: String(row.city || ''),
+            jobsite: String(row.jobsite || '')
+          });
+      }
     }
     return byUser;
   }
@@ -1354,14 +1452,22 @@ async function readScopesForUserIds(userIds) {
   if (WASABI_SCOPES_PRIMARY_ENABLED) {
     try {
       const snapshotResult = await fromSnapshot();
-      if (snapshotResult) return snapshotResult;
-      if (WASABI_SCOPES_PRIMARY_STRICT) return byUser;
+      if (snapshotResult) {
+        await mergePsrScopesFromWasabiWhenPlannerOnly(byUser, ids);
+        return byUser;
+      }
+      if (WASABI_SCOPES_PRIMARY_STRICT) {
+        await mergePsrScopesFromWasabiWhenPlannerOnly(byUser, ids);
+        return byUser;
+      }
     } catch (error) {
       if (WASABI_SCOPES_PRIMARY_STRICT) throw error;
     }
   }
 
-  return fromPostgres();
+  await fromPostgres();
+  await mergePsrScopesFromWasabiWhenPlannerOnly(byUser, ids);
+  return byUser;
 }
 
 async function attachScopesToUsers(users) {
@@ -1486,26 +1592,8 @@ function buildPermissionsTreesFromRows({ portalRows = [], portalPathRows = [], p
   return { portalTree, psrTree };
 }
 
-async function buildPermissionsTreesFromSnapshot() {
-  const snapshot = await loadWasabiLatestStateSnapshot();
-  if (!snapshotLooksFresh(snapshot, WASABI_PERMISSIONS_TREE_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
-  const users = snapshotRows(snapshot, 'users');
-  const userPortalScopes = snapshotRows(snapshot, 'user_portal_scopes');
-  const portalPathGrants = snapshotRows(snapshot, 'portal_path_grants');
-  const plannerRecords = snapshotRows(snapshot, 'planner_records');
-
-  const scopeSet = new Map();
-  const addScope = (clientIdValue, jobIdValue) => {
-    const clientId = String(clientIdValue || '').trim();
-    const jobId = String(jobIdValue || '').trim();
-    if (!clientId || !jobId) return;
-    scopeSet.set(`${clientId}|||${jobId}`, { client_id: clientId, job_id: jobId });
-  };
-
-  for (const row of userPortalScopes) addScope(row.client_id, row.job_id);
-  for (const row of users) addScope(row.portal_files_client_id, row.portal_files_job_id);
-  for (const row of portalPathGrants) addScope(row.client_id, row.job_id);
-
+/** Match portal scope pairs to planner rows for admin tree labels (client/city/jobsite display). */
+function attachPlannerLabelsToScopeRows(scopePairRows, plannerRecords) {
   const plannerByClient = new Map();
   for (const row of plannerRecords) {
     const client = String(row.client || '').trim().toLowerCase();
@@ -1515,7 +1603,7 @@ async function buildPermissionsTreesFromSnapshot() {
   }
 
   const portalRows = [];
-  for (const row of scopeSet.values()) {
+  for (const row of scopePairRows) {
     const c = String(row.client_id || '').trim();
     const j = String(row.job_id || '').trim();
     const candidates = plannerByClient.get(c.toLowerCase()) || [];
@@ -1542,6 +1630,30 @@ async function buildPermissionsTreesFromSnapshot() {
       label_jobsite: best ? best.jobsite : j
     });
   }
+  return portalRows;
+}
+
+async function buildPermissionsTreesFromSnapshot() {
+  const snapshot = await loadWasabiLatestStateSnapshot();
+  if (!snapshotLooksFresh(snapshot, WASABI_PERMISSIONS_TREE_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  const users = snapshotRows(snapshot, 'users');
+  const userPortalScopes = snapshotRows(snapshot, 'user_portal_scopes');
+  const portalPathGrants = snapshotRows(snapshot, 'portal_path_grants');
+  const plannerRecords = snapshotRows(snapshot, 'planner_records');
+
+  const scopeSet = new Map();
+  const addScope = (clientIdValue, jobIdValue) => {
+    const clientId = String(clientIdValue || '').trim();
+    const jobId = String(jobIdValue || '').trim();
+    if (!clientId || !jobId) return;
+    scopeSet.set(`${clientId}|||${jobId}`, { client_id: clientId, job_id: jobId });
+  };
+
+  for (const row of userPortalScopes) addScope(row.client_id, row.job_id);
+  for (const row of users) addScope(row.portal_files_client_id, row.portal_files_job_id);
+  for (const row of portalPathGrants) addScope(row.client_id, row.job_id);
+
+  const portalRows = attachPlannerLabelsToScopeRows([...scopeSet.values()], plannerRecords);
 
   const psrRows = plannerRecords
     .map((row) => ({
@@ -1580,13 +1692,8 @@ async function readLoginUserFromWasabiSnapshot(submittedUsername) {
   return users.find((row) => snapshotUserMatchesLogin(row, submittedUsername)) || null;
 }
 
-async function readRecordsFromWasabiSnapshotForUser(user) {
-  const snapshot = await loadWasabiLatestStateSnapshot();
-  if (!snapshotLooksFresh(snapshot, WASABI_RECORDS_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
-  const rows = snapshotRows(snapshot, 'planner_records');
-  const normalized = rows.map((row) => normalizeRecordRow(row));
-  const filtered = normalized.filter((record) => userCanAccessPsrScope(user, record));
-  filtered.sort((a, b) => {
+function sortPlannerRecordsForList(records) {
+  return [...records].sort((a, b) => {
     const c = String(a.client || '').localeCompare(String(b.client || ''), undefined, { sensitivity: 'base' });
     if (c !== 0) return c;
     const d = String(a.city || '').localeCompare(String(b.city || ''), undefined, { sensitivity: 'base' });
@@ -1599,7 +1706,215 @@ async function readRecordsFromWasabiSnapshotForUser(user) {
     const bu = Date.parse(String(b.updated_at || '')) || 0;
     return bu - au;
   });
-  return filtered;
+}
+
+/** Merge Wasabi + Postgres planner rows by id so refresh never hides data that exists in only one store. */
+function mergePlannerRecordsById(wasabiRecords, postgresRecords) {
+  const map = new Map();
+  const put = (rec) => {
+    const id = String(rec?.id || '').trim();
+    if (!id) return;
+    const prev = map.get(id);
+    if (!prev) {
+      map.set(id, rec);
+      return;
+    }
+    const ta = Date.parse(String(rec.updated_at || rec.created_at || '')) || 0;
+    const tb = Date.parse(String(prev.updated_at || prev.created_at || '')) || 0;
+    map.set(id, ta >= tb ? rec : prev);
+  };
+  (wasabiRecords || []).forEach(put);
+  (postgresRecords || []).forEach(put);
+  return [...map.values()];
+}
+
+function plannerRowToSnapshotShape(row) {
+  const dataRaw = row.data;
+  const dataObj =
+    dataRaw && typeof dataRaw === 'object' && !Array.isArray(dataRaw)
+      ? dataRaw
+      : parseJsonObject(dataRaw, {});
+  return {
+    id: row.id,
+    record_date: row.record_date,
+    client: row.client,
+    city: row.city,
+    street: row.street,
+    jobsite: row.jobsite,
+    status: row.status || '',
+    saved_by: row.saved_by || '',
+    data: dataObj,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+function pricingRowToSnapshotShape(row) {
+  return {
+    dia: upperCleanString(row.dia || ''),
+    rate: Number(row.rate),
+    updated_at: row.updated_at || nowIso()
+  };
+}
+
+function dailyReportRowToSnapshotShape(row) {
+  return {
+    id: row.id,
+    title: cleanString(row.title || ''),
+    report_date: row.report_date,
+    notes: cleanString(row.notes || ''),
+    files: Array.isArray(row.files) ? row.files : parseJsonObject(row.files, []),
+    created_by: cleanString(row.created_by || ''),
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+function jobsiteAssetRowToSnapshotShape(row) {
+  return {
+    id: row.id,
+    client: row.client,
+    city: row.city,
+    jobsite: row.jobsite,
+    contact_name: cleanString(row.contact_name || ''),
+    contact_phone: cleanString(row.contact_phone || ''),
+    contact_email: cleanString(row.contact_email || ''),
+    notes: cleanString(row.notes || ''),
+    drive_url: cleanString(row.drive_url || ''),
+    files: Array.isArray(row.files) ? row.files : parseJsonObject(row.files, []),
+    created_by: cleanString(row.created_by || ''),
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+function userPsrScopeMergeKey(row) {
+  const uid = String(row.user_id || '').trim();
+  const client = String(row.client || '').trim().toLowerCase();
+  const city = String(row.city || '').trim().toLowerCase();
+  const jobsite = String(row.jobsite || '').trim().toLowerCase();
+  return `${uid}|||${client}|||${city}|||${jobsite}`;
+}
+
+function userPsrScopeRowToSnapshotShape(row) {
+  return {
+    user_id: String(row.user_id || '').trim(),
+    client: String(row.client || '').trim(),
+    city: String(row.city || '').trim(),
+    jobsite: String(row.jobsite || '').trim(),
+    psr_record_id: cleanString(row.psr_record_id || '') || null,
+    created_at: row.created_at
+  };
+}
+
+/** Merge Postgres business tables into Wasabi snapshot (Postgres row wins on duplicate key). Requires Wasabi write primary. */
+async function migrateAppDataFromPostgresToWasabi() {
+  const [plannerPg, pricingPg, reportsPg, assetsPg, psrPg] = await Promise.all([
+    pool.query('SELECT * FROM planner_records'),
+    pool.query('SELECT * FROM pricing_rates'),
+    pool.query('SELECT * FROM daily_reports'),
+    pool.query('SELECT * FROM jobsite_assets'),
+    pool.query('SELECT * FROM user_psr_scopes')
+  ]);
+  await runWasabiStateWrite('migrate-app-data-pg-to-wasabi', async (data) => {
+    const pRows = plannerPg.rows;
+    const pBy = new Map();
+    for (const r of ensureSnapshotTable(data, 'planner_records')) {
+      pBy.set(String(r.id), r);
+    }
+    for (const row of pRows) {
+      pBy.set(String(row.id), plannerRowToSnapshotShape(row));
+    }
+    data.planner_records = [...pBy.values()];
+
+    const prBy = new Map();
+    for (const r of ensureSnapshotTable(data, 'pricing_rates')) {
+      prBy.set(String(r.dia || '').trim().toUpperCase(), r);
+    }
+    for (const row of pricingPg.rows) {
+      const snap = pricingRowToSnapshotShape(row);
+      prBy.set(String(snap.dia || '').trim().toUpperCase(), snap);
+    }
+    data.pricing_rates = [...prBy.values()];
+
+    const repBy = new Map();
+    for (const r of ensureSnapshotTable(data, 'daily_reports')) {
+      repBy.set(String(r.id), r);
+    }
+    for (const row of reportsPg.rows) {
+      repBy.set(String(row.id), dailyReportRowToSnapshotShape(row));
+    }
+    data.daily_reports = [...repBy.values()];
+
+    const aBy = new Map();
+    for (const r of ensureSnapshotTable(data, 'jobsite_assets')) {
+      aBy.set(String(r.id), r);
+    }
+    for (const row of assetsPg.rows) {
+      aBy.set(String(row.id), jobsiteAssetRowToSnapshotShape(row));
+    }
+    data.jobsite_assets = [...aBy.values()];
+
+    const upsBy = new Map();
+    for (const r of ensureSnapshotTable(data, 'user_psr_scopes')) {
+      upsBy.set(userPsrScopeMergeKey(r), userPsrScopeRowToSnapshotShape(r));
+    }
+    for (const row of psrPg.rows) {
+      upsBy.set(userPsrScopeMergeKey(row), userPsrScopeRowToSnapshotShape(row));
+    }
+    data.user_psr_scopes = [...upsBy.values()];
+  });
+  return {
+    planner_records: plannerPg.rows.length,
+    pricing_rates: pricingPg.rows.length,
+    daily_reports: reportsPg.rows.length,
+    jobsite_assets: assetsPg.rows.length,
+    user_psr_scopes: psrPg.rows.length
+  };
+}
+
+async function getTableSyncMetaFromWasabi(tableName) {
+  try {
+    const snapshot = await loadWasabiLatestStateSnapshot();
+    const rows = snapshotRows(snapshot, tableName);
+    let best = 0;
+    let bestIso = new Date(0).toISOString();
+    for (const r of rows) {
+      const u = Date.parse(String(r.updated_at || r.created_at || '')) || 0;
+      if (u >= best) {
+        best = u;
+        bestIso = String(r.updated_at || r.created_at || bestIso);
+      }
+    }
+    return { count: rows.length, updated_at: best ? bestIso : new Date(0).toISOString() };
+  } catch {
+    return { count: 0, updated_at: new Date(0).toISOString() };
+  }
+}
+
+async function getPlannerRecordsSyncMetaFromWasabi() {
+  return getTableSyncMetaFromWasabi('planner_records');
+}
+
+async function readPlannerRecordsFromPostgresForUser(user) {
+  const scopeFilter = buildPsrScopeWhere(user);
+  const result = await pool.query(
+    `SELECT id, record_date, client, city, street, jobsite, status, saved_by, data, created_at, updated_at
+     FROM planner_records
+     WHERE ${scopeFilter.clause}
+     ORDER BY LOWER(client), LOWER(city), LOWER(jobsite), record_date DESC, updated_at DESC`,
+    scopeFilter.params
+  );
+  return result.rows.map(normalizeRecordRow);
+}
+
+async function readRecordsFromWasabiSnapshotForUser(user) {
+  const snapshot = await loadWasabiLatestStateSnapshot();
+  // Same as record-by-id: do not drop the whole list when snapshot age exceeds threshold — merge with Postgres covers drift.
+  if (!snapshot || !snapshot.data) return [];
+  const rows = snapshotRows(snapshot, 'planner_records');
+  const normalized = rows.map((row) => normalizeRecordRow(row));
+  return normalized.filter((record) => userCanAccessPsrScope(user, record));
 }
 
 async function fetchRecordByIdFromWasabiSnapshot(id) {
@@ -1615,7 +1930,13 @@ async function fetchRecordByIdFromWasabiSnapshot(id) {
 
 async function readPricingRatesFromWasabiSnapshot() {
   const snapshot = await loadWasabiLatestStateSnapshot();
-  if (!snapshotLooksFresh(snapshot, WASABI_PRICING_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  if (
+    !WASABI_APP_DATA_STORE_WASABI_ONLY &&
+    !snapshotLooksFresh(snapshot, WASABI_PRICING_PRIMARY_MAX_SNAPSHOT_AGE_MS)
+  ) {
+    return null;
+  }
+  if (!snapshot?.data) return WASABI_APP_DATA_STORE_WASABI_ONLY ? [] : null;
   const rows = snapshotRows(snapshot, 'pricing_rates')
     .map((row) => ({
       dia: upperCleanString(row.dia || ''),
@@ -1629,7 +1950,13 @@ async function readPricingRatesFromWasabiSnapshot() {
 
 async function readDailyReportsFromWasabiSnapshot() {
   const snapshot = await loadWasabiLatestStateSnapshot();
-  if (!snapshotLooksFresh(snapshot, WASABI_REPORTS_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  if (
+    !WASABI_APP_DATA_STORE_WASABI_ONLY &&
+    !snapshotLooksFresh(snapshot, WASABI_REPORTS_PRIMARY_MAX_SNAPSHOT_AGE_MS)
+  ) {
+    return null;
+  }
+  if (!snapshot?.data) return WASABI_APP_DATA_STORE_WASABI_ONLY ? [] : null;
   const rows = snapshotRows(snapshot, 'daily_reports')
     .map((row) => ({
       ...row,
@@ -1647,7 +1974,7 @@ async function readDailyReportsFromWasabiSnapshot() {
 
 async function readDailyReportByIdFromWasabiSnapshot(id) {
   const reports = await readDailyReportsFromWasabiSnapshot();
-  if (!reports) return null;
+  if (reports == null) return null;
   return reports.find((row) => String(row.id || '') === String(id || '')) || null;
 }
 
@@ -1679,6 +2006,11 @@ async function upsertPricingRate(dia, rate) {
     out = next;
   });
   if (wrote && out) return out;
+  if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    throw new Error(
+      'Pricing is stored only in Wasabi; write failed. Verify WASABI_WRITES_PRIMARY_ENABLED=1 and Wasabi bucket configuration.'
+    );
+  }
   const result = await pool.query(
     `INSERT INTO pricing_rates (dia, rate, updated_at)
      VALUES ($1, $2, NOW())
@@ -1702,6 +2034,9 @@ async function deletePricingRate(dia) {
     });
   });
   if (wrote) return deletedDia;
+  if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    return null;
+  }
   const result = await pool.query('DELETE FROM pricing_rates WHERE dia = $1 RETURNING dia', [dia]);
   return result.rows.length ? result.rows[0].dia : null;
 }
@@ -1711,8 +2046,9 @@ async function createDailyReport(reportInput) {
   const wrote = await tryWasabiStateWrite('create-daily-report', async (data) => {
     const rows = ensureSnapshotTable(data, 'daily_reports');
     const now = nowIso();
+    const newId = WASABI_APP_DATA_STORE_WASABI_ONLY ? crypto.randomUUID() : nextNumericId(rows);
     created = {
-      id: nextNumericId(rows),
+      id: newId,
       title: cleanString(reportInput.title),
       report_date: cleanString(reportInput.report_date || new Date().toISOString().slice(0, 10)),
       notes: cleanString(reportInput.notes),
@@ -1724,6 +2060,11 @@ async function createDailyReport(reportInput) {
     rows.push(created);
   });
   if (wrote && created) return created;
+  if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    throw new Error(
+      'Daily reports are stored only in Wasabi; create failed. Verify WASABI_WRITES_PRIMARY_ENABLED=1 and Wasabi bucket configuration.'
+    );
+  }
   const result = await pool.query(
     `INSERT INTO daily_reports (title, report_date, notes, files, created_by)
      VALUES ($1, $2, $3, $4::jsonb, $5)
@@ -1756,6 +2097,11 @@ async function updateDailyReportById(id, patch) {
     rows[idx] = updated;
   });
   if (wrote && updated) return updated;
+  if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    throw new Error(
+      'Daily reports are stored only in Wasabi; update failed. Verify WASABI_WRITES_PRIMARY_ENABLED=1 and Wasabi bucket configuration.'
+    );
+  }
   const result = await pool.query(
     `UPDATE daily_reports
      SET title = $1,
@@ -1780,6 +2126,11 @@ async function deleteDailyReportById(id) {
     data.daily_reports = next;
   });
   if (wrote) return deleted;
+  if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    throw new Error(
+      'Daily reports are stored only in Wasabi; delete failed. Verify WASABI_WRITES_PRIMARY_ENABLED=1 and Wasabi bucket configuration.'
+    );
+  }
   const result = await pool.query('DELETE FROM daily_reports WHERE id = $1 RETURNING id', [id]);
   return result.rows.length > 0;
 }
@@ -1789,8 +2140,9 @@ async function createJobsiteAsset(assetInput) {
   const wrote = await tryWasabiStateWrite('create-jobsite-asset', async (data) => {
     const rows = ensureSnapshotTable(data, 'jobsite_assets');
     const now = nowIso();
+    const newId = WASABI_APP_DATA_STORE_WASABI_ONLY ? crypto.randomUUID() : nextNumericId(rows);
     created = {
-      id: nextNumericId(rows),
+      id: newId,
       client: upperCleanString(assetInput.client),
       city: upperCleanString(assetInput.city),
       jobsite: normalizeJobsiteName(assetInput.jobsite),
@@ -1807,6 +2159,11 @@ async function createJobsiteAsset(assetInput) {
     rows.push(created);
   });
   if (wrote && created) return created;
+  if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    throw new Error(
+      'Jobsite assets are stored only in Wasabi; create failed. Verify WASABI_WRITES_PRIMARY_ENABLED=1 and Wasabi bucket configuration.'
+    );
+  }
   const result = await pool.query(
     `INSERT INTO jobsite_assets
      (client, city, jobsite, contact_name, contact_phone, contact_email, notes, drive_url, files, created_by)
@@ -1837,6 +2194,11 @@ async function deleteJobsiteAssetById(id) {
     data.jobsite_assets = next;
   });
   if (wrote) return deleted;
+  if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    throw new Error(
+      'Jobsite assets are stored only in Wasabi; delete failed. Verify WASABI_WRITES_PRIMARY_ENABLED=1 and Wasabi bucket configuration.'
+    );
+  }
   const result = await pool.query('DELETE FROM jobsite_assets WHERE id = $1 RETURNING id', [id]);
   return result.rows.length > 0;
 }
@@ -1851,13 +2213,24 @@ async function deleteJobsiteAssetsByClient(client) {
     data.jobsite_assets = next;
   });
   if (wrote) return deletedCount;
+  if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    throw new Error(
+      'Jobsite assets are stored only in Wasabi; bulk delete failed. Verify WASABI_WRITES_PRIMARY_ENABLED=1 and Wasabi bucket configuration.'
+    );
+  }
   const result = await pool.query('DELETE FROM jobsite_assets WHERE client = $1 RETURNING id', [client]);
   return Number(result.rowCount || 0);
 }
 
 async function readJobsiteAssetsFromWasabiSnapshotForUser(user) {
   const snapshot = await loadWasabiLatestStateSnapshot();
-  if (!snapshotLooksFresh(snapshot, WASABI_ASSETS_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  if (
+    !WASABI_APP_DATA_STORE_WASABI_ONLY &&
+    !snapshotLooksFresh(snapshot, WASABI_ASSETS_PRIMARY_MAX_SNAPSHOT_AGE_MS)
+  ) {
+    return null;
+  }
+  if (!snapshot?.data) return WASABI_APP_DATA_STORE_WASABI_ONLY ? [] : null;
   const rows = snapshotRows(snapshot, 'jobsite_assets')
     .map((row) => ({
       ...row,
@@ -1899,6 +2272,7 @@ async function readSyncStateFromWasabiSnapshot() {
     pricing: summarizeRowsForSyncState(snapshotRows(snapshot, 'pricing_rates')),
     reports: summarizeRowsForSyncState(snapshotRows(snapshot, 'daily_reports')),
     assets: summarizeRowsForSyncState(snapshotRows(snapshot, 'jobsite_assets')),
+    psr_scopes: summarizeRowsForSyncState(snapshotRows(snapshot, 'user_psr_scopes')),
     users: summarizeRowsForSyncState(snapshotRows(snapshot, 'users')),
     emails: summarizeRowsForSyncState(snapshotRows(snapshot, 'user_outlook_tokens'))
   };
@@ -1951,7 +2325,13 @@ function sortRecordsByUpdatedDesc(records) {
 
 async function findPlannerRecordsByScopeFromWasabiSnapshot(client, city, jobsite) {
   const snapshot = await loadWasabiLatestStateSnapshot();
-  if (!snapshotLooksFresh(snapshot, WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_MAX_SNAPSHOT_AGE_MS)) return null;
+  if (!snapshot || !snapshot.data) return PLANNER_STORE_WASABI_ONLY ? [] : null;
+  if (
+    !PLANNER_STORE_WASABI_ONLY &&
+    !snapshotLooksFresh(snapshot, WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_MAX_SNAPSHOT_AGE_MS)
+  ) {
+    return null;
+  }
   const rows = snapshotRows(snapshot, 'planner_records');
   const matched = rows.filter((row) => plannerScopeMatch(row, client, city, jobsite)).map((row) => normalizeRecordRow(row));
   return sortRecordsByUpdatedDesc(matched);
@@ -1959,15 +2339,17 @@ async function findPlannerRecordsByScopeFromWasabiSnapshot(client, city, jobsite
 
 async function findPlannerRecordsByScope(client, city, jobsite, options = {}) {
   const latestOnly = options && options.latestOnly === true;
-  if (WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_ENABLED) {
+  const preferWasabiForScope = PLANNER_STORE_WASABI_ONLY || WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_ENABLED;
+  if (preferWasabiForScope) {
     try {
       const snapshotRecords = await findPlannerRecordsByScopeFromWasabiSnapshot(client, city, jobsite);
-      if (snapshotRecords) return latestOnly ? snapshotRecords.slice(0, 1) : snapshotRecords;
-      if (WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_STRICT) return [];
+      if (snapshotRecords !== null) return latestOnly ? snapshotRecords.slice(0, 1) : snapshotRecords;
+      if (WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_STRICT && !PLANNER_STORE_WASABI_ONLY) return [];
     } catch (error) {
-      if (WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_STRICT) throw error;
+      if (WASABI_PLANNER_SCOPE_LOOKUP_PRIMARY_STRICT && !PLANNER_STORE_WASABI_ONLY) throw error;
     }
   }
+  if (PLANNER_STORE_WASABI_ONLY) return [];
   const sql = latestOnly
     ? `SELECT * FROM planner_records
        WHERE LOWER(client) = LOWER($1)
@@ -3234,6 +3616,44 @@ app.post('/admin/wasabi-sync-now', requireAuth, requireAdmin, async (req, res) =
   }
 });
 
+app.post('/admin/planner-migrate-postgres-to-wasabi', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    if (!WASABI_WRITES_PRIMARY_ENABLED) {
+      return res.status(400).json({
+        success: false,
+        error: 'Set WASABI_WRITES_PRIMARY_ENABLED=1 so the snapshot can be updated.'
+      });
+    }
+    if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+      return res.status(400).json({ success: false, error: 'Wasabi state bucket is not configured.' });
+    }
+    const result = await migrateAppDataFromPostgresToWasabi();
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('APP DATA MIGRATE ERROR:', error);
+    res.status(500).json({ success: false, error: error.message || String(error) });
+  }
+});
+
+app.post('/admin/app-data-migrate-postgres-to-wasabi', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    if (!WASABI_WRITES_PRIMARY_ENABLED) {
+      return res.status(400).json({
+        success: false,
+        error: 'Set WASABI_WRITES_PRIMARY_ENABLED=1 so the snapshot can be updated.'
+      });
+    }
+    if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+      return res.status(400).json({ success: false, error: 'Wasabi state bucket is not configured.' });
+    }
+    const result = await migrateAppDataFromPostgresToWasabi();
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('APP DATA MIGRATE ERROR:', error);
+    res.status(500).json({ success: false, error: error.message || String(error) });
+  }
+});
+
 app.get('/sync-state', requireAuth, async (req, res) => {
   try {
     if (WASABI_SYNC_STATE_PRIMARY_ENABLED) {
@@ -3249,6 +3669,7 @@ app.get('/sync-state', requireAuth, async (req, res) => {
             pricing: { count: 0, updated_at: new Date(0).toISOString() },
             reports: { count: 0, updated_at: new Date(0).toISOString() },
             assets: { count: 0, updated_at: new Date(0).toISOString() },
+            psr_scopes: { count: 0, updated_at: new Date(0).toISOString() },
             users: { count: 0, updated_at: new Date(0).toISOString() },
             emails: { count: 0, updated_at: new Date(0).toISOString() }
           };
@@ -3260,15 +3681,49 @@ app.get('/sync-state', requireAuth, async (req, res) => {
       }
     }
 
-    const [records, pricing, reports, assets, users, emails] = await Promise.all([
-      pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM planner_records`),
-      pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM pricing_rates`),
-      pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM daily_reports`),
-      pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM jobsite_assets`),
+    const recordsMetaPromise = PLANNER_STORE_WASABI_ONLY
+      ? getPlannerRecordsSyncMetaFromWasabi().then((m) => ({ rows: [m] }))
+      : pool.query(
+          `SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM planner_records`
+        );
+    const pricingMetaPromise = WASABI_APP_DATA_STORE_WASABI_ONLY
+      ? getTableSyncMetaFromWasabi('pricing_rates').then((m) => ({ rows: [m] }))
+      : pool.query(
+          `SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM pricing_rates`
+        );
+    const reportsMetaPromise = WASABI_APP_DATA_STORE_WASABI_ONLY
+      ? getTableSyncMetaFromWasabi('daily_reports').then((m) => ({ rows: [m] }))
+      : pool.query(
+          `SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM daily_reports`
+        );
+    const assetsMetaPromise = WASABI_APP_DATA_STORE_WASABI_ONLY
+      ? getTableSyncMetaFromWasabi('jobsite_assets').then((m) => ({ rows: [m] }))
+      : pool.query(
+          `SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM jobsite_assets`
+        );
+    const psrScopesMetaPromise = PLANNER_STORE_WASABI_ONLY
+      ? getTableSyncMetaFromWasabi('user_psr_scopes').then((m) => ({ rows: [m] }))
+      : pool.query(
+          `SELECT COUNT(*)::int AS count, COALESCE(MAX(created_at), TO_TIMESTAMP(0)) AS updated_at FROM user_psr_scopes`
+        );
+    const [records, pricing, reports, assets, psr_scopes, users, emails] = await Promise.all([
+      recordsMetaPromise,
+      pricingMetaPromise,
+      reportsMetaPromise,
+      assetsMetaPromise,
+      psrScopesMetaPromise,
       pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM users`),
       pool.query(`SELECT COUNT(*)::int AS count, COALESCE(MAX(updated_at), TO_TIMESTAMP(0)) AS updated_at FROM user_outlook_tokens`)
     ]);
-    const payload = { records: records.rows[0], pricing: pricing.rows[0], reports: reports.rows[0], assets: assets.rows[0], users: users.rows[0], emails: emails.rows[0] };
+    const payload = {
+      records: records.rows[0],
+      pricing: pricing.rows[0],
+      reports: reports.rows[0],
+      assets: assets.rows[0],
+      psr_scopes: psr_scopes.rows[0],
+      users: users.rows[0],
+      emails: emails.rows[0]
+    };
     const signature = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
     res.json({ success: true, signature, state: payload });
   } catch (error) {
@@ -3306,7 +3761,66 @@ app.get('/users', requireAuth, async (req, res) => {
 
 app.get('/permissions/tree', requireAuth, requireAdminPanelAccess, async (req, res) => {
   try {
-    /** Same as GET /users: tree drives checkboxes — always build from live Postgres state. */
+    /**
+     * Portal scopes and path grants stay live from Postgres.
+     * When planner canonical data is Wasabi-only, job labels and PSR tree come from the snapshot — not `planner_records` in Postgres.
+     */
+    const portalPathGrantsSql = `SELECT client_id, job_id, path_prefix
+         FROM portal_path_grants
+         WHERE client_id IS NOT NULL AND BTRIM(client_id) <> ''
+           AND job_id IS NOT NULL AND BTRIM(job_id) <> ''
+         ORDER BY client_id, job_id, path_prefix`;
+
+    if (PLANNER_STORE_WASABI_ONLY) {
+      const scopePairsSql = `WITH scope_pairs AS (
+           SELECT client_id, job_id FROM user_portal_scopes
+           UNION
+           SELECT portal_files_client_id AS client_id, portal_files_job_id AS job_id
+           FROM users
+           WHERE portal_files_client_id IS NOT NULL
+             AND BTRIM(portal_files_client_id) <> ''
+             AND portal_files_job_id IS NOT NULL
+             AND BTRIM(portal_files_job_id) <> ''
+           UNION
+           SELECT client_id, job_id FROM portal_path_grants
+         ),
+         scope_pairs_clean AS (
+           SELECT DISTINCT BTRIM(client_id) AS client_id, BTRIM(job_id) AS job_id
+           FROM scope_pairs
+           WHERE client_id IS NOT NULL AND BTRIM(client_id) <> ''
+             AND job_id IS NOT NULL AND BTRIM(job_id) <> ''
+         )
+         SELECT client_id, job_id
+         FROM scope_pairs_clean
+         ORDER BY client_id, job_id`;
+      const [scopePairsRes, portalPathRows] = await Promise.all([
+        pool.query(scopePairsSql),
+        pool.query(portalPathGrantsSql)
+      ]);
+      const snapshot = await loadWasabiLatestStateSnapshot(true);
+      const plannerRecords = snapshotRows(snapshot, 'planner_records');
+      const portalRows = attachPlannerLabelsToScopeRows(scopePairsRes.rows, plannerRecords);
+      const psrRows = plannerRecords
+        .map((row) => ({
+          id: row.id,
+          client: row.client,
+          city: row.city,
+          jobsite: row.jobsite
+        }))
+        .filter(
+          (row) =>
+            String(row.client || '').trim() &&
+            String(row.city || '').trim() &&
+            String(row.jobsite || '').trim()
+        );
+      const trees = buildPermissionsTreesFromRows({
+        portalRows,
+        portalPathRows: portalPathRows.rows,
+        psrRows
+      });
+      return res.json({ success: true, ...trees });
+    }
+
     const [portalRows, portalPathRows, psrRows] = await Promise.all([
       pool.query(
         `WITH scope_pairs AS (
@@ -3347,13 +3861,7 @@ app.get('/permissions/tree', requireAuth, requireAdminPanelAccess, async (req, r
          FROM job_labels
          ORDER BY COALESCE(label_client, client_id), COALESCE(label_city, 'ZZZ'), COALESCE(label_jobsite, job_id)`
       ),
-      pool.query(
-        `SELECT client_id, job_id, path_prefix
-         FROM portal_path_grants
-         WHERE client_id IS NOT NULL AND BTRIM(client_id) <> ''
-           AND job_id IS NOT NULL AND BTRIM(job_id) <> ''
-         ORDER BY client_id, job_id, path_prefix`
-      ),
+      pool.query(portalPathGrantsSql),
       pool.query(
         `SELECT DISTINCT id, client, city, jobsite
          FROM planner_records
@@ -3818,6 +4326,14 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
       nextPortalFilesJobId = null;
     }
 
+    if (hasPsrScopesPayload && PLANNER_STORE_WASABI_ONLY && !WASABI_WRITES_PRIMARY_ENABLED) {
+      return res.status(503).json({
+        success: false,
+        error:
+          'PSR scopes are stored only in Wasabi when WASABI_PLANNER_STORE_WASABI_ONLY or WASABI_APP_DATA_STORE_WASABI_ONLY is set. Enable WASABI_WRITES_PRIMARY_ENABLED=1 to save them.'
+      });
+    }
+
     const passwordHash = password ? await bcrypt.hash(password, 10) : null;
 
     /**
@@ -3872,7 +4388,7 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
         }
       }
 
-      if (hasPsrScopesPayload) {
+      if (hasPsrScopesPayload && !PLANNER_STORE_WASABI_ONLY) {
         await pool.query('DELETE FROM user_psr_scopes WHERE user_id = $1', [String(id)]);
         for (const scope of nextPsrScopes) {
           await pool.query(
@@ -4062,30 +4578,31 @@ app.delete('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) 
 
 app.get('/records', requireAuth, requirePsrViewerAccess, async (req, res) => {
   try {
-    if (WASABI_RECORDS_PRIMARY_ENABLED) {
+    if (PLANNER_STORE_WASABI_ONLY) {
+      let snapshotRecords = [];
       try {
-        const snapshotRecords = await readRecordsFromWasabiSnapshotForUser(req.user);
-        if (snapshotRecords) {
-          return res.json({ success: true, records: snapshotRecords });
-        }
-        if (WASABI_RECORDS_PRIMARY_STRICT) {
-          return res.json({ success: true, records: [] });
-        }
+        snapshotRecords = await readRecordsFromWasabiSnapshotForUser(req.user);
       } catch (error) {
         if (WASABI_RECORDS_PRIMARY_STRICT) throw error;
       }
+      return res.json({ success: true, records: sortPlannerRecordsForList(snapshotRecords) });
     }
 
-    const scopeFilter = buildPsrScopeWhere(req.user);
-    const result = await pool.query(
-      `SELECT id, record_date, client, city, street, jobsite, status, saved_by, data, created_at, updated_at
-       FROM planner_records
-       WHERE ${scopeFilter.clause}
-       ORDER BY LOWER(client), LOWER(city), LOWER(jobsite), record_date DESC, updated_at DESC`,
-      scopeFilter.params
-    );
-    const records = result.rows.map(normalizeRecordRow);
-    res.json({ success: true, records });
+    const pgRecords = await readPlannerRecordsFromPostgresForUser(req.user);
+
+    if (!WASABI_RECORDS_PRIMARY_ENABLED) {
+      return res.json({ success: true, records: sortPlannerRecordsForList(pgRecords) });
+    }
+
+    let snapshotRecords = [];
+    try {
+      snapshotRecords = await readRecordsFromWasabiSnapshotForUser(req.user);
+    } catch (error) {
+      if (WASABI_RECORDS_PRIMARY_STRICT) throw error;
+    }
+
+    const merged = mergePlannerRecordsById(snapshotRecords, pgRecords);
+    return res.json({ success: true, records: sortPlannerRecordsForList(merged) });
   } catch (error) {
     console.error('GET RECORDS ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -4118,48 +4635,20 @@ app.post('/records', requireAuth, requirePsrDataEntryAccess, async (req, res) =>
 });
 
 async function fetchRecordById(id) {
-  if (WASABI_RECORD_DETAIL_PRIMARY_ENABLED) {
+  const readWasabiFirst =
+    WASABI_RECORD_DETAIL_PRIMARY_ENABLED || PLANNER_STORE_WASABI_ONLY;
+  if (readWasabiFirst) {
     try {
       const snapshotRecord = await fetchRecordByIdFromWasabiSnapshot(id);
-      // #region agent log
-      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-        body: JSON.stringify({
-          sessionId: '2228ee',
-          hypothesisId: 'H1',
-          location: 'server.js:fetchRecordById',
-          message: 'wasabi snapshot lookup',
-          data: {
-            id: String(id),
-            strict: WASABI_RECORD_DETAIL_PRIMARY_STRICT,
-            snapshotHit: !!snapshotRecord
-          },
-          timestamp: Date.now()
-        })
-      }).catch(() => {});
-      // #endregion
       if (snapshotRecord) return snapshotRecord;
-      // Snapshot miss: always fall through to Postgres so new / out-of-sync rows still resolve.
     } catch (error) {
-      if (WASABI_RECORD_DETAIL_PRIMARY_STRICT) throw error;
+      if (WASABI_RECORD_DETAIL_PRIMARY_STRICT && !PLANNER_STORE_WASABI_ONLY) throw error;
     }
   }
+  if (PLANNER_STORE_WASABI_ONLY) {
+    return null;
+  }
   const result = await pool.query('SELECT * FROM planner_records WHERE CAST(id AS text) = $1 LIMIT 1', [String(id)]);
-  // #region agent log
-  fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-    body: JSON.stringify({
-      sessionId: '2228ee',
-      hypothesisId: 'H1',
-      location: 'server.js:fetchRecordById:pg',
-      message: 'postgres planner_records lookup',
-      data: { id: String(id), rowCount: result.rows.length },
-      timestamp: Date.now()
-    })
-  }).catch(() => {});
-  // #endregion
   if (!result.rows.length) return null;
   return normalizeRecordRow(result.rows[0]);
 }
@@ -4186,20 +4675,6 @@ async function persistRecord(record) {
         updated_at: now
       };
       rows.push(savedRow);
-      // #region agent log
-      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-        body: JSON.stringify({
-          sessionId: '2228ee',
-          hypothesisId: 'H2',
-          location: 'server.js:persistRecord',
-          message: 'wasabi snapshot append missing record',
-          data: { recordId: String(record.id || '') },
-          timestamp: Date.now()
-        })
-      }).catch(() => {});
-      // #endregion
     } else {
       savedRow = {
         ...rows[idx],
@@ -4218,6 +4693,9 @@ async function persistRecord(record) {
   });
   if (wasabiWrote && savedRow) {
     return normalizeRecordRow(savedRow);
+  }
+  if (PLANNER_STORE_WASABI_ONLY) {
+    throw new Error('Planner data is stored only in Wasabi; persist write failed. Check WASABI_WRITES_PRIMARY_ENABLED and bucket credentials.');
   }
   const payload = [
     record.record_date,
@@ -4250,20 +4728,6 @@ async function persistRecord(record) {
   }
   // Wasabi-only or pre-migration row: no PG row to UPDATE — upsert when id is a UUID.
   if (!isPlannerRecordUuid(record.id)) {
-    // #region agent log
-    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-      body: JSON.stringify({
-        sessionId: '2228ee',
-        hypothesisId: 'H4',
-        location: 'server.js:persistRecord:pg',
-        message: 'postgres update 0 rows, non-uuid id',
-        data: { recordId: String(record.id || '') },
-        timestamp: Date.now()
-      })
-    }).catch(() => {});
-    // #endregion
     throw new Error('Record not found');
   }
   const ins = await pool.query(
@@ -4282,20 +4746,6 @@ async function persistRecord(record) {
      RETURNING *`,
     payload
   );
-  // #region agent log
-  fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-    body: JSON.stringify({
-      sessionId: '2228ee',
-      hypothesisId: 'H4',
-      location: 'server.js:persistRecord:pg-upsert',
-      message: 'postgres upsert after missing row',
-      data: { recordId: String(record.id || '') },
-      timestamp: Date.now()
-    })
-  }).catch(() => {});
-  // #endregion
   return normalizeRecordRow(ins.rows[0]);
 }
 
@@ -4320,7 +4770,14 @@ async function createPlannerRecord(record) {
     };
     rows.push(createdRow);
   });
-  // Always persist to Postgres so Render/SQL paths (segments, scope, backups) see the same id as Wasabi.
+  if (PLANNER_STORE_WASABI_ONLY) {
+    if (!wasabiWrote || !createdRow) {
+      throw new Error(
+        'Planner data is stored only in Wasabi; create failed. Enable WASABI_WRITES_PRIMARY_ENABLED=1 and configure Wasabi bucket keys.'
+      );
+    }
+    return normalizeRecordRow(createdRow);
+  }
   const result = await pool.query(
     `INSERT INTO planner_records (id, record_date, client, city, street, jobsite, status, saved_by, data)
      VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
@@ -4337,20 +4794,6 @@ async function createPlannerRecord(record) {
       JSON.stringify(serializeRecordData(record))
     ]
   );
-  // #region agent log
-  fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-    body: JSON.stringify({
-      sessionId: '2228ee',
-      hypothesisId: 'H5',
-      location: 'server.js:createPlannerRecord',
-      message: 'planner record created',
-      data: { id, wasabiWrote: !!wasabiWrote },
-      timestamp: Date.now()
-    })
-  }).catch(() => {});
-  // #endregion
   return normalizeRecordRow(result.rows[0]);
 }
 
@@ -4366,6 +4809,9 @@ async function deletePlannerRecordById(id) {
     data.planner_records = next;
   });
   if (wasabiWrote) return deletedId;
+  if (PLANNER_STORE_WASABI_ONLY) {
+    return null;
+  }
   const result = await pool.query('DELETE FROM planner_records WHERE CAST(id AS text) = $1 RETURNING id', [String(id)]);
   return result.rows.length ? result.rows[0].id : null;
 }
@@ -4380,6 +4826,9 @@ async function deletePlannerRecordsByClient(client) {
     data.planner_records = next;
   });
   if (wasabiWrote) return deletedCount;
+  if (PLANNER_STORE_WASABI_ONLY) {
+    return 0;
+  }
   const result = await pool.query('DELETE FROM planner_records WHERE client = $1 RETURNING id', [client]);
   return Number(result.rowCount || 0);
 }
@@ -4460,20 +4909,6 @@ app.delete('/clients/:client', requireAuth, requireAdmin, async (req, res) => {
 app.post('/records/:id/segments', requireAuth, requirePsrDataEntryAccess, async (req, res) => {
   try {
     const record = await fetchRecordById(req.params.id);
-    // #region agent log
-    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-      body: JSON.stringify({
-        sessionId: '2228ee',
-        hypothesisId: 'H3',
-        location: 'server.js:POST /records/:id/segments',
-        message: 'add segment fetchRecordById result',
-        data: { paramId: String(req.params.id || ''), found: !!record },
-        timestamp: Date.now()
-      })
-    }).catch(() => {});
-    // #endregion
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
     if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
     const system = cleanString(req.body?.system || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
@@ -4690,6 +5125,10 @@ app.post('/records/:id/segments/:segmentId/move', requireAuth, requireAdmin, asy
 
 app.get('/pricing-rates', requireAuth, requirePricingAccess, async (req, res) => {
   try {
+    if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+      const rates = (await readPricingRatesFromWasabiSnapshot()) || [];
+      return res.json({ success: true, rates });
+    }
     if (WASABI_PRICING_PRIMARY_ENABLED) {
       try {
         const snapshotRates = await readPricingRatesFromWasabiSnapshot();
@@ -4738,6 +5177,10 @@ app.delete('/pricing-rates/:dia', requireAuth, requireAdmin, async (req, res) =>
 
 app.get('/daily-reports', requireAuth, requireAdmin, async (req, res) => {
   try {
+    if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+      const reports = (await readDailyReportsFromWasabiSnapshot()) || [];
+      return res.json({ success: true, reports });
+    }
     if (WASABI_REPORTS_PRIMARY_ENABLED) {
       try {
         const snapshotReports = await readDailyReportsFromWasabiSnapshot();
@@ -4781,7 +5224,10 @@ app.post('/daily-reports', requireAuth, requireAdmin, upload.array('files'), asy
 app.put('/daily-reports/:id', requireAuth, requireAdmin, upload.array('files'), async (req, res) => {
   try {
     let current = null;
-    if (WASABI_REPORTS_PRIMARY_ENABLED) {
+    if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+      current = await readDailyReportByIdFromWasabiSnapshot(req.params.id);
+      if (!current) return res.status(404).json({ success: false, error: 'Daily report not found' });
+    } else if (WASABI_REPORTS_PRIMARY_ENABLED) {
       try {
         const snapshotReport = await readDailyReportByIdFromWasabiSnapshot(req.params.id);
         if (snapshotReport) {
@@ -4818,7 +5264,8 @@ app.put('/daily-reports/:id', requireAuth, requireAdmin, upload.array('files'), 
 
 app.delete('/daily-reports/:id', requireAuth, requireAdmin, async (req, res) => {
   try {
-    await deleteDailyReportById(req.params.id);
+    const ok = await deleteDailyReportById(req.params.id);
+    if (!ok) return res.status(404).json({ success: false, error: 'Daily report not found' });
     res.json({ success: true });
   } catch (error) {
     console.error('DELETE DAILY REPORT ERROR:', error);
@@ -4828,6 +5275,10 @@ app.delete('/daily-reports/:id', requireAuth, requireAdmin, async (req, res) => 
 
 app.get('/jobsite-assets', requireAuth, requireFootageAccess, async (req, res) => {
   try {
+    if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+      const assets = (await readJobsiteAssetsFromWasabiSnapshotForUser(req.user)) || [];
+      return res.json({ success: true, assets });
+    }
     if (WASABI_ASSETS_PRIMARY_ENABLED) {
       try {
         const snapshotAssets = await readJobsiteAssetsFromWasabiSnapshotForUser(req.user);
@@ -4881,7 +5332,8 @@ app.post('/jobsite-assets', requireAuth, requireAdmin, upload.array('files'), as
 
 app.delete('/jobsite-assets/:id', requireAuth, requireAdmin, async (req, res) => {
   try {
-    await deleteJobsiteAssetById(req.params.id);
+    const ok = await deleteJobsiteAssetById(req.params.id);
+    if (!ok) return res.status(404).json({ success: false, error: 'Asset not found' });
     res.json({ success: true });
   } catch (error) {
     console.error('DELETE JOBSITE ASSET ERROR:', error);
@@ -6514,6 +6966,30 @@ ensureSchema()
     await autoImportPlugin.initSchema();
     if (wasabiStateClient && WASABI_STATE_BUCKET) {
       await runWasabiStateSnapshot();
+      if (PLANNER_STORE_WASABI_ONLY || WASABI_APP_DATA_STORE_WASABI_ONLY) {
+        if (!WASABI_WRITES_PRIMARY_ENABLED) {
+          console.error(
+            '[wasabi-app-data] Wasabi-only business data requires WASABI_WRITES_PRIMARY_ENABLED=1 or creates/updates/deletes will fail.'
+          );
+        }
+        if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
+          console.log(
+            '[wasabi-app-data] WASABI_APP_DATA_STORE_WASABI_ONLY=1: planner, pricing, reports, jobsite assets, and user_psr_scopes are authoritative in Wasabi; periodic snapshots preserve those tables from the latest object (not from Postgres).'
+          );
+        } else if (PLANNER_STORE_WASABI_ONLY) {
+          console.log(
+            '[wasabi-app-data] WASABI_PLANNER_STORE_WASABI_ONLY=1: planner_records and user_psr_scopes are authoritative in Wasabi (PSR tool). Copy any legacy Postgres rows with POST /admin/planner-migrate-postgres-to-wasabi or WASABI_*_MIGRATE_FROM_POSTGRES_ON_BOOT=1.'
+          );
+        }
+        if (MIGRATE_APP_DATA_FROM_POSTGRES_ON_BOOT && WASABI_WRITES_PRIMARY_ENABLED) {
+          try {
+            const m = await migrateAppDataFromPostgresToWasabi();
+            console.log('[wasabi-app-data-migrate] boot:', m);
+          } catch (error) {
+            console.error('[wasabi-app-data-migrate] boot failed:', error?.message || error);
+          }
+        }
+      }
       try {
         const readiness = evaluateWasabiRuntimeReadiness(await loadWasabiLatestStateSnapshot(true));
         if (WASABI_ALL_READS_PRIMARY_ENABLED && !readiness.readyForAllReadsPrimary) {

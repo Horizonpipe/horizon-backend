@@ -1078,7 +1078,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     throw new Error('registerPortalFilesRoutes requires either pool.query or options.query.');
   }
   const pool = { query: dbQuery };
-  /** Path grants must match `GET /permissions/tree` (Postgres). Wasabi portal-data-primary must not shadow them. */
+  /** Path grants must match `GET /permissions/tree` portal path rows (live Postgres in all modes). Wasabi portal-data-primary must not shadow them. */
   const aclPool =
     poolOption && typeof poolOption.query === 'function'
       ? { query: (text, params) => poolOption.query(text, params) }
