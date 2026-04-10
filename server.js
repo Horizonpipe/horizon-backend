@@ -2253,7 +2253,7 @@ async function readSessionFromPostgres(token) {
     [token, ttlMinutes]
   );
   return {
-    user: attachScopesToUser(normalizeUser(row)),
+    user: await attachScopesToUser(normalizeUser(row)),
     keepSession
   };
 }
