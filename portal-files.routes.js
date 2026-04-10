@@ -796,28 +796,6 @@ async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) 
       userCanDataAutoSync(user) && j === DATA_AUTO_SYNC_JOB_ID && !isDataAutoSyncLineEmployee(user);
   }
 
-  // #region agent log
-  if (optWide === true) {
-    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-      body: JSON.stringify({
-        sessionId: '2228ee',
-        hypothesisId: 'H3',
-        location: 'portal-files.routes.js:assertPortalJobAccess',
-        message: 'DAS allowClientWide',
-        data: {
-          j,
-          allowClientWideDataAutoSync,
-          lineEmp: isDataAutoSyncLineEmployee(user),
-          canDas: userCanDataAutoSync(user)
-        },
-        timestamp: Date.now()
-      })
-    }).catch(() => {});
-  }
-  // #endregion
-
   const scopeList = Array.isArray(user.portalScopes) ? user.portalScopes : [];
   if (scopeList.length) {
     if (
