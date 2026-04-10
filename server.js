@@ -5335,6 +5335,31 @@ async function runPortalDataWasabiQuery(text, params = []) {
   }
   if (
     sql.startsWith(
+      'select path_prefix, coalesce(recursive, true) as recursive, coalesce(access_mode, \'full\') as access_mode from portal_path_grants where client_id = $1 and job_id = $2 and ( lower(trim(username)) = lower(trim($3)) or ($4 <> \'\' and lower(trim(username)) = lower(trim($4))) )'
+    )
+  ) {
+    const snapshot = await requireFreshSnapshot();
+    const clientId = String(params[0] || '');
+    const jobId = String(params[1] || '');
+    const u = String(params[2] || '').trim().toLowerCase();
+    const em = String(params[3] || '').trim().toLowerCase();
+    const rows = snapshotRows(snapshot, 'portal_path_grants')
+      .filter((row) => {
+        if (String(row.client_id || '') !== clientId || String(row.job_id || '') !== jobId) return false;
+        const run = String(row.username || '').trim().toLowerCase();
+        if (u && run === u) return true;
+        if (em && run === em) return true;
+        return false;
+      })
+      .map((row) => ({
+        path_prefix: String(row.path_prefix || ''),
+        recursive: row.recursive !== false,
+        access_mode: String(row.access_mode || 'full') || 'full'
+      }));
+    return pgRows(rows);
+  }
+  if (
+    sql.startsWith(
       'select path_prefix, coalesce(recursive, true) as recursive, coalesce(access_mode, \'full\') as access_mode from portal_path_grants where client_id = $1 and job_id = $2 and lower(trim(username)) = lower(trim($3))'
     )
   ) {
