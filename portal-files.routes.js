@@ -784,13 +784,32 @@ async function portalJobHasPathGrants(pool, clientId, jobId) {
   return r.rows.length > 0;
 }
 
-async function loadUserPathGrants(pool, clientId, jobId, username) {
+/**
+ * Grants for the signed-in user. Match DB `username` column to session username or email (some admins store email in grants).
+ * @param {import('express').Request['user'] | null | undefined} user
+ */
+async function loadUserPathGrants(pool, clientId, jobId, user) {
+  const u = String(user?.username || '').trim();
+  const em = String(user?.email || '').trim();
   const r = await pool.query(
-    `SELECT path_prefix, COALESCE(recursive, true) AS recursive, COALESCE(access_mode, 'full') AS access_mode FROM portal_path_grants
-     WHERE client_id = $1 AND job_id = $2 AND LOWER(TRIM(username)) = LOWER(TRIM($3))`,
-    [String(clientId), String(jobId), String(username || '')]
+    `SELECT path_prefix, COALESCE(recursive, true) AS recursive, COALESCE(access_mode, 'full') AS access_mode
+     FROM portal_path_grants
+     WHERE client_id = $1 AND job_id = $2
+       AND (
+         LOWER(TRIM(username)) = LOWER(TRIM($3))
+         OR ($4 <> '' AND LOWER(TRIM(username)) = LOWER(TRIM($4)))
+       )`,
+    [String(clientId), String(jobId), u, em]
   );
   return r.rows;
+}
+
+/** When true, `GET /api/files` and `/tree` skip path-grant filtering so permission editors see the full job tree. */
+function readPermissionsEditorQuery(req) {
+  const v = String(req.query?.permissionsEditor || req.query?.permEditor || '')
+    .trim()
+    .toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
 }
 
 async function remapPortalPathGrantPrefixes(pool, clientId, jobId, fromRelPath, toRelPath) {
@@ -871,7 +890,7 @@ async function assertPortalPathRel(pool, user, clientId, jobId, relPath, require
   if (!jobOk) return false;
   const anyGrants = await portalJobHasPathGrants(pool, clientId, jobId);
   if (!anyGrants) return true;
-  const grants = await loadUserPathGrants(pool, clientId, jobId, user.username);
+  const grants = await loadUserPathGrants(pool, clientId, jobId, user);
   if (!grants.length) return false;
   const rp = normalizeRelPath(relPath);
   return grants.some(
@@ -1063,9 +1082,12 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
+      const jobHasPathGrants = await portalJobHasPathGrants(pool, clientId, jobId);
+      const permEditorList =
+        readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
       let userGrants = null;
-      if (!userIsPortalAdmin(req.user) && (await portalJobHasPathGrants(pool, clientId, jobId))) {
-        userGrants = await loadUserPathGrants(pool, clientId, jobId, req.user.username);
+      if (jobHasPathGrants && !permEditorList) {
+        userGrants = await loadUserPathGrants(pool, clientId, jobId, req.user);
       }
       const out = [];
       const keys = await listAllKeys(s3, bucket, prefix);
@@ -1103,8 +1125,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const prefix = jobPrefix(String(clientId), String(jobId));
       const keys = await listAllKeys(s3, bucket, prefix);
       let tree = buildTreeFromKeys(prefix, keys);
-      if (!userIsPortalAdmin(req.user) && (await portalJobHasPathGrants(pool, clientId, jobId))) {
-        const userGrants = await loadUserPathGrants(pool, clientId, jobId, req.user.username);
+      const jobHasPathGrantsTree = await portalJobHasPathGrants(pool, clientId, jobId);
+      const permEditorTree =
+        readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
+      if (jobHasPathGrantsTree && !permEditorTree) {
+        const userGrants = await loadUserPathGrants(pool, clientId, jobId, req.user);
         tree = filterTreeByPathGrants(tree, userGrants, true);
       }
       return res.json(tree);
