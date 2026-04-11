@@ -17,6 +17,8 @@ const { resolveCapabilities, canAccessAdminPanel } = require('./capabilities');
 
 const app = express();
 app.set('trust proxy', 1);
+/** Express defaults to weak ETags on res.json(); browsers cache GET /records etc. and revalidate with If-None-Match → 304 with an empty body. fetch() then fails or yields no JSON, and the planner clears after a silent refresh. */
+app.set('etag', false);
 
 /** Comma-separated list, or a single `*` to reflect any Origin (Bearer auth still required for data). */
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
