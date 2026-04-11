@@ -2553,6 +2553,18 @@ function serializeRecordData(record) {
   };
 }
 
+/** Jobsite persisted to Wasabi/Postgres must use the scope key (psrScopeJobsite), not display jobsite coerced to NOT SET. */
+function persistedPlannerJobsiteForWrite(record) {
+  const street = upperCleanString(record?.street);
+  const display = cleanString(record?.jobsite ?? '');
+  const scope = cleanString(record?.psrScopeJobsite ?? record?.authJobsiteForPsrScope ?? '');
+  const displayIsUnset = !display || display.toUpperCase() === 'NOT SET';
+  if (scope && displayIsUnset) {
+    return normalizeJobsiteName(scope, street);
+  }
+  return normalizeJobsiteName(record?.jobsite, street);
+}
+
 async function mirrorSessionToPostgres(token, userId, keepSession) {
   const ttlMinutes = resolveSessionTtlMinutes(keepSession);
   await pool.query(
@@ -4836,6 +4848,7 @@ async function fetchRecordById(id) {
 
 async function persistRecord(record) {
   let savedRow = null;
+  const jobsiteWrite = persistedPlannerJobsiteForWrite(record);
   const wasabiWrote = await tryWasabiStateWrite('persist-record', async (data) => {
     const rows = ensureSnapshotTable(data, 'planner_records');
     const idx = rows.findIndex((row) => String(row.id || '') === String(record.id || ''));
@@ -4848,7 +4861,7 @@ async function persistRecord(record) {
         client: upperCleanString(record.client),
         city: upperCleanString(record.city),
         street: upperCleanString(record.street),
-        jobsite: normalizeJobsiteName(record.jobsite, record.street),
+        jobsite: jobsiteWrite,
         status: cleanString(record.status || ''),
         saved_by: cleanString(record.saved_by || ''),
         data: serializeRecordData(record),
@@ -4863,7 +4876,7 @@ async function persistRecord(record) {
         client: upperCleanString(record.client),
         city: upperCleanString(record.city),
         street: upperCleanString(record.street),
-        jobsite: normalizeJobsiteName(record.jobsite, record.street),
+        jobsite: jobsiteWrite,
         status: cleanString(record.status || ''),
         saved_by: cleanString(record.saved_by || ''),
         data: serializeRecordData(record),
@@ -4872,6 +4885,30 @@ async function persistRecord(record) {
       rows[idx] = savedRow;
     }
   });
+  // #region agent log
+  {
+    const display = cleanString(record?.jobsite ?? '');
+    const scope = cleanString(record?.psrScopeJobsite ?? '');
+    const displayIsUnset = !display || display.toUpperCase() === 'NOT SET';
+    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+      body: JSON.stringify({
+        sessionId: '2228ee',
+        hypothesisId: 'E',
+        location: 'server.js:persistRecord',
+        message: 'planner persist jobsite source',
+        data: {
+          wasabiWrote: !!wasabiWrote,
+          usedScopeFallback: !!(scope && displayIsUnset),
+          displayWasNotSet: displayIsUnset ? 1 : 0
+        },
+        timestamp: Date.now(),
+        runId: 'persist-jobsite-fix'
+      })
+    }).catch(() => {});
+  }
+  // #endregion
   if (wasabiWrote && savedRow) {
     return normalizeRecordRow(savedRow);
   }
@@ -4883,7 +4920,7 @@ async function persistRecord(record) {
     record.client,
     record.city,
     record.street,
-    normalizeJobsiteName(record.jobsite, record.street),
+    jobsiteWrite,
     record.status || '',
     record.saved_by || '',
     JSON.stringify(serializeRecordData(record)),
