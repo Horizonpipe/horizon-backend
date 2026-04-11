@@ -44,8 +44,8 @@ const { canManagePortalExtras } = require('./capabilities');
 const CATEGORIES = new Set(['videos', 'db3', 'pdf', 'photos']);
 const FOLDER_MARKER = '.hp-folder';
 const DATA_AUTO_SYNC_MODE = 'dataautosync';
-/** Client / non-employee AUTOSYNC accounts are pinned to this job folder (default 8). */
-const DATA_AUTO_SYNC_JOB_ID = String(process.env.DATA_AUTO_SYNC_CLIENT_JOB_ID || '8').trim() || '8';
+/** Client / non-employee AUTOSYNC accounts are pinned to this job folder (default 2; override with DATA_AUTO_SYNC_CLIENT_JOB_ID). */
+const DATA_AUTO_SYNC_JOB_ID = String(process.env.DATA_AUTO_SYNC_CLIENT_JOB_ID || '2').trim() || '2';
 /** `roles.dataAutoSyncEmployee` users who are not portal admins are pinned to this folder (default 2). */
 const DATA_AUTO_SYNC_EMPLOYEE_JOB_ID = String(process.env.DATA_AUTO_SYNC_EMPLOYEE_JOB_ID || '2').trim() || '2';
 /** When no explicit jobId is provided, portal admins start on this folder. */
@@ -1017,6 +1017,41 @@ async function assertPortalPathRel(grantPool, user, clientId, jobId, relPath, re
   );
 }
 
+/** Keep only files (and ancestor folders) under a relative path prefix — used for Data Auto Sync tree when job has grants but the user has no explicit grant rows yet. */
+function filterTreeToDescendantPrefix(tree, prefixRel) {
+  const p = normalizeRelPath(prefixRel || '');
+  if (!p) return { folders: tree.folders || [], files: tree.files || [] };
+  const files = (tree.files || []).filter((f) => {
+    const rp = normalizeRelPath(f.path || '');
+    return rp === p || rp.startsWith(`${p}/`);
+  });
+  const keepFolders = new Set();
+  for (const f of files) {
+    let cur = f.parentPath || '';
+    while (cur) {
+      keepFolders.add(normalizeRelPath(cur));
+      cur = parentRelPath(cur);
+    }
+    keepFolders.add(p);
+    let up = p;
+    while (up) {
+      keepFolders.add(up);
+      up = parentRelPath(up);
+    }
+  }
+  const folders = (tree.folders || []).filter((fol) => keepFolders.has(normalizeRelPath(fol.path || '')));
+  return { folders, files };
+}
+
+/** Match Java {@code FileRelativizer.sanitizeUserFolder} for per-user portal folders. */
+function dataAutosyncPortalUserFolderPrefix(user) {
+  const raw = String(user?.displayName || user?.username || '').trim();
+  if (!raw) return '';
+  const safe = raw.replace(/[^A-Za-z0-9 _-]/g, '').trim();
+  if (!safe) return '';
+  return safe.length > 72 ? safe.slice(0, 72) : safe;
+}
+
 function filterTreeByPathGrants(tree, grants, jobHasAnyGrant) {
   if (!jobHasAnyGrant) return tree;
   if (!grants.length) return { folders: [], files: [] };
@@ -1311,6 +1346,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const prefix = jobPrefix(String(clientId), String(jobId));
       const keys = await listAllKeys(s3, bucket, prefix);
       let tree = buildTreeFromKeys(prefix, keys);
+      const treePortalMode = readPortalMode(req, req.query);
+      const isDataAutoSyncTreeList = treePortalMode === DATA_AUTO_SYNC_MODE;
       const jobHasPathGrantsTree = await portalJobHasPathGrants(aclPool, clientId, jobId);
       const permEditorTree =
         readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
@@ -1324,8 +1361,19 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
             tree = filterTreeByPathGrants(tree, treeUserGrants, true);
             appliedPathGrantFilter = true;
           } else if (!portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) {
-            tree = filterTreeByPathGrants(tree, treeUserGrants, true);
-            appliedPathGrantFilter = true;
+            if (isDataAutoSyncTreeList) {
+              const userRoot = dataAutosyncPortalUserFolderPrefix(req.user);
+              if (userRoot) {
+                tree = filterTreeToDescendantPrefix(tree, userRoot);
+                appliedPathGrantFilter = true;
+              } else {
+                tree = filterTreeByPathGrants(tree, treeUserGrants, true);
+                appliedPathGrantFilter = true;
+              }
+            } else {
+              tree = filterTreeByPathGrants(tree, treeUserGrants, true);
+              appliedPathGrantFilter = true;
+            }
           }
         }
       }

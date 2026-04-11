@@ -13,7 +13,7 @@ const { ensureOutlookSchema, registerOutlookRoutes } = require('./outlook');
 const { registerPortalFilesRoutes } = require('./portal-files.routes');
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
 const { registerSignupRoutes } = require('./signup.routes');
-const { resolveCapabilities, canAccessAdminPanel } = require('./capabilities');
+const { resolveCapabilities, canAccessAdminPanel, canManagePortalExtras } = require('./capabilities');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -2945,6 +2945,24 @@ const requireDataAutoSyncEmployeeAccess = requireAnyRole(
   ['dataAutoSyncEmployee'],
   'DataAutoSync employee access is not enabled for this account'
 );
+
+/** Same users who can use portal Data Auto Sync (not only the dataAutoSyncEmployee role bit). */
+function requireDataAutoSyncDesktopHeartbeatAccess(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ success: false, error: 'Authentication required' });
+  }
+  const u = req.user;
+  const roles = u.roles && typeof u.roles === 'object' ? u.roles : {};
+  if (roles.dataAutoSyncEmployee === true) return next();
+  if (canManagePortalExtras(u)) return next();
+  if (u.portalFilesAccessGranted === true) return next();
+  if (u.isAdmin === true) return next();
+  return res.status(403).json({
+    success: false,
+    error:
+      'Desktop status requires Data Auto Sync access (dataAutoSyncEmployee, portal admin, portalFilesAccessGranted, or administrator).'
+  });
+}
 const requirePricingAccess = requireAnyRole(
   ['pricingView'],
   'Pricing access is not enabled for this account'
@@ -7139,6 +7157,7 @@ const autoImportPlugin = createAutoImportPlugin({
   pool,
   query: queryAutoImportWithWasabiFallback,
   requireMike: requireDataAutoSyncEmployeeAccess,
+  requireDesktopHeartbeat: requireDataAutoSyncDesktopHeartbeatAccess,
   requireAuth,
   writeSegment: async (jobsiteId, payload, savedBy) => {
     const record = await fetchRecordById(String(jobsiteId));

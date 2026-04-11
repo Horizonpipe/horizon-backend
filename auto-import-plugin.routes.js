@@ -11,6 +11,8 @@ function createAutoImportPlugin(options = {}) {
     pool: poolOption,
     query,
     requireMike,
+    /** Optional; when set, used only for desktop heartbeat routes (align with portal Data Auto Sync users). */
+    requireDesktopHeartbeat,
     requireAuth,
     writeSegment,
     buildVersion,
@@ -29,6 +31,8 @@ function createAutoImportPlugin(options = {}) {
   }
   const pool = { query: dbQuery };
   if (typeof requireMike !== 'function') throw new Error('createAutoImportPlugin requires requireMike middleware.');
+  const desktopHeartbeatGate =
+    typeof requireDesktopHeartbeat === 'function' ? requireDesktopHeartbeat : requireMike;
   if (typeof requireAuth !== 'function') throw new Error('createAutoImportPlugin requires requireAuth middleware.');
   if (typeof writeSegment !== 'function') throw new Error('createAutoImportPlugin requires writeSegment(jobsiteId, payload, savedBy).');
   if (typeof buildVersion !== 'function') throw new Error('createAutoImportPlugin requires buildVersion(payload).');
@@ -424,7 +428,7 @@ function createAutoImportPlugin(options = {}) {
     return { changed, inserted, updated, omitted };
   }
 
-  router.get('/health', requireMike, async (req, res) => {
+  router.get('/health', desktopHeartbeatGate, async (req, res) => {
     res.json({
       success: true,
       service: 'auto-import-plugin',
@@ -433,7 +437,7 @@ function createAutoImportPlugin(options = {}) {
     });
   });
 
-  router.post('/desktop-heartbeat', requireMike, express.json(), async (req, res) => {
+  router.post('/desktop-heartbeat', desktopHeartbeatGate, express.json(), async (req, res) => {
     const key = heartbeatKey(req);
     const nowMs = Date.now();
     const state = clean(req.body?.state || 'connected').toLowerCase() || 'connected';
@@ -441,7 +445,7 @@ function createAutoImportPlugin(options = {}) {
       atMs: nowMs,
       state,
       source: clean(req.body?.source || 'desktop') || 'desktop',
-      detail: clean(req.body?.detail || ''),
+      detail: clean(req.body?.detail || req.body?.message || ''),
       username: clean(req.user?.username || ''),
       displayName: clean(req.user?.displayName || '')
     });
@@ -453,7 +457,7 @@ function createAutoImportPlugin(options = {}) {
     });
   });
 
-  router.get('/desktop-heartbeat', requireMike, async (req, res) => {
+  router.get('/desktop-heartbeat', desktopHeartbeatGate, async (req, res) => {
     const key = heartbeatKey(req);
     const rec = desktopHeartbeatByUser.get(key) || null;
     const nowMs = Date.now();
