@@ -4870,22 +4870,27 @@ async function persistRecord(record) {
       rows[idx] = savedRow;
     }
   });
-if (wasabiWrote && savedRow) {
-    return normalizeRecordRow(savedRow);
-  }
   if (PLANNER_STORE_WASABI_ONLY) {
+    if (wasabiWrote && savedRow) return normalizeRecordRow(savedRow);
     throw new Error('Planner data is stored only in Wasabi; persist write failed. Check WASABI_WRITES_PRIMARY_ENABLED and bucket credentials.');
   }
+  /**
+   * Hybrid mode: GET /records uses Postgres whenever WASABI_RECORDS_PRIMARY_ENABLED is off (the default).
+   * A successful Wasabi write used to return here without mirroring to Postgres, so edits existed only in
+   * latest.json and disappeared on the next read. Always upsert Postgres when not Wasabi-only canonical.
+   */
+  const pgSource = wasabiWrote && savedRow ? normalizeRecordRow(savedRow) : record;
+  const jobsiteForPg = persistedPlannerJobsiteForWrite(pgSource);
   const payload = [
-    record.record_date,
-    record.client,
-    record.city,
-    record.street,
-    jobsiteWrite,
-    record.status || '',
-    record.saved_by || '',
-    JSON.stringify(serializeRecordData(record)),
-    String(record.id)
+    cleanString(pgSource.record_date),
+    pgSource.client,
+    pgSource.city,
+    upperCleanString(pgSource.street),
+    jobsiteForPg,
+    cleanString(pgSource.status || ''),
+    cleanString(pgSource.saved_by || ''),
+    JSON.stringify(serializeRecordData(pgSource)),
+    String(pgSource.id)
   ];
   const result = await pool.query(
     `UPDATE planner_records
@@ -4906,7 +4911,7 @@ if (wasabiWrote && savedRow) {
     return normalizeRecordRow(result.rows[0]);
   }
   // Wasabi-only or pre-migration row: no PG row to UPDATE — upsert when id is a UUID.
-  if (!isPlannerRecordUuid(record.id)) {
+  if (!isPlannerRecordUuid(pgSource.id)) {
     throw new Error('Record not found');
   }
   const ins = await pool.query(
@@ -4987,12 +4992,13 @@ async function deletePlannerRecordById(id) {
     });
     data.planner_records = next;
   });
-  if (wasabiWrote) return deletedId;
   if (PLANNER_STORE_WASABI_ONLY) {
-    return null;
+    return wasabiWrote ? deletedId : null;
   }
+  /** Hybrid: mirror delete to Postgres; Wasabi-only returns above. */
   const result = await pool.query('DELETE FROM planner_records WHERE CAST(id AS text) = $1 RETURNING id', [String(id)]);
-  return result.rows.length ? result.rows[0].id : null;
+  if (result.rows.length) return result.rows[0].id;
+  return deletedId;
 }
 
 async function deletePlannerRecordsByClient(client) {
@@ -5004,10 +5010,10 @@ async function deletePlannerRecordsByClient(client) {
     deletedCount = rows.length - next.length;
     data.planner_records = next;
   });
-  if (wasabiWrote) return deletedCount;
   if (PLANNER_STORE_WASABI_ONLY) {
-    return 0;
+    return wasabiWrote ? deletedCount : 0;
   }
+  /** Hybrid: always remove matching rows from Postgres as well. */
   const result = await pool.query('DELETE FROM planner_records WHERE client = $1 RETURNING id', [client]);
   return Number(result.rowCount || 0);
 }
