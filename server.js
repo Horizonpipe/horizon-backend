@@ -2952,8 +2952,9 @@ function requireDataAutoSyncDesktopHeartbeatAccess(req, res, next) {
     return res.status(401).json({ success: false, error: 'Authentication required' });
   }
   const u = req.user;
-  const roles = u.roles && typeof u.roles === 'object' ? u.roles : {};
+  const roles = normalizeRoles(u.roles);
   if (roles.dataAutoSyncEmployee === true) return next();
+  if (u.dataAutoSyncEmployee === true) return next();
   if (canManagePortalExtras(u)) return next();
   if (u.portalFilesAccessGranted === true) return next();
   if (u.isAdmin === true) return next();
