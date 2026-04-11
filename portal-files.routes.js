@@ -1006,10 +1006,13 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
 
   r.post('/shares', express.json({ limit: '512kb' }), async (req, res) => {
     try {
-      const { clientId, jobId, kind, folderPaths, fileIds } = req.body || {};
+      const { clientId, jobId, kind: kindRaw, folderPaths, fileIds } = req.body || {};
       if (!clientId || !jobId) {
         return res.status(400).json({ error: 'clientId and jobId are required' });
       }
+      const kind = String(kindRaw ?? '')
+        .trim()
+        .toLowerCase();
       if (kind !== 'public' && kind !== 'interactive' && kind !== 'signin') {
         return res.status(400).json({ error: 'kind must be public, interactive, or signin' });
       }
@@ -1333,11 +1336,20 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     return q.rows[0] || null;
   }
 
+  /** @param {{ kind?: unknown, Kind?: unknown } | null | undefined} row */
+  function portalShareLinkKind(row) {
+    if (!row) return '';
+    const raw = row.kind != null ? row.kind : row.Kind;
+    return String(raw ?? '')
+      .trim()
+      .toLowerCase();
+  }
+
   /** Sign-in share: tree for authenticated users with job access. */
   r.get('/share-view/:token/tree', async (req, res) => {
     try {
       const row = await loadShareLinkRowForToken(req.params.token);
-      if (!row || row.kind !== 'signin') return res.status(404).json({ error: 'Not found' });
+      if (!row || portalShareLinkKind(row) !== 'signin') return res.status(404).json({ error: 'Not found' });
       if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
@@ -1357,7 +1369,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   r.get('/share-view/:token/download/:id', async (req, res) => {
     try {
       const row = await loadShareLinkRowForToken(req.params.token);
-      if (!row || row.kind !== 'signin') return res.status(404).json({ error: 'Not found' });
+      if (!row || portalShareLinkKind(row) !== 'signin') return res.status(404).json({ error: 'Not found' });
       if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
@@ -1389,7 +1401,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   r.head('/share-view/:token/download/:id', async (req, res) => {
     try {
       const row = await loadShareLinkRowForToken(req.params.token);
-      if (!row || row.kind !== 'signin') return res.status(404).json({ error: 'Not found' });
+      if (!row || portalShareLinkKind(row) !== 'signin') return res.status(404).json({ error: 'Not found' });
       if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
@@ -2844,7 +2856,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     try {
       const row = await loadGuestShareRow(req.params.token);
       if (!row) return res.status(404).json({ error: 'Link not found' });
-      if (row.kind === 'signin') {
+      const linkKind = portalShareLinkKind(row);
+      if (linkKind === 'signin') {
         return res.json({
           kind: 'signin',
           requiresSignIn: true,
@@ -2852,11 +2865,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           jobId: row.job_id
         });
       }
-      const interactive = row.kind === 'interactive';
+      const interactive = linkKind === 'interactive';
       const gt = readGuestTokenFromReq(req);
       const unlocked = !interactive || (gt && (await validateGuestSession(gt, row.id)));
       return res.json({
-        kind: row.kind,
+        kind: linkKind || 'public',
         needsRegistration: interactive && !unlocked,
         clientId: row.client_id,
         jobId: row.job_id
@@ -2871,7 +2884,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     try {
       const row = await loadGuestShareRow(req.params.token);
       if (!row) return res.status(404).json({ error: 'Link not found' });
-      if (row.kind !== 'interactive') {
+      if (portalShareLinkKind(row) !== 'interactive') {
         return res.status(400).json({ error: 'This link does not require registration' });
       }
       const { email, firstName, lastName, role, company } = req.body || {};
@@ -2921,7 +2934,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   });
 
   async function ensureGuestTreeAccess(req, shareRow) {
-    if (shareRow.kind !== 'interactive') return true;
+    if (portalShareLinkKind(shareRow) !== 'interactive') return true;
     const gt = readGuestTokenFromReq(req);
     if (!gt) return false;
     return validateGuestSession(gt, shareRow.id);
@@ -2931,7 +2944,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     try {
       const row = await loadGuestShareRow(req.params.token);
       if (!row) return res.status(404).json({ error: 'Link not found' });
-      if (row.kind === 'signin') {
+      if (portalShareLinkKind(row) === 'signin') {
         return res.status(401).json({ error: 'Sign in required', requiresSignIn: true, kind: 'signin' });
       }
       if (!(await ensureGuestTreeAccess(req, row))) {
@@ -2953,7 +2966,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     try {
       const row = await loadGuestShareRow(req.params.token);
       if (!row) return res.status(404).json({ error: 'Link not found' });
-      if (row.kind === 'signin') {
+      if (portalShareLinkKind(row) === 'signin') {
         return res.status(401).json({ error: 'Sign in required', requiresSignIn: true, kind: 'signin' });
       }
       if (!(await ensureGuestTreeAccess(req, row))) {
@@ -2988,7 +3001,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     try {
       const row = await loadGuestShareRow(req.params.token);
       if (!row) return res.status(404).json({ error: 'Link not found' });
-      if (row.kind === 'signin') {
+      if (portalShareLinkKind(row) === 'signin') {
         return res.status(401).json({ error: 'Sign in required', requiresSignIn: true, kind: 'signin' });
       }
       if (!(await ensureGuestTreeAccess(req, row))) {
