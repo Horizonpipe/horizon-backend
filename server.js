@@ -71,6 +71,13 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
+try {
+  // eslint-disable-next-line global-require
+  const compression = require('compression');
+  app.use(compression({ threshold: 1024 }));
+} catch {
+  console.warn('[http] Install optional `compression` (npm i) to gzip JSON/text API responses and cut HTTP egress.');
+}
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
@@ -156,6 +163,14 @@ const WASABI_STATE_SNAPSHOT_ON_WRITE =
 const WASABI_STATE_WRITE_DEBOUNCE_MS = Math.max(
   1000,
   Math.min(60000, Number(process.env.WASABI_STATE_WRITE_DEBOUNCE_MS || 5000))
+);
+/** Duplicate full JSON to `history/snapshot-*.json` on each state write (doubles Wasabi upload). Set `0` to skip archives if you only need `latest.json`. */
+const WASABI_STATE_ARCHIVE_SNAPSHOTS =
+  String(process.env.WASABI_STATE_ARCHIVE_SNAPSHOTS || '1').trim().toLowerCase() !== '0';
+/** In-memory TTL for repeated reads of `latest.json` (non-force); lowers Wasabi download volume. */
+const WASABI_LATEST_STATE_CACHE_MS = Math.max(
+  1000,
+  Math.min(300000, Number(process.env.WASABI_LATEST_STATE_CACHE_MS || 15000))
 );
 const WASABI_WRITES_PRIMARY_ENABLED =
   String(process.env.WASABI_WRITES_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
@@ -412,7 +427,7 @@ async function bodyToBuffer(body) {
 async function loadWasabiLatestStateSnapshot(force = false) {
   if (!wasabiStateClient || !WASABI_STATE_BUCKET) return null;
   const now = Date.now();
-  if (!force && wasabiLatestStateCache && now - wasabiLatestStateCacheAt <= WASABI_AUTH_FALLBACK_CACHE_MS) {
+  if (!force && wasabiLatestStateCache && now - wasabiLatestStateCacheAt <= WASABI_LATEST_STATE_CACHE_MS) {
     return wasabiLatestStateCache;
   }
   const out = await wasabiStateClient.send(
@@ -437,7 +452,7 @@ async function putWasabiStateObject(stateObject) {
     throw new Error('Wasabi state client is not configured');
   }
   const stamp = nowIso().replace(/[:.]/g, '-');
-  const payload = Buffer.from(JSON.stringify(stateObject, null, 2), 'utf8');
+  const payload = Buffer.from(JSON.stringify(stateObject), 'utf8');
   const latestKey = `${WASABI_STATE_PREFIX}/latest.json`;
   const archiveKey = `${WASABI_STATE_PREFIX}/history/snapshot-${stamp}.json`;
   await wasabiStateClient.send(
@@ -448,14 +463,16 @@ async function putWasabiStateObject(stateObject) {
       ContentType: 'application/json'
     })
   );
-  await wasabiStateClient.send(
-    new PutObjectCommand({
-      Bucket: WASABI_STATE_BUCKET,
-      Key: archiveKey,
-      Body: payload,
-      ContentType: 'application/json'
-    })
-  );
+  if (WASABI_STATE_ARCHIVE_SNAPSHOTS) {
+    await wasabiStateClient.send(
+      new PutObjectCommand({
+        Bucket: WASABI_STATE_BUCKET,
+        Key: archiveKey,
+        Body: payload,
+        ContentType: 'application/json'
+      })
+    );
+  }
   wasabiLatestStateCache = stateObject;
   wasabiLatestStateCacheAt = Date.now();
 }
@@ -777,6 +794,8 @@ function currentWasabiStateStatus() {
   return {
     enabled: !!(wasabiStateClient && WASABI_STATE_BUCKET),
     onWrite: WASABI_STATE_SNAPSHOT_ON_WRITE,
+    archiveSnapshots: WASABI_STATE_ARCHIVE_SNAPSHOTS,
+    latestStateCacheMs: WASABI_LATEST_STATE_CACHE_MS,
     bucket: WASABI_STATE_BUCKET || null,
     prefix: WASABI_STATE_PREFIX,
     intervalMs: WASABI_STATE_SNAPSHOT_MS,
