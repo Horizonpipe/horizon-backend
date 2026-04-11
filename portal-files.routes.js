@@ -1175,6 +1175,14 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   const PORTAL_PRESIGN_TTL_SECONDS = Math.max(60, Math.min(604800, Number(process.env.PORTAL_PRESIGN_TTL_SECONDS || 3600)));
   const PORTAL_PRESIGN_DISABLED = String(process.env.PORTAL_PRESIGN_DISABLED || '0').trim() === '1';
 
+  /**
+   * When `1`, resumable `/upload/resumable/complete` re-downloads the full object from Wasabi to verify SHA-256.
+   * Default `0`: trust the client-provided digest (already required) and only `HeadObject` for size — full-object
+   * streaming through Render times out or OOMs on large zips and looked like “upload never finishes”.
+   */
+  const PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY =
+    String(process.env.PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY || '0').trim() === '1';
+
   /** Browser → Wasabi direct PUT / multipart parts. Set `PORTAL_UPLOAD_PRESIGN=0` to disable (client uses proxy upload). */
   const PORTAL_UPLOAD_PRESIGN_ENABLED = String(process.env.PORTAL_UPLOAD_PRESIGN || '1').trim().toLowerCase() !== '0';
   const PORTAL_UPLOAD_PRESIGN_MAX_BYTES = Math.max(
@@ -2925,28 +2933,54 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           MultipartUpload: { Parts: use }
         })
       );
-      const finalObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
-      if (!finalObj.Body || typeof finalObj.Body.pipe !== 'function') {
-        throw new Error('Missing completed object body for hash verification');
-      }
-      const actualFileSha256 = normalizeSha256Hex(await sha256HexForReadable(finalObj.Body));
-      if (actualFileSha256 !== expectedFileSha256) {
-        try {
-          await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
-        } catch (_) {
-          /* ignore delete failure after hash mismatch */
+      let actualFileSha256 = expectedFileSha256;
+      if (PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY) {
+        const finalObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+        if (!finalObj.Body || typeof finalObj.Body.pipe !== 'function') {
+          throw new Error('Missing completed object body for hash verification');
         }
-        await uploadMetaPool.query(
-          `UPDATE portal_upload_sessions
-           SET status = 'failed', sha256 = $2, updated_at = NOW()
-           WHERE id = $1`,
-          [sessionId, actualFileSha256]
-        );
-        return res.status(409).json({
-          error: 'Final file hash mismatch',
-          expected: expectedFileSha256,
-          actual: actualFileSha256
-        });
+        actualFileSha256 = normalizeSha256Hex(await sha256HexForReadable(finalObj.Body));
+        if (actualFileSha256 !== expectedFileSha256) {
+          try {
+            await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+          } catch (_) {
+            /* ignore delete failure after hash mismatch */
+          }
+          await uploadMetaPool.query(
+            `UPDATE portal_upload_sessions
+             SET status = 'failed', sha256 = $2, updated_at = NOW()
+             WHERE id = $1`,
+            [sessionId, actualFileSha256]
+          );
+          return res.status(409).json({
+            error: 'Final file hash mismatch',
+            expected: expectedFileSha256,
+            actual: actualFileSha256
+          });
+        }
+      } else {
+        const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+        const expectedSize = Math.floor(Number(sessionRow.file_size || 0));
+        const contentLen = Number(head.ContentLength);
+        if (!Number.isFinite(expectedSize) || expectedSize <= 0) {
+          throw new Error('Invalid session file_size for finalize');
+        }
+        if (!Number.isFinite(contentLen) || contentLen !== expectedSize) {
+          try {
+            await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+          } catch (_) {
+            /* ignore */
+          }
+          await uploadMetaPool.query(
+            `UPDATE portal_upload_sessions SET status = 'failed', updated_at = NOW() WHERE id = $1`,
+            [sessionId]
+          );
+          return res.status(409).json({
+            error: 'Completed object size mismatch',
+            expectedBytes: expectedSize,
+            actualBytes: Number.isFinite(contentLen) ? contentLen : null
+          });
+        }
       }
       await uploadMetaPool.query(
         `UPDATE portal_upload_sessions
