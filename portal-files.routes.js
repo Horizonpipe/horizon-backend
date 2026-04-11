@@ -780,12 +780,84 @@ function portalUsersPeerReadEnabled() {
   return v === '1' || v === 'true' || v === 'yes' || v === 'on';
 }
 
+/** Aligns with `normalizePsrScopeEntry` in server.js (portal-files cannot import server — avoid circular require). */
+function portalPsrClean(s) {
+  return String(s || '').trim();
+}
+function portalPsrUpper(s) {
+  return portalPsrClean(s).toUpperCase();
+}
+function portalNormalizeJobsiteLabel(jobsite, street) {
+  const j = portalPsrUpper(jobsite);
+  const st = portalPsrUpper(street);
+  if (!j) return '';
+  if (st && j.toLowerCase() === st.toLowerCase()) return '';
+  return j;
+}
+function portalNormalizePsrScopeEntry(value) {
+  if (!value || typeof value !== 'object') return null;
+  const recordId = portalPsrClean(value.recordId || value.record_id || value.jobsiteId || value.record || '');
+  const client = portalPsrUpper(value.client);
+  const city = portalPsrUpper(value.city);
+  const jobsite = portalNormalizeJobsiteLabel(value.jobsite, value.street);
+  if (!client || !city || !jobsite) return null;
+  return { recordId: recordId || null, client, city, jobsite };
+}
+/**
+ * Portal `(clientId, jobId)` pairs are keyed like planner rows: `job_id` is often the planner UUID or the jobsite label.
+ * PSR-only accounts may lack `user.portalScopes[]` rows even when `user.psrScopes[]` grants the same job folder.
+ */
+function portalJobAllowedByPsrScopes(user, clientId, jobId) {
+  if (!user || user.portalFilesAccessGranted !== true) return false;
+  const c = portalPsrClean(clientId);
+  const j = portalPsrClean(jobId);
+  if (!c || !j) return false;
+  const list = Array.isArray(user.psrScopes) ? user.psrScopes : [];
+  for (const raw of list) {
+    const entry = portalNormalizePsrScopeEntry(raw);
+    if (!entry) continue;
+    if (entry.client !== portalPsrUpper(c)) continue;
+    if (entry.recordId && entry.recordId === j) return true;
+    if (entry.jobsite && entry.jobsite.toLowerCase() === j.toLowerCase()) return true;
+  }
+  return false;
+}
+
+function portalPsrScopesTouchClient(user, clientId) {
+  const want = portalPsrUpper(clientId);
+  if (!want) return false;
+  const list = Array.isArray(user?.psrScopes) ? user.psrScopes : [];
+  for (const raw of list) {
+    const entry = portalNormalizePsrScopeEntry(raw);
+    if (entry && entry.client === want) return true;
+  }
+  return false;
+}
+
 async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) {
   if (userIsPortalAdmin(user)) return true;
   if (!user || user.portalFilesAccessGranted !== true) return false;
   const c = String(clientId || '').trim();
   const j = String(jobId || '').trim();
   if (!c || !j) return false;
+
+  // #region agent log
+  if (portalJobAllowedByPsrScopes(user, c, j)) {
+    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+      body: JSON.stringify({
+        sessionId: '2228ee',
+        hypothesisId: 'A',
+        location: 'portal-files.routes.js:assertPortalJobAccess',
+        message: 'portal job access via psrScopes',
+        data: { clientLen: c.length, jobLen: j.length, portalScopeLen: Array.isArray(user.portalScopes) ? user.portalScopes.length : -1 },
+        timestamp: Date.now()
+      })
+    }).catch(() => {});
+    return true;
+  }
+  // #endregion
 
   const optWide = options.allowClientWideDataAutoSync;
   let allowClientWideDataAutoSync = false;
@@ -824,6 +896,25 @@ async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) 
   if (!legacyClient || !legacyJob) return false;
   if (c === legacyClient && j === legacyJob) return true;
   if (allowClientWideDataAutoSync && c === legacyClient) return true;
+  // #region agent log
+  fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+    body: JSON.stringify({
+      sessionId: '2228ee',
+      hypothesisId: 'A',
+      location: 'portal-files.routes.js:assertPortalJobAccess',
+      message: 'portal job access denied',
+      data: {
+        clientLen: c.length,
+        jobLen: j.length,
+        portalScopeLen: Array.isArray(user.portalScopes) ? user.portalScopes.length : -1,
+        psrScopeLen: Array.isArray(user.psrScopes) ? user.psrScopes.length : -1
+      },
+      timestamp: Date.now()
+    })
+  }).catch(() => {});
+  // #endregion
   return false;
 }
 
@@ -950,6 +1041,23 @@ async function assertPortalPathRel(grantPool, user, clientId, jobId, relPath, re
   if (!anyGrants) return true;
   const grants = await loadUserPathGrants(grantPool, clientId, jobId, user);
   if (!grants.length) {
+    if (portalJobAllowedByPsrScopes(user, String(clientId), String(jobId))) {
+      // #region agent log
+      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+        body: JSON.stringify({
+          sessionId: '2228ee',
+          hypothesisId: 'B',
+          location: 'portal-files.routes.js:assertPortalPathRel',
+          message: 'path ACL bypass: PSR-scoped user with no personal portal_path_grants rows',
+          data: { required: String(required || '') },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
+      return true;
+    }
     return bypassPathGrantsForLenientPortalClient(user, grants);
   }
   const rp = normalizeRelPath(relPath);
@@ -1196,7 +1304,27 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (jobHasPathGrants && !permEditorList) {
         const loaded = await loadUserPathGrants(aclPool, clientId, jobId, req.user);
         if (!bypassPathGrantsForLenientPortalClient(req.user, loaded)) {
-          userGrants = loaded;
+          if (loaded.length) {
+            userGrants = loaded;
+          } else if (!portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) {
+            userGrants = loaded;
+          }
+          // #region agent log
+          else {
+            fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+              body: JSON.stringify({
+                sessionId: '2228ee',
+                hypothesisId: 'C',
+                location: 'portal-files.routes.js:GET/',
+                message: 'list: skip path-grant filter (PSR scope, no personal grants)',
+                data: {},
+                timestamp: Date.now()
+              })
+            }).catch(() => {});
+          }
+          // #endregion
         }
       }
       const out = [];
@@ -1244,8 +1372,29 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (jobHasPathGrantsTree && !permEditorTree) {
         treeUserGrants = await loadUserPathGrants(aclPool, clientId, jobId, req.user);
         if (!bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) {
-          tree = filterTreeByPathGrants(tree, treeUserGrants, true);
-          appliedPathGrantFilter = true;
+          if (treeUserGrants.length) {
+            tree = filterTreeByPathGrants(tree, treeUserGrants, true);
+            appliedPathGrantFilter = true;
+          } else if (!portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) {
+            tree = filterTreeByPathGrants(tree, treeUserGrants, true);
+            appliedPathGrantFilter = true;
+          }
+          // #region agent log
+          else {
+            fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+              body: JSON.stringify({
+                sessionId: '2228ee',
+                hypothesisId: 'C',
+                location: 'portal-files.routes.js:GET/tree',
+                message: 'tree: skip path-grant filter (PSR scope, no personal grants)',
+                data: {},
+                timestamp: Date.now()
+              })
+            }).catch(() => {});
+          }
+          // #endregion
         }
       }
       return res.json(tree);
@@ -1257,9 +1406,6 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   r.get('/jobs', async (req, res) => {
     try {
-      if (!userIsPortalAdmin(req.user)) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
       const scope = resolvePortalScope(req, req.query, { requireJob: false });
       if (scope.error) {
         return res.status(400).json({ error: 'clientId query param is required' });
@@ -1267,6 +1413,19 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const clientId = String(scope.clientId || '').trim();
       if (!clientId) {
         return res.status(400).json({ error: 'clientId query param is required' });
+      }
+      const admin = userIsPortalAdmin(req.user);
+      const portalClientOk =
+        req.user?.portalFilesAccessGranted === true &&
+        Array.isArray(req.user.portalScopes) &&
+        req.user.portalScopes.some((s) => String(s?.clientId || '').trim() === clientId);
+      const psrClientOk =
+        req.user?.portalFilesAccessGranted === true && portalPsrScopesTouchClient(req.user, clientId);
+      const legacyClientOk =
+        req.user?.portalFilesAccessGranted === true &&
+        String(req.user?.portalFilesClientId || '').trim() === clientId;
+      if (!admin && !portalClientOk && !psrClientOk && !legacyClientOk) {
+        return res.status(403).json({ error: 'Forbidden' });
       }
       const probePrefix = jobPrefix(clientId, '__hp_jobs_probe__');
       const prefix = probePrefix.replace(/__hp_jobs_probe__\/$/, '');
@@ -1290,6 +1449,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const legacyJob = String(req.user?.portalFilesJobId || '').trim();
       const legacyClient = String(req.user?.portalFilesClientId || '').trim();
       if (legacyJob && legacyClient === clientId) set.add(legacyJob);
+      const psrList = Array.isArray(req.user?.psrScopes) ? req.user.psrScopes : [];
+      for (const raw of psrList) {
+        const e = portalNormalizePsrScopeEntry(raw);
+        if (!e || e.client !== portalPsrUpper(clientId)) continue;
+        if (e.recordId) set.add(e.recordId);
+        if (e.jobsite) set.add(e.jobsite);
+      }
       const jobs = [...set].sort((a, b) => {
         const an = Number(a);
         const bn = Number(b);
