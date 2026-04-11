@@ -1375,20 +1375,39 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
         return res.status(403).json({ error: 'Not included in this share' });
       }
-      const head = await s3.send(new GetObjectCommand({ Bucket: bucket, Key }));
-      const filename = path.basename(Key);
-      const s3Type = head.ContentType;
-      const useGuess =
-        s3Type === 'application/octet-stream' || s3Type === 'binary/octet-stream' || !s3Type;
-      const contentType = useGuess ? contentTypeFromFilename(filename) || 'application/octet-stream' : s3Type;
-      res.setHeader('Content-Type', contentType);
-      res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(filename)}"`);
-      if (head.ContentLength != null) res.setHeader('Content-Length', String(head.ContentLength));
-      if (head.Body && typeof head.Body.pipe === 'function') {
-        head.Body.pipe(res);
-        return;
+      return await sendPortalS3ObjectWithRanges(req, res, Key, 'share');
+    } catch (e) {
+      const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
+      if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
+        return res.status(404).json({ error: 'Not found' });
       }
-      return res.status(500).json({ error: 'Empty body' });
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  r.head('/share-view/:token/download/:id', async (req, res) => {
+    try {
+      const row = await loadShareLinkRowForToken(req.params.token);
+      if (!row || row.kind !== 'signin') return res.status(404).json({ error: 'Not found' });
+      if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const payload = row.payload || {};
+      const Key = idToKey(req.params.id);
+      if (!Key.startsWith('clients/')) {
+        return res.status(400).json({ error: 'Invalid id' });
+      }
+      const parsed = parseJobFromObjectKey(Key);
+      if (!parsed || parsed.clientId !== String(row.client_id) || parsed.jobId !== String(row.job_id)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const pref = jobPrefix(String(row.client_id), String(row.job_id));
+      const rel = Key.slice(pref.length);
+      if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
+        return res.status(403).json({ error: 'Not included in this share' });
+      }
+      return await sendPortalS3ObjectWithRanges(req, res, Key, 'share');
     } catch (e) {
       const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
       if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
@@ -2514,6 +2533,128 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     return entry;
   }
 
+  /**
+   * Stream one object from Wasabi with Range + HEAD metadata (video scrubbing). Caller enforces ACL.
+   * @param {'portal'|'share'} dispositionMode share/guest links always inline; portal uses video/PDF rules.
+   */
+  async function sendPortalS3ObjectWithRanges(req, res, Key, dispositionMode) {
+    const filename = path.basename(Key);
+    const fromKey = contentTypeFromFilename(filename);
+    let om;
+    try {
+      om = await resolvePortalDownloadObjectMeta(Key);
+    } catch (headErr) {
+      const hn = headErr && typeof headErr === 'object' && 'name' in headErr ? headErr.name : '';
+      if (
+        hn === 'NoSuchKey' ||
+        (headErr instanceof Error && headErr.message && headErr.message.includes('NoSuchKey'))
+      ) {
+        return res.status(404).json({ error: 'Not found' });
+      }
+      throw headErr;
+    }
+    const total = om.total;
+
+    const s3Type = om.s3Type;
+    const useGuess =
+      fromKey && (!s3Type || s3Type === 'application/octet-stream' || s3Type === 'binary/octet-stream');
+    const contentType = useGuess ? fromKey : om.rawContentType || 'application/octet-stream';
+    const inline =
+      dispositionMode === 'share'
+        ? true
+        : /^video\//i.test(contentType) ||
+          contentType === 'application/pdf' ||
+          String(req.query?.inline || '') === '1';
+    res.setHeader(
+      'Content-Disposition',
+      inline
+        ? `inline; filename="${encodeURIComponent(filename)}"`
+        : `attachment; filename="${encodeURIComponent(filename)}"`
+    );
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, max-age=300');
+
+    const rangeHdr = req.headers.range;
+    const isHead = req.method === 'HEAD';
+
+    if (isHead) {
+      if (rangeHdr) {
+        let pr = parseBytesRange(rangeHdr, total);
+        if (!pr) {
+          res.setHeader('Content-Range', `bytes */${total}`);
+          return res.status(416).end();
+        }
+        pr = clampBytesRangeToMaxChunk(pr, total, PORTAL_DL_MAX_RANGE_BYTES);
+        const chunk = pr.end - pr.start + 1;
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${pr.start}-${pr.end}/${total}`);
+        res.setHeader('Content-Length', String(chunk));
+        return res.end();
+      }
+      res.setHeader('Content-Length', String(total));
+      return res.status(200).end();
+    }
+
+    if (rangeHdr) {
+      let pr = parseBytesRange(rangeHdr, total);
+      if (!pr) {
+        res.setHeader('Content-Range', `bytes */${total}`);
+        return res.status(416).end();
+      }
+      pr = clampBytesRangeToMaxChunk(pr, total, PORTAL_DL_MAX_RANGE_BYTES);
+      if (!portalDlTryAcquireStreamSlot(req, res)) {
+        return res
+          .status(429)
+          .setHeader('Retry-After', '2')
+          .json({
+            error:
+              'Too many simultaneous video/download requests from this connection. Wait a second or avoid rapid scrubbing.'
+          });
+      }
+      const obj = await s3.send(
+        new GetObjectCommand({
+          Bucket: bucket,
+          Key,
+          Range: `bytes=${pr.start}-${pr.end}`
+        })
+      );
+      const chunk = pr.end - pr.start + 1;
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${pr.start}-${pr.end}/${total}`);
+      res.setHeader('Content-Length', String(chunk));
+      if (!obj.Body || typeof obj.Body.pipe !== 'function') {
+        return res.status(500).json({ error: 'Empty body' });
+      }
+      if (!pipeS3BodyWithAbortSupport(req, res, /** @type {import('stream').Readable} */ (obj.Body))) {
+        return res.status(500).json({ error: 'Empty body' });
+      }
+      return;
+    }
+
+    if (!portalDlTryAcquireStreamSlot(req, res)) {
+      return res
+        .status(429)
+        .setHeader('Retry-After', '2')
+        .json({
+          error:
+            'Too many simultaneous video/download requests from this connection. Wait a second or avoid rapid scrubbing.'
+        });
+    }
+
+    const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key }));
+    if (obj.ContentLength != null) {
+      res.setHeader('Content-Length', String(obj.ContentLength));
+    }
+    if (!obj.Body || typeof obj.Body.pipe !== 'function') {
+      return res.status(500).json({ error: 'Empty body' });
+    }
+    res.status(200);
+    if (!pipeS3BodyWithAbortSupport(req, res, /** @type {import('stream').Readable} */ (obj.Body))) {
+      return res.status(500).json({ error: 'Empty body' });
+    }
+  }
+
   async function handlePortalFileDownload(req, res) {
     try {
       if (!userCanPortalCapability(req.user, 'download')) {
@@ -2557,120 +2698,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(403).json({ error: 'Forbidden' });
       }
 
-      const filename = path.basename(Key);
-      const fromKey = contentTypeFromFilename(filename);
-      let om;
-      try {
-        om = await resolvePortalDownloadObjectMeta(Key);
-      } catch (headErr) {
-        const hn = headErr && typeof headErr === 'object' && 'name' in headErr ? headErr.name : '';
-        if (
-          hn === 'NoSuchKey' ||
-          (headErr instanceof Error && headErr.message && headErr.message.includes('NoSuchKey'))
-        ) {
-          return res.status(404).json({ error: 'Not found' });
-        }
-        throw headErr;
-      }
-      const total = om.total;
-
-      const s3Type = om.s3Type;
-      const useGuess =
-        fromKey &&
-        (!s3Type || s3Type === 'application/octet-stream' || s3Type === 'binary/octet-stream');
-      const contentType = useGuess ? fromKey : om.rawContentType || 'application/octet-stream';
-      const inline =
-        /^video\//i.test(contentType) ||
-        contentType === 'application/pdf' ||
-        String(req.query?.inline || '') === '1';
-      res.setHeader(
-        'Content-Disposition',
-        inline
-          ? `inline; filename="${encodeURIComponent(filename)}"`
-          : `attachment; filename="${encodeURIComponent(filename)}"`
-      );
-      res.setHeader('Content-Type', contentType);
-      res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Cache-Control', 'private, max-age=300');
-
-      const rangeHdr = req.headers.range;
-      const isHead = req.method === 'HEAD';
-
-      if (isHead) {
-        if (rangeHdr) {
-          let pr = parseBytesRange(rangeHdr, total);
-          if (!pr) {
-            res.setHeader('Content-Range', `bytes */${total}`);
-            return res.status(416).end();
-          }
-          pr = clampBytesRangeToMaxChunk(pr, total, PORTAL_DL_MAX_RANGE_BYTES);
-          const chunk = pr.end - pr.start + 1;
-          res.status(206);
-          res.setHeader('Content-Range', `bytes ${pr.start}-${pr.end}/${total}`);
-          res.setHeader('Content-Length', String(chunk));
-          return res.end();
-        }
-        res.setHeader('Content-Length', String(total));
-        return res.status(200).end();
-      }
-
-      if (rangeHdr) {
-        let pr = parseBytesRange(rangeHdr, total);
-        if (!pr) {
-          res.setHeader('Content-Range', `bytes */${total}`);
-          return res.status(416).end();
-        }
-        pr = clampBytesRangeToMaxChunk(pr, total, PORTAL_DL_MAX_RANGE_BYTES);
-        if (!portalDlTryAcquireStreamSlot(req, res)) {
-          return res
-            .status(429)
-            .setHeader('Retry-After', '2')
-            .json({
-              error:
-                'Too many simultaneous video/download requests from this connection. Wait a second or avoid rapid scrubbing.'
-            });
-        }
-        const obj = await s3.send(
-          new GetObjectCommand({
-            Bucket: bucket,
-            Key,
-            Range: `bytes=${pr.start}-${pr.end}`
-          })
-        );
-        const chunk = pr.end - pr.start + 1;
-        res.status(206);
-        res.setHeader('Content-Range', `bytes ${pr.start}-${pr.end}/${total}`);
-        res.setHeader('Content-Length', String(chunk));
-        if (!obj.Body || typeof obj.Body.pipe !== 'function') {
-          return res.status(500).json({ error: 'Empty body' });
-        }
-        if (!pipeS3BodyWithAbortSupport(req, res, /** @type {import('stream').Readable} */ (obj.Body))) {
-          return res.status(500).json({ error: 'Empty body' });
-        }
-        return;
-      }
-
-      if (!portalDlTryAcquireStreamSlot(req, res)) {
-        return res
-          .status(429)
-          .setHeader('Retry-After', '2')
-          .json({
-            error:
-              'Too many simultaneous video/download requests from this connection. Wait a second or avoid rapid scrubbing.'
-          });
-      }
-
-      const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key }));
-      if (obj.ContentLength != null) {
-        res.setHeader('Content-Length', String(obj.ContentLength));
-      }
-      if (!obj.Body || typeof obj.Body.pipe !== 'function') {
-        return res.status(500).json({ error: 'Empty body' });
-      }
-      res.status(200);
-      if (!pipeS3BodyWithAbortSupport(req, res, /** @type {import('stream').Readable} */ (obj.Body))) {
-        return res.status(500).json({ error: 'Empty body' });
-      }
+      return await sendPortalS3ObjectWithRanges(req, res, Key, 'portal');
     } catch (e) {
       const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
       if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
@@ -2945,16 +2973,42 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
         return res.status(403).json({ error: 'Not included in this share' });
       }
-      const head = await s3.send(new GetObjectCommand({ Bucket: bucket, Key }));
-      const filename = path.basename(Key);
-      res.setHeader('Content-Type', head.ContentType || 'application/octet-stream');
-      res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(filename)}"`);
-      if (head.ContentLength != null) res.setHeader('Content-Length', String(head.ContentLength));
-      if (head.Body && typeof head.Body.pipe === 'function') {
-        head.Body.pipe(res);
-        return;
+      return await sendPortalS3ObjectWithRanges(req, res, Key, 'share');
+    } catch (e) {
+      const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
+      if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
+        return res.status(404).json({ error: 'Not found' });
       }
-      return res.status(500).json({ error: 'Empty body' });
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  guest.head('/share/:token/download/:id', async (req, res) => {
+    try {
+      const row = await loadGuestShareRow(req.params.token);
+      if (!row) return res.status(404).json({ error: 'Link not found' });
+      if (row.kind === 'signin') {
+        return res.status(401).json({ error: 'Sign in required', requiresSignIn: true, kind: 'signin' });
+      }
+      if (!(await ensureGuestTreeAccess(req, row))) {
+        return res.status(401).json({ error: 'Registration required', needsRegistration: true });
+      }
+      const payload = row.payload || {};
+      const Key = idToKey(req.params.id);
+      if (!Key.startsWith('clients/')) {
+        return res.status(400).json({ error: 'Invalid id' });
+      }
+      const parsed = parseJobFromObjectKey(Key);
+      if (!parsed || parsed.clientId !== String(row.client_id) || parsed.jobId !== String(row.job_id)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const pref = jobPrefix(String(row.client_id), String(row.job_id));
+      const rel = Key.slice(pref.length);
+      if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
+        return res.status(403).json({ error: 'Not included in this share' });
+      }
+      return await sendPortalS3ObjectWithRanges(req, res, Key, 'share');
     } catch (e) {
       const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
       if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
