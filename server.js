@@ -6126,6 +6126,25 @@ function portalShareDataLivePostgresSql(text) {
   return false;
 }
 
+/**
+ * When WASABI_PORTAL_DATA_PRIMARY is on, mutating portal SQL is applied inside latest.json only.
+ * PipeShare reads `portal_path_grants` (and share-link rows used by guests) from **live Postgres** (`aclPool`),
+ * so Wasabi-only writes would look successful yet vanish on refresh — same class of bug as planner Postgres mirror.
+ * Upload session tables are excluded: `queryPortalDataWithWasabiFallback` always forwards them to Postgres first.
+ */
+function portalBusinessDataSqlMirrorPostgresAfterWasabi(text) {
+  const sql = normalizeSqlForPortalData(text);
+  if (!sql || sql === 'begin' || sql === 'commit' || sql === 'rollback') return false;
+  if (!/^(insert|update|delete)\s/.test(sql)) return false;
+  if (sql.includes('portal_upload_sessions') || sql.includes('portal_upload_session_parts')) return false;
+  return (
+    sql.includes('portal_path_grants') ||
+    sql.includes('portal_share_links') ||
+    sql.includes('portal_share_access_log') ||
+    sql.includes('portal_share_guest_sessions')
+  );
+}
+
 async function runPortalDataWasabiQuery(text, params = []) {
   const sql = normalizeSqlForPortalData(text);
   if (!sql) return null;
@@ -6633,6 +6652,13 @@ async function queryPortalDataWithWasabiFallback(text, params = []) {
     const result = await runPortalDataWasabiQuery(text, params);
     if (result) {
       wasabiPortalDataHandledByWasabi += 1;
+      if (portalBusinessDataSqlMirrorPostgresAfterWasabi(text)) {
+        try {
+          await pool.query(text, params);
+        } catch (mirrorErr) {
+          console.warn('[wasabi-portal-data] postgres mirror after Wasabi write failed:', mirrorErr?.message || mirrorErr);
+        }
+      }
       return result;
     }
     if (WASABI_PORTAL_DATA_PRIMARY_STRICT) {
