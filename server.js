@@ -479,12 +479,49 @@ async function putWasabiStateObject(stateObject) {
   wasabiLatestStateCacheAt = Date.now();
 }
 
+/**
+ * Read the mutable tables blob from a loaded Wasabi `latest.json`.
+ * JS treats `typeof null === 'object'`, so `data: null` must not become `{}` on incremental writes
+ * (that would replace the snapshot with an empty `data` object and make planner/PSR edits vanish after refresh).
+ */
+function readWasabiSnapshotDataTables(snapshot, options = {}) {
+  const strict = options.strict === true;
+  if (!snapshot || typeof snapshot !== 'object') return {};
+  const inner = snapshot.data;
+  if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+    return inner;
+  }
+  const skipMeta = new Set(['generatedAt', 'source', 'scope', 'reason', 'data']);
+  const legacy = {};
+  for (const key of Object.keys(snapshot)) {
+    if (skipMeta.has(key)) continue;
+    const v = snapshot[key];
+    if (Array.isArray(v)) legacy[key] = v;
+    else if (v && typeof v === 'object' && !Array.isArray(v)) legacy[key] = v;
+  }
+  if (Object.keys(legacy).length) {
+    console.warn('[wasabi-state] snapshot missing usable .data object; using top-level table keys as data');
+    return legacy;
+  }
+  if (Object.prototype.hasOwnProperty.call(snapshot, 'data') && snapshot.data === null) {
+    const msg =
+      'Wasabi latest.json has data:null with no recoverable table keys — refusing incremental write that would erase planner/auth state. Repair latest.json or run a full snapshot export.';
+    if (strict) throw new Error(msg);
+    console.warn(`[wasabi-state] ${msg}`);
+  }
+  return {};
+}
+
 function snapshotStateShape(snapshot) {
-  const data = snapshot && snapshot.data && typeof snapshot.data === 'object' ? snapshot.data : {};
+  const raw = snapshot && typeof snapshot === 'object' ? snapshot : {};
+  const data = readWasabiSnapshotDataTables(raw, { strict: true });
   return {
     generatedAt: nowIso(),
     source: 'horizon-backend',
-    scope: { clientId: 'portal-users', jobId: '3' },
+    scope:
+      raw.scope && typeof raw.scope === 'object' && !Array.isArray(raw.scope)
+        ? raw.scope
+        : { clientId: 'portal-users', jobId: '3' },
     data
   };
 }
@@ -531,10 +568,11 @@ function snapshotMeta(snapshot) {
   const generatedAtIso = String(snapshot?.generatedAt || '');
   const generatedAtMs = Date.parse(generatedAtIso);
   const ageMs = Number.isFinite(generatedAtMs) ? Math.max(0, Date.now() - generatedAtMs) : null;
+  const tables = readWasabiSnapshotDataTables(snapshot || {}, { strict: false });
   return {
     generatedAt: Number.isFinite(generatedAtMs) ? new Date(generatedAtMs).toISOString() : null,
     ageMs,
-    hasData: !!(snapshot && snapshot.data && typeof snapshot.data === 'object')
+    hasData: Object.keys(tables).length > 0
   };
 }
 
@@ -592,7 +630,7 @@ function wasabiReadDomains() {
 
 function evaluateWasabiRuntimeReadiness(snapshot) {
   const meta = snapshotMeta(snapshot);
-  const data = snapshot && snapshot.data && typeof snapshot.data === 'object' ? snapshot.data : {};
+  const data = readWasabiSnapshotDataTables(snapshot || {}, { strict: false });
   const tableCounts = Object.fromEntries(
     Object.entries(data)
       .filter(([, value]) => Array.isArray(value))
@@ -733,12 +771,10 @@ async function runWasabiStateSnapshot() {
       }
     }
     const data = {};
+    const prevData = readWasabiSnapshotDataTables(previousSnapshot || {}, { strict: false });
     for (const tableName of tables) {
       if (preserveFromLatest.has(tableName)) {
-        const prevRows =
-          previousSnapshot && previousSnapshot.data && Array.isArray(previousSnapshot.data[tableName])
-            ? previousSnapshot.data[tableName]
-            : null;
+        const prevRows = Array.isArray(prevData[tableName]) ? prevData[tableName] : null;
         if (prevRows !== null) {
           data[tableName] = cloneSnapshotRows(prevRows);
           continue;
