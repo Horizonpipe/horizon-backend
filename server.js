@@ -2866,20 +2866,23 @@ function userCanAccessPsrScope(user, scope) {
   if (user?.isAdmin) return true;
   const scopes = dedupePsrScopes(user?.psrScopes || []);
   if (!scopes.length) return false;
-  const recordId = cleanString(scope?.id || scope?.recordId || '');
-  if (recordId) {
-    return scopes.some((entry) => cleanString(entry.recordId || '') === recordId);
-  }
+  const recId = cleanString(scope?.id || scope?.recordId || '');
   const client = upperCleanString(scope?.client);
   const city = upperCleanString(scope?.city);
   const jobsite = normalizeJobsiteName(scope?.jobsite, scope?.street);
-  if (!client || !city || !jobsite) return false;
-  return scopes.some(
-    (entry) =>
+  const tripleReady = !!(client && city && jobsite);
+  return scopes.some((entry) => {
+    const eRid = cleanString(entry.recordId || '');
+    const triple =
+      tripleReady &&
       String(entry.client || '').toLowerCase() === client.toLowerCase() &&
       String(entry.city || '').toLowerCase() === city.toLowerCase() &&
-      String(entry.jobsite || '').toLowerCase() === jobsite.toLowerCase()
-  );
+      String(entry.jobsite || '').toLowerCase() === jobsite.toLowerCase();
+    if (eRid) {
+      return (recId && eRid === recId) || triple;
+    }
+    return triple;
+  });
 }
 
 function buildPsrScopeWhere(user, alias = '') {
