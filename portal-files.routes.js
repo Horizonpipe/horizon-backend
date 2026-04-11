@@ -841,23 +841,7 @@ async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) 
   const j = String(jobId || '').trim();
   if (!c || !j) return false;
 
-  // #region agent log
-  if (portalJobAllowedByPsrScopes(user, c, j)) {
-    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-      body: JSON.stringify({
-        sessionId: '2228ee',
-        hypothesisId: 'A',
-        location: 'portal-files.routes.js:assertPortalJobAccess',
-        message: 'portal job access via psrScopes',
-        data: { clientLen: c.length, jobLen: j.length, portalScopeLen: Array.isArray(user.portalScopes) ? user.portalScopes.length : -1 },
-        timestamp: Date.now()
-      })
-    }).catch(() => {});
-    return true;
-  }
-  // #endregion
+  if (portalJobAllowedByPsrScopes(user, c, j)) return true;
 
   const optWide = options.allowClientWideDataAutoSync;
   let allowClientWideDataAutoSync = false;
@@ -896,25 +880,6 @@ async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) 
   if (!legacyClient || !legacyJob) return false;
   if (c === legacyClient && j === legacyJob) return true;
   if (allowClientWideDataAutoSync && c === legacyClient) return true;
-  // #region agent log
-  fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-    body: JSON.stringify({
-      sessionId: '2228ee',
-      hypothesisId: 'A',
-      location: 'portal-files.routes.js:assertPortalJobAccess',
-      message: 'portal job access denied',
-      data: {
-        clientLen: c.length,
-        jobLen: j.length,
-        portalScopeLen: Array.isArray(user.portalScopes) ? user.portalScopes.length : -1,
-        psrScopeLen: Array.isArray(user.psrScopes) ? user.psrScopes.length : -1
-      },
-      timestamp: Date.now()
-    })
-  }).catch(() => {});
-  // #endregion
   return false;
 }
 
@@ -1042,20 +1007,6 @@ async function assertPortalPathRel(grantPool, user, clientId, jobId, relPath, re
   const grants = await loadUserPathGrants(grantPool, clientId, jobId, user);
   if (!grants.length) {
     if (portalJobAllowedByPsrScopes(user, String(clientId), String(jobId))) {
-      // #region agent log
-      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-        body: JSON.stringify({
-          sessionId: '2228ee',
-          hypothesisId: 'B',
-          location: 'portal-files.routes.js:assertPortalPathRel',
-          message: 'path ACL bypass: PSR-scoped user with no personal portal_path_grants rows',
-          data: { required: String(required || '') },
-          timestamp: Date.now()
-        })
-      }).catch(() => {});
-      // #endregion
       return true;
     }
     return bypassPathGrantsForLenientPortalClient(user, grants);
@@ -1309,22 +1260,6 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           } else if (!portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) {
             userGrants = loaded;
           }
-          // #region agent log
-          else {
-            fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-              body: JSON.stringify({
-                sessionId: '2228ee',
-                hypothesisId: 'C',
-                location: 'portal-files.routes.js:GET/',
-                message: 'list: skip path-grant filter (PSR scope, no personal grants)',
-                data: {},
-                timestamp: Date.now()
-              })
-            }).catch(() => {});
-          }
-          // #endregion
         }
       }
       const out = [];
@@ -1379,22 +1314,6 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
             tree = filterTreeByPathGrants(tree, treeUserGrants, true);
             appliedPathGrantFilter = true;
           }
-          // #region agent log
-          else {
-            fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-              body: JSON.stringify({
-                sessionId: '2228ee',
-                hypothesisId: 'C',
-                location: 'portal-files.routes.js:GET/tree',
-                message: 'tree: skip path-grant filter (PSR scope, no personal grants)',
-                data: {},
-                timestamp: Date.now()
-              })
-            }).catch(() => {});
-          }
-          // #endregion
         }
       }
       return res.json(tree);
