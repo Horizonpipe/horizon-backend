@@ -1111,6 +1111,41 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   const PORTAL_PRESIGN_TTL_SECONDS = Math.max(60, Math.min(604800, Number(process.env.PORTAL_PRESIGN_TTL_SECONDS || 3600)));
   const PORTAL_PRESIGN_DISABLED = String(process.env.PORTAL_PRESIGN_DISABLED || '0').trim() === '1';
 
+  /** Browser → Wasabi direct PUT / multipart parts. Set `PORTAL_UPLOAD_PRESIGN=0` to disable (client uses proxy upload). */
+  const PORTAL_UPLOAD_PRESIGN_ENABLED = String(process.env.PORTAL_UPLOAD_PRESIGN || '1').trim().toLowerCase() !== '0';
+  const PORTAL_UPLOAD_PRESIGN_MAX_BYTES = Math.max(
+    1024 * 1024,
+    Math.min(5368709120, Number(process.env.PORTAL_UPLOAD_PRESIGN_MAX_BYTES || 5368709120))
+  );
+  const S3_MAX_PARTS_HORIZON = 10000;
+  const S3_MIN_PART_BYTES_HORIZON = 5 * 1024 * 1024;
+  const MULTIPART_TARGET_PART_BYTES_HORIZON = Math.max(
+    S3_MIN_PART_BYTES_HORIZON,
+    Math.min(128 * 1024 * 1024, Number(process.env.PORTAL_MULTIPART_PART_BYTES || 8 * 1024 * 1024))
+  );
+
+  /**
+   * @param {number} fileSize
+   * @returns {{ partSize: number, partCount: number }}
+   */
+  function multipartUploadLayoutHorizon(fileSize) {
+    const n = Number(fileSize);
+    if (!Number.isFinite(n) || n < 0) throw new Error('Invalid fileSize');
+    if (n === 0) return { partSize: 0, partCount: 0 };
+    let partSize = MULTIPART_TARGET_PART_BYTES_HORIZON;
+    let partCount = Math.ceil(n / partSize);
+    if (partCount > S3_MAX_PARTS_HORIZON) {
+      partSize = Math.ceil(n / S3_MAX_PARTS_HORIZON);
+      const align = 64 * 1024;
+      partSize = Math.max(S3_MIN_PART_BYTES_HORIZON, Math.ceil(partSize / align) * align);
+      partCount = Math.ceil(n / partSize);
+      if (partCount > S3_MAX_PARTS_HORIZON) {
+        throw new Error('File too large for multipart upload part limit');
+      }
+    }
+    return { partSize, partCount };
+  }
+
   const r = express.Router();
   r.use(requireAuth);
 
@@ -1924,6 +1959,409 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       await removePortalPathGrantPrefixes(aclPool, clientId, jobId, folderRel);
       return res.status(204).send();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  async function assertWritablePresignPath(req, clientId, jobId, objectKey) {
+    if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) return false;
+    if (!userCanPortalCapability(req.user, 'upload')) return false;
+    const pref = jobPrefix(String(clientId), String(jobId));
+    const k = String(objectKey || '');
+    if (!k.startsWith(pref)) return false;
+    const rel = k.slice(pref.length);
+    return assertPortalPathRel(aclPool, req.user, clientId, jobId, rel, 'full');
+  }
+
+  function buildPresignedUploadObjectKey(clientId, jobId, body) {
+    const fileName = String(body?.fileName || '').trim();
+    if (!fileName) return { error: { status: 400, body: { error: 'fileName is required' } } };
+    const folderPath = normalizeRelPath(body?.folderPath || '');
+    const categoryRaw = String(body?.category || '').trim().toLowerCase();
+    if (folderPath) {
+      const key = portalUploadKey(clientId, jobId, folderPath, fileName, null);
+      return { key };
+    }
+    if (!categoryRaw || !CATEGORIES.has(categoryRaw)) {
+      return {
+        error: {
+          status: 400,
+          body: { error: 'category must be one of videos|db3|pdf|photos when folderPath is empty' }
+        }
+      };
+    }
+    const key = portalUploadKey(clientId, jobId, '', fileName, categoryRaw);
+    return { key };
+  }
+
+  function expectedResumablePartBytes(sessionRow, partNumber) {
+    const fileSize = Math.floor(Number(sessionRow.file_size || 0));
+    const cs = Number(sessionRow.chunk_size || 0);
+    if (!fileSize || !cs || partNumber < 1) return 0;
+    const start = (partNumber - 1) * cs;
+    if (start >= fileSize) return 0;
+    return Math.min(cs, fileSize - start);
+  }
+
+  /** JSON: { clientId, jobId, folderPath?, category?, fileName, contentType?, fileSize? } → presigned PUT to Wasabi. */
+  r.post('/upload/presign', express.json({ limit: '64kb' }), async (req, res) => {
+    if (!PORTAL_UPLOAD_PRESIGN_ENABLED) {
+      return res.status(404).json({ error: 'Direct upload presign is disabled' });
+    }
+    try {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      if (scope.error) return res.status(400).json({ error: 'clientId and jobId are required' });
+      const { clientId, jobId } = scope;
+      const built = buildPresignedUploadObjectKey(clientId, jobId, body);
+      if (built.error) return res.status(built.error.status).json(built.error.body);
+      if (!(await assertWritablePresignPath(req, clientId, jobId, built.key))) {
+        return res.status(403).json({ error: 'Forbidden for this path' });
+      }
+      const rawSize = body.fileSize != null ? Number(body.fileSize) : NaN;
+      if (Number.isFinite(rawSize) && rawSize > PORTAL_UPLOAD_PRESIGN_MAX_BYTES) {
+        return res.status(400).json({
+          error: `File exceeds direct upload limit (${PORTAL_UPLOAD_PRESIGN_MAX_BYTES} bytes); use multipart upload`
+        });
+      }
+      const ct =
+        body.contentType != null && String(body.contentType).trim() !== ''
+          ? String(body.contentType).trim().slice(0, 256)
+          : 'application/octet-stream';
+      const url = await getSignedUrl(
+        s3,
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: built.key,
+          ContentType: ct
+        }),
+        { expiresIn: PORTAL_PRESIGN_TTL_SECONDS }
+      );
+      const pref = jobPrefix(String(clientId), String(jobId));
+      const rel = built.key.slice(pref.length);
+      return res.json({
+        url,
+        expiresIn: PORTAL_PRESIGN_TTL_SECONDS,
+        headers: { 'Content-Type': ct },
+        id: keyToId(built.key),
+        key: built.key,
+        name: path.basename(built.key),
+        path: rel,
+        parentPath: parentRelPath(rel)
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(400).json({ error: msg });
+    }
+  });
+
+  /** JSON: { clientId, jobId, folderPath?, category?, fileName, contentType?, fileSize } — start S3 multipart (no DB). */
+  r.post('/upload/multipart/init', express.json({ limit: '64kb' }), async (req, res) => {
+    if (!PORTAL_UPLOAD_PRESIGN_ENABLED) {
+      return res.status(404).json({ error: 'Direct upload presign is disabled' });
+    }
+    try {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      if (scope.error) return res.status(400).json({ error: 'clientId and jobId are required' });
+      const { clientId, jobId } = scope;
+      const fileSize = Number(body.fileSize);
+      if (!Number.isFinite(fileSize) || fileSize <= 0) {
+        return res.status(400).json({ error: 'fileSize must be a positive number' });
+      }
+      const built = buildPresignedUploadObjectKey(clientId, jobId, body);
+      if (built.error) return res.status(built.error.status).json(built.error.body);
+      if (!(await assertWritablePresignPath(req, clientId, jobId, built.key))) {
+        return res.status(403).json({ error: 'Forbidden for this path' });
+      }
+      const ct =
+        body.contentType != null && String(body.contentType).trim() !== ''
+          ? String(body.contentType).trim().slice(0, 256)
+          : 'application/octet-stream';
+      const { partSize, partCount } = multipartUploadLayoutHorizon(fileSize);
+      const created = await s3.send(
+        new CreateMultipartUploadCommand({
+          Bucket: bucket,
+          Key: built.key,
+          ContentType: ct
+        })
+      );
+      const uploadId = created.UploadId;
+      if (!uploadId) return res.status(500).json({ error: 'Failed to start multipart upload' });
+      const pref = jobPrefix(String(clientId), String(jobId));
+      const rel = built.key.slice(pref.length);
+      return res.json({
+        uploadId,
+        key: built.key,
+        partSize,
+        partCount,
+        fileSize,
+        contentType: ct,
+        expiresIn: PORTAL_PRESIGN_TTL_SECONDS,
+        id: keyToId(built.key),
+        name: path.basename(built.key),
+        path: rel,
+        parentPath: parentRelPath(rel)
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(400).json({ error: msg });
+    }
+  });
+
+  /** JSON: { key, uploadId, partNumbers: number[] } */
+  r.post('/upload/multipart/sign-parts', express.json({ limit: '512kb' }), async (req, res) => {
+    if (!PORTAL_UPLOAD_PRESIGN_ENABLED) {
+      return res.status(404).json({ error: 'Direct upload presign is disabled' });
+    }
+    try {
+      const { key: rawKey, uploadId, partNumbers } = req.body || {};
+      const key = String(rawKey || '');
+      const uid = String(uploadId || '');
+      if (!key || !uid || !Array.isArray(partNumbers) || partNumbers.length === 0) {
+        return res.status(400).json({ error: 'key, uploadId, and partNumbers are required' });
+      }
+      if (partNumbers.length > 2000) {
+        return res.status(400).json({ error: 'Too many part numbers in one request (max 2000)' });
+      }
+      if (!key.startsWith('clients/')) return res.status(400).json({ error: 'Invalid key' });
+      const parsed = parseJobFromObjectKey(key);
+      if (!parsed || !(await assertWritablePresignPath(req, parsed.clientId, parsed.jobId, key))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const seen = new Set();
+      const nums = [];
+      for (const p of partNumbers) {
+        const n = Number(p);
+        if (!Number.isInteger(n) || n < 1 || n > 10000 || seen.has(n)) continue;
+        seen.add(n);
+        nums.push(n);
+      }
+      nums.sort((a, b) => a - b);
+      if (nums.length === 0) return res.status(400).json({ error: 'No valid part numbers' });
+      const parts = [];
+      for (const pn of nums) {
+        const url = await getSignedUrl(
+          s3,
+          new UploadPartCommand({
+            Bucket: bucket,
+            Key: key,
+            UploadId: uid,
+            PartNumber: pn
+          }),
+          { expiresIn: PORTAL_PRESIGN_TTL_SECONDS }
+        );
+        parts.push({ partNumber: pn, url });
+      }
+      return res.json({ parts, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(400).json({ error: msg });
+    }
+  });
+
+  /** JSON: { key, uploadId, parts: [{ partNumber, etag }] } */
+  r.post('/upload/multipart/complete', express.json({ limit: '8mb' }), async (req, res) => {
+    if (!PORTAL_UPLOAD_PRESIGN_ENABLED) {
+      return res.status(404).json({ error: 'Direct upload presign is disabled' });
+    }
+    try {
+      const { key: rawKey, uploadId, parts: rawParts } = req.body || {};
+      const key = String(rawKey || '');
+      const uid = String(uploadId || '');
+      if (!key || !uid || !Array.isArray(rawParts) || rawParts.length === 0) {
+        return res.status(400).json({ error: 'key, uploadId, and parts are required' });
+      }
+      if (!key.startsWith('clients/')) return res.status(400).json({ error: 'Invalid key' });
+      const parsed = parseJobFromObjectKey(key);
+      if (!parsed || !(await assertWritablePresignPath(req, parsed.clientId, parsed.jobId, key))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const s3Parts = rawParts
+        .map((p) => {
+          const pn = Number(p?.partNumber ?? p?.PartNumber);
+          const etagRaw = p?.etag ?? p?.ETag ?? '';
+          const etag = String(etagRaw).trim();
+          return { PartNumber: pn, ETag: etag };
+        })
+        .filter((p) => Number.isInteger(p.PartNumber) && p.PartNumber >= 1 && p.ETag.length > 0)
+        .sort((a, b) => a.PartNumber - b.PartNumber);
+      if (s3Parts.length === 0 || s3Parts.length !== rawParts.length) {
+        return res.status(400).json({ error: 'Each part must include partNumber and etag' });
+      }
+      await s3.send(
+        new CompleteMultipartUploadCommand({
+          Bucket: bucket,
+          Key: key,
+          UploadId: uid,
+          MultipartUpload: { Parts: s3Parts }
+        })
+      );
+      let size = 0;
+      try {
+        const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+        size = Number(head.ContentLength || 0);
+      } catch {
+        /* ignore */
+      }
+      const pref = jobPrefix(parsed.clientId, parsed.jobId);
+      const rel = key.slice(pref.length);
+      return res.status(201).json({
+        id: keyToId(key),
+        key,
+        name: path.basename(key),
+        size,
+        path: rel,
+        parentPath: parentRelPath(rel)
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(400).json({ error: msg });
+    }
+  });
+
+  /** JSON: { key, uploadId } */
+  r.post('/upload/multipart/abort', express.json({ limit: '64kb' }), async (req, res) => {
+    if (!PORTAL_UPLOAD_PRESIGN_ENABLED) {
+      return res.status(404).end();
+    }
+    try {
+      const { key: rawKey, uploadId } = req.body || {};
+      const key = String(rawKey || '');
+      const uid = String(uploadId || '');
+      if (!key || !uid || !key.startsWith('clients/')) {
+        return res.status(400).json({ error: 'key and uploadId are required' });
+      }
+      const parsed = parseJobFromObjectKey(key);
+      if (!parsed || !(await assertWritablePresignPath(req, parsed.clientId, parsed.jobId, key))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      await s3.send(new AbortMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uid }));
+      return res.status(204).end();
+    } catch {
+      return res.status(204).end();
+    }
+  });
+
+  /** JSON: { sessionId, partNumber } — presigned UploadPart URL (bytes go browser → Wasabi). */
+  r.post('/upload/resumable/sign-part', express.json({ limit: '64kb' }), async (req, res) => {
+    if (!PORTAL_UPLOAD_PRESIGN_ENABLED) {
+      return res.status(404).json({ error: 'Direct upload presign is disabled' });
+    }
+    try {
+      await ensurePortalResumeSchema(pool);
+      const sessionId = String(req.body?.sessionId || '').trim();
+      const partNumber = Number(req.body?.partNumber);
+      if (!sessionId || !Number.isInteger(partNumber) || partNumber < 1) {
+        return res.status(400).json({ error: 'sessionId and integer partNumber are required' });
+      }
+      const sRes = await pool.query(
+        `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
+        [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
+      );
+      const sessionRow = sRes.rows[0];
+      if (!isUploadSessionOpen(sessionRow)) {
+        return res.status(404).json({ error: 'Upload session not found or closed' });
+      }
+      if (!(await assertPortalJobAccessForRequest(pool, req, sessionRow.client_id, sessionRow.job_id))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (!userCanPortalCapability(req.user, 'upload')) {
+        return res.status(403).json({ error: 'Portal upload is not enabled for this account' });
+      }
+      const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id));
+      const relForAcl = String(sessionRow.object_key || '').slice(pref.length);
+      if (!(await assertPortalPathRel(aclPool, req.user, sessionRow.client_id, sessionRow.job_id, relForAcl, 'full'))) {
+        return res.status(403).json({ error: 'Forbidden for this path' });
+      }
+      const expBytes = expectedResumablePartBytes(sessionRow, partNumber);
+      if (expBytes <= 0) {
+        return res.status(400).json({ error: 'Invalid part number for this session' });
+      }
+      const url = await getSignedUrl(
+        s3,
+        new UploadPartCommand({
+          Bucket: bucket,
+          Key: sessionRow.object_key,
+          UploadId: sessionRow.multipart_upload_id,
+          PartNumber: partNumber
+        }),
+        { expiresIn: PORTAL_PRESIGN_TTL_SECONDS }
+      );
+      return res.json({ url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS, expectedBytes: expBytes });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  /** JSON: { sessionId, partNumber, etag, size, chunkSha256? } — record part after direct PUT to presigned URL. */
+  r.post('/upload/resumable/part-complete', express.json({ limit: '64kb' }), async (req, res) => {
+    if (!PORTAL_UPLOAD_PRESIGN_ENABLED) {
+      return res.status(404).json({ error: 'Direct upload presign is disabled' });
+    }
+    try {
+      await ensurePortalResumeSchema(pool);
+      const sessionId = String(req.body?.sessionId || '').trim();
+      const partNumber = Number(req.body?.partNumber);
+      const etagIn = String(req.body?.etag || '').replace(/^"+|"+$/g, '');
+      const sizeIn = Math.floor(Number(req.body?.size));
+      const chunkSha256 = normalizeSha256Hex(req.body?.chunkSha256 || '');
+      if (!sessionId || !Number.isInteger(partNumber) || partNumber < 1) {
+        return res.status(400).json({ error: 'sessionId and integer partNumber are required' });
+      }
+      if (!etagIn) return res.status(400).json({ error: 'etag is required' });
+      if (!Number.isFinite(sizeIn) || sizeIn <= 0) {
+        return res.status(400).json({ error: 'size must be a positive integer' });
+      }
+      if (chunkSha256 && chunkSha256.length !== 64) {
+        return res.status(400).json({ error: 'chunkSha256 must be a 64-char hex digest when provided' });
+      }
+      const sRes = await pool.query(
+        `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
+        [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
+      );
+      const sessionRow = sRes.rows[0];
+      if (!isUploadSessionOpen(sessionRow)) {
+        return res.status(404).json({ error: 'Upload session not found or closed' });
+      }
+      if (!(await assertPortalJobAccessForRequest(pool, req, sessionRow.client_id, sessionRow.job_id))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (!userCanPortalCapability(req.user, 'upload')) {
+        return res.status(403).json({ error: 'Portal upload is not enabled for this account' });
+      }
+      const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id));
+      const relForAcl = String(sessionRow.object_key || '').slice(pref.length);
+      if (!(await assertPortalPathRel(aclPool, req.user, sessionRow.client_id, sessionRow.job_id, relForAcl, 'full'))) {
+        return res.status(403).json({ error: 'Forbidden for this path' });
+      }
+      const expected = expectedResumablePartBytes(sessionRow, partNumber);
+      if (expected !== sizeIn) {
+        return res.status(409).json({ error: `Part size mismatch (expected ${expected}, got ${sizeIn})` });
+      }
+      const shaStored = chunkSha256 && chunkSha256.length === 64 ? chunkSha256 : null;
+      await pool.query(
+        `INSERT INTO portal_upload_session_parts (session_id, part_number, etag, sha256, size)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (session_id, part_number)
+         DO UPDATE SET etag = EXCLUDED.etag, sha256 = EXCLUDED.sha256, size = EXCLUDED.size, created_at = NOW()`,
+        [sessionId, partNumber, etagIn, shaStored, sizeIn]
+      );
+      await pool.query(`UPDATE portal_upload_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
+      const parts = await pool.query(
+        `SELECT part_number, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
+        [sessionId]
+      );
+      const uploadedBytes = contiguousUploadedBytes(parts.rows);
+      return res.json({
+        sessionId,
+        partNumber,
+        uploadedBytes,
+        nextPartNumber: parts.rows.length + 1
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
