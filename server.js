@@ -3,6 +3,8 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const multer = require('multer');
 const initSqlJs = require('sql.js');
 const { Pool } = require('pg');
@@ -1928,7 +1930,8 @@ async function readPlannerRecordsFromPostgresForUser(user) {
 }
 
 async function readRecordsFromWasabiSnapshotForUser(user) {
-  const snapshot = await loadWasabiLatestStateSnapshot();
+  /** Force S3 read: each Node process caches latest.json; another dyno may have written — stale cache looks like "not saving". */
+  const snapshot = await loadWasabiLatestStateSnapshot(true);
   // Same as record-by-id: do not drop the whole list when snapshot age exceeds threshold — merge with Postgres covers drift.
   if (!snapshot || !snapshot.data) return [];
   const rows = snapshotRows(snapshot, 'planner_records');
@@ -1961,11 +1964,23 @@ async function readRecordsFromWasabiSnapshotForUser(user) {
     })
   }).catch(() => {});
   // #endregion
+  dbgPsrFileLog({
+    hypothesisId: 'F',
+    location: 'readRecordsFromWasabiSnapshotForUser',
+    uid: String(user?.id || ''),
+    isAdmin: !!user?.isAdmin,
+    plannerStoreWasabiOnly: !!PLANNER_STORE_WASABI_ONLY,
+    recordsPrimary: !!WASABI_RECORDS_PRIMARY_ENABLED,
+    scopeEntryCount: Array.isArray(user?.psrScopes) ? user.psrScopes.length : 0,
+    rawRowCount: rows.length,
+    afterFilterCount: filtered.length,
+    normalizedThenFilterCount
+  });
   return filtered;
 }
 
 async function fetchRecordByIdFromWasabiSnapshot(id) {
-  const snapshot = await loadWasabiLatestStateSnapshot();
+  const snapshot = await loadWasabiLatestStateSnapshot(true);
   // Do not gate on snapshot age here: stale snapshot data beats a false 404 when Postgres was never
   // mirrored (Wasabi-primary creates) or when clocks / generatedAt skew.
   if (!snapshot || !snapshot.data) return null;
@@ -2371,7 +2386,7 @@ function sortRecordsByUpdatedDesc(records) {
 }
 
 async function findPlannerRecordsByScopeFromWasabiSnapshot(client, city, jobsite) {
-  const snapshot = await loadWasabiLatestStateSnapshot();
+  const snapshot = await loadWasabiLatestStateSnapshot(true);
   if (!snapshot || !snapshot.data) return PLANNER_STORE_WASABI_ONLY ? [] : null;
   if (
     !PLANNER_STORE_WASABI_ONLY &&
@@ -2410,6 +2425,17 @@ async function findPlannerRecordsByScope(client, city, jobsite, options = {}) {
          AND LOWER(jobsite) = LOWER($3)`;
   const result = await pool.query(sql, [client, city, jobsite]);
   return result.rows.map(normalizeRecordRow);
+}
+
+function dbgPsrFileLog(payload) {
+  try {
+    fs.appendFileSync(
+      path.join(__dirname, 'debug-2228ee.log'),
+      `${JSON.stringify({ sessionId: '2228ee', timestamp: Date.now(), ...payload })}\n`
+    );
+  } catch {
+    // ignore disk errors (read-only deploy dir, etc.)
+  }
 }
 
 function parseJsonObject(value, fallback = {}) {
@@ -2914,7 +2940,9 @@ function userCanAccessPsrScope(user, scope) {
   const scopes = dedupePsrScopes(user?.psrScopes || []);
   if (!scopes.length) return false;
   const data =
-    scope && scope.data && typeof scope.data === 'object' && !Array.isArray(scope.data) ? scope.data : {};
+    scope && scope.data && typeof scope.data === 'object' && !Array.isArray(scope.data)
+      ? scope.data
+      : parseJsonObject(scope?.data, {});
   const recId = cleanString(scope?.id || scope?.recordId || '');
   /** Persisted planner row triple (matches POST / SQL). NOT display jobsite (e.g. segment UI may coerce jobsite to NOT SET). */
   const client = upperCleanString(
