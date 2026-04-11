@@ -49,7 +49,6 @@ function createAutoImportPlugin(options = {}) {
   const upload = multer({ storage, limits: { fileSize: 60 * 1024 * 1024 } });
 
   const router = express.Router();
-  const desktopHeartbeatByUser = new Map();
   const HEARTBEAT_TTL_MS = (() => {
     const raw = Number(process.env.AUTO_IMPORT_HEARTBEAT_TTL_MS);
     if (!Number.isFinite(raw)) return 45_000;
@@ -147,6 +146,18 @@ function createAutoImportPlugin(options = {}) {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_auto_import_logs_project_created ON auto_import_logs(project_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS auto_import_desktop_heartbeats (
+        user_key TEXT PRIMARY KEY,
+        at_ms BIGINT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'connected',
+        source TEXT NOT NULL DEFAULT 'desktop',
+        detail TEXT NOT NULL DEFAULT '',
+        username TEXT NOT NULL DEFAULT '',
+        display_name TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_auto_import_desktop_hb_updated ON auto_import_desktop_heartbeats(updated_at DESC);
     `);
   }
 
@@ -441,14 +452,28 @@ function createAutoImportPlugin(options = {}) {
     const key = heartbeatKey(req);
     const nowMs = Date.now();
     const state = clean(req.body?.state || 'connected').toLowerCase() || 'connected';
-    desktopHeartbeatByUser.set(key, {
-      atMs: nowMs,
-      state,
-      source: clean(req.body?.source || 'desktop') || 'desktop',
-      detail: clean(req.body?.detail || req.body?.message || ''),
-      username: clean(req.user?.username || ''),
-      displayName: clean(req.user?.displayName || '')
-    });
+    const source = clean(req.body?.source || 'desktop') || 'desktop';
+    const detail = clean(req.body?.detail || req.body?.message || '');
+    const username = clean(req.user?.username || '');
+    const displayName = clean(req.user?.displayName || '');
+    try {
+      await pool.query(
+        `INSERT INTO auto_import_desktop_heartbeats (user_key, at_ms, state, source, detail, username, display_name, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+         ON CONFLICT (user_key) DO UPDATE SET
+           at_ms = EXCLUDED.at_ms,
+           state = EXCLUDED.state,
+           source = EXCLUDED.source,
+           detail = EXCLUDED.detail,
+           username = EXCLUDED.username,
+           display_name = EXCLUDED.display_name,
+           updated_at = NOW()`,
+        [key, nowMs, state, source, detail, username, displayName]
+      );
+    } catch (error) {
+      logger.error?.('auto-import desktop-heartbeat UPSERT failed:', error?.message || error);
+      return res.status(500).json({ success: false, error: 'Heartbeat persistence failed.' });
+    }
     res.json({
       success: true,
       connected: true,
@@ -459,15 +484,26 @@ function createAutoImportPlugin(options = {}) {
 
   router.get('/desktop-heartbeat', desktopHeartbeatGate, async (req, res) => {
     const key = heartbeatKey(req);
-    const rec = desktopHeartbeatByUser.get(key) || null;
     const nowMs = Date.now();
-    const ageMs = rec ? Math.max(0, nowMs - Number(rec.atMs || 0)) : Number.POSITIVE_INFINITY;
+    let rec = null;
+    try {
+      const r = await pool.query(
+        'SELECT at_ms, state, source, detail FROM auto_import_desktop_heartbeats WHERE user_key = $1 LIMIT 1',
+        [key]
+      );
+      rec = r.rows[0] || null;
+    } catch (error) {
+      logger.error?.('auto-import desktop-heartbeat SELECT failed:', error?.message || error);
+      return res.status(500).json({ success: false, error: 'Heartbeat read failed.' });
+    }
+    const atMs = rec ? Number(rec.at_ms) : NaN;
+    const ageMs = rec && Number.isFinite(atMs) ? Math.max(0, nowMs - atMs) : Number.POSITIVE_INFINITY;
     const connected = !!(rec && ageMs <= HEARTBEAT_TTL_MS && String(rec.state || '').toLowerCase() !== 'offline');
     res.json({
       success: true,
       connected,
       state: connected ? rec.state || 'connected' : 'offline',
-      lastSeenAt: rec ? new Date(rec.atMs).toISOString() : null,
+      lastSeenAt: rec && Number.isFinite(atMs) ? new Date(atMs).toISOString() : null,
       ageMs: Number.isFinite(ageMs) ? ageMs : null,
       ttlMs: HEARTBEAT_TTL_MS,
       source: rec?.source || null,
