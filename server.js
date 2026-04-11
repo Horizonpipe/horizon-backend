@@ -738,9 +738,12 @@ async function runWasabiStateSnapshot() {
         const prevRows =
           previousSnapshot && previousSnapshot.data && Array.isArray(previousSnapshot.data[tableName])
             ? previousSnapshot.data[tableName]
-            : [];
-        data[tableName] = cloneSnapshotRows(prevRows);
-        continue;
+            : null;
+        if (prevRows !== null) {
+          data[tableName] = cloneSnapshotRows(prevRows);
+          continue;
+        }
+        // No Wasabi rows yet for this preserved table — pull Postgres once instead of writing [] over latest.json.
       }
       try {
         const q = await pool.query(`SELECT * FROM ${tableName}`);
@@ -5763,7 +5766,7 @@ async function runAutoImportWasabiQuery(text, params = []) {
 
   let snapshotCache = null;
   async function requireFreshSnapshot() {
-    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot();
+    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot(true);
     if (!snapshotLooksFresh(snapshotCache, WASABI_AUTO_IMPORT_PRIMARY_MAX_SNAPSHOT_AGE_MS)) {
       throw new Error('Auto import snapshot is missing or stale');
     }
@@ -6117,7 +6120,7 @@ async function runAutoImportWasabiQuery(text, params = []) {
 
 async function queryAutoImportWithWasabiFallback(text, params = []) {
   const normalizedSql = normalizeSqlForAutoImport(text);
-  if (!WASABI_AUTO_IMPORT_PRIMARY_ENABLED) {
+  if (!WASABI_AUTO_IMPORT_PRIMARY_ENABLED || !WASABI_WRITES_PRIMARY_ENABLED) {
     return pool.query(text, params);
   }
   try {
@@ -6225,7 +6228,7 @@ async function runPortalDataWasabiQuery(text, params = []) {
 
   let snapshotCache = null;
   async function requireFreshSnapshot() {
-    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot();
+    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot(true);
     if (!snapshotLooksFresh(snapshotCache, WASABI_PORTAL_DATA_PRIMARY_MAX_SNAPSHOT_AGE_MS)) {
       throw new Error('Portal data snapshot is missing or stale');
     }
@@ -6706,10 +6709,10 @@ async function queryPortalDataWithWasabiFallback(text, params = []) {
   if (portalShareDataLivePostgresSql(text)) {
     return pool.query(text, params);
   }
-  const normalizedSql = normalizeSqlForPortalData(text);
-  if (!WASABI_PORTAL_DATA_PRIMARY_ENABLED) {
+  if (!WASABI_PORTAL_DATA_PRIMARY_ENABLED || !WASABI_WRITES_PRIMARY_ENABLED) {
     return pool.query(text, params);
   }
+  const normalizedSql = normalizeSqlForPortalData(text);
   try {
     const result = await runPortalDataWasabiQuery(text, params);
     if (result) {
@@ -6765,7 +6768,7 @@ async function runOutlookDataWasabiQuery(text, params = []) {
 
   let snapshotCache = null;
   async function requireFreshSnapshot() {
-    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot();
+    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot(true);
     if (!snapshotLooksFresh(snapshotCache, WASABI_OUTLOOK_PRIMARY_MAX_SNAPSHOT_AGE_MS)) {
       throw new Error('Outlook snapshot is missing or stale');
     }
@@ -6834,7 +6837,7 @@ async function runOutlookDataWasabiQuery(text, params = []) {
 
 async function queryOutlookDataWithWasabiFallback(text, params = []) {
   const normalizedSql = normalizeSqlForOutlookData(text);
-  if (!WASABI_OUTLOOK_PRIMARY_ENABLED) {
+  if (!WASABI_OUTLOOK_PRIMARY_ENABLED || !WASABI_WRITES_PRIMARY_ENABLED) {
     return pool.query(text, params);
   }
   try {
@@ -6889,7 +6892,7 @@ async function runSignupDataWasabiQuery(text, params = []) {
 
   let snapshotCache = null;
   async function requireFreshSnapshot() {
-    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot();
+    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot(true);
     if (!snapshotLooksFresh(snapshotCache, WASABI_SIGNUP_PRIMARY_MAX_SNAPSHOT_AGE_MS)) {
       throw new Error('Signup snapshot is missing or stale');
     }
@@ -7030,7 +7033,7 @@ async function runSignupDataWasabiQuery(text, params = []) {
 
 async function querySignupDataWithWasabiFallback(text, params = []) {
   const normalizedSql = normalizeSqlForSignupData(text);
-  if (!WASABI_SIGNUP_PRIMARY_ENABLED) {
+  if (!WASABI_SIGNUP_PRIMARY_ENABLED || !WASABI_WRITES_PRIMARY_ENABLED) {
     return pool.query(text, params);
   }
   try {
