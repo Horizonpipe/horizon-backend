@@ -5951,6 +5951,17 @@ function normalizeSqlForPortalData(text) {
     .toLowerCase();
 }
 
+/**
+ * Resumable multipart metadata must stay on Postgres: it is high-churn, needs immediate read-after-write,
+ * and Wasabi snapshot routing (staleness checks + tryWasabiStateWrite) breaks uploads when portal-data-primary is on.
+ * Object bytes still go to Wasabi S3 via portal-files.routes.js.
+ */
+function portalUploadMetadataSql(text) {
+  const sql = normalizeSqlForPortalData(text);
+  if (!sql) return false;
+  return sql.includes('portal_upload_sessions') || sql.includes('portal_upload_session_parts');
+}
+
 async function runPortalDataWasabiQuery(text, params = []) {
   const sql = normalizeSqlForPortalData(text);
   if (!sql) return null;
@@ -6459,6 +6470,9 @@ async function runPortalDataWasabiQuery(text, params = []) {
 }
 
 async function queryPortalDataWithWasabiFallback(text, params = []) {
+  if (portalUploadMetadataSql(text)) {
+    return pool.query(text, params);
+  }
   const normalizedSql = normalizeSqlForPortalData(text);
   if (!WASABI_PORTAL_DATA_PRIMARY_ENABLED) {
     return pool.query(text, params);
