@@ -2855,6 +2855,25 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   guest.get('/share/:token/meta', async (req, res) => {
     try {
       const row = await loadGuestShareRow(req.params.token);
+      // #region agent log
+      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+        body: JSON.stringify({
+          sessionId: '2228ee',
+          runId: 'guest-meta',
+          hypothesisId: 'H404',
+          location: 'portal-files.routes.js:guest-meta',
+          message: 'guest share meta after loadGuestShareRow',
+          data: {
+            tokenLen: String(req.params.token || '').length,
+            hasRow: !!row,
+            linkKind: row ? portalShareLinkKind(row) : null
+          },
+          timestamp: Date.now()
+        })
+      }).catch(() => {});
+      // #endregion
       if (!row) return res.status(404).json({ error: 'Link not found' });
       const linkKind = portalShareLinkKind(row);
       if (linkKind === 'signin') {
