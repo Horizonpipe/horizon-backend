@@ -1332,7 +1332,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   });
 
   async function loadShareLinkRowForToken(tkn) {
-    const q = await pool.query(`SELECT * FROM portal_share_links WHERE token = $1`, [String(tkn)]);
+    const q = await aclPool.query(`SELECT * FROM portal_share_links WHERE token = $1`, [String(tkn)]);
     return q.rows[0] || null;
   }
 
@@ -2835,12 +2835,12 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   const guest = express.Router();
 
   async function loadGuestShareRow(tkn) {
-    const q = await pool.query(`SELECT * FROM portal_share_links WHERE token = $1`, [String(tkn)]);
+    const q = await aclPool.query(`SELECT * FROM portal_share_links WHERE token = $1`, [String(tkn)]);
     return q.rows[0] || null;
   }
 
   async function validateGuestSession(guestToken, shareLinkId) {
-    const q = await pool.query(
+    const q = await aclPool.query(
       `SELECT 1 FROM portal_share_guest_sessions WHERE guest_token = $1 AND share_link_id = $2`,
       [String(guestToken), String(shareLinkId)]
     );
