@@ -5962,13 +5962,33 @@ function portalUploadMetadataSql(text) {
   return sql.includes('portal_upload_sessions') || sql.includes('portal_upload_session_parts');
 }
 
-/** Guest share reads must use live Postgres: Wasabi snapshot can miss newly created links (404). */
-function portalShareGuestLivePostgresSql(text) {
+/**
+ * Share links + guest access must use live Postgres when portal-data-primary is on:
+ * `runPortalDataWasabiQuery` handles INSERTs only via Wasabi snapshot (no `pool.query`), so rows
+ * never appeared in Postgres while guest routes read with `aclPool` → 404 on `/meta`.
+ * Also route the share-access report SELECT so it matches rows written here.
+ */
+function portalShareDataLivePostgresSql(text) {
   const sql = normalizeSqlForPortalData(text);
   if (!sql) return false;
+  if (sql === 'begin' || sql === 'commit' || sql === 'rollback') return true;
   if (sql.startsWith('select * from portal_share_links where token = $1')) return true;
   if (sql.startsWith('select 1 from portal_share_guest_sessions where guest_token = $1 and share_link_id = $2'))
     return true;
+  if (
+    sql.startsWith(
+      'select a.id, a.email, a.first_name as "firstname", a.last_name as "lastname", a.role, a.company, a.accessed_at as "accessedat", l.kind, l.token, l.created_at as "linkcreatedat" from portal_share_access_log a join portal_share_links l on l.id = a.share_link_id where l.client_id = $1 and l.job_id = $2 order by a.accessed_at desc limit 500'
+    )
+  )
+    return true;
+  if (
+    sql.startsWith(
+      'insert into portal_share_links (id, token, client_id, job_id, kind, created_by_username, payload) values'
+    )
+  )
+    return true;
+  if (sql.startsWith('insert into portal_share_access_log')) return true;
+  if (sql.startsWith('insert into portal_share_guest_sessions')) return true;
   return false;
 }
 
@@ -6468,7 +6488,7 @@ async function queryPortalDataWithWasabiFallback(text, params = []) {
   if (portalUploadMetadataSql(text)) {
     return pool.query(text, params);
   }
-  if (portalShareGuestLivePostgresSql(text)) {
+  if (portalShareDataLivePostgresSql(text)) {
     return pool.query(text, params);
   }
   const normalizedSql = normalizeSqlForPortalData(text);
