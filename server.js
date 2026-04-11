@@ -5962,6 +5962,16 @@ function portalUploadMetadataSql(text) {
   return sql.includes('portal_upload_sessions') || sql.includes('portal_upload_session_parts');
 }
 
+/** Guest share reads must use live Postgres: Wasabi snapshot can miss newly created links (404). */
+function portalShareGuestLivePostgresSql(text) {
+  const sql = normalizeSqlForPortalData(text);
+  if (!sql) return false;
+  if (sql.startsWith('select * from portal_share_links where token = $1')) return true;
+  if (sql.startsWith('select 1 from portal_share_guest_sessions where guest_token = $1 and share_link_id = $2'))
+    return true;
+  return false;
+}
+
 async function runPortalDataWasabiQuery(text, params = []) {
   const sql = normalizeSqlForPortalData(text);
   if (!sql) return null;
@@ -6077,21 +6087,6 @@ async function runPortalDataWasabiQuery(text, params = []) {
         return String(a.pathPrefix || '').localeCompare(String(b.pathPrefix || ''), undefined, { sensitivity: 'base' });
       });
     return pgRows(rows);
-  }
-  if (sql.startsWith('select * from portal_share_links where token = $1')) {
-    const snapshot = await requireFreshSnapshot();
-    const token = String(params[0] || '');
-    const rows = snapshotRows(snapshot, 'portal_share_links').filter((row) => String(row.token || '') === token).slice(0, 1);
-    return pgRows(rows);
-  }
-  if (sql.startsWith('select 1 from portal_share_guest_sessions where guest_token = $1 and share_link_id = $2')) {
-    const snapshot = await requireFreshSnapshot();
-    const guestToken = String(params[0] || '');
-    const shareLinkId = String(params[1] || '');
-    const exists = snapshotRows(snapshot, 'portal_share_guest_sessions').some(
-      (row) => String(row.guest_token || '') === guestToken && String(row.share_link_id || '') === shareLinkId
-    );
-    return pgRows(exists ? [{ '?column?': 1 }] : []);
   }
   if (
     sql.startsWith(
@@ -6471,6 +6466,9 @@ async function runPortalDataWasabiQuery(text, params = []) {
 
 async function queryPortalDataWithWasabiFallback(text, params = []) {
   if (portalUploadMetadataSql(text)) {
+    return pool.query(text, params);
+  }
+  if (portalShareGuestLivePostgresSql(text)) {
     return pool.query(text, params);
   }
   const normalizedSql = normalizeSqlForPortalData(text);
