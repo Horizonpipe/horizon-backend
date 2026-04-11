@@ -1945,29 +1945,7 @@ async function readRecordsFromWasabiSnapshotForUser(user) {
   const normalizedThenFilterCount = rows
     .map((row) => normalizeRecordRow(row))
     .filter((record) => userCanAccessPsrScope(user, record)).length;
-  // #region agent log
-  fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-    body: JSON.stringify({
-      sessionId: '2228ee',
-      hypothesisId: 'D',
-      location: 'server.js:readRecordsFromWasabiSnapshotForUser',
-      message: 'wasabi planner_records scope filter (raw row vs normalize-then-filter)',
-      data: {
-        uid: String(user?.id || ''),
-        isAdmin: !!user?.isAdmin,
-        scopeEntryCount: Array.isArray(user?.psrScopes) ? user.psrScopes.length : 0,
-        rawRowCount: rows.length,
-        afterFilterCount: filtered.length,
-        normalizedThenFilterCount
-      },
-      timestamp: Date.now(),
-      runId: 'post-fix'
-    })
-  }).catch(() => {});
-  // #endregion
-  dbgPsrFileLog({
+dbgPsrFileLog({
     hypothesisId: 'F',
     location: 'readRecordsFromWasabiSnapshotForUser',
     uid: String(user?.id || ''),
@@ -4745,54 +4723,14 @@ app.get('/records', requireAuth, requirePsrViewerAccess, async (req, res) => {
         if (WASABI_RECORDS_PRIMARY_STRICT) throw error;
       }
       const out = sortPlannerRecordsForList(snapshotRecords);
-      // #region agent log
-      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-        body: JSON.stringify({
-          sessionId: '2228ee',
-          hypothesisId: 'A',
-          location: 'server.js:GET/records',
-          message: 'branch wasabi_only',
-          data: {
-            uid: String(req.user?.id || ''),
-            isAdmin: !!req.user?.isAdmin,
-            scopeEntryCount: Array.isArray(req.user?.psrScopes) ? req.user.psrScopes.length : 0,
-            recordCount: out.length
-          },
-          timestamp: Date.now(),
-          runId: 'pre-fix'
-        })
-      }).catch(() => {});
-      // #endregion
-      return res.json({ success: true, records: out });
+return res.json({ success: true, records: out });
     }
 
     const pgRecords = await readPlannerRecordsFromPostgresForUser(req.user);
 
     if (!WASABI_RECORDS_PRIMARY_ENABLED) {
       const out = sortPlannerRecordsForList(pgRecords);
-      // #region agent log
-      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-        body: JSON.stringify({
-          sessionId: '2228ee',
-          hypothesisId: 'A',
-          location: 'server.js:GET/records',
-          message: 'branch postgres_only',
-          data: {
-            uid: String(req.user?.id || ''),
-            isAdmin: !!req.user?.isAdmin,
-            scopeEntryCount: Array.isArray(req.user?.psrScopes) ? req.user.psrScopes.length : 0,
-            recordCount: out.length
-          },
-          timestamp: Date.now(),
-          runId: 'pre-fix'
-        })
-      }).catch(() => {});
-      // #endregion
-      return res.json({ success: true, records: out });
+return res.json({ success: true, records: out });
     }
 
     let snapshotRecords = [];
@@ -4804,29 +4742,7 @@ app.get('/records', requireAuth, requirePsrViewerAccess, async (req, res) => {
 
     const merged = mergePlannerRecordsById(snapshotRecords, pgRecords);
     const out = sortPlannerRecordsForList(merged);
-    // #region agent log
-    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-      body: JSON.stringify({
-        sessionId: '2228ee',
-        hypothesisId: 'A',
-        location: 'server.js:GET/records',
-        message: 'branch merge_wasabi_postgres',
-        data: {
-          uid: String(req.user?.id || ''),
-          isAdmin: !!req.user?.isAdmin,
-          scopeEntryCount: Array.isArray(req.user?.psrScopes) ? req.user.psrScopes.length : 0,
-          wasabiFilteredCount: snapshotRecords.length,
-          pgCount: pgRecords.length,
-          mergedCount: out.length
-        },
-        timestamp: Date.now(),
-        runId: 'pre-fix'
-      })
-    }).catch(() => {});
-    // #endregion
-    return res.json({ success: true, records: out });
+return res.json({ success: true, records: out });
   } catch (error) {
     console.error('GET RECORDS ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -4916,31 +4832,7 @@ async function persistRecord(record) {
       rows[idx] = savedRow;
     }
   });
-  // #region agent log
-  {
-    const display = cleanString(record?.jobsite ?? '');
-    const scope = cleanString(record?.psrScopeJobsite ?? '');
-    const displayIsUnset = !display || display.toUpperCase() === 'NOT SET';
-    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-      body: JSON.stringify({
-        sessionId: '2228ee',
-        hypothesisId: 'E',
-        location: 'server.js:persistRecord',
-        message: 'planner persist jobsite source',
-        data: {
-          wasabiWrote: !!wasabiWrote,
-          usedScopeFallback: !!(scope && displayIsUnset),
-          displayWasNotSet: displayIsUnset ? 1 : 0
-        },
-        timestamp: Date.now(),
-        runId: 'persist-jobsite-fix'
-      })
-    }).catch(() => {});
-  }
-  // #endregion
-  if (wasabiWrote && savedRow) {
+if (wasabiWrote && savedRow) {
     return normalizeRecordRow(savedRow);
   }
   if (PLANNER_STORE_WASABI_ONLY) {
@@ -5188,27 +5080,7 @@ app.post('/records/:id/segments', requireAuth, requirePsrDataEntryAccess, async 
     record.saved_by = req.user.displayName || req.user.username;
 
     const saved = await persistRecord(record);
-    // #region agent log
-    const _segN = (saved?.systems?.[system] || []).length;
-    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-      body: JSON.stringify({
-        sessionId: '2228ee',
-        hypothesisId: 'C',
-        location: 'server.js:POST/records/:id/segments',
-        message: 'segment persisted',
-        data: {
-          recordIdLen: String(req.params.id || '').length,
-          system,
-          segmentCountInSystem: _segN
-        },
-        timestamp: Date.now(),
-        runId: 'pre-fix'
-      })
-    }).catch(() => {});
-    // #endregion
-    res.status(201).json({ success: true, record: saved, segment });
+res.status(201).json({ success: true, record: saved, segment });
   } catch (error) {
     console.error('ADD SEGMENT ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
