@@ -1151,6 +1151,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     poolOption && typeof poolOption.query === 'function'
       ? { query: (text, params) => poolOption.query(text, params) }
       : pool;
+  /** Resumable upload metadata must always use live Postgres (never `queryPortalDataWithWasabiFallback`). */
+  const uploadMetaPool =
+    poolOption && typeof poolOption.query === 'function'
+      ? { query: (text, params) => poolOption.query(text, params) }
+      : pool;
   registerPortalShareLinkRoutes(app, { pool, query: dbQuery, requireAuth, requireAdmin });
 
   const s3 = createWasabiClient();
@@ -2336,13 +2341,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       return res.status(404).json({ error: 'Direct upload presign is disabled' });
     }
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const sessionId = String(req.body?.sessionId || '').trim();
       const partNumber = Number(req.body?.partNumber);
       if (!sessionId || !Number.isInteger(partNumber) || partNumber < 1) {
         return res.status(400).json({ error: 'sessionId and integer partNumber are required' });
       }
-      const sRes = await pool.query(
+      const sRes = await uploadMetaPool.query(
         `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
         [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
       );
@@ -2388,7 +2393,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       return res.status(404).json({ error: 'Direct upload presign is disabled' });
     }
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const sessionId = String(req.body?.sessionId || '').trim();
       const partNumber = Number(req.body?.partNumber);
       const etagIn = String(req.body?.etag || '').replace(/^"+|"+$/g, '');
@@ -2404,7 +2409,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (chunkSha256 && chunkSha256.length !== 64) {
         return res.status(400).json({ error: 'chunkSha256 must be a 64-char hex digest when provided' });
       }
-      const sRes = await pool.query(
+      const sRes = await uploadMetaPool.query(
         `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
         [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
       );
@@ -2428,15 +2433,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(409).json({ error: `Part size mismatch (expected ${expected}, got ${sizeIn})` });
       }
       const shaStored = chunkSha256 && chunkSha256.length === 64 ? chunkSha256 : null;
-      await pool.query(
+      await uploadMetaPool.query(
         `INSERT INTO portal_upload_session_parts (session_id, part_number, etag, sha256, size)
          VALUES ($1,$2,$3,$4,$5)
          ON CONFLICT (session_id, part_number)
          DO UPDATE SET etag = EXCLUDED.etag, sha256 = EXCLUDED.sha256, size = EXCLUDED.size, created_at = NOW()`,
         [sessionId, partNumber, etagIn, shaStored, sizeIn]
       );
-      await pool.query(`UPDATE portal_upload_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
-      const parts = await pool.query(
+      await uploadMetaPool.query(`UPDATE portal_upload_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
+      const parts = await uploadMetaPool.query(
         `SELECT part_number, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
         [sessionId]
       );
@@ -2620,7 +2625,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   r.get('/upload/resumable/active', async (req, res) => {
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const scope = resolvePortalScope(req, req.query, { requireJob: false });
       const clientId = scope.error ? '' : scope.clientId;
       const jobId = scope.error ? '' : scope.jobId;
@@ -2634,7 +2639,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         vals.push(String(jobId));
         where.push(`job_id = $${vals.length}`);
       }
-      const out = await pool.query(
+      const out = await uploadMetaPool.query(
         `SELECT id, client_id, job_id, folder_path, file_name, file_size, mime_type, object_key, chunk_size, updated_at
          FROM portal_upload_sessions
          WHERE ${where.join(' AND ')}
@@ -2644,7 +2649,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       );
       const rows = [];
       for (const s of out.rows) {
-        const p = await pool.query(
+        const p = await uploadMetaPool.query(
           `SELECT part_number, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
           [s.id]
         );
@@ -2674,7 +2679,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   r.post('/upload/resumable/init', express.json({ limit: '256kb' }), async (req, res) => {
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const body = req.body || {};
       const scope = resolvePortalScope(req, body);
       const { folderPath, fileName, fileSize, mimeType, chunkSize, sha256 } = body;
@@ -2707,7 +2712,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
 
       const userId = String(req.user?.id ?? req.user?.username ?? '');
-      const existing = await pool.query(
+      const existing = await uploadMetaPool.query(
         `SELECT id, multipart_upload_id, chunk_size, object_key, file_size, file_name, mime_type, sha256
          FROM portal_upload_sessions
          WHERE user_id = $1 AND client_id = $2 AND job_id = $3
@@ -2723,7 +2728,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         if (sessionSha256 && expectedFileSha256 && sessionSha256 !== expectedFileSha256) {
           return res.status(409).json({ error: 'Existing resumable session hash mismatch for this file' });
         }
-        const p = await pool.query(
+        const p = await uploadMetaPool.query(
           `SELECT part_number, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
           [s.id]
         );
@@ -2749,7 +2754,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!uploadId) {
         throw new Error('Failed to start multipart upload');
       }
-      const created = await pool.query(
+      const created = await uploadMetaPool.query(
         `INSERT INTO portal_upload_sessions
          (user_id, client_id, job_id, folder_path, file_name, file_size, mime_type, object_key, multipart_upload_id, chunk_size, sha256, status)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'uploading')
@@ -2786,7 +2791,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     const f = req.file;
     if (!f) return res.status(400).json({ error: 'Missing file field "chunk"' });
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const sessionId = String(req.body?.sessionId || '').trim();
       const partNumber = Number(req.body?.partNumber);
       const chunkSha256 = normalizeSha256Hex(req.body?.chunkSha256 || '');
@@ -2799,7 +2804,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!f.buffer || !Number.isFinite(Number(f.size || 0)) || Number(f.size || 0) <= 0) {
         return res.status(400).json({ error: 'Uploaded chunk body is empty' });
       }
-      const sRes = await pool.query(
+      const sRes = await uploadMetaPool.query(
         `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
         [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
       );
@@ -2836,15 +2841,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       );
       const etag = String(partResp.ETag || '').replace(/^"+|"+$/g, '');
       if (!etag) throw new Error('Missing ETag for uploaded part');
-      await pool.query(
+      await uploadMetaPool.query(
         `INSERT INTO portal_upload_session_parts (session_id, part_number, etag, sha256, size)
          VALUES ($1,$2,$3,$4,$5)
          ON CONFLICT (session_id, part_number)
          DO UPDATE SET etag = EXCLUDED.etag, sha256 = EXCLUDED.sha256, size = EXCLUDED.size, created_at = NOW()`,
         [sessionId, partNumber, etag, actualChunkSha256, Math.floor(Number(f.size || 0))]
       );
-      await pool.query(`UPDATE portal_upload_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
-      const parts = await pool.query(
+      await uploadMetaPool.query(`UPDATE portal_upload_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
+      const parts = await uploadMetaPool.query(
         `SELECT part_number, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
         [sessionId]
       );
@@ -2863,7 +2868,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   r.post('/upload/resumable/complete', express.json({ limit: '128kb' }), async (req, res) => {
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const sessionId = String(req.body?.sessionId || '').trim();
       const totalParts = Number(req.body?.totalParts);
       const bodySha256 = normalizeSha256Hex(req.body?.sha256 || '');
@@ -2873,7 +2878,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (bodySha256 && bodySha256.length !== 64) {
         return res.status(400).json({ error: 'sha256 must be a 64-char hex digest' });
       }
-      const sRes = await pool.query(
+      const sRes = await uploadMetaPool.query(
         `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
         [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
       );
@@ -2895,7 +2900,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (expectedFileSha256.length !== 64) {
         return res.status(400).json({ error: 'sha256 is required to finalize resumable uploads' });
       }
-      const parts = await pool.query(
+      const parts = await uploadMetaPool.query(
         `SELECT part_number, etag, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
         [sessionId]
       );
@@ -2931,7 +2936,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         } catch (_) {
           /* ignore delete failure after hash mismatch */
         }
-        await pool.query(
+        await uploadMetaPool.query(
           `UPDATE portal_upload_sessions
            SET status = 'failed', sha256 = $2, updated_at = NOW()
            WHERE id = $1`,
@@ -2943,7 +2948,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           actual: actualFileSha256
         });
       }
-      await pool.query(
+      await uploadMetaPool.query(
         `UPDATE portal_upload_sessions
          SET status = 'completed', sha256 = $2, completed_at = NOW(), updated_at = NOW()
          WHERE id = $1`,
@@ -2966,10 +2971,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   r.post('/upload/resumable/abort', express.json({ limit: '64kb' }), async (req, res) => {
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const sessionId = String(req.body?.sessionId || '').trim();
       if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
-      const sRes = await pool.query(
+      const sRes = await uploadMetaPool.query(
         `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
         [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
       );
@@ -2991,7 +2996,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           /* ignore provider-side missing upload */
         }
       }
-      await pool.query(`UPDATE portal_upload_sessions SET status = 'aborted', updated_at = NOW() WHERE id = $1`, [
+      await uploadMetaPool.query(`UPDATE portal_upload_sessions SET status = 'aborted', updated_at = NOW() WHERE id = $1`, [
         sessionId
       ]);
       return res.status(204).send();
