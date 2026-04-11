@@ -1,0 +1,11 @@
+---
+description: Canonical clone lives on C: — use C:\GITHUBS, not Google Drive
+alwaysApply: true
+---
+
+# Canonical paths
+
+- **This repo:** `C:\GITHUBS\horizon-backend`
+- **Frontend:** `C:\GITHUBS\horizon-frontend`
+
+Use **`C:\GITHUBS\...`** only for edits, git, terminals, and npm. Do not use `I:\My Drive\GITHUBS\...` for agent work (Drive is backup / sync only).
