@@ -4,6 +4,11 @@
  * Client portal Wasabi proxy — same auth as the rest of horizon-backend.
  * Env (Render): WASABI_ACCESS_KEY_ID, WASABI_SECRET_ACCESS_KEY, WASABI_BUCKET,
  * WASABI_REGION, WASABI_ENDPOINT (also accepts WASABI_ACCESS_KEY / WASABI_SECRET_KEY).
+ *
+ * Heavy GET traffic (video, large downloads) should use `/api/files/presign/:id`,
+ * `/api/files/share-view/:token/presign/:id`, or `/api/guest/share/:token/presign/:id`
+ * so browsers fetch object bytes directly from Wasabi (configure bucket CORS for your portal origins).
+ * Multipart resumable chunks still POST through this service unless extended with presigned part URLs.
  */
 
 const fs = require('fs');
@@ -31,6 +36,7 @@ const {
   PutObjectCommand,
   UploadPartCommand
 } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { Upload } = require('@aws-sdk/lib-storage');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
 const { canManagePortalExtras } = require('./capabilities');
@@ -1101,6 +1107,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     return;
   }
 
+  /** Browser → Wasabi direct GET (video/blob). Match portal-api / horizon-frontend `PORTAL_PRESIGN_TTL_SECONDS`. */
+  const PORTAL_PRESIGN_TTL_SECONDS = Math.max(60, Math.min(604800, Number(process.env.PORTAL_PRESIGN_TTL_SECONDS || 3600)));
+  const PORTAL_PRESIGN_DISABLED = String(process.env.PORTAL_PRESIGN_DISABLED || '0').trim() === '1';
+
   const r = express.Router();
   r.use(requireAuth);
 
@@ -1345,6 +1355,32 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       .toLowerCase();
   }
 
+  /**
+   * @returns {Promise<{ ok: true, Key: string } | { ok: false, status: number, body: Record<string, unknown> }>}
+   */
+  async function shareViewAuthObjectKey(req, token, idParam) {
+    const row = await loadShareLinkRowForToken(token);
+    if (!row || portalShareLinkKind(row) !== 'signin') return { ok: false, status: 404, body: { error: 'Not found' } };
+    if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
+      return { ok: false, status: 403, body: { error: 'Forbidden' } };
+    }
+    const payload = row.payload || {};
+    const Key = idToKey(idParam);
+    if (!Key.startsWith('clients/')) {
+      return { ok: false, status: 400, body: { error: 'Invalid id' } };
+    }
+    const parsed = parseJobFromObjectKey(Key);
+    if (!parsed || parsed.clientId !== String(row.client_id) || parsed.jobId !== String(row.job_id)) {
+      return { ok: false, status: 403, body: { error: 'Forbidden' } };
+    }
+    const pref = jobPrefix(String(row.client_id), String(row.job_id));
+    const rel = Key.slice(pref.length);
+    if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
+      return { ok: false, status: 403, body: { error: 'Not included in this share' } };
+    }
+    return { ok: true, Key };
+  }
+
   /** Sign-in share: tree for authenticated users with job access. */
   r.get('/share-view/:token/tree', async (req, res) => {
     try {
@@ -1368,26 +1404,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   /** Sign-in share: download one file (Bearer or ?access_token= for video tags). */
   r.get('/share-view/:token/download/:id', async (req, res) => {
     try {
-      const row = await loadShareLinkRowForToken(req.params.token);
-      if (!row || portalShareLinkKind(row) !== 'signin') return res.status(404).json({ error: 'Not found' });
-      if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-      const payload = row.payload || {};
-      const Key = idToKey(req.params.id);
-      if (!Key.startsWith('clients/')) {
-        return res.status(400).json({ error: 'Invalid id' });
-      }
-      const parsed = parseJobFromObjectKey(Key);
-      if (!parsed || parsed.clientId !== String(row.client_id) || parsed.jobId !== String(row.job_id)) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-      const pref = jobPrefix(String(row.client_id), String(row.job_id));
-      const rel = Key.slice(pref.length);
-      if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
-        return res.status(403).json({ error: 'Not included in this share' });
-      }
-      return await sendPortalS3ObjectWithRanges(req, res, Key, 'share');
+      const auth = await shareViewAuthObjectKey(req, req.params.token, req.params.id);
+      if (!auth.ok) return res.status(auth.status).json(auth.body);
+      return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'share');
     } catch (e) {
       const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
       if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
@@ -1400,26 +1419,40 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   r.head('/share-view/:token/download/:id', async (req, res) => {
     try {
-      const row = await loadShareLinkRowForToken(req.params.token);
-      if (!row || portalShareLinkKind(row) !== 'signin') return res.status(404).json({ error: 'Not found' });
-      if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
-        return res.status(403).json({ error: 'Forbidden' });
+      const auth = await shareViewAuthObjectKey(req, req.params.token, req.params.id);
+      if (!auth.ok) return res.status(auth.status).json(auth.body);
+      return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'share');
+    } catch (e) {
+      const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
+      if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
+        return res.status(404).json({ error: 'Not found' });
       }
-      const payload = row.payload || {};
-      const Key = idToKey(req.params.id);
-      if (!Key.startsWith('clients/')) {
-        return res.status(400).json({ error: 'Invalid id' });
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  /** Sign-in share: presigned Wasabi GET so bytes do not proxy through Render. */
+  r.get('/share-view/:token/presign/:id', async (req, res) => {
+    try {
+      if (PORTAL_PRESIGN_DISABLED) {
+        return res.status(404).json({ error: 'Presigned playback disabled' });
       }
-      const parsed = parseJobFromObjectKey(Key);
-      if (!parsed || parsed.clientId !== String(row.client_id) || parsed.jobId !== String(row.job_id)) {
-        return res.status(403).json({ error: 'Forbidden' });
+      const auth = await shareViewAuthObjectKey(req, req.params.token, req.params.id);
+      if (!auth.ok) return res.status(auth.status).json(auth.body);
+      try {
+        await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: auth.Key }));
+      } catch (he) {
+        const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
+        if (hn === 'NotFound' || hn === 'NoSuchKey' || he?.$metadata?.httpStatusCode === 404) {
+          return res.status(404).json({ error: 'Not found' });
+        }
+        throw he;
       }
-      const pref = jobPrefix(String(row.client_id), String(row.job_id));
-      const rel = Key.slice(pref.length);
-      if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
-        return res.status(403).json({ error: 'Not included in this share' });
-      }
-      return await sendPortalS3ObjectWithRanges(req, res, Key, 'share');
+      const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: auth.Key }), {
+        expiresIn: PORTAL_PRESIGN_TTL_SECONDS
+      });
+      return res.json({ url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
     } catch (e) {
       const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
       if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
@@ -2667,50 +2700,55 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     }
   }
 
+  /**
+   * @returns {Promise<{ ok: true, Key: string } | { ok: false, status: number, body: Record<string, unknown> }>}
+   */
+  async function portalAuthDownloadKey(req, fileId) {
+    if (!userCanPortalCapability(req.user, 'download')) {
+      return { ok: false, status: 403, body: { error: 'Portal download is not enabled for this account' } };
+    }
+    const Key = idToKey(fileId);
+    if (!Key.startsWith('clients/')) {
+      return { ok: false, status: 400, body: { error: 'Invalid id' } };
+    }
+    if (Key.endsWith(`/${FOLDER_MARKER}`) || path.basename(Key) === FOLDER_MARKER) {
+      return { ok: false, status: 400, body: { error: 'Not a downloadable file' } };
+    }
+    const parsed = parseJobFromObjectKey(Key);
+    if (!parsed) {
+      return { ok: false, status: 403, body: { error: 'Forbidden' } };
+    }
+    const prefDl = jobPrefix(parsed.clientId, parsed.jobId);
+    const relPathDl = Key.slice(prefDl.length);
+    let pathOk = false;
+    if (userIsPortalAdmin(req.user)) {
+      const now = Date.now();
+      const authK = portalDlAuthCacheKey(req.user, fileId);
+      const authHit = portalDlAuthCache.get(authK);
+      if (authHit && authHit.exp > now) {
+        pathOk = authHit.allowed;
+      } else {
+        pathOk = await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
+        portalDlAuthCache.set(authK, {
+          allowed: pathOk,
+          exp: now + (pathOk ? PORTAL_DL_AUTH_TTL_MS : PORTAL_DL_AUTH_DENY_TTL_MS)
+        });
+        trimPortalDlMap(portalDlAuthCache);
+      }
+    } else {
+      pathOk = await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
+    }
+    if (!pathOk) {
+      return { ok: false, status: 403, body: { error: 'Forbidden' } };
+    }
+    return { ok: true, Key };
+  }
+
   async function handlePortalFileDownload(req, res) {
     try {
-      if (!userCanPortalCapability(req.user, 'download')) {
-        return res.status(403).json({ error: 'Portal download is not enabled for this account' });
-      }
-      const fileId = req.params.id;
-      const Key = idToKey(fileId);
-      if (!Key.startsWith('clients/')) {
-        return res.status(400).json({ error: 'Invalid id' });
-      }
-      if (Key.endsWith(`/${FOLDER_MARKER}`) || path.basename(Key) === FOLDER_MARKER) {
-        return res.status(400).json({ error: 'Not a downloadable file' });
-      }
-      const parsed = parseJobFromObjectKey(Key);
-      if (!parsed) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-      const prefDl = jobPrefix(parsed.clientId, parsed.jobId);
-      const relPathDl = Key.slice(prefDl.length);
-      let pathOk = false;
-      if (userIsPortalAdmin(req.user)) {
-        const now = Date.now();
-        const authK = portalDlAuthCacheKey(req.user, fileId);
-        const authHit = portalDlAuthCache.get(authK);
-        if (authHit && authHit.exp > now) {
-          pathOk = authHit.allowed;
-        } else {
-          // Single check: includes job access (avoid duplicate assertPortalJobAccess vs older handler).
-          pathOk = await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
-          portalDlAuthCache.set(authK, {
-            allowed: pathOk,
-            exp: now + (pathOk ? PORTAL_DL_AUTH_TTL_MS : PORTAL_DL_AUTH_DENY_TTL_MS)
-          });
-          trimPortalDlMap(portalDlAuthCache);
-        }
-      } else {
-        // Non-admin users re-check path grants every request so permission revokes apply immediately.
-        pathOk = await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
-      }
-      if (!pathOk) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-
-      return await sendPortalS3ObjectWithRanges(req, res, Key, 'portal');
+      const auth = await portalAuthDownloadKey(req, req.params.id);
+      if (!auth.ok) return res.status(auth.status).json(auth.body);
+      return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'portal');
     } catch (e) {
       const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
       if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
@@ -2720,6 +2758,58 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       return res.status(500).json({ error: msg });
     }
   }
+
+  /** HeadObject metadata for parallel ranged downloads (small JSON; no object body through Render). */
+  r.get('/meta/:id', async (req, res) => {
+    try {
+      const auth = await portalAuthDownloadKey(req, req.params.id);
+      if (!auth.ok) return res.status(auth.status).json(auth.body);
+      const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: auth.Key }));
+      return res.json({
+        size: Number(head.ContentLength || 0),
+        contentType: head.ContentType || 'application/octet-stream',
+        ...(head.LastModified ? { lastModified: head.LastModified.toISOString() } : {})
+      });
+    } catch (e) {
+      const hn = e && typeof e === 'object' && 'name' in e ? /** @type {{ name?: string }} */ (e).name : '';
+      if (hn === 'NotFound' || hn === 'NoSuchKey' || (e instanceof Error && e.message?.includes('NoSuchKey'))) {
+        return res.status(404).json({ error: 'Not found' });
+      }
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  /** Presigned Wasabi GET — browser fetches bytes directly (video + large blobs). */
+  r.get('/presign/:id', async (req, res) => {
+    try {
+      if (PORTAL_PRESIGN_DISABLED) {
+        return res.status(404).json({ error: 'Presigned playback disabled' });
+      }
+      const auth = await portalAuthDownloadKey(req, req.params.id);
+      if (!auth.ok) return res.status(auth.status).json(auth.body);
+      try {
+        await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: auth.Key }));
+      } catch (he) {
+        const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
+        if (hn === 'NotFound' || hn === 'NoSuchKey' || he?.$metadata?.httpStatusCode === 404) {
+          return res.status(404).json({ error: 'Not found' });
+        }
+        throw he;
+      }
+      const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: auth.Key }), {
+        expiresIn: PORTAL_PRESIGN_TTL_SECONDS
+      });
+      return res.json({ url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
+    } catch (e) {
+      const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
+      if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
+        return res.status(404).json({ error: 'Not found' });
+      }
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
 
   r.get('/folders/download', async (req, res) => {
     try {
@@ -2940,6 +3030,66 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     return validateGuestSession(gt, shareRow.id);
   }
 
+  /**
+   * @returns {Promise<{ ok: true, Key: string } | { ok: false, status: number, body: Record<string, unknown> }>}
+   */
+  async function guestShareAuthObjectKey(req, token, idParam) {
+    const row = await loadGuestShareRow(token);
+    if (!row) return { ok: false, status: 404, body: { error: 'Link not found' } };
+    if (portalShareLinkKind(row) === 'signin') {
+      return { ok: false, status: 401, body: { error: 'Sign in required', requiresSignIn: true, kind: 'signin' } };
+    }
+    if (!(await ensureGuestTreeAccess(req, row))) {
+      return { ok: false, status: 401, body: { error: 'Registration required', needsRegistration: true } };
+    }
+    const payload = row.payload || {};
+    const Key = idToKey(idParam);
+    if (!Key.startsWith('clients/')) {
+      return { ok: false, status: 400, body: { error: 'Invalid id' } };
+    }
+    const parsed = parseJobFromObjectKey(Key);
+    if (!parsed || parsed.clientId !== String(row.client_id) || parsed.jobId !== String(row.job_id)) {
+      return { ok: false, status: 403, body: { error: 'Forbidden' } };
+    }
+    const pref = jobPrefix(String(row.client_id), String(row.job_id));
+    const rel = Key.slice(pref.length);
+    if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
+      return { ok: false, status: 403, body: { error: 'Not included in this share' } };
+    }
+    return { ok: true, Key };
+  }
+
+  /** Guest/public share: presigned Wasabi GET (bytes bypass Render). */
+  guest.get('/share/:token/presign/:id', async (req, res) => {
+    try {
+      if (PORTAL_PRESIGN_DISABLED) {
+        return res.status(404).json({ error: 'Presigned playback disabled' });
+      }
+      const auth = await guestShareAuthObjectKey(req, req.params.token, req.params.id);
+      if (!auth.ok) return res.status(auth.status).json(auth.body);
+      try {
+        await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: auth.Key }));
+      } catch (he) {
+        const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
+        if (hn === 'NotFound' || hn === 'NoSuchKey' || he?.$metadata?.httpStatusCode === 404) {
+          return res.status(404).json({ error: 'Not found' });
+        }
+        throw he;
+      }
+      const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: auth.Key }), {
+        expiresIn: PORTAL_PRESIGN_TTL_SECONDS
+      });
+      return res.json({ url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
+    } catch (e) {
+      const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
+      if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
+        return res.status(404).json({ error: 'Not found' });
+      }
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
   guest.get('/share/:token/tree', async (req, res) => {
     try {
       const row = await loadGuestShareRow(req.params.token);
@@ -2964,29 +3114,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   guest.get('/share/:token/download/:id', async (req, res) => {
     try {
-      const row = await loadGuestShareRow(req.params.token);
-      if (!row) return res.status(404).json({ error: 'Link not found' });
-      if (portalShareLinkKind(row) === 'signin') {
-        return res.status(401).json({ error: 'Sign in required', requiresSignIn: true, kind: 'signin' });
-      }
-      if (!(await ensureGuestTreeAccess(req, row))) {
-        return res.status(401).json({ error: 'Registration required', needsRegistration: true });
-      }
-      const payload = row.payload || {};
-      const Key = idToKey(req.params.id);
-      if (!Key.startsWith('clients/')) {
-        return res.status(400).json({ error: 'Invalid id' });
-      }
-      const parsed = parseJobFromObjectKey(Key);
-      if (!parsed || parsed.clientId !== String(row.client_id) || parsed.jobId !== String(row.job_id)) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-      const pref = jobPrefix(String(row.client_id), String(row.job_id));
-      const rel = Key.slice(pref.length);
-      if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
-        return res.status(403).json({ error: 'Not included in this share' });
-      }
-      return await sendPortalS3ObjectWithRanges(req, res, Key, 'share');
+      const auth = await guestShareAuthObjectKey(req, req.params.token, req.params.id);
+      if (!auth.ok) return res.status(auth.status).json(auth.body);
+      return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'share');
     } catch (e) {
       const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
       if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
@@ -2999,29 +3129,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   guest.head('/share/:token/download/:id', async (req, res) => {
     try {
-      const row = await loadGuestShareRow(req.params.token);
-      if (!row) return res.status(404).json({ error: 'Link not found' });
-      if (portalShareLinkKind(row) === 'signin') {
-        return res.status(401).json({ error: 'Sign in required', requiresSignIn: true, kind: 'signin' });
-      }
-      if (!(await ensureGuestTreeAccess(req, row))) {
-        return res.status(401).json({ error: 'Registration required', needsRegistration: true });
-      }
-      const payload = row.payload || {};
-      const Key = idToKey(req.params.id);
-      if (!Key.startsWith('clients/')) {
-        return res.status(400).json({ error: 'Invalid id' });
-      }
-      const parsed = parseJobFromObjectKey(Key);
-      if (!parsed || parsed.clientId !== String(row.client_id) || parsed.jobId !== String(row.job_id)) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-      const pref = jobPrefix(String(row.client_id), String(row.job_id));
-      const rel = Key.slice(pref.length);
-      if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
-        return res.status(403).json({ error: 'Not included in this share' });
-      }
-      return await sendPortalS3ObjectWithRanges(req, res, Key, 'share');
+      const auth = await guestShareAuthObjectKey(req, req.params.token, req.params.id);
+      if (!auth.ok) return res.status(auth.status).json(auth.body);
+      return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'share');
     } catch (e) {
       const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
       if (name === 'NoSuchKey' || (e instanceof Error && e.message && e.message.includes('NoSuchKey'))) {
