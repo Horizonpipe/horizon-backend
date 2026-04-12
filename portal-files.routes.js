@@ -1052,6 +1052,38 @@ async function assertPortalPathRel(grantPool, user, clientId, jobId, relPath, re
   );
 }
 
+/**
+ * Whether {@code relPath} would appear in {@code GET /api/files/tree} for this user (path grants, DAS user folder, PSR).
+ * Used by lightweight POST helpers so they cannot probe keys outside the visible tree.
+ */
+async function assertRelPathMatchesPortalTreeVisibility(grantPool, req, clientId, jobId, treePortalMode, relPath) {
+  if (userIsPortalAdmin(req.user)) return true;
+  const rp = normalizeRelPath(relPath || '');
+  if (!rp) return false;
+  const isDas = treePortalMode === DATA_AUTO_SYNC_MODE;
+  const jobHasPathGrants = await portalJobHasPathGrants(grantPool, clientId, jobId);
+  const permEditorTree = readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
+  if (!jobHasPathGrants || permEditorTree) {
+    if (isDas) {
+      const ur = normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user));
+      if (ur && rp !== ur && !rp.startsWith(`${ur}/`)) return false;
+    }
+    return true;
+  }
+  const treeUserGrants = await loadUserPathGrants(grantPool, clientId, jobId, req.user);
+  if (bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) return true;
+  if (treeUserGrants.length) {
+    return treeUserGrants.some((g) => relPathMatchesGrant(rp, g.path_prefix, g.recursive));
+  }
+  if (portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) return true;
+  if (isDas) {
+    const ur = normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user));
+    if (ur) return rp === ur || rp.startsWith(`${ur}/`);
+    return false;
+  }
+  return false;
+}
+
 /** Keep only files (and ancestor folders) under a relative path prefix — used for Data Auto Sync tree when job has grants but the user has no explicit grant rows yet. */
 function filterTreeToDescendantPrefix(tree, prefixRel) {
   const p = normalizeRelPath(prefixRel || '');
@@ -1485,6 +1517,126 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(400).json({ error: msg });
+    }
+  });
+
+  /**
+   * Lightweight existence + size check for Data Auto Sync / desktop (avoids downloading the full `/tree` JSON).
+   * Body: `{ clientId, jobId, portalMode?: "dataautosync", items: [{ path, size }] }` — path is portal-relative
+   * (same as tree `path`). Uses S3 HeadObject per item (max 400).
+   */
+  r.post('/check-paths', express.json({ limit: '4mb' }), async (req, res) => {
+    try {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      if (scope.error) return res.status(400).json({ error: scope.error });
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const treePortalMode = readPortalMode(req, body);
+      const rawItems = Array.isArray(body.items) ? body.items : [];
+      const max = 400;
+      if (rawItems.length > max) {
+        return res.status(400).json({ error: `At most ${max} paths per request.` });
+      }
+      const pref = jobPrefix(String(clientId), String(jobId));
+      const present = [];
+      const missing = [];
+      const sizeMismatch = [];
+      for (const raw of rawItems) {
+        let pathRel;
+        try {
+          pathRel = normalizeRelPath(raw?.path ?? raw?.remotePath ?? '');
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          return res.status(400).json({ error: m });
+        }
+        if (!pathRel) continue;
+        if (!(await assertRelPathMatchesPortalTreeVisibility(aclPool, req, clientId, jobId, treePortalMode, pathRel))) {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+        const key = pref + pathRel;
+        const expected = raw?.size != null ? Number(raw.size) : NaN;
+        try {
+          const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+          const cl = Number(head.ContentLength ?? 0);
+          if (Number.isFinite(expected) && expected >= 0 && cl !== expected) {
+            sizeMismatch.push({ path: pathRel, expectedSize: expected, actualSize: cl });
+          } else {
+            present.push({ path: pathRel, size: cl });
+          }
+        } catch (e) {
+          const code = e?.$metadata?.httpStatusCode;
+          const name = String(e?.name || '');
+          if (code === 404 || name === 'NotFound' || String(e?.Code || '') === '404') {
+            missing.push({ path: pathRel, expectedSize: Number.isFinite(expected) ? expected : null });
+          } else {
+            throw e;
+          }
+        }
+      }
+      return res.json({ success: true, present, missing, sizeMismatch });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  /**
+   * DB-only: list portal-relative paths registered with the given SHA-256 (global dedupe without loading `/tree`).
+   * Body: `{ clientId, jobId, portalMode?: "dataautosync", sha256 }`.
+   */
+  r.post('/find-hash-paths', express.json({ limit: '32kb' }), async (req, res) => {
+    try {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      if (scope.error) return res.status(400).json({ error: scope.error });
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const hash = normalizeSha256Hex(String(body.sha256 ?? body.hash ?? ''));
+      if (hash.length !== 64) {
+        return res.status(400).json({ error: 'sha256 must be 64 hex characters.' });
+      }
+      const treePortalMode = readPortalMode(req, body);
+      const pref = jobPrefix(String(clientId), String(jobId));
+      await ensurePortalObjectSha256Schema(uploadMetaPool);
+      await ensurePortalResumeSchema(uploadMetaPool);
+      const keys = new Set();
+      const q1 = await uploadMetaPool.query(
+        `SELECT object_key FROM portal_object_sha256
+         WHERE client_id = $1 AND job_id = $2 AND lower(sha256) = lower($3)
+         LIMIT 80`,
+        [String(clientId), String(jobId), hash]
+      );
+      for (const row of q1.rows || []) {
+        const k = String(row.object_key || '');
+        if (k.startsWith(pref)) keys.add(k.slice(pref.length));
+      }
+      const q2 = await uploadMetaPool.query(
+        `SELECT object_key FROM portal_upload_sessions
+         WHERE client_id = $1 AND job_id = $2 AND status = 'completed'
+           AND sha256 IS NOT NULL AND lower(btrim(sha256)) = lower($3)
+         ORDER BY completed_at DESC NULLS LAST
+         LIMIT 80`,
+        [String(clientId), String(jobId), hash]
+      );
+      for (const row of q2.rows || []) {
+        const k = String(row.object_key || '');
+        if (k.startsWith(pref)) keys.add(k.slice(pref.length));
+      }
+      const allowed = [];
+      for (const rel of keys) {
+        if (await assertRelPathMatchesPortalTreeVisibility(aclPool, req, clientId, jobId, treePortalMode, rel)) {
+          allowed.push(rel);
+        }
+      }
+      return res.json({ success: true, paths: allowed });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
     }
   });
 
