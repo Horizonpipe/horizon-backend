@@ -1319,20 +1319,6 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
    */
   async function mergeCompletedUploadSha256IntoTree(clientId, jobId, tree) {
     const files = tree && Array.isArray(tree.files) ? tree.files : [];
-    // #region agent log
-    fetch('http://127.0.0.1:7557/ingest/9737bd06-d5e6-4686-9f6f-597f8bc8a26c', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '720a64' },
-      body: JSON.stringify({
-        sessionId: '720a64',
-        location: 'portal-files.routes.js:mergeSHA',
-        message: 'merge enter',
-        data: { clientId: String(clientId), jobId: String(jobId), treeFileCount: files.length },
-        timestamp: Date.now(),
-        hypothesisId: 'H1'
-      })
-    }).catch(() => {});
-    // #endregion
     try {
       await ensurePortalResumeSchema(uploadMetaPool);
       await ensurePortalObjectSha256Schema(uploadMetaPool);
@@ -1350,20 +1336,6 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         [String(clientId), String(jobId)]
       );
       const objRows = rObj.rows || [];
-      // #region agent log
-      fetch('http://127.0.0.1:7557/ingest/9737bd06-d5e6-4686-9f6f-597f8bc8a26c', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '720a64' },
-        body: JSON.stringify({
-          sessionId: '720a64',
-          location: 'portal-files.routes.js:mergeSHA',
-          message: 'merge db rows',
-          data: { sessionRowCount: rows.length, objectShaRowCount: objRows.length },
-          timestamp: Date.now(),
-          hypothesisId: 'H2'
-        })
-      }).catch(() => {});
-      // #endregion
       const byKey = new Map();
       for (const row of rows) {
         const k = String(row.object_key || '');
@@ -1375,44 +1347,14 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         const h = normalizeSha256Hex(row.sha256);
         if (k && h.length === 64) byKey.set(k, h);
       }
-      let merged = 0;
       for (const f of files) {
         const key = String(f.key || '');
         const h = byKey.get(key);
         if (h) {
           f.sha256 = h;
-          merged += 1;
         }
       }
-      // #region agent log
-      fetch('http://127.0.0.1:7557/ingest/9737bd06-d5e6-4686-9f6f-597f8bc8a26c', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '720a64' },
-        body: JSON.stringify({
-          sessionId: '720a64',
-          location: 'portal-files.routes.js:mergeSHA',
-          message: 'merge applied',
-          data: { byKeySize: byKey.size, mergedOnTree: merged },
-          timestamp: Date.now(),
-          hypothesisId: 'H3'
-        })
-      }).catch(() => {});
-      // #endregion
     } catch (e) {
-      // #region agent log
-      fetch('http://127.0.0.1:7557/ingest/9737bd06-d5e6-4686-9f6f-597f8bc8a26c', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '720a64' },
-        body: JSON.stringify({
-          sessionId: '720a64',
-          location: 'portal-files.routes.js:mergeSHA',
-          message: 'merge error',
-          data: { err: String(e?.message || e) },
-          timestamp: Date.now(),
-          hypothesisId: 'H4'
-        })
-      }).catch(() => {});
-      // #endregion
       console.warn('[portal-files] mergeCompletedUploadSha256IntoTree:', e?.message || e);
     }
   }
