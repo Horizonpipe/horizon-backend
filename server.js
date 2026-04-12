@@ -4178,17 +4178,73 @@ app.get('/data-auto-sync/access', requireAuth, requireDataAutoSyncEmployeeAccess
 app.post('/auto-import-plugin/push', requireAuth, requireDataAutoSyncEmployeeAccess, async (req, res) => {
   try {
     const body = req.body || {};
-    const source = String(body.source || '').trim();
+    const source = String(body.source || 'desktop').trim() || 'desktop';
     const rows = Array.isArray(body.rows) ? body.rows : [];
+    const rowCount = rows.length;
+
+    /**
+     * The DAS monitor reads `auto_import_projects` + `auto_import_logs` from Postgres first. This route used to be
+     * a no-op JSON ack, so the queue + live log stayed empty even when uploads "worked". Persist a log line (and
+     * optionally touch a project row when `db3Path` is sent) on **live Postgres** so the portal monitor reflects activity.
+     */
+    const logId = crypto.randomUUID();
+    const msg =
+      cleanString(body.message || '').slice(0, 2000) ||
+      (rowCount ? `Push received: ${rowCount} row(s)` : 'Push received (ping)');
+    const payloadJson = JSON.stringify({
+      rowCount,
+      username: req.user?.username || '',
+      db3Path: body.db3Path != null ? String(body.db3Path).slice(0, 800) : ''
+    });
+    try {
+      await pool.query(
+        `INSERT INTO auto_import_logs (id, project_id, source, level, message, payload)
+         VALUES ($1, NULL, $2, 'info', $3, $4::jsonb)`,
+        [logId, source.slice(0, 64), msg, payloadJson]
+      );
+    } catch (e) {
+      console.warn('[auto-import-plugin/push] log insert skipped:', e?.message || e);
+    }
+
+    const db3Raw = cleanString(body.db3Path || '');
+    if (db3Raw) {
+      try {
+        const absPath = path.resolve(db3Raw);
+        const sourceKey = crypto.createHash('sha1').update(absPath).digest('hex');
+        const displayName = cleanString(body.displayName || '') || path.basename(absPath);
+        const existing = await pool.query('SELECT id FROM auto_import_projects WHERE source_key = $1 LIMIT 1', [
+          sourceKey
+        ]);
+        if (existing.rows[0]) {
+          await pool.query(
+            `UPDATE auto_import_projects
+             SET display_name = COALESCE(NULLIF($2::text, ''), display_name),
+                 db3_path = $3,
+                 last_seen_at = NOW(),
+                 updated_at = NOW()
+             WHERE source_key = $1`,
+            [sourceKey, displayName, absPath]
+          );
+        } else {
+          const projectId = crypto.randomUUID();
+          await pool.query(
+            `INSERT INTO auto_import_projects (
+              id, source_key, display_name, db3_path, status, last_seen_at, metadata, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, 'idle', NOW(), '{}'::jsonb, NOW(), NOW())`,
+            [projectId, sourceKey, displayName, absPath]
+          );
+        }
+      } catch (e) {
+        console.warn('[auto-import-plugin/push] project touch skipped:', e?.message || e);
+      }
+    }
 
     return res.json({
       success: true,
-      message: rows.length
-        ? 'Auto import payload received.'
-        : 'Auto import test received.',
+      message: rowCount ? 'Auto import payload received.' : 'Auto import test received.',
       received: {
         source,
-        rowCount: rows.length
+        rowCount
       }
     });
   } catch (error) {
