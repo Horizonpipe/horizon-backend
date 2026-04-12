@@ -359,6 +359,32 @@ async function ensurePortalResumeSchema(pool) {
   return portalResumeSchemaReady;
 }
 
+let portalObjectSha256SchemaReady = null;
+
+/** SHA-256 for presigned PUT / browser-agnostic multipart (no `portal_upload_sessions` row). */
+async function ensurePortalObjectSha256Schema(pool) {
+  if (!portalObjectSha256SchemaReady) {
+    portalObjectSha256SchemaReady = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS portal_object_sha256 (
+          object_key TEXT PRIMARY KEY,
+          client_id TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          sha256 TEXT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(
+        `CREATE INDEX IF NOT EXISTS idx_portal_object_sha256_scope ON portal_object_sha256 (client_id, job_id)`
+      );
+    })().catch((e) => {
+      portalObjectSha256SchemaReady = null;
+      throw e;
+    });
+  }
+  return portalObjectSha256SchemaReady;
+}
+
 function resumableChunkSize(raw) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return 8 * 1024 * 1024;
@@ -1269,8 +1295,27 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   r.use(requireAuth);
 
   /**
-   * Attach SHA-256 from completed resumable `portal_upload_sessions` rows (object_key match)
-   * so clients can hash-dedupe against the server tree.
+   * Persist client-reported full-object SHA-256 (presigned uploads; trusted like resumable flow).
+   */
+  async function upsertPortalObjectSha256FromClient(key, clientId, jobId, rawSha256) {
+    const bodySha256 = normalizeSha256Hex(rawSha256);
+    if (bodySha256.length !== 64) return;
+    await ensurePortalObjectSha256Schema(uploadMetaPool);
+    await uploadMetaPool.query(
+      `INSERT INTO portal_object_sha256 (object_key, client_id, job_id, sha256, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (object_key) DO UPDATE SET
+         sha256 = EXCLUDED.sha256,
+         client_id = EXCLUDED.client_id,
+         job_id = EXCLUDED.job_id,
+         updated_at = NOW()`,
+      [String(key), String(clientId), String(jobId), bodySha256]
+    );
+  }
+
+  /**
+   * Attach SHA-256 from `portal_upload_sessions` (resumable) and `portal_object_sha256` (presigned)
+   * onto tree file nodes for client-side hash dedupe.
    */
   async function mergeCompletedUploadSha256IntoTree(clientId, jobId, tree) {
     const files = tree && Array.isArray(tree.files) ? tree.files : [];
@@ -1290,6 +1335,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     // #endregion
     try {
       await ensurePortalResumeSchema(uploadMetaPool);
+      await ensurePortalObjectSha256Schema(uploadMetaPool);
       const r = await uploadMetaPool.query(
         `SELECT DISTINCT ON (object_key) object_key, sha256
          FROM portal_upload_sessions
@@ -1299,6 +1345,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         [String(clientId), String(jobId)]
       );
       const rows = r.rows || [];
+      const rObj = await uploadMetaPool.query(
+        `SELECT object_key, sha256 FROM portal_object_sha256 WHERE client_id = $1 AND job_id = $2`,
+        [String(clientId), String(jobId)]
+      );
+      const objRows = rObj.rows || [];
       // #region agent log
       fetch('http://127.0.0.1:7557/ingest/9737bd06-d5e6-4686-9f6f-597f8bc8a26c', {
         method: 'POST',
@@ -1307,7 +1358,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           sessionId: '720a64',
           location: 'portal-files.routes.js:mergeSHA',
           message: 'merge db rows',
-          data: { dbRowCount: rows.length },
+          data: { sessionRowCount: rows.length, objectShaRowCount: objRows.length },
           timestamp: Date.now(),
           hypothesisId: 'H2'
         })
@@ -1315,6 +1366,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       // #endregion
       const byKey = new Map();
       for (const row of rows) {
+        const k = String(row.object_key || '');
+        const h = normalizeSha256Hex(row.sha256);
+        if (k && h.length === 64) byKey.set(k, h);
+      }
+      for (const row of objRows) {
         const k = String(row.object_key || '');
         const h = normalizeSha256Hex(row.sha256);
         if (k && h.length === 64) byKey.set(k, h);
@@ -2452,6 +2508,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           MultipartUpload: { Parts: s3Parts }
         })
       );
+      try {
+        await upsertPortalObjectSha256FromClient(key, parsed.clientId, parsed.jobId, req.body?.sha256);
+      } catch (e) {
+        console.warn('[portal-files] upsertPortalObjectSha256FromClient (multipart complete):', e?.message || e);
+      }
       let size = 0;
       try {
         const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
@@ -2469,6 +2530,34 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         path: rel,
         parentPath: parentRelPath(rel)
       });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(400).json({ error: msg });
+    }
+  });
+
+  /** JSON: { key, sha256 } — after presigned PUT so tree merge can expose `sha256` (multipart sends digest on complete). */
+  r.post('/upload/register-sha256', express.json({ limit: '64kb' }), async (req, res) => {
+    try {
+      const body = req.body || {};
+      const key = String(body.key || '').trim();
+      const h = normalizeSha256Hex(body.sha256 || '');
+      if (!key.startsWith('clients/')) {
+        return res.status(400).json({ error: 'key is required' });
+      }
+      if (h.length !== 64) {
+        return res.status(400).json({ error: 'sha256 must be a 64-char hex digest' });
+      }
+      const parsed = parseJobFromObjectKey(key);
+      if (!parsed) return res.status(400).json({ error: 'Invalid key' });
+      if (!(await assertPortalJobAccessForRequest(pool, req, parsed.clientId, parsed.jobId))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (!(await assertWritablePresignPath(req, parsed.clientId, parsed.jobId, key))) {
+        return res.status(403).json({ error: 'Forbidden for this path' });
+      }
+      await upsertPortalObjectSha256FromClient(key, parsed.clientId, parsed.jobId, h);
+      return res.status(204).end();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(400).json({ error: msg });
