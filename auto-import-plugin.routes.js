@@ -30,6 +30,16 @@ function createAutoImportPlugin(options = {}) {
     throw new Error('createAutoImportPlugin requires either pool.query or options.query.');
   }
   const pool = { query: dbQuery };
+  /**
+   * Heartbeats + init DDL must hit Postgres even when `options.query` is the Wasabi auto-import adapter
+   * (that adapter intentionally no-ops `CREATE TABLE auto_import_*`, which would leave desktop_heartbeats missing).
+   */
+  const directPgQuery =
+    poolOption && typeof poolOption.query === 'function' ? poolOption.query.bind(poolOption) : null;
+  async function runPostgresHeartbeatSql(text, params = []) {
+    if (directPgQuery) return directPgQuery(text, params);
+    return pool.query(text, params);
+  }
   if (typeof requireMike !== 'function') throw new Error('createAutoImportPlugin requires requireMike middleware.');
   const desktopHeartbeatGate =
     typeof requireDesktopHeartbeat === 'function' ? requireDesktopHeartbeat : requireMike;
@@ -64,7 +74,7 @@ function createAutoImportPlugin(options = {}) {
   }
 
   async function initSchema() {
-    await pool.query(`
+    await runPostgresHeartbeatSql(`
       CREATE TABLE IF NOT EXISTS auto_import_projects (
         id TEXT PRIMARY KEY,
         source_key TEXT NOT NULL UNIQUE,
@@ -457,7 +467,7 @@ function createAutoImportPlugin(options = {}) {
     const username = clean(req.user?.username || '');
     const displayName = clean(req.user?.displayName || '');
     try {
-      await pool.query(
+      await runPostgresHeartbeatSql(
         `INSERT INTO auto_import_desktop_heartbeats (user_key, at_ms, state, source, detail, username, display_name, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
          ON CONFLICT (user_key) DO UPDATE SET
@@ -471,7 +481,12 @@ function createAutoImportPlugin(options = {}) {
         [key, nowMs, state, source, detail, username, displayName]
       );
     } catch (error) {
-      logger.error?.('auto-import desktop-heartbeat UPSERT failed:', error?.message || error);
+      logger.error?.(
+        'auto-import desktop-heartbeat UPSERT failed:',
+        error?.code || '',
+        error?.message || error,
+        error?.detail || ''
+      );
       return res.status(500).json({ success: false, error: 'Heartbeat persistence failed.' });
     }
     res.json({
@@ -487,13 +502,13 @@ function createAutoImportPlugin(options = {}) {
     const nowMs = Date.now();
     let rec = null;
     try {
-      const r = await pool.query(
+      const r = await runPostgresHeartbeatSql(
         'SELECT at_ms, state, source, detail FROM auto_import_desktop_heartbeats WHERE user_key = $1 LIMIT 1',
         [key]
       );
       rec = r.rows[0] || null;
     } catch (error) {
-      logger.error?.('auto-import desktop-heartbeat SELECT failed:', error?.message || error);
+      logger.error?.('auto-import desktop-heartbeat SELECT failed:', error?.code || '', error?.message || error);
       return res.status(500).json({ success: false, error: 'Heartbeat read failed.' });
     }
     const atMs = rec ? Number(rec.at_ms) : NaN;
