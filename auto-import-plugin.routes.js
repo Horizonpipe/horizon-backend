@@ -548,7 +548,8 @@ function createAutoImportPlugin(options = {}) {
     });
   });
 
-  router.get('/projects', requireMike, async (req, res, next) => {
+  /** Same gate as desktop heartbeat + portal DAS monitor (not only `dataAutoSyncEmployee`). */
+  router.get('/projects', desktopHeartbeatGate, async (req, res, next) => {
     try {
       const [projects, bindings] = await Promise.all([
         pool.query('SELECT * FROM auto_import_projects ORDER BY COALESCE(last_seen_at, created_at) DESC, display_name ASC'),
@@ -833,16 +834,28 @@ function createAutoImportPlugin(options = {}) {
     }
   });
 
-  router.get('/logs/:projectId', requireMike, async (req, res, next) => {
+  /** Same gate as `/projects` monitor reads — must match `requireDataAutoSyncDesktopHeartbeatAccess` on the server. */
+  router.get('/logs/:projectId', desktopHeartbeatGate, async (req, res, next) => {
     try {
       const limit = Math.max(20, Math.min(500, Number(req.query.limit || 200)));
-      const result = await pool.query(
-        `SELECT * FROM auto_import_logs
-         WHERE project_id = $1 OR project_id IS NULL
-         ORDER BY created_at DESC
-         LIMIT $2`,
-        [req.params.projectId, limit]
-      );
+      const projectId = clean(req.params.projectId) || '__global__';
+      let result;
+      if (projectId === '__global__') {
+        result = await pool.query(
+          `SELECT * FROM auto_import_logs
+           ORDER BY created_at DESC
+           LIMIT $1`,
+          [limit]
+        );
+      } else {
+        result = await pool.query(
+          `SELECT * FROM auto_import_logs
+           WHERE project_id = $1 OR project_id IS NULL
+           ORDER BY created_at DESC
+           LIMIT $2`,
+          [projectId, limit]
+        );
+      }
       res.json({ success: true, logs: result.rows.reverse() });
     } catch (error) {
       next(error);
