@@ -231,10 +231,19 @@ function createAutoImportPlugin(options = {}) {
 
   async function logEvent(projectId, source, level, message, payload = {}) {
     try {
-      await pool.query(
+      const rawPid = projectId == null ? '' : String(projectId).trim();
+      const pid = !rawPid || rawPid === '__global__' ? null : clean(rawPid);
+      await runPostgresAutoImportSql(
         `INSERT INTO auto_import_logs (id, project_id, source, level, message, payload)
          VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
-        [uid(), projectId || null, clean(source || 'server') || 'server', clean(level || 'info') || 'info', clean(message), JSON.stringify(payload || {})]
+        [
+          uid(),
+          pid,
+          clean(source || 'server') || 'server',
+          clean(level || 'info') || 'info',
+          clean(message),
+          JSON.stringify(payload || {})
+        ]
       );
     } catch (e) {
       logger.warn?.('AUTO IMPORT LOG WRITE FAILED:', e?.message || e);
@@ -526,17 +535,57 @@ function createAutoImportPlugin(options = {}) {
         runPostgresAutoImportSql(
           `SELECT id, project_id, source, level, message, created_at
            FROM auto_import_logs
+           WHERE project_id IS NULL
            ORDER BY created_at DESC NULLS LAST
-           LIMIT 20`
+           LIMIT 40`
         )
       ]);
       const hb = summarizeHeartbeat(rec, nowMs);
-      const projects = (projR.rows || []).map((p) => ({ ...p, binding: null }));
-      const logs = logR.rows || [];
+      let projects = (projR.rows || []).map((p) => ({ ...p, binding: null }));
+      if ((!projects || projects.length === 0) && hb.connected) {
+        const u = req?.user || {};
+        const label = clean(u.displayName || u.username || u.email || 'Auto sync desktop');
+        const atIso = hb.lastSeenAt || new Date(nowMs).toISOString();
+        projects = [
+          {
+            id: '__autosync_desktop__',
+            display_name: label || 'Auto sync desktop',
+            status: String(hb.state || 'online').toUpperCase(),
+            detection_mode: 'DATA_AUTOSYNC',
+            last_seen_at: atIso,
+            last_scan_at: atIso,
+            updated_at: atIso,
+            created_at: atIso,
+            binding: null
+          }
+        ];
+      }
+      let logs = logR.rows || [];
+      const hbDetail = String(hb.detail || '').trim();
+      if (hbDetail) {
+        const atIso = hb.lastSeenAt || new Date(nowMs).toISOString();
+        const dup =
+          logs.length > 0 &&
+          String(logs[0]?.message || '').trim() === hbDetail &&
+          Math.abs(Date.parse(String(logs[0]?.created_at || '')) - Date.parse(atIso)) < 5000;
+        if (!dup) {
+          logs = [
+            {
+              id: 'heartbeat-detail',
+              project_id: null,
+              source: 'desktop',
+              level: 'info',
+              message: hbDetail,
+              created_at: atIso
+            },
+            ...logs
+          ].slice(0, 40);
+        }
+      }
       let desktopRecent = false;
       for (const r of logs) {
         const src = String(r?.source || '').toLowerCase();
-        if (src !== 'desktop') continue;
+        if (src !== 'desktop' && src !== 'java-desktop') continue;
         const t = Date.parse(String(r?.created_at || ''));
         if (Number.isFinite(t) && nowMs - t <= 90000) {
           desktopRecent = true;
@@ -583,7 +632,8 @@ function createAutoImportPlugin(options = {}) {
     const keys = heartbeatKeys(req);
     const nowMs = Date.now();
     const state = clean(req.body?.state || 'connected').toLowerCase() || 'connected';
-    const source = clean(req.body?.source || 'desktop') || 'desktop';
+    let source = clean(req.body?.source || 'desktop') || 'desktop';
+    if (String(source).toLowerCase() === 'java-desktop') source = 'desktop';
     const detail = clean(req.body?.detail || req.body?.message || '');
     const username = clean(req.user?.username || '');
     const displayName = clean(req.user?.displayName || '');
@@ -929,6 +979,7 @@ function createAutoImportPlugin(options = {}) {
       if (projectId === '__global__') {
         result = await readAutoImportMonitorSql(
           `SELECT * FROM auto_import_logs
+           WHERE project_id IS NULL
            ORDER BY created_at DESC
            LIMIT $1`,
           [limit]
@@ -945,6 +996,23 @@ function createAutoImportPlugin(options = {}) {
       res.json({ success: true, logs: result.rows.reverse() });
     } catch (error) {
       next(error);
+    }
+  });
+
+  /** Data Auto Sync / Java desktop: append portal-visible monitor lines (`project_id` null). Same auth as heartbeat. */
+  router.post('/logs/__global__', desktopHeartbeatGate, express.json({ limit: '32kb' }), async (req, res) => {
+    try {
+      let source = clean(req.body?.source || 'desktop') || 'desktop';
+      if (String(source).toLowerCase() === 'java-desktop') source = 'desktop';
+      const level = clean(req.body?.level || 'info').toLowerCase() || 'info';
+      const message = clean(req.body?.message || '');
+      if (!message) return res.status(400).json({ success: false, error: 'message is required.' });
+      if (message.length > 8000) return res.status(400).json({ success: false, error: 'message too long.' });
+      await logEvent(null, source, level, message, req.body?.payload && typeof req.body.payload === 'object' ? req.body.payload : {});
+      res.json({ success: true });
+    } catch (error) {
+      logger.error?.('auto-import logs __global__ POST:', error?.message || error);
+      return res.status(500).json({ success: false, error: 'Log write failed.' });
     }
   });
 
