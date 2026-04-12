@@ -53,6 +53,10 @@ const DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID =
   String(process.env.DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID || '8').trim() || '8';
 const PORTAL_FOLDER_COPY_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_COPY_CONCURRENCY', 8, 1, 32);
 const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCURRENCY', 8, 1, 32);
+/** Max items per {@code POST /check-paths} (JSON body stays well under express 4mb). */
+const PORTAL_CHECK_PATHS_MAX = clampIntEnv('PORTAL_CHECK_PATHS_MAX', 800, 50, 2000);
+/** Parallel S3 HeadObject calls per check-paths request (Wasabi handles many concurrent small reads). */
+const PORTAL_CHECK_PATHS_HEAD_CONCURRENCY = clampIntEnv('PORTAL_CHECK_PATHS_HEAD_CONCURRENCY', 16, 1, 64);
 
 /**
  * When the job has path grants, users with **no** matching `portal_path_grants` rows see an empty tree (strict).
@@ -82,6 +86,30 @@ function clampIntEnv(name, fallback, min, max) {
   const raw = Number(process.env[name]);
   if (!Number.isFinite(raw)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(raw)));
+}
+
+/**
+ * @template T, R
+ * @param {T[]} items
+ * @param {number} concurrency
+ * @param {(item: T) => Promise<R>} fn
+ * @returns {Promise<R[]>}
+ */
+async function mapWithConcurrency(items, concurrency, fn) {
+  if (!items.length) return [];
+  const results = new Array(items.length);
+  let next = 0;
+  const n = items.length;
+  const workers = Math.min(Math.max(1, Math.floor(concurrency)), n);
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= n) return;
+      results[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: workers }, () => worker()));
+  return results;
 }
 
 /**
@@ -1084,6 +1112,58 @@ async function assertRelPathMatchesPortalTreeVisibility(grantPool, req, clientId
   return false;
 }
 
+/**
+ * Same rules as {@link assertRelPathMatchesPortalTreeVisibility} but loads grants once per request.
+ * Used by {@code POST /check-paths} so large batches do not re-hit the DB for every path.
+ */
+async function createPortalPathVisibilityChecker(grantPool, req, clientId, jobId, treePortalMode) {
+  if (userIsPortalAdmin(req.user)) {
+    return { check: () => true };
+  }
+  const isDas = treePortalMode === DATA_AUTO_SYNC_MODE;
+  const jobHasPathGrants = await portalJobHasPathGrants(grantPool, clientId, jobId);
+  const permEditorTree = readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
+  if (!jobHasPathGrants || permEditorTree) {
+    const ur = isDas ? normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user)) : '';
+    return {
+      check(relPath) {
+        const rp = normalizeRelPath(relPath || '');
+        if (!rp) return false;
+        if (isDas && ur && rp !== ur && !rp.startsWith(`${ur}/`)) return false;
+        return true;
+      }
+    };
+  }
+  const treeUserGrants = await loadUserPathGrants(grantPool, clientId, jobId, req.user);
+  if (bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) {
+    return { check: () => true };
+  }
+  if (treeUserGrants.length) {
+    return {
+      check(relPath) {
+        const rp = normalizeRelPath(relPath || '');
+        if (!rp) return false;
+        return treeUserGrants.some((g) => relPathMatchesGrant(rp, g.path_prefix, g.recursive));
+      }
+    };
+  }
+  if (portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) {
+    return { check: () => true };
+  }
+  if (isDas) {
+    const ur = normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user));
+    return {
+      check(relPath) {
+        const rp = normalizeRelPath(relPath || '');
+        if (!rp) return false;
+        if (ur) return rp === ur || rp.startsWith(`${ur}/`);
+        return false;
+      }
+    };
+  }
+  return { check: () => false };
+}
+
 /** Keep only files (and ancestor folders) under a relative path prefix — used for Data Auto Sync tree when job has grants but the user has no explicit grant rows yet. */
 function filterTreeToDescendantPrefix(tree, prefixRel) {
   const p = normalizeRelPath(prefixRel || '');
@@ -1523,7 +1603,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   /**
    * Lightweight existence + size check for Data Auto Sync / desktop (avoids downloading the full `/tree` JSON).
    * Body: `{ clientId, jobId, portalMode?: "dataautosync", items: [{ path, size }] }` — path is portal-relative
-   * (same as tree `path`). Uses S3 HeadObject per item (max 400).
+   * (same as tree `path`). Uses S3 HeadObject per item; batch size capped by PORTAL_CHECK_PATHS_MAX (default 800),
+   * parallel heads by PORTAL_CHECK_PATHS_HEAD_CONCURRENCY (default 16). Tune via env on Render if needed.
    */
   r.post('/check-paths', express.json({ limit: '4mb' }), async (req, res) => {
     try {
@@ -1536,14 +1617,14 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const treePortalMode = readPortalMode(req, body);
       const rawItems = Array.isArray(body.items) ? body.items : [];
-      const max = 400;
+      const max = PORTAL_CHECK_PATHS_MAX;
       if (rawItems.length > max) {
         return res.status(400).json({ error: `At most ${max} paths per request.` });
       }
       const pref = jobPrefix(String(clientId), String(jobId));
-      const present = [];
-      const missing = [];
-      const sizeMismatch = [];
+      const pathGate = await createPortalPathVisibilityChecker(aclPool, req, clientId, jobId, treePortalMode);
+      /** @type {{ pathRel: string, key: string, expected: number }[]} */
+      const work = [];
       for (const raw of rawItems) {
         let pathRel;
         try {
@@ -1553,27 +1634,50 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           return res.status(400).json({ error: m });
         }
         if (!pathRel) continue;
-        if (!(await assertRelPathMatchesPortalTreeVisibility(aclPool, req, clientId, jobId, treePortalMode, pathRel))) {
+        if (!pathGate.check(pathRel)) {
           return res.status(403).json({ error: 'Forbidden' });
         }
         const key = pref + pathRel;
         const expected = raw?.size != null ? Number(raw.size) : NaN;
+        work.push({ pathRel, key, expected });
+      }
+
+      const headOne = async (w) => {
         try {
-          const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+          const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: w.key }));
           const cl = Number(head.ContentLength ?? 0);
-          if (Number.isFinite(expected) && expected >= 0 && cl !== expected) {
-            sizeMismatch.push({ path: pathRel, expectedSize: expected, actualSize: cl });
-          } else {
-            present.push({ path: pathRel, size: cl });
+          if (Number.isFinite(w.expected) && w.expected >= 0 && cl !== w.expected) {
+            return { kind: 'mismatch', pathRel: w.pathRel, expectedSize: w.expected, actualSize: cl };
           }
+          return { kind: 'present', pathRel: w.pathRel, size: cl };
         } catch (e) {
           const code = e?.$metadata?.httpStatusCode;
           const name = String(e?.name || '');
           if (code === 404 || name === 'NotFound' || String(e?.Code || '') === '404') {
-            missing.push({ path: pathRel, expectedSize: Number.isFinite(expected) ? expected : null });
-          } else {
-            throw e;
+            return {
+              kind: 'missing',
+              pathRel: w.pathRel,
+              expectedSize: Number.isFinite(w.expected) ? w.expected : null
+            };
           }
+          throw e;
+        }
+      };
+
+      const rowResults = await mapWithConcurrency(work, PORTAL_CHECK_PATHS_HEAD_CONCURRENCY, headOne);
+      const present = [];
+      const missing = [];
+      const sizeMismatch = [];
+      for (const r of rowResults) {
+        if (r.kind === 'present') present.push({ path: r.pathRel, size: r.size });
+        else if (r.kind === 'missing') {
+          missing.push({ path: r.pathRel, expectedSize: r.expectedSize });
+        } else {
+          sizeMismatch.push({
+            path: r.pathRel,
+            expectedSize: r.expectedSize,
+            actualSize: r.actualSize
+          });
         }
       }
       return res.json({ success: true, present, missing, sizeMismatch });
