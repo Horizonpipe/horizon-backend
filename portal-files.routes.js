@@ -458,7 +458,8 @@ function sanitizeFilename(name) {
 function sanitizeFolderSegment(name) {
   const t = String(name ?? '').trim();
   if (!t || t === '.' || t === '..') throw new Error('Invalid folder name');
-  if (t.includes('/') || t.includes('\\') || t.includes('..')) throw new Error('Invalid folder name');
+  /** Slashes only — do not reject `..` as substring (e.g. `A..J.J` job folder names). Traversal is blocked in {@link normalizeRelPath}. */
+  if (t.includes('/') || t.includes('\\')) throw new Error('Invalid folder name');
   const cleaned = t.replace(/[^\w.\- ()\[\]]+/g, '_').slice(0, 120);
   if (!cleaned) throw new Error('Invalid folder name');
   if (cleaned === FOLDER_MARKER) throw new Error('Reserved folder name');
