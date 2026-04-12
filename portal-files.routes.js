@@ -684,7 +684,14 @@ async function listAllKeys(s3, bucket, prefix) {
       })
     );
     for (const obj of resp.Contents || []) {
-      if (obj.Key) keys.push({ Key: obj.Key, Size: obj.Size ?? 0, LastModified: obj.LastModified });
+      if (!obj.Key) continue;
+      const rawEtag = obj.ETag != null ? String(obj.ETag).replace(/^"+|"+$/g, '') : '';
+      keys.push({
+        Key: obj.Key,
+        Size: obj.Size ?? 0,
+        LastModified: obj.LastModified,
+        ...(rawEtag ? { ETag: rawEtag } : {})
+      });
     }
     pageToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
   } while (pageToken);
@@ -713,7 +720,7 @@ function buildTreeFromKeys(jobPref, entries) {
 
   const files = [];
 
-  for (const { Key: key, Size: size, LastModified: lm } of entries) {
+  for (const { Key: key, Size: size, LastModified: lm, ETag: etag } of entries) {
     if (!key.startsWith(jobPref)) continue;
     const r = rel(key);
     if (!r) continue;
@@ -748,7 +755,8 @@ function buildTreeFromKeys(jobPref, entries) {
       parentPath,
       name,
       size,
-      lastModified: lm ? lm.toISOString() : null
+      lastModified: lm ? lm.toISOString() : null,
+      ...(etag ? { etag: String(etag) } : {})
     });
   }
 
@@ -1260,6 +1268,99 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   const r = express.Router();
   r.use(requireAuth);
 
+  /**
+   * Attach SHA-256 from completed resumable `portal_upload_sessions` rows (object_key match)
+   * so clients can hash-dedupe against the server tree.
+   */
+  async function mergeCompletedUploadSha256IntoTree(clientId, jobId, tree) {
+    const files = tree && Array.isArray(tree.files) ? tree.files : [];
+    // #region agent log
+    fetch('http://127.0.0.1:7557/ingest/9737bd06-d5e6-4686-9f6f-597f8bc8a26c', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '720a64' },
+      body: JSON.stringify({
+        sessionId: '720a64',
+        location: 'portal-files.routes.js:mergeSHA',
+        message: 'merge enter',
+        data: { clientId: String(clientId), jobId: String(jobId), treeFileCount: files.length },
+        timestamp: Date.now(),
+        hypothesisId: 'H1'
+      })
+    }).catch(() => {});
+    // #endregion
+    try {
+      await ensurePortalResumeSchema(uploadMetaPool);
+      const r = await uploadMetaPool.query(
+        `SELECT DISTINCT ON (object_key) object_key, sha256
+         FROM portal_upload_sessions
+         WHERE client_id = $1 AND job_id = $2 AND status = 'completed'
+           AND sha256 IS NOT NULL AND btrim(sha256) <> ''
+         ORDER BY object_key, completed_at DESC NULLS LAST, updated_at DESC`,
+        [String(clientId), String(jobId)]
+      );
+      const rows = r.rows || [];
+      // #region agent log
+      fetch('http://127.0.0.1:7557/ingest/9737bd06-d5e6-4686-9f6f-597f8bc8a26c', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '720a64' },
+        body: JSON.stringify({
+          sessionId: '720a64',
+          location: 'portal-files.routes.js:mergeSHA',
+          message: 'merge db rows',
+          data: { dbRowCount: rows.length },
+          timestamp: Date.now(),
+          hypothesisId: 'H2'
+        })
+      }).catch(() => {});
+      // #endregion
+      const byKey = new Map();
+      for (const row of rows) {
+        const k = String(row.object_key || '');
+        const h = normalizeSha256Hex(row.sha256);
+        if (k && h.length === 64) byKey.set(k, h);
+      }
+      let merged = 0;
+      for (const f of files) {
+        const key = String(f.key || '');
+        const h = byKey.get(key);
+        if (h) {
+          f.sha256 = h;
+          merged += 1;
+        }
+      }
+      // #region agent log
+      fetch('http://127.0.0.1:7557/ingest/9737bd06-d5e6-4686-9f6f-597f8bc8a26c', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '720a64' },
+        body: JSON.stringify({
+          sessionId: '720a64',
+          location: 'portal-files.routes.js:mergeSHA',
+          message: 'merge applied',
+          data: { byKeySize: byKey.size, mergedOnTree: merged },
+          timestamp: Date.now(),
+          hypothesisId: 'H3'
+        })
+      }).catch(() => {});
+      // #endregion
+    } catch (e) {
+      // #region agent log
+      fetch('http://127.0.0.1:7557/ingest/9737bd06-d5e6-4686-9f6f-597f8bc8a26c', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '720a64' },
+        body: JSON.stringify({
+          sessionId: '720a64',
+          location: 'portal-files.routes.js:mergeSHA',
+          message: 'merge error',
+          data: { err: String(e?.message || e) },
+          timestamp: Date.now(),
+          hypothesisId: 'H4'
+        })
+      }).catch(() => {});
+      // #endregion
+      console.warn('[portal-files] mergeCompletedUploadSha256IntoTree:', e?.message || e);
+    }
+  }
+
   r.get('/storage-health', async (req, res) => {
     try {
       if (!userIsPortalAdmin(req.user)) {
@@ -1381,6 +1482,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           }
         }
       }
+      await mergeCompletedUploadSha256IntoTree(clientId, jobId, tree);
       return res.json(tree);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -1579,6 +1681,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const keys = await listAllKeys(s3, bucket, prefix);
       const full = buildTreeFromKeys(prefix, keys);
       const filtered = filterTreeForSharePayload(full, payload);
+      await mergeCompletedUploadSha256IntoTree(String(row.client_id), String(row.job_id), filtered);
       return res.json(filtered);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -3719,6 +3822,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const keys = await listAllKeys(s3, bucket, prefix);
       const full = buildTreeFromKeys(prefix, keys);
       const filtered = filterTreeForSharePayload(full, payload);
+      await mergeCompletedUploadSha256IntoTree(String(row.client_id), String(row.job_id), filtered);
       return res.json(filtered);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
