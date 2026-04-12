@@ -56,7 +56,7 @@ const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCU
 /** Max items per {@code POST /check-paths} (JSON body stays well under express 4mb). */
 const PORTAL_CHECK_PATHS_MAX = clampIntEnv('PORTAL_CHECK_PATHS_MAX', 800, 50, 2000);
 /** Parallel S3 HeadObject calls per check-paths request (Wasabi handles many concurrent small reads). */
-const PORTAL_CHECK_PATHS_HEAD_CONCURRENCY = clampIntEnv('PORTAL_CHECK_PATHS_HEAD_CONCURRENCY', 16, 1, 64);
+const PORTAL_CHECK_PATHS_HEAD_CONCURRENCY = clampIntEnv('PORTAL_CHECK_PATHS_HEAD_CONCURRENCY', 32, 1, 64);
 
 /**
  * When the job has path grants, users with **no** matching `portal_path_grants` rows see an empty tree (strict).
@@ -750,6 +750,42 @@ async function listAllKeys(s3, bucket, prefix) {
     pageToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
   } while (pageToken);
   return keys;
+}
+
+/**
+ * Distinct job ids that have at least one object under {@code clients/{clientId}/jobs/{jobId}/}.
+ * Uses {@code Delimiter: '/'} so Wasabi returns one common prefix per job folder (fast), not every object key.
+ * @param {import('@aws-sdk/client-s3').S3Client} s3
+ * @param {string} bucket
+ * @param {string} jobsPrefix e.g. {@code clients/acme/jobs/}
+ * @returns {Promise<Set<string>>}
+ */
+async function listJobIdsUnderClientJobsPrefix(s3, bucket, jobsPrefix) {
+  const p = String(jobsPrefix || '').replace(/\\/g, '/');
+  const base = p.endsWith('/') ? p : `${p}/`;
+  const jobIds = new Set();
+  let pageToken;
+  do {
+    const resp = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: base,
+        Delimiter: '/',
+        ContinuationToken: pageToken
+      })
+    );
+    for (const cp of resp.CommonPrefixes || []) {
+      const full = String(cp.Prefix || '');
+      if (!full.startsWith(base)) continue;
+      let rest = full.slice(base.length).replace(/\/+$/, '');
+      const slash = rest.indexOf('/');
+      if (slash >= 0) rest = rest.slice(0, slash);
+      const jobId = rest.trim();
+      if (jobId) jobIds.add(jobId);
+    }
+    pageToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+  } while (pageToken);
+  return jobIds;
 }
 
 function isFolderMarkerKey(relKey) {
@@ -1769,17 +1805,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const probePrefix = jobPrefix(clientId, '__hp_jobs_probe__');
       const prefix = probePrefix.replace(/__hp_jobs_probe__\/$/, '');
-      const keys = await listAllKeys(s3, bucket, prefix);
-      const set = new Set();
-      for (const obj of keys) {
-        const key = String(obj?.Key || '');
-        if (!key.startsWith(prefix)) continue;
-        const rel = key.slice(prefix.length);
-        const slash = rel.indexOf('/');
-        if (slash <= 0) continue;
-        const jobId = rel.slice(0, slash).trim();
-        if (jobId) set.add(jobId);
-      }
+      const set = await listJobIdsUnderClientJobsPrefix(s3, bucket, prefix);
       const scoped = Array.isArray(req.user?.portalScopes) ? req.user.portalScopes : [];
       for (const s of scoped) {
         if (String(s?.clientId || '').trim() !== clientId) continue;
