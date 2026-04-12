@@ -61,7 +61,8 @@ function createAutoImportPlugin(options = {}) {
   const router = express.Router();
   const HEARTBEAT_TTL_MS = (() => {
     const raw = Number(process.env.AUTO_IMPORT_HEARTBEAT_TTL_MS);
-    if (!Number.isFinite(raw)) return 45_000;
+    /** Default 90s so slower desktop poll intervals do not flash "offline" while uploads still work. */
+    if (!Number.isFinite(raw)) return 90_000;
     return Math.max(10_000, Math.min(300_000, Math.floor(raw)));
   })();
 
