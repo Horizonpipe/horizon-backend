@@ -1211,12 +1211,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   const PORTAL_PRESIGN_DISABLED = String(process.env.PORTAL_PRESIGN_DISABLED || '0').trim() === '1';
 
   /**
-   * When `1`, resumable `/upload/resumable/complete` re-downloads the full object from Wasabi to verify SHA-256.
-   * Default `0`: trust the client-provided digest (already required) and only `HeadObject` for size — full-object
-   * streaming through Render times out or OOMs on large zips and looked like “upload never finishes”.
+   * Optional: resumable `/upload/resumable/complete` re-downloads the full object from Wasabi to verify SHA-256.
+   * **Off by default** (no full-object read through Render). Enabling is deliberate: you must set **both**
+   * `PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY=1` and `PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY_CONFIRM=1`.
+   * A lone `PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY=1` does nothing — avoids accidental dashboard toggles.
+   * When off: trust the client-provided digest (already required) and only `HeadObject` for size.
    */
   const PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY =
-    String(process.env.PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY || '0').trim() === '1';
+    String(process.env.PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY || '0').trim() === '1' &&
+    String(process.env.PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY_CONFIRM || '0').trim() === '1';
 
   /** Browser → Wasabi direct PUT / multipart parts. Set `PORTAL_UPLOAD_PRESIGN=0` to disable (client uses proxy upload). */
   const PORTAL_UPLOAD_PRESIGN_ENABLED = String(process.env.PORTAL_UPLOAD_PRESIGN || '1').trim().toLowerCase() !== '0';

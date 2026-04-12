@@ -65,12 +65,21 @@ function createAutoImportPlugin(options = {}) {
     return Math.max(10_000, Math.min(300_000, Math.floor(raw)));
   })();
 
-  function heartbeatKey(req) {
-    const id = req?.user?.id;
-    const un = req?.user?.username;
-    if (id != null && String(id).trim()) return String(id).trim();
-    if (un != null && String(un).trim()) return String(un).trim().toLowerCase();
-    return 'anon';
+  /**
+   * Desktop JWT and browser session must resolve the same logical user; some clients only have
+   * numeric `id`, others only `username` in the persisted session. We read/write heartbeats under
+   * every stable key so GET sees POSTs regardless of which field the gateway attached first.
+   * @returns {string[]}
+   */
+  function heartbeatKeys(req) {
+    const u = req?.user;
+    if (!u) return ['anon'];
+    const keys = [];
+    const id = u.id != null ? String(u.id).trim() : '';
+    const un = u.username != null ? String(u.username).trim().toLowerCase() : '';
+    if (id) keys.push(id);
+    if (un && (!id || un !== id.toLowerCase())) keys.push(un);
+    return keys.length ? keys : ['anon'];
   }
 
   async function initSchema() {
@@ -459,7 +468,7 @@ function createAutoImportPlugin(options = {}) {
   });
 
   router.post('/desktop-heartbeat', desktopHeartbeatGate, express.json(), async (req, res) => {
-    const key = heartbeatKey(req);
+    const keys = heartbeatKeys(req);
     const nowMs = Date.now();
     const state = clean(req.body?.state || 'connected').toLowerCase() || 'connected';
     const source = clean(req.body?.source || 'desktop') || 'desktop';
@@ -467,19 +476,21 @@ function createAutoImportPlugin(options = {}) {
     const username = clean(req.user?.username || '');
     const displayName = clean(req.user?.displayName || '');
     try {
-      await runPostgresHeartbeatSql(
-        `INSERT INTO auto_import_desktop_heartbeats (user_key, at_ms, state, source, detail, username, display_name, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-         ON CONFLICT (user_key) DO UPDATE SET
-           at_ms = EXCLUDED.at_ms,
-           state = EXCLUDED.state,
-           source = EXCLUDED.source,
-           detail = EXCLUDED.detail,
-           username = EXCLUDED.username,
-           display_name = EXCLUDED.display_name,
-           updated_at = NOW()`,
-        [key, nowMs, state, source, detail, username, displayName]
-      );
+      for (const key of keys) {
+        await runPostgresHeartbeatSql(
+          `INSERT INTO auto_import_desktop_heartbeats (user_key, at_ms, state, source, detail, username, display_name, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+           ON CONFLICT (user_key) DO UPDATE SET
+             at_ms = EXCLUDED.at_ms,
+             state = EXCLUDED.state,
+             source = EXCLUDED.source,
+             detail = EXCLUDED.detail,
+             username = EXCLUDED.username,
+             display_name = EXCLUDED.display_name,
+             updated_at = NOW()`,
+          [key, nowMs, state, source, detail, username, displayName]
+        );
+      }
     } catch (error) {
       logger.error?.(
         'auto-import desktop-heartbeat UPSERT failed:',
@@ -498,13 +509,16 @@ function createAutoImportPlugin(options = {}) {
   });
 
   router.get('/desktop-heartbeat', desktopHeartbeatGate, async (req, res) => {
-    const key = heartbeatKey(req);
+    const keys = heartbeatKeys(req);
     const nowMs = Date.now();
     let rec = null;
     try {
       const r = await runPostgresHeartbeatSql(
-        'SELECT at_ms, state, source, detail FROM auto_import_desktop_heartbeats WHERE user_key = $1 LIMIT 1',
-        [key]
+        `SELECT at_ms, state, source, detail FROM auto_import_desktop_heartbeats
+         WHERE user_key = ANY($1::text[])
+         ORDER BY at_ms DESC NULLS LAST
+         LIMIT 1`,
+        [keys]
       );
       rec = r.rows[0] || null;
     } catch (error) {
