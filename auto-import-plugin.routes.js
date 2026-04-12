@@ -75,10 +75,17 @@ function createAutoImportPlugin(options = {}) {
     const u = req?.user;
     if (!u) return ['anon'];
     const keys = [];
+    const pushKey = (raw) => {
+      const k = String(raw || '').trim();
+      if (!k) return;
+      if (!keys.includes(k)) keys.push(k);
+    };
     const id = u.id != null ? String(u.id).trim() : '';
     const un = u.username != null ? String(u.username).trim().toLowerCase() : '';
-    if (id) keys.push(id);
-    if (un && (!id || un !== id.toLowerCase())) keys.push(un);
+    const em = u.email != null ? String(u.email).trim().toLowerCase() : '';
+    pushKey(id);
+    if (un) pushKey(un);
+    if (em) pushKey(em);
     return keys.length ? keys : ['anon'];
   }
 
