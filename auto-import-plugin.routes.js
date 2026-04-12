@@ -31,14 +31,30 @@ function createAutoImportPlugin(options = {}) {
   }
   const pool = { query: dbQuery };
   /**
-   * Heartbeats + init DDL must hit Postgres even when `options.query` is the Wasabi auto-import adapter
-   * (that adapter intentionally no-ops `CREATE TABLE auto_import_*`, which would leave desktop_heartbeats missing).
+   * Heartbeats, init DDL, and **portal DAS monitor reads** must hit live Postgres when `options.query` is the
+   * Wasabi auto-import adapter (snapshot can lag or omit rows that uploads/heartbeat just wrote).
    */
   const directPgQuery =
     poolOption && typeof poolOption.query === 'function' ? poolOption.query.bind(poolOption) : null;
-  async function runPostgresHeartbeatSql(text, params = []) {
+  async function runPostgresAutoImportSql(text, params = []) {
     if (directPgQuery) return directPgQuery(text, params);
     return pool.query(text, params);
+  }
+
+  /**
+   * DAS monitor reads: live Postgres first (matches heartbeat + immediate writes). If the table is empty there
+   * but Wasabi-primary has populated the snapshot adapter, fall back to `pool.query` so the UI is not blank.
+   */
+  async function readAutoImportMonitorSql(text, params = []) {
+    const pg = await runPostgresAutoImportSql(text, params);
+    if (pg && Array.isArray(pg.rows) && pg.rows.length > 0) return pg;
+    try {
+      const viaAdapter = await pool.query(text, params);
+      if (viaAdapter && Array.isArray(viaAdapter.rows) && viaAdapter.rows.length > 0) return viaAdapter;
+    } catch {
+      /* ignore */
+    }
+    return pg || { rows: [] };
   }
   if (typeof requireMike !== 'function') throw new Error('createAutoImportPlugin requires requireMike middleware.');
   const desktopHeartbeatGate =
@@ -91,7 +107,7 @@ function createAutoImportPlugin(options = {}) {
   }
 
   async function initSchema() {
-    await runPostgresHeartbeatSql(`
+    await runPostgresAutoImportSql(`
       CREATE TABLE IF NOT EXISTS auto_import_projects (
         id TEXT PRIMARY KEY,
         source_key TEXT NOT NULL UNIQUE,
@@ -485,7 +501,7 @@ function createAutoImportPlugin(options = {}) {
     const displayName = clean(req.user?.displayName || '');
     try {
       for (const key of keys) {
-        await runPostgresHeartbeatSql(
+        await runPostgresAutoImportSql(
           `INSERT INTO auto_import_desktop_heartbeats (user_key, at_ms, state, source, detail, username, display_name, updated_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
            ON CONFLICT (user_key) DO UPDATE SET
@@ -521,7 +537,7 @@ function createAutoImportPlugin(options = {}) {
     const nowMs = Date.now();
     let rec = null;
     try {
-      const r = await runPostgresHeartbeatSql(
+      const r = await runPostgresAutoImportSql(
         `SELECT at_ms, state, source, detail FROM auto_import_desktop_heartbeats
          WHERE user_key = ANY($1::text[])
          ORDER BY at_ms DESC NULLS LAST
@@ -552,8 +568,10 @@ function createAutoImportPlugin(options = {}) {
   router.get('/projects', desktopHeartbeatGate, async (req, res, next) => {
     try {
       const [projects, bindings] = await Promise.all([
-        pool.query('SELECT * FROM auto_import_projects ORDER BY COALESCE(last_seen_at, created_at) DESC, display_name ASC'),
-        pool.query('SELECT * FROM auto_import_bindings ORDER BY updated_at DESC')
+        readAutoImportMonitorSql(
+          'SELECT * FROM auto_import_projects ORDER BY COALESCE(last_seen_at, created_at) DESC, display_name ASC'
+        ),
+        readAutoImportMonitorSql('SELECT * FROM auto_import_bindings ORDER BY updated_at DESC')
       ]);
       const bindingMap = new Map(bindings.rows.map((row) => [row.project_id, row]));
       res.json({
@@ -841,14 +859,14 @@ function createAutoImportPlugin(options = {}) {
       const projectId = clean(req.params.projectId) || '__global__';
       let result;
       if (projectId === '__global__') {
-        result = await pool.query(
+        result = await readAutoImportMonitorSql(
           `SELECT * FROM auto_import_logs
            ORDER BY created_at DESC
            LIMIT $1`,
           [limit]
         );
       } else {
-        result = await pool.query(
+        result = await readAutoImportMonitorSql(
           `SELECT * FROM auto_import_logs
            WHERE project_id = $1 OR project_id IS NULL
            ORDER BY created_at DESC

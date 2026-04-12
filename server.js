@@ -5788,6 +5788,14 @@ async function runAutoImportWasabiQuery(text, params = []) {
       .slice(0, limit);
     return pgRows(rows);
   }
+  if (sql.startsWith('select * from auto_import_logs order by created_at desc limit')) {
+    const snapshot = await requireFreshSnapshot();
+    const limit = Math.max(1, Number(params[0] || 200));
+    const rows = [...snapshotRows(snapshot, 'auto_import_logs')]
+      .sort((a, b) => tsMs(b?.created_at) - tsMs(a?.created_at))
+      .slice(0, limit);
+    return pgRows(rows);
+  }
   if (sql.startsWith('select id from planner_records where lower(client) = lower($1) and lower(city) = lower($2) and lower(jobsite) = lower($3)')) {
     const snapshot = await requireFreshSnapshot();
     const hit = findAutoImportProjectByScope(snapshot, params[0], params[1], params[2]);
