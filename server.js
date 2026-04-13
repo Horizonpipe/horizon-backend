@@ -14,6 +14,16 @@ const { registerPortalFilesRoutes } = require('./portal-files.routes');
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
 const { registerSignupRoutes } = require('./signup.routes');
 const { resolveCapabilities, canAccessAdminPanel, canManagePortalExtras } = require('./capabilities');
+const {
+  buildAdminAttachmentStorageKey,
+  isAllowedAdminAttachmentContentType,
+  presignAdminAttachmentPut,
+  deleteAdminAttachmentKeys,
+  collectAdminAttachmentStorageKeysFromFiles,
+  storageKeysRemovedBetweenFileLists,
+  normalizeAdminFilesForPersist,
+  hydrateAdminReportOrAssetRows
+} = require('./admin-attachments-wasabi');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -207,6 +217,7 @@ const WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATH_SET = new Set(
     '/api/files/upload/resumable/abort',
     '/api/files/folders/zip-manifest',
     '/api/files/presign-batch',
+    '/admin/attachments/upload-presign',
     ...String(process.env.WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATHS || '')
       .split(',')
       .map((s) => normalizeWasabiSnapshotHttpSkipPath(s))
@@ -421,6 +432,48 @@ const WASABI_STATE_EXCLUDE_TABLES = new Set(
     .filter(Boolean)
 );
 const wasabiStateClient = createWasabiStateClient();
+
+const ADMIN_ATTACHMENT_MAX_BYTES = Math.max(
+  1024,
+  Math.min(50 * 1024 * 1024, Number(process.env.ADMIN_ATTACHMENT_MAX_BYTES || 25 * 1024 * 1024))
+);
+const ADMIN_ATTACHMENT_UPLOAD_TTL_SECONDS = Math.max(
+  60,
+  Math.min(86400, Number(process.env.ADMIN_ATTACHMENT_UPLOAD_TTL_SECONDS || 3600))
+);
+const ADMIN_ATTACHMENT_VIEW_TTL_SECONDS = Math.max(
+  300,
+  Math.min(604800, Number(process.env.ADMIN_ATTACHMENT_VIEW_TTL_SECONDS || 86400))
+);
+
+function adminAttachmentsWasabiConfigured() {
+  return !!(wasabiStateClient && WASABI_STATE_BUCKET);
+}
+
+async function hydrateDailyReportsResponseRows(reports) {
+  const list = Array.isArray(reports) ? reports : [];
+  if (!adminAttachmentsWasabiConfigured()) return list;
+  return hydrateAdminReportOrAssetRows(
+    wasabiStateClient,
+    WASABI_STATE_BUCKET,
+    list,
+    'files',
+    ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+  );
+}
+
+async function hydrateJobsiteAssetsResponseRows(assets) {
+  const list = Array.isArray(assets) ? assets : [];
+  if (!adminAttachmentsWasabiConfigured()) return list;
+  return hydrateAdminReportOrAssetRows(
+    wasabiStateClient,
+    WASABI_STATE_BUCKET,
+    list,
+    'files',
+    ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+  );
+}
+
 let wasabiStateSnapshotBusy = false;
 let wasabiStateSnapshotTimer = null;
 let wasabiStateLastQueuedAt = 0;
@@ -2241,6 +2294,31 @@ async function updateDailyReportById(id, patch) {
 }
 
 async function deleteDailyReportById(id) {
+  let filesToPurge = [];
+  try {
+    const snapRow = await readDailyReportByIdFromWasabiSnapshot(id);
+    if (snapRow && Array.isArray(snapRow.files)) filesToPurge = snapRow.files;
+  } catch {
+    /* ignore */
+  }
+  if (!filesToPurge.length && !WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    try {
+      const r = await pool.query('SELECT files FROM daily_reports WHERE id = $1', [id]);
+      if (r.rows[0]) {
+        filesToPurge = Array.isArray(r.rows[0].files) ? r.rows[0].files : parseJsonObject(r.rows[0].files, []);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  if (adminAttachmentsWasabiConfigured()) {
+    await deleteAdminAttachmentKeys(
+      wasabiStateClient,
+      WASABI_STATE_BUCKET,
+      collectAdminAttachmentStorageKeysFromFiles(filesToPurge)
+    );
+  }
+
   let deleted = false;
   const wrote = await tryWasabiStateWrite('delete-daily-report', async (data) => {
     const rows = ensureSnapshotTable(data, 'daily_reports');
@@ -2309,6 +2387,35 @@ async function createJobsiteAsset(assetInput) {
 }
 
 async function deleteJobsiteAssetById(id) {
+  let filesToPurge = [];
+  try {
+    const snapshot = await loadWasabiLatestStateSnapshot();
+    if (snapshot?.data) {
+      const rows = snapshotRows(snapshot, 'jobsite_assets');
+      const hit = rows.find((row) => String(row.id || '') === String(id || ''));
+      if (hit && Array.isArray(hit.files)) filesToPurge = hit.files;
+    }
+  } catch {
+    /* ignore */
+  }
+  if (!filesToPurge.length && !WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    try {
+      const r = await pool.query('SELECT files FROM jobsite_assets WHERE id = $1', [id]);
+      if (r.rows[0]) {
+        filesToPurge = Array.isArray(r.rows[0].files) ? r.rows[0].files : parseJsonObject(r.rows[0].files, []);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  if (adminAttachmentsWasabiConfigured()) {
+    await deleteAdminAttachmentKeys(
+      wasabiStateClient,
+      WASABI_STATE_BUCKET,
+      collectAdminAttachmentStorageKeysFromFiles(filesToPurge)
+    );
+  }
+
   let deleted = false;
   const wrote = await tryWasabiStateWrite('delete-jobsite-asset', async (data) => {
     const rows = ensureSnapshotTable(data, 'jobsite_assets');
@@ -2327,10 +2434,37 @@ async function deleteJobsiteAssetById(id) {
 }
 
 async function deleteJobsiteAssetsByClient(client) {
+  const target = String(client || '').toLowerCase();
+  const keysToDelete = [];
+  try {
+    const snapshot = await loadWasabiLatestStateSnapshot();
+    if (snapshot?.data) {
+      for (const row of snapshotRows(snapshot, 'jobsite_assets')) {
+        if (String(row.client || '').toLowerCase() !== target) continue;
+        keysToDelete.push(...collectAdminAttachmentStorageKeysFromFiles(row.files));
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  if (!WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    try {
+      const r = await pool.query('SELECT files FROM jobsite_assets WHERE LOWER(client) = $1', [target]);
+      for (const row of r.rows) {
+        const files = Array.isArray(row.files) ? row.files : parseJsonObject(row.files, []);
+        keysToDelete.push(...collectAdminAttachmentStorageKeysFromFiles(files));
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  if (adminAttachmentsWasabiConfigured()) {
+    await deleteAdminAttachmentKeys(wasabiStateClient, WASABI_STATE_BUCKET, keysToDelete);
+  }
+
   let deletedCount = 0;
   const wrote = await tryWasabiStateWrite('delete-jobsite-assets-by-client', async (data) => {
     const rows = ensureSnapshotTable(data, 'jobsite_assets');
-    const target = String(client || '').toLowerCase();
     const next = rows.filter((row) => String(row.client || '').toLowerCase() !== target);
     deletedCount = rows.length - next.length;
     data.jobsite_assets = next;
@@ -5477,17 +5611,52 @@ app.delete('/pricing-rates/:dia', requireAuth, requireAdmin, async (req, res) =>
   }
 });
 
+app.post('/admin/attachments/upload-presign', requireAuth, requireAdmin, express.json({ limit: '64kb' }), async (req, res) => {
+  try {
+    if (!adminAttachmentsWasabiConfigured()) {
+      return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
+    }
+    const fileName = cleanString(req.body?.fileName);
+    const contentType = cleanString(req.body?.contentType || 'application/octet-stream');
+    const fileSize = Number(req.body?.fileSize);
+    const fileKind =
+      String(req.body?.fileKind || 'jobsite-asset').trim().toLowerCase() === 'daily-report' ? 'daily-report' : 'jobsite-asset';
+    if (!fileName) return res.status(400).json({ success: false, error: 'fileName is required' });
+    if (!Number.isFinite(fileSize) || fileSize < 1 || fileSize > ADMIN_ATTACHMENT_MAX_BYTES) {
+      return res.status(400).json({
+        success: false,
+        error: `fileSize must be between 1 and ${ADMIN_ATTACHMENT_MAX_BYTES} bytes`
+      });
+    }
+    if (!isAllowedAdminAttachmentContentType(contentType, fileKind)) {
+      return res.status(400).json({ success: false, error: 'Unsupported content type for this upload kind' });
+    }
+    const storageKey = buildAdminAttachmentStorageKey(fileName);
+    const signed = await presignAdminAttachmentPut(
+      wasabiStateClient,
+      WASABI_STATE_BUCKET,
+      storageKey,
+      contentType,
+      ADMIN_ATTACHMENT_UPLOAD_TTL_SECONDS
+    );
+    return res.json({ success: true, ...signed });
+  } catch (error) {
+    console.error('ADMIN ATTACHMENT PRESIGN ERROR:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/daily-reports', requireAuth, requireAdmin, async (req, res) => {
   try {
     if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
       const reports = (await readDailyReportsFromWasabiSnapshot()) || [];
-      return res.json({ success: true, reports });
+      return res.json({ success: true, reports: await hydrateDailyReportsResponseRows(reports) });
     }
     if (WASABI_REPORTS_PRIMARY_ENABLED) {
       try {
         const snapshotReports = await readDailyReportsFromWasabiSnapshot();
         if (snapshotReports) {
-          return res.json({ success: true, reports: snapshotReports });
+          return res.json({ success: true, reports: await hydrateDailyReportsResponseRows(snapshotReports) });
         }
         if (WASABI_REPORTS_PRIMARY_STRICT) {
           return res.json({ success: true, reports: [] });
@@ -5499,16 +5668,16 @@ app.get('/daily-reports', requireAuth, requireAdmin, async (req, res) => {
 
     const result = await pool.query('SELECT * FROM daily_reports ORDER BY report_date DESC, updated_at DESC');
     const reports = result.rows.map((row) => ({ ...row, files: Array.isArray(row.files) ? row.files : parseJsonObject(row.files, []) }));
-    res.json({ success: true, reports });
+    res.json({ success: true, reports: await hydrateDailyReportsResponseRows(reports) });
   } catch (error) {
     console.error('GET DAILY REPORTS ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-app.post('/daily-reports', requireAuth, requireAdmin, upload.array('files'), async (req, res) => {
+app.post('/daily-reports', requireAuth, requireAdmin, express.json({ limit: '20mb' }), async (req, res) => {
   try {
-    const files = (req.files || []).map(fileToStoredJson);
+    const files = normalizeAdminFilesForPersist(req.body?.files);
     const created = await createDailyReport({
       title: cleanString(req.body?.title),
       report_date: cleanString(req.body?.report_date || new Date().toISOString().slice(0, 10)),
@@ -5516,14 +5685,15 @@ app.post('/daily-reports', requireAuth, requireAdmin, upload.array('files'), asy
       files,
       created_by: req.user.displayName || req.user.username
     });
-    res.status(201).json({ success: true, report: created });
+    const hydrated = (await hydrateDailyReportsResponseRows([created]))[0] || created;
+    res.status(201).json({ success: true, report: hydrated });
   } catch (error) {
     console.error('CREATE DAILY REPORT ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-app.put('/daily-reports/:id', requireAuth, requireAdmin, upload.array('files'), async (req, res) => {
+app.put('/daily-reports/:id', requireAuth, requireAdmin, express.json({ limit: '20mb' }), async (req, res) => {
   try {
     let current = null;
     if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
@@ -5549,15 +5719,20 @@ app.put('/daily-reports/:id', requireAuth, requireAdmin, upload.array('files'), 
     const currentFiles = Array.isArray(current.files) ? current.files : parseJsonObject(current.files, []);
     const keepIds = new Set([].concat(req.body?.keepFileIds || []).filter(Boolean));
     const keptFiles = keepIds.size ? currentFiles.filter((file) => keepIds.has(file.id)) : currentFiles;
-    const addedFiles = (req.files || []).map(fileToStoredJson);
-    const nextFiles = [...keptFiles, ...addedFiles];
+    const addedFiles = Array.isArray(req.body?.files) ? req.body.files : [];
+    const nextFiles = normalizeAdminFilesForPersist([...keptFiles, ...addedFiles]);
+    const removedKeys = storageKeysRemovedBetweenFileLists(currentFiles, nextFiles);
+    if (adminAttachmentsWasabiConfigured() && removedKeys.length) {
+      await deleteAdminAttachmentKeys(wasabiStateClient, WASABI_STATE_BUCKET, removedKeys);
+    }
     const updated = await updateDailyReportById(req.params.id, {
       title: cleanString(req.body?.title),
       report_date: cleanString(req.body?.report_date || current.report_date),
       notes: cleanString(req.body?.notes),
       files: nextFiles
     });
-    res.json({ success: true, report: updated });
+    const hydrated = (await hydrateDailyReportsResponseRows([updated]))[0] || updated;
+    res.json({ success: true, report: hydrated });
   } catch (error) {
     console.error('UPDATE DAILY REPORT ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -5579,13 +5754,13 @@ app.get('/jobsite-assets', requireAuth, requireFootageAccess, async (req, res) =
   try {
     if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
       const assets = (await readJobsiteAssetsFromWasabiSnapshotForUser(req.user)) || [];
-      return res.json({ success: true, assets });
+      return res.json({ success: true, assets: await hydrateJobsiteAssetsResponseRows(assets) });
     }
     if (WASABI_ASSETS_PRIMARY_ENABLED) {
       try {
         const snapshotAssets = await readJobsiteAssetsFromWasabiSnapshotForUser(req.user);
         if (snapshotAssets) {
-          return res.json({ success: true, assets: snapshotAssets });
+          return res.json({ success: true, assets: await hydrateJobsiteAssetsResponseRows(snapshotAssets) });
         }
         if (WASABI_ASSETS_PRIMARY_STRICT) {
           return res.json({ success: true, assets: [] });
@@ -5603,16 +5778,16 @@ app.get('/jobsite-assets', requireAuth, requireFootageAccess, async (req, res) =
       scopeFilter.params
     );
     const assets = result.rows.map((row) => ({ ...row, files: Array.isArray(row.files) ? row.files : parseJsonObject(row.files, []) }));
-    res.json({ success: true, assets });
+    res.json({ success: true, assets: await hydrateJobsiteAssetsResponseRows(assets) });
   } catch (error) {
     console.error('GET JOBSITE ASSETS ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-app.post('/jobsite-assets', requireAuth, requireAdmin, upload.array('files'), async (req, res) => {
+app.post('/jobsite-assets', requireAuth, requireAdmin, express.json({ limit: '20mb' }), async (req, res) => {
   try {
-    const files = (req.files || []).map(fileToStoredJson);
+    const files = normalizeAdminFilesForPersist(req.body?.files);
     const created = await createJobsiteAsset({
       client: req.body?.assetClient || req.body?.client,
       city: req.body?.assetCity || req.body?.city,
@@ -5625,7 +5800,8 @@ app.post('/jobsite-assets', requireAuth, requireAdmin, upload.array('files'), as
       files,
       created_by: req.user.displayName || req.user.username
     });
-    res.status(201).json({ success: true, asset: created });
+    const hydrated = (await hydrateJobsiteAssetsResponseRows([created]))[0] || created;
+    res.status(201).json({ success: true, asset: hydrated });
   } catch (error) {
     console.error('CREATE JOBSITE ASSET ERROR:', error);
     res.status(500).json({ success: false, error: error.message });

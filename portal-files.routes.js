@@ -1428,6 +1428,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   }
 
   /**
+   * When `PORTAL_RESUMABLE_PROXY_CHUNK=0`, `POST …/upload/resumable/chunk` (multipart body through Render) is disabled.
+   * Default `1` keeps legacy behavior. Set `0` on Render and use `POST …/upload/resumable/sign-part` + direct PUT to Wasabi.
+   */
+  const PORTAL_RESUMABLE_PROXY_CHUNK =
+    String(process.env.PORTAL_RESUMABLE_PROXY_CHUNK ?? '1').trim().toLowerCase() !== '0';
+
+  /**
    * Optional: resumable `/upload/resumable/complete` re-downloads the full object from Wasabi to verify SHA-256.
    * **Off by default** (no full-object read through Render). Enabling is deliberate: you must set **both**
    * `PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY=1` and `PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY_CONFIRM=1`.
@@ -3332,7 +3339,19 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     }
   });
 
-  r.post('/upload/resumable/chunk', portalChunkUpload.single('chunk'), async (req, res) => {
+  r.post(
+    '/upload/resumable/chunk',
+    (req, res, next) => {
+      if (PORTAL_RESUMABLE_PROXY_CHUNK) return next();
+      res.status(410).json({
+        error: 'Proxy resumable chunk upload disabled',
+        code: 'USE_PRESIGN',
+        hint:
+          'Use POST /api/files/upload/resumable/sign-part with a JSON body { sessionId, partNumber }, PUT bytes to the returned URL, then POST /api/files/upload/resumable/part-complete.'
+      });
+    },
+    portalChunkUpload.single('chunk'),
+    async (req, res) => {
     const f = req.file;
     if (!f) return res.status(400).json({ error: 'Missing file field "chunk"' });
     try {
@@ -3409,7 +3428,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
     }
-  });
+  }
+  );
 
   r.post('/upload/resumable/complete', express.json({ limit: '128kb' }), async (req, res) => {
     try {
