@@ -90,6 +90,7 @@ app.use((req, res, next) => {
     const writable = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
     if (!writable) return;
     if (res.statusCode >= 500) return;
+    if (requestPathSkipsWasabiStateSnapshot(req)) return;
     queueWasabiStateSnapshot(`${method} ${req.originalUrl || req.url || ''}`);
   });
   next();
@@ -158,9 +159,14 @@ const WASABI_STATE_BUCKET = String(process.env.WASABI_BUCKET || '').trim();
 const WASABI_STATE_PREFIX = String(process.env.WASABI_PIPESYNC_STATE_PREFIX || 'clients/portal-users/jobs/3/system-state')
   .trim()
   .replace(/\/+$/, '');
+/** Upper cap for timed snapshot interval (Render env); default 24h. Lower with `WASABI_STATE_SNAPSHOT_MAX_MS` if needed. */
+const WASABI_STATE_SNAPSHOT_MAX_MS = Math.max(
+  60000,
+  Math.min(86400000, Number(process.env.WASABI_STATE_SNAPSHOT_MAX_MS || 86400000))
+);
 const WASABI_STATE_SNAPSHOT_MS = Math.max(
   10000,
-  Math.min(300000, Number(process.env.WASABI_STATE_SNAPSHOT_MS || 60000))
+  Math.min(WASABI_STATE_SNAPSHOT_MAX_MS, Number(process.env.WASABI_STATE_SNAPSHOT_MS || 60000))
 );
 const WASABI_STATE_SNAPSHOT_ON_WRITE =
   String(process.env.WASABI_STATE_SNAPSHOT_ON_WRITE || '1').trim().toLowerCase() !== '0';
@@ -176,6 +182,41 @@ const WASABI_LATEST_STATE_CACHE_MS = Math.max(
   1000,
   Math.min(300000, Number(process.env.WASABI_LATEST_STATE_CACHE_MS || 15000))
 );
+/** POST paths that must not trigger on-write Wasabi state snapshots (high volume, no app-table mutations). */
+function normalizeWasabiSnapshotHttpSkipPath(p) {
+  const s = String(p || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\/+$/, '');
+  return s || '/';
+}
+const WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATH_SET = new Set(
+  [
+    '/api/files/check-paths',
+    '/api/files/find-hash-paths',
+    '/api/files/upload/presign',
+    '/api/files/upload/multipart/init',
+    '/api/files/upload/multipart/sign-parts',
+    '/api/files/upload/multipart/complete',
+    '/api/files/upload/multipart/abort',
+    '/api/files/upload/register-sha256',
+    '/api/files/upload/resumable/init',
+    '/api/files/upload/resumable/sign-part',
+    '/api/files/upload/resumable/part-complete',
+    '/api/files/upload/resumable/complete',
+    '/api/files/upload/resumable/abort',
+    '/api/files/folders/zip-manifest',
+    '/api/files/presign-batch',
+    ...String(process.env.WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATHS || '')
+      .split(',')
+      .map((s) => normalizeWasabiSnapshotHttpSkipPath(s))
+      .filter((s) => s !== '/')
+  ].map((s) => normalizeWasabiSnapshotHttpSkipPath(s))
+);
+function requestPathSkipsWasabiStateSnapshot(req) {
+  const raw = String(req.originalUrl || req.url || '').split('?')[0].split('#')[0];
+  return WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATH_SET.has(normalizeWasabiSnapshotHttpSkipPath(raw));
+}
 const WASABI_WRITES_PRIMARY_ENABLED =
   String(process.env.WASABI_WRITES_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
 const WASABI_WRITES_PRIMARY_STRICT =
@@ -842,6 +883,7 @@ function currentWasabiStateStatus() {
     bucket: WASABI_STATE_BUCKET || null,
     prefix: WASABI_STATE_PREFIX,
     intervalMs: WASABI_STATE_SNAPSHOT_MS,
+    maxIntervalMs: WASABI_STATE_SNAPSHOT_MAX_MS,
     writeDebounceMs: WASABI_STATE_WRITE_DEBOUNCE_MS,
     includeAllTables: WASABI_STATE_INCLUDE_ALL_TABLES,
     excludedTables: Array.from(WASABI_STATE_EXCLUDE_TABLES),

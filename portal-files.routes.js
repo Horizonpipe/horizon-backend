@@ -9,13 +9,13 @@
  * `/api/files/share-view/:token/presign/:id`, or `/api/guest/share/:token/presign/:id`
  * so browsers fetch object bytes directly from Wasabi (configure bucket CORS for your portal origins).
  * Multipart resumable chunks still POST through this service unless extended with presigned part URLs.
+ * Folder ZIP: use `GET /folders/zip-manifest` + `POST /presign-batch` + browser zip (bytes: Wasabi → browser only).
  */
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const archiver = require('archiver');
 const express = require('express');
 const {
   filterTreeForSharePayload,
@@ -705,6 +705,7 @@ function basenameRel(rel) {
   return i === -1 ? n : n.slice(i + 1);
 }
 
+/** Safe single path segment / zip archive entry (client-side ZIP manifest). */
 function safeZipSegment(seg) {
   return String(seg || '')
     .replace(/\\/g, '/')
@@ -712,6 +713,7 @@ function safeZipSegment(seg) {
     .trim();
 }
 
+/** Safe relative path inside a zip tree. */
 function safeZipEntryPath(relPath) {
   const bits = String(relPath || '')
     .replace(/\\/g, '/')
@@ -1392,6 +1394,38 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   /** Browser → Wasabi direct GET (video/blob). Match portal-api / horizon-frontend `PORTAL_PRESIGN_TTL_SECONDS`. */
   const PORTAL_PRESIGN_TTL_SECONDS = Math.max(60, Math.min(604800, Number(process.env.PORTAL_PRESIGN_TTL_SECONDS || 3600)));
   const PORTAL_PRESIGN_DISABLED = String(process.env.PORTAL_PRESIGN_DISABLED || '0').trim() === '1';
+  /** Client-built folder ZIP: manifest entry cap (browser memory). */
+  const PORTAL_FOLDER_ZIP_MANIFEST_MAX_FILES = Math.max(
+    1,
+    Math.min(5000, Number(process.env.PORTAL_FOLDER_ZIP_MANIFEST_MAX_FILES || 400))
+  );
+  const PORTAL_FOLDER_ZIP_MANIFEST_MAX_BYTES = Math.max(
+    1024 * 1024,
+    Math.min(
+      8 * 1024 * 1024 * 1024,
+      Number(process.env.PORTAL_FOLDER_ZIP_MANIFEST_MAX_BYTES || 3 * 1024 * 1024 * 1024)
+    )
+  );
+  const PORTAL_PRESIGN_BATCH_MAX = Math.max(1, Math.min(100, Number(process.env.PORTAL_PRESIGN_BATCH_MAX || 40)));
+  const PORTAL_FOLDER_ZIP_CLIENT_ENABLED =
+    String(process.env.PORTAL_FOLDER_ZIP_CLIENT_ENABLED ?? '1').trim().toLowerCase() !== '0';
+  /**
+   * When `PORTAL_PROXY_FILE_DOWNLOAD=0`, `GET|HEAD …/download/:id` proxy streaming (Wasabi→Render→client) is disabled.
+   * Default `1` keeps legacy behavior. Set `0` on Render to force presigned GET (`/presign/:id`, share/guest presign routes).
+   */
+  const PORTAL_PROXY_FILE_DOWNLOAD =
+    String(process.env.PORTAL_PROXY_FILE_DOWNLOAD ?? '1').trim().toLowerCase() !== '0';
+
+  function portalProxyDownloadAllowedOrJson(res) {
+    if (PORTAL_PROXY_FILE_DOWNLOAD) return true;
+    res.status(410).json({
+      error: 'Proxy download disabled',
+      code: 'USE_PRESIGN',
+      hint:
+        'Use GET /api/files/presign/:id, /api/files/share-view/:token/presign/:id, or /api/guest/share/:token/presign/:id so bytes stream directly from Wasabi.'
+    });
+    return false;
+  }
 
   /**
    * Optional: resumable `/upload/resumable/complete` re-downloads the full object from Wasabi to verify SHA-256.
@@ -1595,7 +1629,19 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
-      const keys = await listAllKeys(s3, bucket, prefix);
+      let listPrefix = prefix;
+      const subtreeRaw = String(req.query.pathPrefix ?? req.query.prefix ?? '').trim();
+      if (subtreeRaw) {
+        let rel;
+        try {
+          rel = normalizeRelPath(subtreeRaw);
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          return res.status(400).json({ error: m });
+        }
+        if (rel) listPrefix = `${prefix}${rel}/`;
+      }
+      const keys = await listAllKeys(s3, bucket, listPrefix);
       let tree = buildTreeFromKeys(prefix, keys);
       const treePortalMode = readPortalMode(req, req.query);
       const isDataAutoSyncTreeList = treePortalMode === DATA_AUTO_SYNC_MODE;
@@ -1958,7 +2004,19 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const payload = row.payload || {};
       const prefix = jobPrefix(String(row.client_id), String(row.job_id));
-      const keys = await listAllKeys(s3, bucket, prefix);
+      let listPrefix = prefix;
+      const subtreeRaw = String(req.query.pathPrefix ?? req.query.prefix ?? '').trim();
+      if (subtreeRaw) {
+        let rel;
+        try {
+          rel = normalizeRelPath(subtreeRaw);
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          return res.status(400).json({ error: m });
+        }
+        if (rel) listPrefix = `${prefix}${rel}/`;
+      }
+      const keys = await listAllKeys(s3, bucket, listPrefix);
       const full = buildTreeFromKeys(prefix, keys);
       const filtered = filterTreeForSharePayload(full, payload);
       await mergeCompletedUploadSha256IntoTree(String(row.client_id), String(row.job_id), filtered);
@@ -1972,6 +2030,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   /** Sign-in share: download one file (Bearer or ?access_token= for video tags). */
   r.get('/share-view/:token/download/:id', async (req, res) => {
     try {
+      if (!portalProxyDownloadAllowedOrJson(res)) return;
       const auth = await shareViewAuthObjectKey(req, req.params.token, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'share');
@@ -1987,6 +2046,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   r.head('/share-view/:token/download/:id', async (req, res) => {
     try {
+      if (!portalProxyDownloadAllowedOrJson(res)) return;
       const auth = await shareViewAuthObjectKey(req, req.params.token, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'share');
@@ -2724,14 +2784,23 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (s3Parts.length === 0 || s3Parts.length !== rawParts.length) {
         return res.status(400).json({ error: 'Each part must include partNumber and etag' });
       }
-      await s3.send(
-        new CompleteMultipartUploadCommand({
-          Bucket: bucket,
-          Key: key,
-          UploadId: uid,
-          MultipartUpload: { Parts: s3Parts }
-        })
-      );
+      try {
+        await s3.send(
+          new CompleteMultipartUploadCommand({
+            Bucket: bucket,
+            Key: key,
+            UploadId: uid,
+            MultipartUpload: { Parts: s3Parts }
+          })
+        );
+      } catch (completeErr) {
+        const headProbe = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key })).catch(() => null);
+        const len = headProbe ? Number(headProbe.ContentLength || 0) : 0;
+        if (!headProbe || !Number.isFinite(len) || len <= 0) {
+          throw completeErr;
+        }
+        /* Idempotent retry: object already finalized from a prior successful CompleteMultipartUpload. */
+      }
       try {
         await upsertPortalObjectSha256FromClient(key, parsed.clientId, parsed.jobId, req.body?.sha256);
       } catch (e) {
@@ -3776,6 +3845,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   async function handlePortalFileDownload(req, res) {
     try {
+      if (!portalProxyDownloadAllowedOrJson(res)) return;
       const auth = await portalAuthDownloadKey(req, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'portal');
@@ -3841,8 +3911,20 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     }
   });
 
-  r.get('/folders/download', async (req, res) => {
+  /**
+   * JSON manifest for browser-built folder ZIPs: each file is downloaded with `GET /presign/:id`
+   * or `POST /presign-batch` (bytes go Wasabi → browser only; this route returns metadata + sizes only).
+   */
+  r.get('/folders/zip-manifest', async (req, res) => {
     try {
+      if (!PORTAL_FOLDER_ZIP_CLIENT_ENABLED) {
+        return res.status(404).json({ error: 'Client folder ZIP manifest is disabled' });
+      }
+      if (PORTAL_PRESIGN_DISABLED) {
+        return res.status(503).json({
+          error: 'Presigned GET is disabled; enable GET /api/files/presign for client-side folder ZIP.'
+        });
+      }
       if (!userCanPortalCapability(req.user, 'download')) {
         return res.status(403).json({ error: 'Portal download is not enabled for this account' });
       }
@@ -3865,56 +3947,136 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
       const pref = jobPrefix(String(clientId), String(jobId));
       const prefix = `${pref}${folderRel}/`;
-      const keys = await listAllKeys(s3, bucket, prefix);
-      if (!keys.length) {
-        return res.status(404).json({ error: 'Folder not found' });
-      }
-
-      /** @type {Array<{ key: string, rel: string }>} */
-      const files = [];
-      for (const entry of keys) {
-        const rel = entry.Key.slice(pref.length);
-        if (!rel || isFolderMarkerKey(rel)) continue;
-        if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, rel, 'download'))) continue;
-        const subRel = rel.slice(folderRel.length + 1);
-        const zipRel = safeZipEntryPath(subRel);
-        if (!zipRel) continue;
-        files.push({ key: entry.Key, rel: zipRel });
-      }
-
       const rootName = safeZipSegment(basenameRel(folderRel) || 'folder') || 'folder';
-      const downloadName = `${rootName}.zip`;
-      res.setHeader('Content-Type', 'application/zip');
-      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(downloadName)}"`);
-      res.setHeader('Cache-Control', 'private, max-age=60');
 
-      const zip = archiver('zip', { zlib: { level: 9 } });
-      zip.on('warning', (warn) => {
-        console.warn('[portal-files] zip warning', warn);
+      /** @type {Array<{ id: string, entry: string, size: number }>} */
+      const files = [];
+      let totalBytes = 0;
+      let pageToken;
+      do {
+        const resp = await s3.send(
+          new ListObjectsV2Command({
+            Bucket: bucket,
+            Prefix: prefix,
+            ContinuationToken: pageToken,
+            MaxKeys: 1000
+          })
+        );
+        for (const obj of resp.Contents || []) {
+          if (!obj.Key) continue;
+          const rel = obj.Key.slice(pref.length);
+          if (!rel || isFolderMarkerKey(rel)) continue;
+          if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, rel, 'download'))) continue;
+          const subRel = rel.slice(folderRel.length + 1);
+          const zipRel = safeZipEntryPath(subRel);
+          if (!zipRel) continue;
+          const size = Number(obj.Size || 0);
+          totalBytes += size;
+          if (totalBytes > PORTAL_FOLDER_ZIP_MANIFEST_MAX_BYTES) {
+            return res.status(413).json({
+              code: 'FOLDER_ZIP_TOO_LARGE',
+              error: 'Folder exceeds the size limit for browser ZIP download.',
+              maxBytes: PORTAL_FOLDER_ZIP_MANIFEST_MAX_BYTES
+            });
+          }
+          files.push({
+            id: keyToId(obj.Key),
+            entry: `${rootName}/${zipRel}`,
+            size
+          });
+          if (files.length > PORTAL_FOLDER_ZIP_MANIFEST_MAX_FILES) {
+            return res.status(413).json({
+              code: 'FOLDER_ZIP_TOO_MANY_FILES',
+              error: 'Folder has too many files for browser ZIP download.',
+              maxFiles: PORTAL_FOLDER_ZIP_MANIFEST_MAX_FILES
+            });
+          }
+        }
+        pageToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+      } while (pageToken);
+
+      return res.json({
+        rootName,
+        folderRel,
+        totalBytes,
+        fileCount: files.length,
+        presignBatchMax: PORTAL_PRESIGN_BATCH_MAX,
+        files
       });
-      zip.on('error', (err) => {
-        if (!res.headersSent) res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-        else res.destroy(err);
-      });
-      zip.pipe(res);
-
-      if (!files.length) {
-        zip.append('', { name: `${rootName}/` });
-        await zip.finalize();
-        return;
-      }
-
-      for (const file of files) {
-        const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: file.key }));
-        if (!obj.Body || typeof obj.Body.pipe !== 'function') continue;
-        zip.append(obj.Body, { name: `${rootName}/${file.rel}` });
-      }
-      await zip.finalize();
-      return;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
     }
+  });
+
+  /**
+   * Batch presigned Wasabi GET URLs (small JSON only). Used with `/folders/zip-manifest` so the
+   * browser can fetch object bytes directly from storage.
+   */
+  r.post('/presign-batch', express.json({ limit: '512kb' }), async (req, res) => {
+    try {
+      if (PORTAL_PRESIGN_DISABLED) {
+        return res.status(404).json({ error: 'Presigned playback disabled' });
+      }
+      const raw = req.body && typeof req.body === 'object' && Array.isArray(req.body.ids) ? req.body.ids : [];
+      const ids = [];
+      const seen = new Set();
+      for (const x of raw) {
+        const id = String(x || '').trim();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        ids.push(id);
+        if (ids.length > PORTAL_PRESIGN_BATCH_MAX) {
+          return res.status(400).json({ error: `At most ${PORTAL_PRESIGN_BATCH_MAX} ids per request` });
+        }
+      }
+      if (!ids.length) {
+        return res.status(400).json({ error: 'Non-empty ids array required' });
+      }
+
+      /** @type {Array<{ id: string, url: string, expiresIn: number }>} */
+      const items = [];
+      /** @type {Array<{ id: string, status: number, error: string }>} */
+      const failures = [];
+      for (const fileId of ids) {
+        try {
+          const auth = await portalAuthDownloadKey(req, fileId);
+          if (!auth.ok) {
+            failures.push({
+              id: fileId,
+              status: auth.status,
+              error: String(auth.body?.error || 'Forbidden')
+            });
+            continue;
+          }
+          const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: auth.Key }), {
+            expiresIn: PORTAL_PRESIGN_TTL_SECONDS
+          });
+          items.push({ id: fileId, url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
+        } catch (e) {
+          failures.push({
+            id: fileId,
+            status: 500,
+            error: e instanceof Error ? e.message : String(e)
+          });
+        }
+      }
+      return res.json({ items, failures, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  /**
+   * Legacy folder ZIP (streamed via this host). Removed — use zip-manifest + presign-batch in the browser.
+   */
+  r.get('/folders/download', (req, res) => {
+    return res.status(410).json({
+      code: 'FOLDER_ZIP_DISABLED',
+      error:
+        'Server-streamed folder ZIP is disabled. Use the portal folder download (browser ZIP via /folders/zip-manifest + presign), or download individual files / desktop sync.'
+    });
   });
 
   r.get('/download/:id', handlePortalFileDownload);
@@ -4132,7 +4294,19 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const payload = row.payload || {};
       const prefix = jobPrefix(String(row.client_id), String(row.job_id));
-      const keys = await listAllKeys(s3, bucket, prefix);
+      let listPrefix = prefix;
+      const subtreeRaw = String(req.query.pathPrefix ?? req.query.prefix ?? '').trim();
+      if (subtreeRaw) {
+        let rel;
+        try {
+          rel = normalizeRelPath(subtreeRaw);
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          return res.status(400).json({ error: m });
+        }
+        if (rel) listPrefix = `${prefix}${rel}/`;
+      }
+      const keys = await listAllKeys(s3, bucket, listPrefix);
       const full = buildTreeFromKeys(prefix, keys);
       const filtered = filterTreeForSharePayload(full, payload);
       await mergeCompletedUploadSha256IntoTree(String(row.client_id), String(row.job_id), filtered);
@@ -4145,6 +4319,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   guest.get('/share/:token/download/:id', async (req, res) => {
     try {
+      if (!portalProxyDownloadAllowedOrJson(res)) return;
       const auth = await guestShareAuthObjectKey(req, req.params.token, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'share');
@@ -4160,6 +4335,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   guest.head('/share/:token/download/:id', async (req, res) => {
     try {
+      if (!portalProxyDownloadAllowedOrJson(res)) return;
       const auth = await guestShareAuthObjectKey(req, req.params.token, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'share');
