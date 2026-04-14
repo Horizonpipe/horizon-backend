@@ -81,16 +81,69 @@ const corsOptions = {
     'Content-Length',
     'Content-Type',
     'Content-Range',
-    'Accept-Ranges'
+    'Accept-Ranges',
+    'Content-Encoding',
+    'Vary'
   ]
 };
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
+
+function clampHttpCompressionInt(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+/** When false, skip `compression` middleware entirely (Render CPU vs egress tradeoff). */
+const HTTP_COMPRESSION_ENABLED = String(process.env.HTTP_COMPRESSION || '1').trim() !== '0';
+/** Bytes; 0 = always attempt (tiny JSON may grow slightly — rare). Default 256 so repetitive file-list JSON is gzipped. */
+const HTTP_COMPRESSION_THRESHOLD = clampHttpCompressionInt(
+  process.env.HTTP_COMPRESSION_THRESHOLD,
+  0,
+  1024 * 1024,
+  256
+);
+/** zlib gzip level 1 (fast) … 9 (smaller). Default 6; use 7–8 for heavier JSON APIs if CPU allows. */
+const HTTP_COMPRESSION_LEVEL = clampHttpCompressionInt(process.env.HTTP_COMPRESSION_LEVEL, 1, 9, 6);
+
+/**
+ * Do not gzip Wasabi→client proxy streams (video/range); wastes CPU and can break length semantics.
+ * Presigned JSON and /api/files/tree still compress normally.
+ */
+function shouldSkipHttpCompressionForStreamingDownload(req) {
+  const method = String(req.method || 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD') return false;
+  const p = req.path || '';
+  if (p.startsWith('/api/files/download/')) return true;
+  if (/^\/api\/files\/share-view\/[^/]+\/download\//.test(p)) return true;
+  if (/^\/api\/guest\/share\/[^/]+\/download\//.test(p)) return true;
+  return false;
+}
+
 try {
   // eslint-disable-next-line global-require
   const compression = require('compression');
-  app.use(compression({ threshold: 1024 }));
+  if (HTTP_COMPRESSION_ENABLED) {
+    app.use(
+      compression({
+        threshold: HTTP_COMPRESSION_THRESHOLD,
+        level: HTTP_COMPRESSION_LEVEL,
+        chunkSize: 32 * 1024,
+        filter: (req, res) => {
+          if (req.headers['x-no-compression']) return false;
+          if (shouldSkipHttpCompressionForStreamingDownload(req)) return false;
+          return compression.filter(req, res);
+        }
+      })
+    );
+    console.info(
+      `[http] Response compression: gzip enabled (threshold=${HTTP_COMPRESSION_THRESHOLD}b, level=${HTTP_COMPRESSION_LEVEL}). Set HTTP_COMPRESSION=0 to disable.`
+    );
+  } else {
+    console.info('[http] Response compression disabled (HTTP_COMPRESSION=0).');
+  }
 } catch {
   console.warn('[http] Install optional `compression` (npm i) to gzip JSON/text API responses and cut HTTP egress.');
 }

@@ -54,6 +54,13 @@ PORTAL_UPLOAD_PRESIGN=1
 # WASABI_LATEST_STATE_CACHE_MS=60000
 # PORTAL_PRESIGN_TTL_SECONDS=3600
 
+# --- HTTP response compression (Render egress for JSON/text APIs: tree, check-paths, presign JSON, etc.) ---
+# Requires npm dependency `compression` (already in package.json). Uses gzip + Accept-Encoding from the client.
+# Does not apply to presigned Wasabi GET/PUT (those bypass Node) or to /api/files/download/* proxy streams.
+# HTTP_COMPRESSION=0                     # disable middleware entirely
+# HTTP_COMPRESSION_THRESHOLD=256         # min response bytes before gzip (default 256; 0 = always try)
+# HTTP_COMPRESSION_LEVEL=6               # zlib 1=fast … 9=smallest (default 6; try 7–8 for huge JSON if CPU ok)
+
 # GET /api/files/tree — caps + subtree (protects Node memory and Render egress on huge jobs):
 # PORTAL_TREE_MAX_OBJECTS=250000          # max S3 objects per tree response when pathPrefix or permissionsEditor=1
 # PORTAL_TREE_MAX_OBJECTS_ROOT=25000      # max when listing whole job without pathPrefix (default 25k)
