@@ -57,6 +57,8 @@ const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCU
 const PORTAL_CHECK_PATHS_MAX = clampIntEnv('PORTAL_CHECK_PATHS_MAX', 800, 50, 2000);
 /** Parallel S3 HeadObject calls per check-paths request (Wasabi handles many concurrent small reads). */
 const PORTAL_CHECK_PATHS_HEAD_CONCURRENCY = clampIntEnv('PORTAL_CHECK_PATHS_HEAD_CONCURRENCY', 32, 1, 64);
+/** Max SHA-256 digests per {@code POST /find-hashes-paths} (Data Auto Sync bulk dedupe; JSON body limit). */
+const PORTAL_FIND_HASHES_BULK_MAX = clampIntEnv('PORTAL_FIND_HASHES_BULK_MAX', 120, 8, 200);
 
 /**
  * When the job has path grants, users with **no** matching `portal_path_grants` rows see an empty tree (strict).
@@ -1906,6 +1908,99 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
       }
       return res.json({ success: true, paths: allowed });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  /**
+   * DB-only: resolve many SHA-256 digests in one request (Data Auto Sync — fewer HTTP round-trips than N×
+   * {@code POST /find-hash-paths}). Body: `{ clientId, jobId, portalMode?, hashes: string[] }` (max
+   * PORTAL_FIND_HASHES_BULK_MAX). Response: `{ success, results: [{ hash, paths: string[] }] }` — only
+   * digests that have at least one visible portal-relative path.
+   */
+  r.post('/find-hashes-paths', express.json({ limit: '512kb' }), async (req, res) => {
+    try {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      if (scope.error) return res.status(400).json({ error: scope.error });
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const treePortalMode = readPortalMode(req, body);
+      const pref = jobPrefix(String(clientId), String(jobId));
+      const rawHashes = Array.isArray(body.hashes) ? body.hashes : [];
+      const max = PORTAL_FIND_HASHES_BULK_MAX;
+      if (rawHashes.length > max) {
+        return res.status(400).json({ error: `At most ${max} hashes per request.` });
+      }
+      const uniq = [];
+      const seen = new Set();
+      for (const r of rawHashes) {
+        const h = normalizeSha256Hex(String(r ?? ''));
+        if (h.length !== 64) continue;
+        const hl = h.toLowerCase();
+        if (seen.has(hl)) continue;
+        seen.add(hl);
+        uniq.push(hl);
+      }
+      if (uniq.length === 0) {
+        return res.json({ success: true, results: [] });
+      }
+      await ensurePortalObjectSha256Schema(uploadMetaPool);
+      await ensurePortalResumeSchema(uploadMetaPool);
+
+      /** @type {Map<string, Set<string>>} */
+      const byHash = new Map();
+      for (const hl of uniq) {
+        byHash.set(hl, new Set());
+      }
+      const keyToRel = (fullKey) => {
+        const k = String(fullKey || '');
+        if (!k.startsWith(pref)) return null;
+        return k.slice(pref.length);
+      };
+      const q1 = await uploadMetaPool.query(
+        `SELECT lower(sha256) AS hx, object_key FROM portal_object_sha256
+         WHERE client_id = $1 AND job_id = $2 AND lower(sha256) = ANY($3::text[])`,
+        [String(clientId), String(jobId), uniq]
+      );
+      for (const row of q1.rows || []) {
+        const hx = String(row.hx || '').toLowerCase();
+        const rel = keyToRel(row.object_key);
+        if (!rel || !byHash.has(hx)) continue;
+        byHash.get(hx).add(rel);
+      }
+      const q2 = await uploadMetaPool.query(
+        `SELECT lower(btrim(sha256)) AS hx, object_key FROM portal_upload_sessions
+         WHERE client_id = $1 AND job_id = $2 AND status = 'completed'
+           AND sha256 IS NOT NULL AND lower(btrim(sha256)) = ANY($3::text[])`,
+        [String(clientId), String(jobId), uniq]
+      );
+      for (const row of q2.rows || []) {
+        const hx = String(row.hx || '').toLowerCase();
+        const rel = keyToRel(row.object_key);
+        if (!rel || !byHash.has(hx)) continue;
+        byHash.get(hx).add(rel);
+      }
+
+      const results = [];
+      for (const hl of uniq) {
+        const rels = byHash.get(hl);
+        if (!rels || rels.size === 0) continue;
+        const allowed = [];
+        for (const rel of rels) {
+          if (await assertRelPathMatchesPortalTreeVisibility(aclPool, req, clientId, jobId, treePortalMode, rel)) {
+            allowed.push(rel);
+          }
+        }
+        if (allowed.length > 0) {
+          results.push({ hash: hl, paths: allowed });
+        }
+      }
+      return res.json({ success: true, results });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });

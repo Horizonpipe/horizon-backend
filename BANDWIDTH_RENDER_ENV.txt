@@ -73,7 +73,7 @@ PORTAL_UPLOAD_PRESIGN=1
 #    - Local indexing: directory scan only (no server).
 #    - Server size compare: POST /api/files/check-paths in batches (PORTAL_CHECK_PATHS_MAX default 800; tune env + client check_paths_batch_size).
 #    - No GET /api/files/tree when client bandwidth_safe_mode=true (default).
-#    - Content dedupe: POST /api/files/find-hash-paths (small JSON); enable client register_sha256_after_portal_put for DB-backed digest rows after upload.
+#    - Content dedupe: POST /api/files/find-hashes-paths (many SHA-256 digests per request; default max 120, PORTAL_FIND_HASHES_BULK_MAX) or POST /api/files/find-hash-paths per digest; enable client register_sha256_after_portal_put for DB-backed digest rows after upload.
 #    - Bytes: presigned PUT / multipart direct to Wasabi (not through Render).
 # 3b) Desktop autosync smoke: check-paths batches, upload, dedupe skip in logs.
 # 4) Planner loads with Wasabi snapshot primary — verify latest.json still parses (gzip on by default).
