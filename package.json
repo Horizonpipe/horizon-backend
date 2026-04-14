@@ -4,7 +4,8 @@
   "private": true,
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "smoke:portal-presign": "node scripts/smoke-portal-presign.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.758.0",

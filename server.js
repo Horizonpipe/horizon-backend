@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 const multer = require('multer');
 const initSqlJs = require('sql.js');
 const { Pool } = require('pg');
@@ -69,6 +70,7 @@ const corsOptions = {
     'Authorization',
     'X-Session-Token',
     'X-HP-Portal-Mode',
+    'X-Horizon-Client',
     'Range',
     'Accept',
     'If-None-Match',
@@ -101,7 +103,7 @@ app.use((req, res, next) => {
     if (!writable) return;
     if (res.statusCode >= 500) return;
     if (requestPathSkipsWasabiStateSnapshot(req)) return;
-    queueWasabiStateSnapshot(`${method} ${req.originalUrl || req.url || ''}`);
+    queueWasabiStateSnapshot(req);
   });
   next();
 });
@@ -176,21 +178,38 @@ const WASABI_STATE_SNAPSHOT_MAX_MS = Math.max(
 );
 const WASABI_STATE_SNAPSHOT_MS = Math.max(
   10000,
-  Math.min(WASABI_STATE_SNAPSHOT_MAX_MS, Number(process.env.WASABI_STATE_SNAPSHOT_MS || 60000))
+  Math.min(WASABI_STATE_SNAPSHOT_MAX_MS, Number(process.env.WASABI_STATE_SNAPSHOT_MS || 300000))
 );
 const WASABI_STATE_SNAPSHOT_ON_WRITE =
   String(process.env.WASABI_STATE_SNAPSHOT_ON_WRITE || '1').trim().toLowerCase() !== '0';
+/** PipeSync / staff APIs and everything not classified as portal or autosync (short debounce). */
 const WASABI_STATE_WRITE_DEBOUNCE_MS = Math.max(
   1000,
-  Math.min(60000, Number(process.env.WASABI_STATE_WRITE_DEBOUNCE_MS || 5000))
+  Math.min(60000, Number(process.env.WASABI_STATE_WRITE_DEBOUNCE_MS || 8000))
 );
-/** Duplicate full JSON to `history/snapshot-*.json` on each state write (doubles Wasabi upload). Set `0` to skip archives if you only need `latest.json`. */
+/**
+ * PipeShare + file explorer (`/api/files` mutations except fast-path rows below): long debounce so bursts of
+ * folder ops/uploads do not schedule full-state Wasabi exports often.
+ */
+const WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS = Math.max(
+  5000,
+  Math.min(600000, Number(process.env.WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS || 120000))
+);
+/** Data Auto Sync desktop (`X-Horizon-Client: horizon-data-autosync`): longest debounce (optional third tier). */
+const WASABI_STATE_WRITE_DEBOUNCE_AUTOSYNC_MS = Math.max(
+  5000,
+  Math.min(900000, Number(process.env.WASABI_STATE_WRITE_DEBOUNCE_AUTOSYNC_MS || 180000))
+);
+/** Duplicate full JSON to `history/snapshot-*.json` on each state write (doubles Wasabi upload). Set `1` to enable archives. Default `0` keeps Wasabi writes lighter. */
 const WASABI_STATE_ARCHIVE_SNAPSHOTS =
-  String(process.env.WASABI_STATE_ARCHIVE_SNAPSHOTS || '1').trim().toLowerCase() !== '0';
+  String(process.env.WASABI_STATE_ARCHIVE_SNAPSHOTS || '0').trim().toLowerCase() === '1';
+/** When true, gzip `latest.json` (and archives) before PUT; reads accept gzip or legacy plain JSON. Set `WASABI_STATE_SNAPSHOT_GZIP=0` to disable. */
+const WASABI_STATE_SNAPSHOT_GZIP =
+  String(process.env.WASABI_STATE_SNAPSHOT_GZIP || '1').trim().toLowerCase() !== '0';
 /** In-memory TTL for repeated reads of `latest.json` (non-force); lowers Wasabi download volume. */
 const WASABI_LATEST_STATE_CACHE_MS = Math.max(
   1000,
-  Math.min(300000, Number(process.env.WASABI_LATEST_STATE_CACHE_MS || 15000))
+  Math.min(300000, Number(process.env.WASABI_LATEST_STATE_CACHE_MS || 30000))
 );
 /** POST paths that must not trigger on-write Wasabi state snapshots (high volume, no app-table mutations). */
 function normalizeWasabiSnapshotHttpSkipPath(p) {
@@ -226,7 +245,67 @@ const WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATH_SET = new Set(
 );
 function requestPathSkipsWasabiStateSnapshot(req) {
   const raw = String(req.originalUrl || req.url || '').split('?')[0].split('#')[0];
-  return WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATH_SET.has(normalizeWasabiSnapshotHttpSkipPath(raw));
+  const n = normalizeWasabiSnapshotHttpSkipPath(raw);
+  if (WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATH_SET.has(n)) return true;
+  /* Desktop telemetry / heartbeats: no app-wide snapshot (indexing + uploads already skip most /api/files paths). */
+  if (n.startsWith('/auto-import-plugin/')) return true;
+  return false;
+}
+
+function readHorizonClientHeader(req) {
+  try {
+    const h = req.get && req.get('x-horizon-client');
+    return h ? String(h).trim().toLowerCase() : '';
+  } catch {
+    return '';
+  }
+}
+
+/** Portal ACL + share links: keep PipeSync-class debounce so permission editors see backups reasonably soon. */
+const WASABI_STATE_SNAPSHOT_PORTAL_FAST_DEBOUNCE_PATHS = String(
+  process.env.WASABI_STATE_SNAPSHOT_PORTAL_FAST_DEBOUNCE_PATHS ||
+    '/api/files/permissions,/api/files/shares,/api/files/share-view'
+)
+  .split(',')
+  .map((s) => normalizeWasabiSnapshotHttpSkipPath(s))
+  .filter((s) => s && s !== '/');
+
+/**
+ * Optional extra path prefixes (normalized) that must use PipeSync debounce (`WASABI_STATE_WRITE_DEBOUNCE_MS`).
+ * Leave unset: every route that is not `/api/files`, `/api/guest`, or a portal-fast path already uses PipeSync timing.
+ * Set when you introduce a new top-level API and want to force the short debounce explicitly.
+ */
+const WASABI_STATE_SNAPSHOT_PIPESYNC_DEBOUNCE_PREFIXES = String(
+  process.env.WASABI_STATE_SNAPSHOT_PIPESYNC_DEBOUNCE_PREFIXES || ''
+)
+  .split(',')
+  .map((s) => normalizeWasabiSnapshotHttpSkipPath(s))
+  .filter((s) => s && s !== '/');
+
+function wasabiSnapshotDebounceMsForRequest(req) {
+  const hc = readHorizonClientHeader(req);
+  if (
+    hc &&
+    (hc.includes('dataautosync') ||
+      hc.includes('horizon-data-autosync') ||
+      hc.includes('java-desktop') ||
+      hc === 'autosync')
+  ) {
+    return WASABI_STATE_WRITE_DEBOUNCE_AUTOSYNC_MS;
+  }
+  if (hc && (hc.includes('pipeshare') || hc.includes('file-explorer') || hc.includes('portal-files'))) {
+    return WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS;
+  }
+  const raw = String(req.originalUrl || req.url || '').split('?')[0].split('#')[0];
+  const p = normalizeWasabiSnapshotHttpSkipPath(raw);
+  for (const sp of WASABI_STATE_SNAPSHOT_PORTAL_FAST_DEBOUNCE_PATHS) {
+    if (p === sp || p.startsWith(`${sp}/`)) return WASABI_STATE_WRITE_DEBOUNCE_MS;
+  }
+  for (const hp of WASABI_STATE_SNAPSHOT_PIPESYNC_DEBOUNCE_PREFIXES) {
+    if (p === hp || p.startsWith(`${hp}/`)) return WASABI_STATE_WRITE_DEBOUNCE_MS;
+  }
+  if (p.startsWith('/api/files') || p.startsWith('/api/guest')) return WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS;
+  return WASABI_STATE_WRITE_DEBOUNCE_MS;
 }
 const WASABI_WRITES_PRIMARY_ENABLED =
   String(process.env.WASABI_WRITES_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
@@ -253,6 +332,34 @@ const WASABI_SQL_MIRROR_MAX_BUFFER = Math.max(
   10,
   Math.min(500, Number(process.env.WASABI_SQL_MIRROR_MAX_BUFFER || 100))
 );
+/** Base table name for skip matching (`public.foo` → `foo`). */
+function sqlMirrorSkipBaseTable(raw) {
+  const t = String(raw || '')
+    .trim()
+    .replace(/"/g, '');
+  if (!t) return '';
+  const i = t.lastIndexOf('.');
+  return (i >= 0 ? t.slice(i + 1) : t).toLowerCase();
+}
+/**
+ * Comma-separated base table names whose INSERT/UPDATE/DELETE should not enqueue Wasabi SQL-mirror batches.
+ * Unset: default skips high-churn portal upload metadata (`portal_object_sha256`, resumable session tables).
+ * `none` or empty: mirror all mutations again.
+ */
+function buildWasabiSqlMirrorSkipTableSet() {
+  const raw = process.env.WASABI_SQL_MIRROR_SKIP_TABLES;
+  const defaults = ['portal_object_sha256', 'portal_upload_sessions', 'portal_upload_session_parts'];
+  if (raw === undefined) return new Set(defaults);
+  const trimmed = String(raw).trim();
+  if (!trimmed || trimmed.toLowerCase() === 'none') return new Set();
+  const out = new Set();
+  for (const piece of trimmed.split(',')) {
+    const b = sqlMirrorSkipBaseTable(piece);
+    if (b) out.add(b);
+  }
+  return out;
+}
+const WASABI_SQL_MIRROR_SKIP_TABLE_SET = buildWasabiSqlMirrorSkipTableSet();
 const WASABI_AUTH_FALLBACK_ENABLED =
   String(process.env.WASABI_AUTH_FALLBACK_ENABLED || '1').trim().toLowerCase() !== '0';
 const WASABI_AUTH_FALLBACK_CACHE_MS = Math.max(
@@ -522,6 +629,16 @@ async function bodyToBuffer(body) {
   return Buffer.concat(chunks);
 }
 
+function decodeWasabiStateSnapshotBody(raw, contentEncoding) {
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw || []);
+  const enc = String(contentEncoding || '').toLowerCase();
+  const gzipMagic = buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+  if (enc.includes('gzip') || gzipMagic) {
+    return zlib.gunzipSync(buf).toString('utf8');
+  }
+  return buf.toString('utf8');
+}
+
 async function loadWasabiLatestStateSnapshot(force = false) {
   if (!wasabiStateClient || !WASABI_STATE_BUCKET) return null;
   const now = Date.now();
@@ -535,7 +652,8 @@ async function loadWasabiLatestStateSnapshot(force = false) {
     })
   );
   const raw = await bodyToBuffer(out.Body);
-  const parsed = JSON.parse(raw.toString('utf8'));
+  const jsonText = decodeWasabiStateSnapshotBody(raw, out.ContentEncoding);
+  const parsed = JSON.parse(jsonText);
   wasabiLatestStateCache = parsed;
   wasabiLatestStateCacheAt = now;
   return parsed;
@@ -550,24 +668,32 @@ async function putWasabiStateObject(stateObject) {
     throw new Error('Wasabi state client is not configured');
   }
   const stamp = nowIso().replace(/[:.]/g, '-');
-  const payload = Buffer.from(JSON.stringify(stateObject), 'utf8');
+  const rawJson = Buffer.from(JSON.stringify(stateObject), 'utf8');
+  let payload = rawJson;
+  let contentEncoding;
+  if (WASABI_STATE_SNAPSHOT_GZIP) {
+    payload = zlib.gzipSync(rawJson);
+    contentEncoding = 'gzip';
+  }
   const latestKey = `${WASABI_STATE_PREFIX}/latest.json`;
   const archiveKey = `${WASABI_STATE_PREFIX}/history/snapshot-${stamp}.json`;
+  const putBase = {
+    Bucket: WASABI_STATE_BUCKET,
+    Body: payload,
+    ContentType: 'application/json'
+  };
+  if (contentEncoding) putBase.ContentEncoding = contentEncoding;
   await wasabiStateClient.send(
     new PutObjectCommand({
-      Bucket: WASABI_STATE_BUCKET,
-      Key: latestKey,
-      Body: payload,
-      ContentType: 'application/json'
+      ...putBase,
+      Key: latestKey
     })
   );
   if (WASABI_STATE_ARCHIVE_SNAPSHOTS) {
     await wasabiStateClient.send(
       new PutObjectCommand({
-        Bucket: WASABI_STATE_BUCKET,
-        Key: archiveKey,
-        Body: payload,
-        ContentType: 'application/json'
+        ...putBase,
+        Key: archiveKey
       })
     );
   }
@@ -915,16 +1041,18 @@ async function syncWasabiNow(reason = 'manual') {
   };
 }
 
-function queueWasabiStateSnapshot(reason) {
+function queueWasabiStateSnapshot(req) {
   if (!WASABI_STATE_SNAPSHOT_ON_WRITE) return;
   if (!wasabiStateClient || !WASABI_STATE_BUCKET) return;
+  const debounceMs = wasabiSnapshotDebounceMsForRequest(req);
   wasabiStateLastQueuedAt = Date.now();
-  wasabiStateLastReason = String(reason || '').trim() || 'mutation';
-  if (wasabiStateSnapshotTimer) return;
+  const path = String(req.originalUrl || req.url || '').split('?')[0] || '';
+  wasabiStateLastReason = `${String(req.method || '').toUpperCase()} ${path} @debounce=${debounceMs}ms`;
+  if (wasabiStateSnapshotTimer) clearTimeout(wasabiStateSnapshotTimer);
   wasabiStateSnapshotTimer = setTimeout(async () => {
     wasabiStateSnapshotTimer = null;
     await runWasabiStateSnapshot();
-  }, WASABI_STATE_WRITE_DEBOUNCE_MS);
+  }, debounceMs);
 }
 
 function currentWasabiStateStatus() {
@@ -932,11 +1060,15 @@ function currentWasabiStateStatus() {
     enabled: !!(wasabiStateClient && WASABI_STATE_BUCKET),
     onWrite: WASABI_STATE_SNAPSHOT_ON_WRITE,
     archiveSnapshots: WASABI_STATE_ARCHIVE_SNAPSHOTS,
+    snapshotGzip: WASABI_STATE_SNAPSHOT_GZIP,
     latestStateCacheMs: WASABI_LATEST_STATE_CACHE_MS,
     bucket: WASABI_STATE_BUCKET || null,
     prefix: WASABI_STATE_PREFIX,
     intervalMs: WASABI_STATE_SNAPSHOT_MS,
     maxIntervalMs: WASABI_STATE_SNAPSHOT_MAX_MS,
+    writeDebounceMsPipesync: WASABI_STATE_WRITE_DEBOUNCE_MS,
+    writeDebounceMsPortal: WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS,
+    writeDebounceMsAutosync: WASABI_STATE_WRITE_DEBOUNCE_AUTOSYNC_MS,
     writeDebounceMs: WASABI_STATE_WRITE_DEBOUNCE_MS,
     includeAllTables: WASABI_STATE_INCLUDE_ALL_TABLES,
     excludedTables: Array.from(WASABI_STATE_EXCLUDE_TABLES),
@@ -1117,6 +1249,8 @@ function currentWasabiSqlMirrorStatus() {
     prefix: WASABI_SQL_MIRROR_PREFIX,
     flushMs: WASABI_SQL_MIRROR_FLUSH_MS,
     maxBuffer: WASABI_SQL_MIRROR_MAX_BUFFER,
+    skipTables: Array.from(WASABI_SQL_MIRROR_SKIP_TABLE_SET).sort(),
+    skipTablesFromEnv: process.env.WASABI_SQL_MIRROR_SKIP_TABLES !== undefined,
     buffered: wasabiSqlMirrorEvents.length,
     busy: wasabiSqlMirrorBusy,
     totalFlushed: wasabiSqlMirrorTotalFlushed,
@@ -1188,36 +1322,42 @@ pool.query = function patchedPoolQuery(text, values, callback) {
   return rawPoolQuery(text, values)
     .then((result) => {
       if (mutation) {
-        queueWasabiSqlMirrorEvent({
-          id: crypto.randomUUID(),
-          at: new Date().toISOString(),
-          ok: true,
-          operation: mutation.operation,
-          table: mutation.table,
-          rowCount: Number(result?.rowCount || 0),
-          durationMs: Date.now() - startedAt,
-          sql: String(sqlText || '').slice(0, 500),
-          valuesCount: Array.isArray(values) ? values.length : 0,
-          values: normalizeMirrorParams(values)
-        });
+        const skipBase = sqlMirrorSkipBaseTable(mutation.table);
+        if (!WASABI_SQL_MIRROR_SKIP_TABLE_SET.has(skipBase)) {
+          queueWasabiSqlMirrorEvent({
+            id: crypto.randomUUID(),
+            at: new Date().toISOString(),
+            ok: true,
+            operation: mutation.operation,
+            table: mutation.table,
+            rowCount: Number(result?.rowCount || 0),
+            durationMs: Date.now() - startedAt,
+            sql: String(sqlText || '').slice(0, 500),
+            valuesCount: Array.isArray(values) ? values.length : 0,
+            values: normalizeMirrorParams(values)
+          });
+        }
       }
       return result;
     })
     .catch((error) => {
       if (mutation) {
-        queueWasabiSqlMirrorEvent({
-          id: crypto.randomUUID(),
-          at: new Date().toISOString(),
-          ok: false,
-          operation: mutation.operation,
-          table: mutation.table,
-          rowCount: 0,
-          durationMs: Date.now() - startedAt,
-          sql: String(sqlText || '').slice(0, 500),
-          valuesCount: Array.isArray(values) ? values.length : 0,
-          values: normalizeMirrorParams(values),
-          error: String(error?.message || error)
-        });
+        const skipBase = sqlMirrorSkipBaseTable(mutation.table);
+        if (!WASABI_SQL_MIRROR_SKIP_TABLE_SET.has(skipBase)) {
+          queueWasabiSqlMirrorEvent({
+            id: crypto.randomUUID(),
+            at: new Date().toISOString(),
+            ok: false,
+            operation: mutation.operation,
+            table: mutation.table,
+            rowCount: 0,
+            durationMs: Date.now() - startedAt,
+            sql: String(sqlText || '').slice(0, 500),
+            valuesCount: Array.isArray(values) ? values.length : 0,
+            values: normalizeMirrorParams(values),
+            error: String(error?.message || error)
+          });
+        }
       }
       throw error;
     });
@@ -7559,7 +7699,7 @@ ensureSchema()
         `[wasabi-state] snapshots enabled: bucket=${WASABI_STATE_BUCKET} prefix=${WASABI_STATE_PREFIX} every=${WASABI_STATE_SNAPSHOT_MS}ms`
       );
       console.log(
-        `[wasabi-sql-mirror] enabled=${WASABI_SQL_MIRROR_ENABLED ? 'yes' : 'no'} prefix=${WASABI_SQL_MIRROR_PREFIX} flush=${WASABI_SQL_MIRROR_FLUSH_MS}ms buffer=${WASABI_SQL_MIRROR_MAX_BUFFER}`
+        `[wasabi-sql-mirror] enabled=${WASABI_SQL_MIRROR_ENABLED ? 'yes' : 'no'} prefix=${WASABI_SQL_MIRROR_PREFIX} flush=${WASABI_SQL_MIRROR_FLUSH_MS}ms buffer=${WASABI_SQL_MIRROR_MAX_BUFFER} skipTables=${Array.from(WASABI_SQL_MIRROR_SKIP_TABLE_SET).sort().join(',') || '(none)'}`
       );
     } else {
       console.warn('[wasabi-state] snapshots disabled: configure WASABI_* and WASABI_BUCKET');

@@ -728,9 +728,19 @@ function copySourceHeader(bucket, key) {
   return `${bucket}/${key.split('/').map(encodeURIComponent).join('/')}`;
 }
 
-async function listAllKeys(s3, bucket, prefix) {
+/**
+ * @param {import('@aws-sdk/client-s3').S3Client} s3
+ * @param {string} bucket
+ * @param {string} prefix
+ * @param {number} [maxKeys] When finite, stop listing after this many objects (still one in-flight page may exceed slightly).
+ * @returns {Promise<{ keys: Array<{ Key: string, Size: number, LastModified?: Date, ETag?: string }>, truncated: boolean }>}
+ */
+async function listAllKeysCapped(s3, bucket, prefix, maxKeys = Number.POSITIVE_INFINITY) {
   const keys = [];
   let pageToken;
+  let truncated = false;
+  const cap = Number(maxKeys);
+  const hasCap = Number.isFinite(cap) && cap >= 1 && cap < 1e12;
   do {
     const resp = await s3.send(
       new ListObjectsV2Command({
@@ -748,9 +758,20 @@ async function listAllKeys(s3, bucket, prefix) {
         LastModified: obj.LastModified,
         ...(rawEtag ? { ETag: rawEtag } : {})
       });
+      if (hasCap && keys.length >= cap) {
+        truncated = true;
+        pageToken = undefined;
+        break;
+      }
     }
+    if (truncated) break;
     pageToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
   } while (pageToken);
+  return { keys, truncated };
+}
+
+async function listAllKeys(s3, bucket, prefix) {
+  const { keys } = await listAllKeysCapped(s3, bucket, prefix, Number.POSITIVE_INFINITY);
   return keys;
 }
 
@@ -1444,9 +1465,35 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   const PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY =
     String(process.env.PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY || '0').trim() === '1' &&
     String(process.env.PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY_CONFIRM || '0').trim() === '1';
+  /**
+   * When stream-verify is off: after `CompleteMultipartUpload`, skip `HeadObject` and trust `portal_upload_sessions.file_size`.
+   * Default on — avoids an extra service-initiated Wasabi read per resumable finalize.
+   */
+  const PORTAL_RESUMABLE_COMPLETE_SKIP_HEAD_VERIFY =
+    String(process.env.PORTAL_RESUMABLE_COMPLETE_SKIP_HEAD_VERIFY ?? '1').trim().toLowerCase() !== '0';
+
+  /**
+   * `GET /tree` and `GET /` list S3 keys under a prefix. Hard caps avoid multi-minute listings and multi‑hundred‑MB JSON
+   * responses that exhaust Node memory and Render egress. Root listing (no `pathPrefix`) uses the lower root cap.
+   */
+  const PORTAL_TREE_MAX_OBJECTS = clampIntEnv('PORTAL_TREE_MAX_OBJECTS', 250000, 2000, 2_000_000);
+  const PORTAL_TREE_MAX_OBJECTS_ROOT = clampIntEnv(
+    'PORTAL_TREE_MAX_OBJECTS_ROOT',
+    25000,
+    500,
+    PORTAL_TREE_MAX_OBJECTS
+  );
+  /** Skip Postgres hash merge into tree when raw object count exceeds this (0 = never skip). */
+  const PORTAL_TREE_MERGE_HASH_MAX_FILES = clampIntEnv('PORTAL_TREE_MERGE_HASH_MAX_FILES', 5000, 0, 2_000_000);
 
   /** Browser → Wasabi direct PUT / multipart parts. Set `PORTAL_UPLOAD_PRESIGN=0` to disable (client uses proxy upload). */
   const PORTAL_UPLOAD_PRESIGN_ENABLED = String(process.env.PORTAL_UPLOAD_PRESIGN || '1').trim().toLowerCase() !== '0';
+  /**
+   * After presigned `POST …/upload/multipart/complete`, use integer `fileSize` from the JSON body when present instead of `HeadObject`.
+   * Desktop autosync sends this; browsers that omit it still get a Head for size. Default on.
+   */
+  const PORTAL_PRESIGN_MULTIPART_TRUST_CLIENT_FILE_SIZE =
+    String(process.env.PORTAL_PRESIGN_MULTIPART_TRUST_CLIENT_FILE_SIZE ?? '1').trim().toLowerCase() !== '0';
   const PORTAL_UPLOAD_PRESIGN_MAX_BYTES = Math.max(
     1024 * 1024,
     Math.min(5368709120, Number(process.env.PORTAL_UPLOAD_PRESIGN_MAX_BYTES || 5368709120))
@@ -1603,8 +1650,19 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
       }
       const out = [];
-      const keys = await listAllKeys(s3, bucket, prefix);
-      for (const obj of keys) {
+      const maxListFlat =
+        permEditorList ? PORTAL_TREE_MAX_OBJECTS : Math.min(PORTAL_TREE_MAX_OBJECTS, PORTAL_TREE_MAX_OBJECTS_ROOT);
+      const { keys: keysFlat, truncated: truncatedFlat } = await listAllKeysCapped(s3, bucket, prefix, maxListFlat);
+      if (truncatedFlat) {
+        return res.status(413).json({
+          error: 'File catalog exceeds the configured maximum object count for this request',
+          code: 'PORTAL_FILE_LIST_TOO_LARGE',
+          maxObjects: maxListFlat,
+          hint:
+            'Use GET /api/files/tree?pathPrefix=… for a subtree, raise PORTAL_TREE_MAX_OBJECTS_ROOT, or use the permissions editor scope when listing the full job.'
+        });
+      }
+      for (const obj of keysFlat) {
         const rel = obj.Key.slice(prefix.length);
         if (!rel || isFolderMarkerKey(rel)) continue;
         if (userGrants && !userGrants.some((g) => relPathMatchesGrant(rel, g.path_prefix, g.recursive))) {
@@ -1648,13 +1706,29 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
         if (rel) listPrefix = `${prefix}${rel}/`;
       }
-      const keys = await listAllKeys(s3, bucket, listPrefix);
+      const hasPathScope = Boolean(subtreeRaw);
+      const permEditorTree =
+        readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
+      const maxList =
+        permEditorTree || hasPathScope
+          ? PORTAL_TREE_MAX_OBJECTS
+          : Math.min(PORTAL_TREE_MAX_OBJECTS, PORTAL_TREE_MAX_OBJECTS_ROOT);
+      const { keys, truncated: listingTruncated } = await listAllKeysCapped(s3, bucket, listPrefix, maxList);
+      if (listingTruncated) {
+        return res.status(413).json({
+          error: 'File catalog for this folder exceeds the configured maximum object count',
+          code: 'TREE_LISTING_TOO_LARGE',
+          maxObjects: maxList,
+          pathPrefix: hasPathScope ? String(subtreeRaw || '') : '',
+          hint: hasPathScope
+            ? `Raise PORTAL_TREE_MAX_OBJECTS (scoped cap is ${maxList}), split the folder in storage, or narrow pathPrefix.`
+            : 'Add ?pathPrefix=<portal-relative-folder> to list one subtree (Horizon File Explorer sends this when you open a folder), or raise PORTAL_TREE_MAX_OBJECTS_ROOT / PORTAL_TREE_MAX_OBJECTS.'
+        });
+      }
       let tree = buildTreeFromKeys(prefix, keys);
       const treePortalMode = readPortalMode(req, req.query);
       const isDataAutoSyncTreeList = treePortalMode === DATA_AUTO_SYNC_MODE;
       const jobHasPathGrantsTree = await portalJobHasPathGrants(aclPool, clientId, jobId);
-      const permEditorTree =
-        readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
       /** @type {Array<{ path_prefix: string, recursive: boolean, access_mode: string }>} */
       let treeUserGrants = [];
       let appliedPathGrantFilter = false;
@@ -1681,7 +1755,12 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           }
         }
       }
-      await mergeCompletedUploadSha256IntoTree(clientId, jobId, tree);
+      const forceHashes = String(req.query.includeHashes ?? '').trim() === '1';
+      const skipHashMerge =
+        !forceHashes && PORTAL_TREE_MERGE_HASH_MAX_FILES > 0 && keys.length > PORTAL_TREE_MERGE_HASH_MAX_FILES;
+      if (!skipHashMerge) {
+        await mergeCompletedUploadSha256IntoTree(clientId, jobId, tree);
+      }
       return res.json(tree);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -2814,11 +2893,22 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         console.warn('[portal-files] upsertPortalObjectSha256FromClient (multipart complete):', e?.message || e);
       }
       let size = 0;
-      try {
-        const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
-        size = Number(head.ContentLength || 0);
-      } catch {
-        /* ignore */
+      const clientSize = Number(req.body?.fileSize);
+      if (
+        PORTAL_PRESIGN_MULTIPART_TRUST_CLIENT_FILE_SIZE &&
+        Number.isFinite(clientSize) &&
+        clientSize >= 0 &&
+        clientSize <= Number.MAX_SAFE_INTEGER &&
+        Math.floor(clientSize) === clientSize
+      ) {
+        size = clientSize;
+      } else {
+        try {
+          const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+          size = Number(head.ContentLength || 0);
+        } catch {
+          /* ignore */
+        }
       }
       const pref = jobPrefix(parsed.clientId, parsed.jobId);
       const rel = key.slice(pref.length);
@@ -3516,27 +3606,29 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           });
         }
       } else {
-        const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
         const expectedSize = Math.floor(Number(sessionRow.file_size || 0));
-        const contentLen = Number(head.ContentLength);
         if (!Number.isFinite(expectedSize) || expectedSize <= 0) {
           throw new Error('Invalid session file_size for finalize');
         }
-        if (!Number.isFinite(contentLen) || contentLen !== expectedSize) {
-          try {
-            await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
-          } catch (_) {
-            /* ignore */
+        if (!PORTAL_RESUMABLE_COMPLETE_SKIP_HEAD_VERIFY) {
+          const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+          const contentLen = Number(head.ContentLength);
+          if (!Number.isFinite(contentLen) || contentLen !== expectedSize) {
+            try {
+              await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+            } catch (_) {
+              /* ignore */
+            }
+            await uploadMetaPool.query(
+              `UPDATE portal_upload_sessions SET status = 'failed', updated_at = NOW() WHERE id = $1`,
+              [sessionId]
+            );
+            return res.status(409).json({
+              error: 'Completed object size mismatch',
+              expectedBytes: expectedSize,
+              actualBytes: Number.isFinite(contentLen) ? contentLen : null
+            });
           }
-          await uploadMetaPool.query(
-            `UPDATE portal_upload_sessions SET status = 'failed', updated_at = NOW() WHERE id = $1`,
-            [sessionId]
-          );
-          return res.status(409).json({
-            error: 'Completed object size mismatch',
-            expectedBytes: expectedSize,
-            actualBytes: Number.isFinite(contentLen) ? contentLen : null
-          });
         }
       }
       await uploadMetaPool.query(

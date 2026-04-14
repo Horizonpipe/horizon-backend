@@ -1,0 +1,81 @@
+# Render / horizon-backend — reduce billed outbound (HTTP responses + service-initiated Wasabi/Postgres)
+# Paste keys into Render Dashboard → Environment. Redeploy after changes.
+#
+# Dedupe / uploads: keep PORTAL_UPLOAD_PRESIGN=1 (default). Desktop: allow_backend_proxy_upload=false in config.json.
+
+# --- Wasabi state snapshot (large SELECT * + PUT latest.json; heavy service-initiated) ---
+WASABI_STATE_INCLUDE_ALL_TABLES=0
+# On-write snapshots: tiered debounce (PipeShare /portal vs PipeSync planner vs Data Auto Sync desktop header).
+# WASABI_STATE_WRITE_DEBOUNCE_MS=8000                      # PipeSync + default APIs (seconds)
+# WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS=120000             # /api/files + /api/guest (PipeShare file explorer)
+# WASABI_STATE_WRITE_DEBOUNCE_AUTOSYNC_MS=180000           # X-Horizon-Client: horizon-data-autosync (Java AUTOSYNC)
+# WASABI_STATE_SNAPSHOT_PORTAL_FAST_DEBOUNCE_PATHS=...     # ACL/share rows still use PipeSync debounce
+# WASABI_STATE_SNAPSHOT_PIPESYNC_DEBOUNCE_PREFIXES=...     # Optional: extra paths forced to PipeSync debounce (default empty)
+# WASABI_STATE_SNAPSHOT_ON_WRITE=0
+# Interval in ms (timed full snapshot). Code default raised to 5m; max see WASABI_STATE_SNAPSHOT_MAX_MS. Example: 1h = 3600000
+WASABI_STATE_SNAPSHOT_MS=3600000
+# Optional hard cap on max interval (default 86400000 = 24h in server.js)
+# WASABI_STATE_SNAPSHOT_MAX_MS=86400000
+WASABI_STATE_ARCHIVE_SNAPSHOTS=0
+# Gzip latest.json (and archives when enabled); server reads gzip or legacy plain JSON. Set 0 to store uncompressed only.
+# WASABI_STATE_SNAPSHOT_GZIP=1
+# Debounce queued full snapshots after mutating HTTP requests (ms, clamped in server.js):
+# WASABI_STATE_WRITE_DEBOUNCE_MS=8000
+# In-process cache TTL for repeated reads of latest.json (ms):
+# WASABI_LATEST_STATE_CACHE_MS=30000
+# Comma-separated table names to omit from snapshot list:
+# WASABI_STATE_EXCLUDE_TABLES=auto_import_logs,portal_share_access_log
+
+# SQL mutation audit batches to Wasabi (service-initiated PUTs). Disable if unused:
+WASABI_SQL_MIRROR_ENABLED=0
+# If SQL mirror stays ON: when WASABI_SQL_MIRROR_SKIP_TABLES is unset, code skips portal_object_sha256 +
+# portal_upload_sessions + portal_upload_session_parts (high churn). Override with your own comma list, or none.
+#
+# Fewer Wasabi HeadObject calls after multipart complete (service-initiated):
+# PORTAL_PRESIGN_MULTIPART_TRUST_CLIENT_FILE_SIZE=1   # use JSON fileSize when present (Java sends it; default on)
+# PORTAL_RESUMABLE_COMPLETE_SKIP_HEAD_VERIFY=1      # trust session row when stream-verify off (default on)
+
+# --- Portal: avoid proxying file bytes through Render (required for multi-TB moves) ---
+# Set 0 so GET/HEAD /api/files/download/:id returns 410; clients use GET /api/files/presign/:id (small JSON) then Wasabi.
+PORTAL_PROXY_FILE_DOWNLOAD=0
+# Set 0 so resumable chunks never POST file bytes through Render (use sign-part + direct PUT only).
+PORTAL_RESUMABLE_PROXY_CHUNK=0
+# Must stay enabled for direct-to-Wasabi uploads (default 1):
+PORTAL_UPLOAD_PRESIGN=1
+#
+# Wasabi bucket CORS (same bucket as WASABI_BUCKET): allow your portal origins; methods GET, PUT, HEAD;
+# expose ETag; allow Authorization on GET if needed; allow Range for video / parallel ranged downloads.
+# Without CORS, presigned URLs fail in the browser and clients may fall back to proxy (high Render egress).
+
+# Extra POST paths to skip on-write snapshot queue (comma-separated, normalized paths):
+# WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATHS=
+
+# --- Optional tuning ---
+# WASABI_LATEST_STATE_CACHE_MS=60000
+# PORTAL_PRESIGN_TTL_SECONDS=3600
+
+# GET /api/files/tree — caps + subtree (protects Node memory and Render egress on huge jobs):
+# PORTAL_TREE_MAX_OBJECTS=250000          # max S3 objects per tree response when pathPrefix or permissionsEditor=1
+# PORTAL_TREE_MAX_OBJECTS_ROOT=25000      # max when listing whole job without pathPrefix (default 25k)
+# PORTAL_TREE_MERGE_HASH_MAX_FILES=5000   # skip Postgres→tree sha256 merge above this raw key count (0=always merge)
+# Optional: ?includeHashes=1 on /tree forces merge for one request.
+# File explorer (horizon-frontend) sends pathPrefix whenever you are inside a folder (set globalThis.__HP_DISABLE_TREE_PATH_PREFIX__=true to opt out).
+
+# --- Manual regression (after deploy) ---
+# 1) Sign-in portal: upload small file (presign PUT), large file (multipart), video preview.
+# 2) Guest share: tree, video Play, file Download (guest-app uses presign-first; proxy link only as fallback if presign fails).
+
+# --- Browser verification (DevTools → Network) ---
+# Large upload: request URL host should be Wasabi/S3, not Render.
+# Large download / guest Download: after presign JSON from Render, byte requests go to object storage.
+# Optional: `npm run smoke:portal-presign` with HP_CHECK_META=1 and HP_CHECK_PROXY_DOWNLOAD=1.
+# 3) Java AUTOSYNC (Data Auto Sync desktop) — full cycle, minimal Render *response* size:
+#    - Local indexing: directory scan only (no server).
+#    - Server size compare: POST /api/files/check-paths in batches (PORTAL_CHECK_PATHS_MAX default 800; tune env + client check_paths_batch_size).
+#    - No GET /api/files/tree when client bandwidth_safe_mode=true (default).
+#    - Content dedupe: POST /api/files/find-hash-paths (small JSON); enable client register_sha256_after_portal_put for DB-backed digest rows after upload.
+#    - Bytes: presigned PUT / multipart direct to Wasabi (not through Render).
+# 3b) Desktop autosync smoke: check-paths batches, upload, dedupe skip in logs.
+# 4) Planner loads with Wasabi snapshot primary — verify latest.json still parses (gzip on by default).
+# 5) npm run smoke:portal-presign (HP_API_BASE, HP_TOKEN, HP_FILE_ID) on a machine that can reach Wasabi presigned URLs.
+# 6) Render Metrics → Outbound Bandwidth: HTTP vs service-initiated should drop vs prior week.
