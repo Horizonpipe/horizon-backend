@@ -7,7 +7,7 @@
  *
  * Heavy GET traffic (video, large downloads) should use `/api/files/presign/:id`,
  * `/api/files/share-view/:token/presign/:id`, or `/api/guest/share/:token/presign/:id`
- * so browsers fetch object bytes directly from Wasabi (configure bucket CORS for your portal origins).
+ * so browsers fetch object bytes directly from Wasabi (configure bucket CORS for your portal origins, including GET/HEAD with Range for progressive video).
  * Multipart resumable chunks still POST through this service unless extended with presigned part URLs.
  * Folder ZIP: use `GET /folders/zip-manifest` + `POST /presign-batch` + browser zip (bytes: Wasabi → browser only).
  */

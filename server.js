@@ -503,6 +503,9 @@ const WASABI_SYNC_STATE_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
   5000,
   Math.min(15 * 60 * 1000, Number(process.env.WASABI_SYNC_STATE_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
 );
+/** In-process cache for GET /sync-state (PipeSync polls; avoids repeated meta queries). 0 disables. */
+const SYNC_STATE_HTTP_CACHE_MS = Math.max(0, Math.min(120000, Number(process.env.SYNC_STATE_HTTP_CACHE_MS ?? 4000)));
+let syncStateHttpCache = { expiresAt: 0, payload: null };
 const WASABI_USERS_PRIMARY_ENABLED =
   WASABI_ALL_READS_PRIMARY_ENABLED || String(process.env.WASABI_USERS_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
 const WASABI_USERS_PRIMARY_STRICT =
@@ -4219,12 +4222,25 @@ app.post('/admin/app-data-migrate-postgres-to-wasabi', requireAuth, requireAdmin
 
 app.get('/sync-state', requireAuth, async (req, res) => {
   try {
+    const syncStateNow = Date.now();
+    if (
+      SYNC_STATE_HTTP_CACHE_MS > 0 &&
+      syncStateHttpCache.payload &&
+      syncStateHttpCache.expiresAt > syncStateNow
+    ) {
+      res.set('X-Sync-State-Cache', 'hit');
+      return res.json(syncStateHttpCache.payload);
+    }
     if (WASABI_SYNC_STATE_PRIMARY_ENABLED) {
       try {
         const snapshotState = await readSyncStateFromWasabiSnapshot();
         if (snapshotState) {
           const signature = crypto.createHash('sha256').update(JSON.stringify(snapshotState)).digest('hex');
-          return res.json({ success: true, signature, state: snapshotState });
+          const out = { success: true, signature, state: snapshotState };
+          if (SYNC_STATE_HTTP_CACHE_MS > 0) {
+            syncStateHttpCache = { expiresAt: Date.now() + SYNC_STATE_HTTP_CACHE_MS, payload: out };
+          }
+          return res.json(out);
         }
         if (WASABI_SYNC_STATE_PRIMARY_STRICT) {
           const empty = {
@@ -4237,7 +4253,11 @@ app.get('/sync-state', requireAuth, async (req, res) => {
             emails: { count: 0, updated_at: new Date(0).toISOString() }
           };
           const signature = crypto.createHash('sha256').update(JSON.stringify(empty)).digest('hex');
-          return res.json({ success: true, signature, state: empty });
+          const out = { success: true, signature, state: empty };
+          if (SYNC_STATE_HTTP_CACHE_MS > 0) {
+            syncStateHttpCache = { expiresAt: Date.now() + SYNC_STATE_HTTP_CACHE_MS, payload: out };
+          }
+          return res.json(out);
         }
       } catch (error) {
         if (WASABI_SYNC_STATE_PRIMARY_STRICT) throw error;
@@ -4288,7 +4308,11 @@ app.get('/sync-state', requireAuth, async (req, res) => {
       emails: emails.rows[0]
     };
     const signature = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
-    res.json({ success: true, signature, state: payload });
+    const out = { success: true, signature, state: payload };
+    if (SYNC_STATE_HTTP_CACHE_MS > 0) {
+      syncStateHttpCache = { expiresAt: Date.now() + SYNC_STATE_HTTP_CACHE_MS, payload: out };
+    }
+    res.json(out);
   } catch (error) {
     console.error('SYNC STATE ERROR:', error);
     res.status(500).json({ success: false, error: error.message });

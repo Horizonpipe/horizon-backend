@@ -81,6 +81,31 @@ function createAutoImportPlugin(options = {}) {
     if (!Number.isFinite(raw)) return 90_000;
     return Math.max(10_000, Math.min(300_000, Math.floor(raw)));
   })();
+  /** GET /monitor-snapshot: coalesce identical viewers (0 disables). */
+  const MONITOR_SNAPSHOT_CACHE_MS = Math.max(
+    0,
+    Math.min(60_000, Number(process.env.AUTO_IMPORT_MONITOR_SNAPSHOT_CACHE_MS ?? 3500))
+  );
+  const monitorSnapshotCache = new Map();
+  /** POST /desktop-heartbeat: min interval between Postgres upserts per user_key (0 = every POST). */
+  const HEARTBEAT_MIN_WRITE_MS = Math.max(
+    0,
+    Math.min(300_000, Number(process.env.AUTO_IMPORT_HEARTBEAT_MIN_WRITE_MS ?? 10_000))
+  );
+  const lastHeartbeatWriteMs = new Map();
+
+  function rememberMonitorSnapshot(cacheKey, body) {
+    if (MONITOR_SNAPSHOT_CACHE_MS <= 0) return;
+    monitorSnapshotCache.set(cacheKey, { exp: Date.now() + MONITOR_SNAPSHOT_CACHE_MS, body });
+    if (monitorSnapshotCache.size > 500) {
+      const drop = Math.ceil(monitorSnapshotCache.size / 2);
+      let n = 0;
+      for (const k of monitorSnapshotCache.keys()) {
+        monitorSnapshotCache.delete(k);
+        if (++n >= drop) break;
+      }
+    }
+  }
 
   /**
    * Desktop JWT and browser session must resolve the same logical user; some clients only have
@@ -522,7 +547,15 @@ function createAutoImportPlugin(options = {}) {
    */
   router.get('/monitor-snapshot', desktopHeartbeatGate, async (req, res) => {
     const keys = heartbeatKeys(req);
+    const cacheKey = keys.join('|');
     const nowMs = Date.now();
+    if (MONITOR_SNAPSHOT_CACHE_MS > 0) {
+      const hit = monitorSnapshotCache.get(cacheKey);
+      if (hit && hit.exp > nowMs) {
+        res.set('X-Monitor-Snapshot-Cache', 'hit');
+        return res.json(hit.body);
+      }
+    }
     try {
       const [rec, projR, logR] = await Promise.all([
         latestHeartbeatRow(keys),
@@ -601,7 +634,7 @@ function createAutoImportPlugin(options = {}) {
       }
       const projectRecent = newestProjectTs > 0 && nowMs - newestProjectTs <= 120000;
       const monitorConnected = hb.connected || desktopRecent || projectRecent;
-      res.json({
+      const body = {
         success: true,
         store: 'postgres',
         heartbeat: hb,
@@ -612,7 +645,9 @@ function createAutoImportPlugin(options = {}) {
         },
         projects,
         logs
-      });
+      };
+      rememberMonitorSnapshot(cacheKey, body);
+      res.json(body);
     } catch (error) {
       logger.error?.('auto-import monitor-snapshot:', error?.code || '', error?.message || error);
       return res.status(500).json({ success: false, error: 'Monitor snapshot failed.' });
@@ -639,6 +674,13 @@ function createAutoImportPlugin(options = {}) {
     const displayName = clean(req.user?.displayName || '');
     try {
       for (const key of keys) {
+        if (HEARTBEAT_MIN_WRITE_MS > 0) {
+          const prev = lastHeartbeatWriteMs.get(key) || 0;
+          if (nowMs - prev < HEARTBEAT_MIN_WRITE_MS) {
+            continue;
+          }
+          lastHeartbeatWriteMs.set(key, nowMs);
+        }
         await runPostgresAutoImportSql(
           `INSERT INTO auto_import_desktop_heartbeats (user_key, at_ms, state, source, detail, username, display_name, updated_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
@@ -652,6 +694,14 @@ function createAutoImportPlugin(options = {}) {
              updated_at = NOW()`,
           [key, nowMs, state, source, detail, username, displayName]
         );
+      }
+      if (lastHeartbeatWriteMs.size > 5000) {
+        const drop = Math.ceil(lastHeartbeatWriteMs.size / 2);
+        let n = 0;
+        for (const k of lastHeartbeatWriteMs.keys()) {
+          lastHeartbeatWriteMs.delete(k);
+          if (++n >= drop) break;
+        }
       }
     } catch (error) {
       logger.error?.(
