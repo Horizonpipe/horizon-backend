@@ -3454,27 +3454,84 @@ function materialLabel(code) {
   return map[upper] || upper || '';
 }
 
+function sqliteTableList(db) {
+  try {
+    const r = db.exec("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
+    return (r[0]?.values || []).map((row) => String(row[0] || '')).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function pickSqliteTable(actualNames, ...wanted) {
+  const set = new Set(actualNames);
+  const byLower = new Map(actualNames.map((n) => [n.toLowerCase(), n]));
+  for (const w of wanted) {
+    if (set.has(w)) return w;
+    const hit = byLower.get(String(w).toLowerCase());
+    if (hit) return hit;
+  }
+  return '';
+}
+
+function sqlIdentQuoted(name) {
+  return `"${String(name).replace(/"/g, '""')}"`;
+}
+
+function mapDb3SectionRow(row, projectName) {
+  const dia = row.size2
+    ? `${String(row.size1).replace(/\.0+$/, '')}/${String(row.size2).replace(/\.0+$/, '')}`
+    : String(row.size1 || '').replace(/\.0+$/, '');
+  return {
+    project: projectName || 'NOT SET',
+    reference: cleanString(row.reference),
+    length: Number(row.length || 0).toFixed(3),
+    city: cleanString(row.city),
+    street: cleanString(row.street),
+    upstream: cleanString(row.upstream),
+    downstream: cleanString(row.downstream),
+    material: materialLabel(row.material_code),
+    shape: shapeLabel(row.shape_code, row.size1, row.size2),
+    dia
+  };
+}
+
 async function parseDb3(buffer) {
   const SQL = await sqlJsPromise;
   const db = new SQL.Database(new Uint8Array(buffer));
+  const tables = sqliteTableList(db);
+  const sectionT = pickSqliteTable(tables, 'SECTION');
+  if (!sectionT) {
+    db.close();
+    const preview = tables.slice(0, 40).join(', ') || '(none)';
+    throw new Error(
+      `Not a WinCan-style pipe DB3: missing SECTION table. Tables in file: ${preview}${tables.length > 40 ? ' …' : ''}`
+    );
+  }
+  const nodeT = pickSqliteTable(tables, 'NODE');
+  const secinspT = pickSqliteTable(tables, 'SECINSP');
+  const projectT = pickSqliteTable(tables, 'PROJECT');
 
   let projectName = '';
-  try {
-    const projectStmt = db.prepare(`
-      SELECT COALESCE(MAX(PRJ_Key), '') AS project_name
-      FROM PROJECT
-    `);
-    if (projectStmt.step()) {
-      const row = projectStmt.getAsObject();
-      projectName = cleanString(row.project_name);
+  if (projectT) {
+    try {
+      const projectStmt = db.prepare(
+        `SELECT COALESCE(MAX(PRJ_Key), '') AS project_name FROM ${sqlIdentQuoted(projectT)}`
+      );
+      if (projectStmt.step()) {
+        const row = projectStmt.getAsObject();
+        projectName = cleanString(row.project_name);
+      }
+      projectStmt.free();
+    } catch {
+      projectName = '';
     }
-    projectStmt.free();
-  } catch (error) {
-    projectName = '';
   }
 
-  const query = `
-    SELECT
+  const S = sqlIdentQuoted(sectionT);
+  const N = nodeT ? sqlIdentQuoted(nodeT) : '';
+
+  const coreCols = `
       s.OBJ_Key AS reference,
       COALESCE(si.inspected_length, s.OBJ_Length, 0) AS length,
       COALESCE(s.OBJ_City, '') AS city,
@@ -3484,41 +3541,114 @@ async function parseDb3(buffer) {
       COALESCE(s.OBJ_Material, '') AS material_code,
       COALESCE(s.OBJ_Shape, '') AS shape_code,
       COALESCE(s.OBJ_Size1, '') AS size1,
-      COALESCE(s.OBJ_Size2, '') AS size2
-    FROM SECTION s
-    LEFT JOIN (
-      SELECT INS_Section_FK, MAX(COALESCE(INS_InspectedLength, INS_EstimatedLength, 0)) AS inspected_length
-      FROM SECINSP
-      GROUP BY INS_Section_FK
-    ) si ON si.INS_Section_FK = s.OBJ_PK
-    LEFT JOIN NODE n1 ON n1.OBJ_PK = s.OBJ_FromNode_REF
-    LEFT JOIN NODE n2 ON n2.OBJ_PK = s.OBJ_ToNode_REF
-    ORDER BY s.OBJ_Key
-  `;
+      COALESCE(s.OBJ_Size2, '') AS size2`;
 
-  const stmt = db.prepare(query);
-  const rows = [];
-  while (stmt.step()) {
-    const row = stmt.getAsObject();
-    const dia = row.size2
-      ? `${String(row.size1).replace(/\.0+$/, '')}/${String(row.size2).replace(/\.0+$/, '')}`
-      : String(row.size1 || '').replace(/\.0+$/, '');
-    rows.push({
-      project: projectName || 'NOT SET',
-      reference: cleanString(row.reference),
-      length: Number(row.length || 0).toFixed(3),
-      city: cleanString(row.city),
-      street: cleanString(row.street),
-      upstream: cleanString(row.upstream),
-      downstream: cleanString(row.downstream),
-      material: materialLabel(row.material_code),
-      shape: shapeLabel(row.shape_code, row.size1, row.size2),
-      dia
-    });
+  const coreColsNoInsp = `
+      s.OBJ_Key AS reference,
+      COALESCE(s.OBJ_Length, 0) AS length,
+      COALESCE(s.OBJ_City, '') AS city,
+      COALESCE(s.OBJ_Street, '') AS street,
+      COALESCE(n1.OBJ_Key, '') AS upstream,
+      COALESCE(n2.OBJ_Key, '') AS downstream,
+      COALESCE(s.OBJ_Material, '') AS material_code,
+      COALESCE(s.OBJ_Shape, '') AS shape_code,
+      COALESCE(s.OBJ_Size1, '') AS size1,
+      COALESCE(s.OBJ_Size2, '') AS size2`;
+
+  const coreColsBare = `
+      s.OBJ_Key AS reference,
+      COALESCE(s.OBJ_Length, 0) AS length,
+      COALESCE(s.OBJ_City, '') AS city,
+      COALESCE(s.OBJ_Street, '') AS street,
+      '' AS upstream,
+      '' AS downstream,
+      COALESCE(s.OBJ_Material, '') AS material_code,
+      COALESCE(s.OBJ_Shape, '') AS shape_code,
+      COALESCE(s.OBJ_Size1, '') AS size1,
+      COALESCE(s.OBJ_Size2, '') AS size2`;
+
+  /** @type {string[]} */
+  const sqlVariants = [];
+  if (secinspT && nodeT) {
+    const SI = sqlIdentQuoted(secinspT);
+    sqlVariants.push(`
+    SELECT ${coreCols}
+    FROM ${S} s
+    LEFT JOIN (
+      SELECT INS_Section_FK AS si_fk, MAX(COALESCE(INS_InspectedLength, INS_EstimatedLength, 0)) AS inspected_length
+      FROM ${SI}
+      GROUP BY INS_Section_FK
+    ) si ON si.si_fk = s.OBJ_PK
+    LEFT JOIN ${N} n1 ON n1.OBJ_PK = s.OBJ_FromNode_REF
+    LEFT JOIN ${N} n2 ON n2.OBJ_PK = s.OBJ_ToNode_REF
+    ORDER BY s.OBJ_Key`);
+    sqlVariants.push(`
+    SELECT ${coreCols}
+    FROM ${S} s
+    LEFT JOIN (
+      SELECT OBJ_ID AS si_fk, MAX(COALESCE(INS_InspectedLength, INS_EstimatedLength, 0)) AS inspected_length
+      FROM ${SI}
+      GROUP BY OBJ_ID
+    ) si ON si.si_fk = s.OBJ_ID
+    LEFT JOIN ${N} n1 ON n1.OBJ_PK = s.OBJ_FromNode_REF
+    LEFT JOIN ${N} n2 ON n2.OBJ_PK = s.OBJ_ToNode_REF
+    ORDER BY s.OBJ_Key`);
+    sqlVariants.push(`
+    SELECT ${coreCols}
+    FROM ${S} s
+    LEFT JOIN (
+      SELECT OBJ_ID AS si_fk, MAX(COALESCE(INS_InspectedLength, INS_EstimatedLength, 0)) AS inspected_length
+      FROM ${SI}
+      GROUP BY OBJ_ID
+    ) si ON si.si_fk = s.OBJ_PK
+    LEFT JOIN ${N} n1 ON n1.OBJ_PK = s.OBJ_FromNode_REF
+    LEFT JOIN ${N} n2 ON n2.OBJ_PK = s.OBJ_ToNode_REF
+    ORDER BY s.OBJ_Key`);
   }
-  stmt.free();
+  if (nodeT) {
+    sqlVariants.push(`
+    SELECT ${coreColsNoInsp}
+    FROM ${S} s
+    LEFT JOIN ${N} n1 ON n1.OBJ_PK = s.OBJ_FromNode_REF
+    LEFT JOIN ${N} n2 ON n2.OBJ_PK = s.OBJ_ToNode_REF
+    ORDER BY s.OBJ_Key`);
+  }
+  sqlVariants.push(`
+    SELECT ${coreColsBare}
+    FROM ${S} s
+    ORDER BY s.OBJ_Key`);
+
+  let lastErr = 'no query variant succeeded';
+  for (const sql of sqlVariants) {
+    let stmt;
+    try {
+      stmt = db.prepare(sql);
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e);
+      continue;
+    }
+    try {
+      const rows = [];
+      while (stmt.step()) {
+        rows.push(mapDb3SectionRow(stmt.getAsObject(), projectName));
+      }
+      stmt.free();
+      db.close();
+      return rows;
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e);
+      try {
+        stmt.free();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
   db.close();
-  return rows;
+  throw new Error(
+    lastErr ||
+      'Could not read SECTION rows from this DB3 (unsupported WinCan schema or missing OBJ_Key / length columns).'
+  );
 }
 
 async function ensureSchema() {
