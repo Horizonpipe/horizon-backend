@@ -3478,6 +3478,32 @@ function sqlIdentQuoted(name) {
   return `"${String(name).replace(/"/g, '""')}"`;
 }
 
+/**
+ * When SECTION is missing, infer common mis-uploads (WinCan catalog / META DB vs pipe project DB).
+ * @param {string[]} tables
+ */
+function explainMissingSectionDb3(tables) {
+  const lower = new Set(tables.map((t) => String(t).toLowerCase()));
+  const hasMeta = [...lower].some((t) => t.startsWith('meta'));
+  const hasDirectory = lower.has('directory');
+  const hasRehab = lower.has('rehabilitation');
+  const hasEquipment = lower.has('equipment');
+  const hasWorkgroup = lower.has('workgroup');
+  const looksCatalogOrSupport =
+    (hasMeta && (hasDirectory || lower.has('metaclass') || lower.has('metaobj'))) ||
+    (hasEquipment && hasRehab && !lower.has('node')) ||
+    (hasWorkgroup && hasEquipment && !lower.has('node'));
+
+  if (looksCatalogOrSupport) {
+    return (
+      ' This file looks like a WinCan catalog, workgroup, equipment, or support database (META*, DIRECTORY, REHABILITATION, etc.) — not a pipe inspection project. ' +
+      'Use the WinCan **project** .db3 for the jobsite run (the database that opens with your pipe sections; it must contain SECTION and NODE tables). ' +
+      'That file is usually beside your inspection videos in the job folder, not the global WinCan catalog database.'
+    );
+  }
+  return '';
+}
+
 function mapDb3SectionRow(row, projectName) {
   const dia = row.size2
     ? `${String(row.size1).replace(/\.0+$/, '')}/${String(row.size2).replace(/\.0+$/, '')}`
@@ -3504,8 +3530,9 @@ async function parseDb3(buffer) {
   if (!sectionT) {
     db.close();
     const preview = tables.slice(0, 40).join(', ') || '(none)';
+    const hint = explainMissingSectionDb3(tables);
     throw new Error(
-      `Not a WinCan-style pipe DB3: missing SECTION table. Tables in file: ${preview}${tables.length > 40 ? ' …' : ''}`
+      `Not a WinCan-style pipe DB3: missing SECTION table.${hint} Tables in file: ${preview}${tables.length > 40 ? ' …' : ''}`
     );
   }
   const nodeT = pickSqliteTable(tables, 'NODE');
