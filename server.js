@@ -2912,7 +2912,11 @@ function normalizeSegment(raw = {}, userName = 'System') {
     system: cleanString(raw.system),
     versions,
     selectedVersionId: raw.selectedVersionId || versions[versions.length - 1].id,
-    db3Imported: sanitizeDb3ImportedObject(raw.db3Imported)
+    db3Imported: sanitizeDb3ImportedObject(raw.db3Imported),
+    linkedPortalDb3FileId: cleanString(raw.linkedPortalDb3FileId).slice(0, 128),
+    linkedPortalDb3FolderPath: cleanString(raw.linkedPortalDb3FolderPath).slice(0, 800),
+    linkedPortalDb3ClientId: cleanString(raw.linkedPortalDb3ClientId).slice(0, 128),
+    linkedPortalDb3JobId: cleanString(raw.linkedPortalDb3JobId).slice(0, 128)
   };
 }
 
@@ -3634,6 +3638,110 @@ function extractDb3ImportedFromRow(raw, aliasNames) {
   return out;
 }
 
+/**
+ * SECTION.OBJ_Key → primary key for joining SECINSP (WinCan variants).
+ * @param {any} db
+ * @param {string} sectionTable
+ * @param {string} reference
+ * @returns {string|number|null}
+ */
+function resolveSectionPrimaryKeyForReference(db, sectionTable, reference) {
+  const S = sqlIdentQuoted(sectionTable);
+  const ref = cleanString(reference);
+  if (!ref) return null;
+  const secCols = sqlitePragmaColumns(db, sectionTable).map((c) => c.name.toUpperCase());
+  const pkCol = secCols.includes('OBJ_PK') ? 'OBJ_PK' : secCols.includes('OBJ_ID') ? 'OBJ_ID' : '';
+  if (!pkCol) return null;
+  let stmt;
+  try {
+    stmt = db.prepare(`SELECT ${sqlIdentQuoted(pkCol)} AS spk FROM ${S} WHERE OBJ_Key = ? LIMIT 1`);
+    stmt.bind([ref]);
+    if (stmt.step()) {
+      const v = stmt.getAsObject().spk;
+      stmt.free();
+      if (v != null && String(v).trim() !== '') return v;
+    } else {
+      stmt.free();
+    }
+  } catch {
+    try {
+      stmt?.free();
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+/**
+ * Merge first matching SECINSP row into db3Imported (inspector, certificate, etc. often live here).
+ * Does not overwrite keys already populated from SECTION extras.
+ * @param {any} db
+ * @param {string} sectionTable
+ * @param {string} secinspTable
+ * @param {string} reference SECTION.OBJ_Key
+ * @param {Record<string, string>} imported
+ */
+function mergeSecinspRowIntoDb3Imported(db, sectionTable, secinspTable, reference, imported) {
+  const out = imported && typeof imported === 'object' ? { ...imported } : {};
+  if (!secinspTable) return out;
+  const spk = resolveSectionPrimaryKeyForReference(db, sectionTable, reference);
+  if (spk == null) return out;
+  const cols = sqlitePragmaColumns(db, secinspTable);
+  if (!cols.length) return out;
+  const wantFks = [
+    'INS_Section_FK',
+    'INS_SECTION_FK',
+    'INS_SectionId',
+    'INS_SECTION_ID',
+    'OBJ_ID',
+    'OBJ_PK',
+    'INS_ObjectId',
+    'INS_OBJECTID'
+  ];
+  /** @type {string[]} */
+  const fkCols = [];
+  for (const w of wantFks) {
+    const hit = cols.find((c) => String(c.name).toUpperCase() === w.toUpperCase());
+    if (hit && !fkCols.includes(hit.name)) fkCols.push(hit.name);
+  }
+  if (!fkCols.length) {
+    for (const c of cols) {
+      const u = String(c.name).toUpperCase();
+      if (u.includes('SECTION') && (u.includes('FK') || u.includes('REF'))) fkCols.push(c.name);
+    }
+  }
+  if (!fkCols.length) return out;
+  const SI = sqlIdentQuoted(secinspTable);
+  const where = fkCols.map((c) => `${sqlIdentQuoted(c)} = ?`).join(' OR ');
+  let stmt;
+  try {
+    stmt = db.prepare(`SELECT * FROM ${SI} WHERE ${where} LIMIT 1`);
+    stmt.bind(fkCols.map(() => spk));
+    if (!stmt.step()) {
+      stmt.free();
+      return out;
+    }
+    const row = stmt.getAsObject();
+    stmt.free();
+    for (const [k, v] of Object.entries(row)) {
+      if (v == null || v === '') continue;
+      const ku = String(k).toUpperCase();
+      if (out[ku] && String(out[ku]).trim() !== '') continue;
+      const str = typeof v === 'number' && Number.isFinite(v) ? String(v) : String(v).trim();
+      if (!str) continue;
+      out[ku] = str.slice(0, 4000);
+    }
+  } catch {
+    try {
+      stmt?.free();
+    } catch {
+      /* ignore */
+    }
+  }
+  return out;
+}
+
 function injectDb3ExtrasBeforeOrderBy(sql, extraSql) {
   if (!extraSql) return sql;
   const trimmed = String(sql || '').trimEnd();
@@ -3801,8 +3909,9 @@ async function parseDb3(buffer) {
       while (stmt.step()) {
         const raw = stmt.getAsObject();
         const mapped = mapDb3SectionRow(raw, projectName);
-        const imported = extractDb3ImportedFromRow(raw, extraFrag.aliasNames);
-        if (imported && Object.keys(imported).length) {
+        let imported = extractDb3ImportedFromRow(raw, extraFrag.aliasNames);
+        imported = mergeSecinspRowIntoDb3Imported(db, sectionT, secinspT || '', mapped.reference, imported);
+        if (Object.keys(imported).length) {
           mapped.db3Imported = imported;
         }
         rows.push(mapped);
@@ -5985,6 +6094,12 @@ app.put('/records/:id/segments/:segmentId', requireAuth, requirePsrDataEntryAcce
       footage: cleanString(segmentPatch.footage !== undefined ? segmentPatch.footage : (segmentPatch.length !== undefined ? segmentPatch.length : found.footage)),
       street: upperCleanString(segmentPatch.street !== undefined ? segmentPatch.street : found.street)
     });
+    if (segmentPatch.linkedPortalDb3FileId !== undefined) {
+      found.linkedPortalDb3FileId = cleanString(segmentPatch.linkedPortalDb3FileId).slice(0, 128);
+      found.linkedPortalDb3FolderPath = cleanString(segmentPatch.linkedPortalDb3FolderPath).slice(0, 800);
+      found.linkedPortalDb3ClientId = cleanString(segmentPatch.linkedPortalDb3ClientId).slice(0, 128);
+      found.linkedPortalDb3JobId = cleanString(segmentPatch.linkedPortalDb3JobId).slice(0, 128);
+    }
 
     if (Object.keys(versionPatch).length) {
       const nextVersion = defaultVersion(req.body?.saveBy || req.user.displayName || req.user.username, {
