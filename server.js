@@ -2878,6 +2878,22 @@ function defaultVersion(userName = 'System', payload = {}) {
   };
 }
 
+function sanitizeDb3ImportedObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    const key = String(k || '')
+      .trim()
+      .slice(0, 120);
+    if (!key || /^__proto__$/i.test(key)) continue;
+    if (v == null) continue;
+    const str = typeof v === 'number' && Number.isFinite(v) ? String(v) : String(v).trim();
+    if (!str) continue;
+    out[key.toUpperCase()] = str.slice(0, 4000);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 function normalizeSegment(raw = {}, userName = 'System') {
   const versions = Array.isArray(raw.versions) && raw.versions.length
     ? raw.versions.map((version) => defaultVersion(version.savedBy || userName, version))
@@ -2889,12 +2905,14 @@ function normalizeSegment(raw = {}, userName = 'System') {
     downstream: upperCleanString(raw.downstream),
     dia: upperCleanString(raw.dia),
     material: upperCleanString(raw.material),
+    shape: upperCleanString(raw.shape),
     length: cleanString(raw.length ?? raw.footage),
     footage: cleanString(raw.footage ?? raw.length),
     street: upperCleanString(raw.street),
     system: cleanString(raw.system),
     versions,
-    selectedVersionId: raw.selectedVersionId || versions[versions.length - 1].id
+    selectedVersionId: raw.selectedVersionId || versions[versions.length - 1].id,
+    db3Imported: sanitizeDb3ImportedObject(raw.db3Imported)
   };
 }
 
@@ -3522,6 +3540,110 @@ function explainMissingSectionDb3(tables) {
   return '';
 }
 
+/** WinCan SECTION columns already surfaced on the main import row — omit from `db3Imported` to avoid duplication. */
+const DB3_SECTION_CORE_PHYSICAL_COLS = new Set(
+  [
+    'OBJ_KEY',
+    'OBJ_LENGTH',
+    'OBJ_CITY',
+    'OBJ_STREET',
+    'OBJ_FROMNODE_REF',
+    'OBJ_TONODE_REF',
+    'OBJ_MATERIAL',
+    'OBJ_SHAPE',
+    'OBJ_SIZE1',
+    'OBJ_SIZE2',
+    'OBJ_PK',
+    'OBJ_ID',
+    'OBJ_GUID'
+  ].map((s) => s.toUpperCase())
+);
+
+/**
+ * @param {any} db sql.js Database
+ * @param {string} tableName
+ * @returns {{ name: string, type: string }[]}
+ */
+function sqlitePragmaColumns(db, tableName) {
+  const out = [];
+  let stmt;
+  try {
+    stmt = db.prepare(`PRAGMA table_info(${sqlIdentQuoted(tableName)})`);
+    while (stmt.step()) {
+      const o = stmt.getAsObject();
+      const name = String(o.name || '');
+      const type = String(o.type || '').toUpperCase();
+      if (!name) continue;
+      if (type.includes('BLOB')) continue;
+      out.push({ name, type });
+    }
+  } catch {
+    return [];
+  } finally {
+    try {
+      stmt?.free();
+    } catch {
+      /* ignore */
+    }
+  }
+  return out;
+}
+
+/**
+ * Extra SECTION columns as SQL select list + parallel original column names for alias decode.
+ * @param {any} db sql.js Database
+ * @param {string} sectionTable
+ * @returns {{ sql: string, aliasNames: string[] }}
+ */
+function buildDb3SectionExtraSelect(db, sectionTable) {
+  const cols = sqlitePragmaColumns(db, sectionTable);
+  const parts = [];
+  /** @type {string[]} */
+  const aliasNames = [];
+  for (const { name } of cols) {
+    if (DB3_SECTION_CORE_PHYSICAL_COLS.has(name.toUpperCase())) continue;
+    const idx = aliasNames.length;
+    parts.push(`s.${sqlIdentQuoted(name)} AS ${sqlIdentQuoted(`__db3_${idx}`)}`);
+    aliasNames.push(name);
+  }
+  if (!parts.length) return { sql: '', aliasNames: [] };
+  return { sql: parts.join(', '), aliasNames };
+}
+
+/**
+ * @param {Record<string, unknown>} raw
+ * @param {string[]} aliasNames
+ * @returns {Record<string, string>}
+ */
+function extractDb3ImportedFromRow(raw, aliasNames) {
+  if (!raw || !Array.isArray(aliasNames) || !aliasNames.length) return {};
+  const out = {};
+  const keys = Object.keys(raw);
+  for (let i = 0; i < aliasNames.length; i++) {
+    const want = `__db3_${i}`;
+    const hit = keys.find((k) => k.toLowerCase() === want.toLowerCase());
+    if (!hit) continue;
+    const v = raw[hit];
+    if (v == null || v === '') continue;
+    const col = aliasNames[i];
+    const key = String(col).toUpperCase();
+    const str = typeof v === 'number' && Number.isFinite(v) ? String(v) : String(v).trim();
+    if (!str) continue;
+    out[key] = str.slice(0, 4000);
+  }
+  return out;
+}
+
+function injectDb3ExtrasBeforeOrderBy(sql, extraSql) {
+  if (!extraSql) return sql;
+  const trimmed = String(sql || '').trimEnd();
+  const m = /\sORDER\s+BY\s/i.exec(trimmed);
+  if (m && m.index >= 0) {
+    return `${trimmed.slice(0, m.index)}, ${extraSql}${trimmed.slice(m.index)}`;
+  }
+  return `${trimmed}, ${extraSql}`;
+}
+
 function mapDb3SectionRow(row, projectName) {
   const dia = row.size2
     ? `${String(row.size1).replace(/\.0+$/, '')}/${String(row.size2).replace(/\.0+$/, '')}`
@@ -3553,6 +3675,7 @@ async function parseDb3(buffer) {
       `Not a WinCan-style pipe DB3: missing SECTION table.${hint} Tables in file: ${preview}${tables.length > 40 ? ' …' : ''}`
     );
   }
+  const extraFrag = buildDb3SectionExtraSelect(db, sectionT);
   const nodeT = pickSqliteTable(tables, 'NODE');
   const secinspT = pickSqliteTable(tables, 'SECINSP');
   const projectT = pickSqliteTable(tables, 'PROJECT');
@@ -3665,9 +3788,10 @@ async function parseDb3(buffer) {
 
   let lastErr = 'no query variant succeeded';
   for (const sql of sqlVariants) {
+    const sqlWithExtras = injectDb3ExtrasBeforeOrderBy(sql, extraFrag.sql);
     let stmt;
     try {
-      stmt = db.prepare(sql);
+      stmt = db.prepare(sqlWithExtras);
     } catch (e) {
       lastErr = e instanceof Error ? e.message : String(e);
       continue;
@@ -3675,7 +3799,13 @@ async function parseDb3(buffer) {
     try {
       const rows = [];
       while (stmt.step()) {
-        rows.push(mapDb3SectionRow(stmt.getAsObject(), projectName));
+        const raw = stmt.getAsObject();
+        const mapped = mapDb3SectionRow(raw, projectName);
+        const imported = extractDb3ImportedFromRow(raw, extraFrag.aliasNames);
+        if (imported && Object.keys(imported).length) {
+          mapped.db3Imported = imported;
+        }
+        rows.push(mapped);
       }
       stmt.free();
       db.close();
@@ -6280,10 +6410,12 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
         downstream: row.downstream,
         dia: row.dia,
         material: row.material,
+        shape: row.shape,
         length: row.length,
         footage: row.length,
         street: row.street,
         system: targetSystem,
+        db3Imported: row.db3Imported,
         versions: [
           defaultVersion(req.user.displayName || req.user.username, {
             status: 'neutral',
