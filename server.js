@@ -2914,6 +2914,24 @@ function normalizeJobsiteName(jobsite, street = '') {
   return j;
 }
 
+/** PipeSync planner client code for WinCan imports staged under “Imported — ready to sort”. */
+const PSR_IMPORT_QUEUE_CLIENT = '__HP_IMPORT_QUEUE__';
+
+function resolveWincanImportScope(body, rows) {
+  let targetClient = cleanString(body?.targetClient);
+  let targetCity = cleanString(body?.targetCity);
+  if (!targetClient) targetClient = PSR_IMPORT_QUEUE_CLIENT;
+  if (!targetCity) targetCity = '';
+  let targetJobsite = normalizeJobsiteName(body?.targetJobsite || 'NOT SET');
+  const projectRow = Array.isArray(rows) ? rows.find((r) => r && cleanString(r.project)) : null;
+  const projectName = projectRow ? cleanString(projectRow.project) : '';
+  if ((!targetJobsite || targetJobsite === 'NOT SET') && projectName) {
+    targetJobsite = normalizeJobsiteName(projectName);
+  }
+  const targetSystem = cleanString(body?.targetSystem || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
+  return { targetClient, targetCity, targetJobsite, targetSystem };
+}
+
 function normalizeRecordRow(row) {
   const data = parseJsonObject(row.data, {});
   const systems = normalizeSystems(data.systems, row.saved_by || 'System');
@@ -6202,17 +6220,9 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
     }
 
     const rows = await parseDb3(req.file.buffer);
-    const targetClient = cleanString(req.body?.targetClient);
-    const targetCity = cleanString(req.body?.targetCity);
-    const targetJobsite = normalizeJobsiteName(req.body?.targetJobsite || 'NOT SET');
-    const targetSystem = cleanString(req.body?.targetSystem || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
+    const { targetClient, targetCity, targetJobsite, targetSystem } = resolveWincanImportScope(req.body, rows);
 
-    const existingRecords = await findPlannerRecordsByScope(
-      targetClient || '',
-      targetCity || '',
-      targetJobsite || 'NOT SET',
-      { latestOnly: false }
-    );
+    const existingRecords = await findPlannerRecordsByScope(targetClient, targetCity, targetJobsite, { latestOnly: false });
     const existingRefs = new Set();
     existingRecords.forEach((record) => {
       (record.systems[targetSystem] || []).forEach((segment) => existingRefs.add(String(segment.reference || '').toLowerCase()));
@@ -6233,12 +6243,12 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
 app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) => {
   try {
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
-    const targetClient = cleanString(req.body?.targetClient);
-    const targetCity = cleanString(req.body?.targetCity);
-    const targetJobsite = normalizeJobsiteName(req.body?.targetJobsite || 'NOT SET');
-    const targetSystem = cleanString(req.body?.targetSystem || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
-    if (!targetClient || !targetCity || !targetJobsite) {
-      return res.status(400).json({ success: false, error: 'Target client, city, and jobsite are required' });
+    const { targetClient, targetCity, targetJobsite, targetSystem } = resolveWincanImportScope(req.body, rows);
+    if (!targetJobsite || targetJobsite === 'NOT SET') {
+      return res.status(400).json({
+        success: false,
+        error: 'Could not determine jobsite. Enter a jobsite name or ensure the WinCan DB3 project name is set.'
+      });
     }
 
     let record;
