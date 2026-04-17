@@ -1558,6 +1558,17 @@ function enforcePortalScopePolicyForUser(user, portalScopes) {
   return dedupePortalScopes(portalScopes);
 }
 
+function parseProductTutorialsSeen(row) {
+  const raw = row?.product_tutorials_seen ?? row?.productTutorialsSeen;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { pipeshare: false, pipesync: false };
+  }
+  return {
+    pipeshare: raw.pipeshare === true,
+    pipesync: raw.pipesync === true
+  };
+}
+
 function normalizeUser(row) {
   const id = row.id;
   const selfSignup = row?.self_signup === true;
@@ -1623,7 +1634,8 @@ function normalizeUser(row) {
     portalScopes: [],
     psrScopes: [],
     portalPermissionsAccessRaw,
-    portalPermissionsAccess
+    portalPermissionsAccess,
+    productTutorialsSeen: parseProductTutorialsSeen(row)
   };
 }
 
@@ -3092,7 +3104,8 @@ async function readFreshUserFromPostgresById(userId) {
   if (!id) return null;
   const result = await pool.query(
     `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-            portal_permissions_access, portal_files_access_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified
+            portal_permissions_access, portal_files_access_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
+            product_tutorials_seen
      FROM users
      WHERE CAST(id AS text) = $1
      LIMIT 1`,
@@ -3142,7 +3155,8 @@ async function readSessionFromPostgres(token) {
   const result = await pool.query(
     `SELECT s.token, s.user_id, s.keep_session, s.expires_at, u.id, u.username, u.display_name, u.password,
             u.is_admin, u.roles, u.must_change_password, u.portal_files_client_id, u.portal_files_job_id,
-            u.portal_permissions_access, u.portal_files_access_granted, u.self_signup, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified
+            u.portal_permissions_access, u.portal_files_access_granted, u.self_signup, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified,
+            u.product_tutorials_seen
      FROM auth_sessions s
      JOIN users u ON CAST(u.id AS text) = s.user_id
      WHERE s.token = $1
@@ -4046,7 +4060,8 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_access_granted BOOLEAN NOT NULL DEFAULT false`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS self_signup BOOLEAN NOT NULL DEFAULT false`
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS self_signup BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS product_tutorials_seen JSONB NOT NULL DEFAULT '{}'::jsonb`
   ];
   for (const query of userAlters) await pool.query(query);
   await pool.query(`
@@ -4971,7 +4986,7 @@ app.post('/login', async (req, res) => {
     try {
       const result = await pool.query(
         `SELECT id, username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-                email, email_verified, portal_files_access_granted, portal_permissions_access, self_signup
+                email, email_verified, portal_files_access_granted, portal_permissions_access, self_signup, product_tutorials_seen
          FROM users u
          WHERE LOWER(TRIM(u.username)) = LOWER(TRIM($1))
             OR LOWER(TRIM(COALESCE(u.display_name, u.username))) = LOWER(TRIM($1))
@@ -5050,6 +5065,70 @@ app.post('/login', async (req, res) => {
 
 app.get('/session', requireAuth, async (req, res) => {
   res.json({ success: true, user: req.user, capabilities: resolveCapabilities(req.user) });
+});
+
+/**
+ * Mark guided product tutorial completion per account (PipeShare / PipeSync).
+ * Body: `{ product: 'pipeshare' | 'pipesync', completed?: boolean }` — `completed` defaults to true; false removes the flag so the tour can auto-run again.
+ */
+app.post('/me/product-tutorials-seen', requireAuth, async (req, res) => {
+  const product = cleanString(req.body?.product).toLowerCase();
+  if (product !== 'pipeshare' && product !== 'pipesync') {
+    return res.status(400).json({ success: false, error: 'product must be pipeshare or pipesync' });
+  }
+  const completed = req.body?.completed !== false;
+  const userId = String(req.user?.id || '').trim();
+  if (!userId) {
+    return res.status(400).json({ success: false, error: 'Missing user id' });
+  }
+  try {
+    if (completed) {
+      await pool.query(
+        `UPDATE users
+         SET product_tutorials_seen = COALESCE(product_tutorials_seen, '{}'::jsonb) || $2::jsonb,
+             updated_at = NOW()
+         WHERE CAST(id AS text) = $1`,
+        [userId, JSON.stringify({ [product]: true })]
+      );
+    } else {
+      await pool.query(
+        `UPDATE users
+         SET product_tutorials_seen = COALESCE(product_tutorials_seen, '{}'::jsonb) - $2::text,
+             updated_at = NOW()
+         WHERE CAST(id AS text) = $1`,
+        [userId, product]
+      );
+    }
+    const fresh = await readFreshUserFromPostgresById(userId);
+    if (!fresh) {
+      return res.status(404).json({ success: false, error: 'User not found after update' });
+    }
+    res.json({ success: true, user: fresh });
+  } catch (error) {
+    console.error('[me/product-tutorials-seen]', error);
+    res.status(500).json({ success: false, error: error.message || 'Server error' });
+  }
+});
+
+/** Admin: clear guided-tutorial flags for another account (both products). */
+app.post('/users/:id/product-tutorials-reset', requireAuth, requireAdminPanelAccess, async (req, res) => {
+  const id = cleanString(req.params.id);
+  if (!id) {
+    return res.status(400).json({ success: false, error: 'User id is required' });
+  }
+  try {
+    await pool.query(`UPDATE users SET product_tutorials_seen = '{}'::jsonb, updated_at = NOW() WHERE CAST(id AS text) = $1`, [
+      id
+    ]);
+    const fresh = await readFreshUserFromPostgresById(id);
+    if (!fresh) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+    res.json({ success: true, user: fresh });
+  } catch (error) {
+    console.error('[users/:id/product-tutorials-reset]', error);
+    res.status(500).json({ success: false, error: error.message || 'Server error' });
+  }
 });
 
 app.get('/data-auto-sync/access', requireAuth, requireDataAutoSyncEmployeeAccess, async (req, res) => {
