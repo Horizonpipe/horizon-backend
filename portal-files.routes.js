@@ -1098,12 +1098,36 @@ function relPathMatchesGrant(relPath, pathPrefix, recursive) {
   return false;
 }
 
+/**
+ * Longest matching path_prefix wins; ties prefer non-recursive (file-scoped) rows.
+ * @param {Array<{ path_prefix: string, recursive: boolean, access_mode?: string }>} grants
+ * @param {string} relPath
+ * @returns {{ path_prefix: string, recursive: boolean, access_mode: string } | null}
+ */
+function bestPathGrantForRelPath(grants, relPath) {
+  const rp = normalizeRelPath(relPath || '');
+  if (!rp) return null;
+  let best = null;
+  let bestScore = -1;
+  for (const g of grants) {
+    if (!relPathMatchesGrant(rp, g.path_prefix, g.recursive)) continue;
+    const p = normalizeRelPath(g.path_prefix ?? '');
+    const score = p.length * 10 + (g.recursive === false ? 2 : 1);
+    if (score > bestScore) {
+      bestScore = score;
+      best = g;
+    }
+  }
+  return best;
+}
+
 function normalizeGrantAccessMode(mode) {
   const m = String(mode || '')
     .trim()
     .toLowerCase();
   if (m === 'view') return 'view';
   if (m === 'view_download') return 'view_download';
+  if (m === 'off' || m === 'none') return 'off';
   return 'full';
 }
 
@@ -1111,11 +1135,12 @@ function isValidGrantAccessMode(mode) {
   const m = String(mode || '')
     .trim()
     .toLowerCase();
-  return m === 'full' || m === 'view' || m === 'view_download';
+  return m === 'full' || m === 'view' || m === 'view_download' || m === 'off' || m === 'none';
 }
 
 function grantModeAllows(mode, required) {
   const m = normalizeGrantAccessMode(mode);
+  if (m === 'off') return false;
   if (required === 'view') return true;
   if (required === 'download') return m === 'full' || m === 'view_download';
   return m === 'full';
@@ -1136,9 +1161,9 @@ async function assertPortalPathRel(grantPool, user, clientId, jobId, relPath, re
     return bypassPathGrantsForLenientPortalClient(user, grants);
   }
   const rp = normalizeRelPath(relPath);
-  return grants.some(
-    (g) => relPathMatchesGrant(rp, g.path_prefix, g.recursive) && grantModeAllows(g.access_mode, required)
-  );
+  const best = bestPathGrantForRelPath(grants, rp);
+  if (!best) return false;
+  return grantModeAllows(best.access_mode, required);
 }
 
 /**
@@ -1162,7 +1187,8 @@ async function assertRelPathMatchesPortalTreeVisibility(grantPool, req, clientId
   const treeUserGrants = await loadUserPathGrants(grantPool, clientId, jobId, req.user);
   if (bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) return true;
   if (treeUserGrants.length) {
-    return treeUserGrants.some((g) => relPathMatchesGrant(rp, g.path_prefix, g.recursive));
+    const best = bestPathGrantForRelPath(treeUserGrants, rp);
+    return Boolean(best && normalizeGrantAccessMode(best.access_mode) !== 'off');
   }
   if (portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) return true;
   if (isDas) {
@@ -1204,7 +1230,8 @@ async function createPortalPathVisibilityChecker(grantPool, req, clientId, jobId
       check(relPath) {
         const rp = normalizeRelPath(relPath || '');
         if (!rp) return false;
-        return treeUserGrants.some((g) => relPathMatchesGrant(rp, g.path_prefix, g.recursive));
+        const best = bestPathGrantForRelPath(treeUserGrants, rp);
+        return Boolean(best && normalizeGrantAccessMode(best.access_mode) !== 'off');
       }
     };
   }
@@ -1263,8 +1290,10 @@ function dataAutosyncPortalUserFolderPrefix(user) {
 function filterTreeByPathGrants(tree, grants, jobHasAnyGrant) {
   if (!jobHasAnyGrant) return tree;
   if (!grants.length) return { folders: [], files: [] };
-  const allows = (rp) =>
-    grants.some((g) => relPathMatchesGrant(normalizeRelPath(rp), g.path_prefix, g.recursive));
+  const allows = (rp) => {
+    const best = bestPathGrantForRelPath(grants, normalizeRelPath(rp));
+    return Boolean(best && normalizeGrantAccessMode(best.access_mode) !== 'off');
+  };
   const files = (tree.files || []).filter((f) => allows(f.path));
   const keepFolders = new Set();
   for (const f of files) {
@@ -1279,6 +1308,7 @@ function filterTreeByPathGrants(tree, grants, jobHasAnyGrant) {
     if (!p) {
       return tree;
     }
+    if (normalizeGrantAccessMode(g.access_mode) === 'off') continue;
     keepFolders.add(p);
     let cur = p;
     while (cur) {
@@ -1667,8 +1697,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       for (const obj of keysFlat) {
         const rel = obj.Key.slice(prefix.length);
         if (!rel || isFolderMarkerKey(rel)) continue;
-        if (userGrants && !userGrants.some((g) => relPathMatchesGrant(rel, g.path_prefix, g.recursive))) {
-          continue;
+        if (userGrants) {
+          const best = bestPathGrantForRelPath(userGrants, rel);
+          if (!best || normalizeGrantAccessMode(best.access_mode) === 'off') continue;
         }
         out.push({
           id: keyToId(obj.Key),
@@ -2120,7 +2151,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
         const rec = g.recursive !== false;
         if (g.accessMode != null && !isValidGrantAccessMode(g.accessMode)) {
-          return res.status(400).json({ error: 'Invalid accessMode. Allowed: full, view, view_download' });
+          return res.status(400).json({ error: 'Invalid accessMode. Allowed: full, view, view_download, off' });
         }
         const accessMode = normalizeGrantAccessMode(g.accessMode || g.access_mode || 'full');
         await aclPool.query(
