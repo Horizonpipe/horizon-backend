@@ -2966,6 +2966,19 @@ function resolveWincanImportScope(body, rows) {
   return { targetClient, targetCity, targetJobsite, targetSystem };
 }
 
+/** Persisted under planner record `data.systemBranches` — which top-level folders show under a jobsite. */
+function coerceSystemBranchesForStorage(branches, systems) {
+  const st = (systems?.storm || []).length > 0;
+  const sa = (systems?.sanitary || []).length > 0;
+  const b = branches && typeof branches === 'object' ? branches : {};
+  let storm = b.storm !== false;
+  let sanitary = b.sanitary === true;
+  if (st) storm = true;
+  if (sa) sanitary = true;
+  if (!storm && !sanitary && !st && !sa) storm = true;
+  return { storm, sanitary };
+}
+
 function normalizeRecordRow(row) {
   const data = parseJsonObject(row.data, {});
   const systems = normalizeSystems(data.systems, row.saved_by || 'System');
@@ -2991,6 +3004,8 @@ function normalizeRecordRow(row) {
     }));
   });
 
+  const systemBranches = coerceSystemBranchesForStorage(data.systemBranches, systems);
+
   const psrScopeClient = upperCleanString(row.client || data.client);
   const psrScopeCity = upperCleanString(row.city || data.city);
   const psrScopeJobsite = normalizeJobsiteName(rawJobsite, rawStreet);
@@ -3008,17 +3023,20 @@ function normalizeRecordRow(row) {
     status: cleanString(row.status || data.status),
     saved_by: cleanString(row.saved_by || data.saved_by),
     systems,
+    systemBranches,
     created_at: row.created_at,
     updated_at: row.updated_at
   };
 }
 
 function serializeRecordData(record) {
+  const systems = {
+    storm: (record.systems?.storm || []).map((segment) => normalizeSegment(segment, record.saved_by || 'System')),
+    sanitary: (record.systems?.sanitary || []).map((segment) => normalizeSegment(segment, record.saved_by || 'System'))
+  };
   return {
-    systems: {
-      storm: (record.systems?.storm || []).map((segment) => normalizeSegment(segment, record.saved_by || 'System')),
-      sanitary: (record.systems?.sanitary || []).map((segment) => normalizeSegment(segment, record.saved_by || 'System'))
-    }
+    systems,
+    systemBranches: coerceSystemBranchesForStorage(record.systemBranches || {}, systems)
   };
 }
 
@@ -5825,6 +5843,8 @@ return res.json({ success: true, records: out });
 
 app.post('/records', requireAuth, requirePsrDataEntryAccess, async (req, res) => {
   try {
+    const showStorm = req.body?.createStorm !== false;
+    const showSanitary = !!req.body?.createSanitary;
     const record = {
       record_date: cleanString(req.body?.record_date || req.body?.date || new Date().toISOString().slice(0, 10)),
       client: upperCleanString(req.body?.client),
@@ -5834,9 +5854,10 @@ app.post('/records', requireAuth, requirePsrDataEntryAccess, async (req, res) =>
       status: '',
       saved_by: req.user.displayName || req.user.username,
       systems: {
-        storm: req.body?.createStorm === false ? [] : [],
-        sanitary: req.body?.createSanitary ? [] : []
-      }
+        storm: [],
+        sanitary: []
+      },
+      systemBranches: { storm: showStorm, sanitary: showSanitary }
     };
     if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
 
@@ -6069,6 +6090,10 @@ app.put('/records/:id', requireAuth, requirePsrDataEntryAccess, async (req, res)
     record.saved_by = cleanString(req.body?.saved_by || req.body?.savedBy || req.user.displayName || req.user.username);
     if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
 
+    if (req.body?.systemBranches && typeof req.body.systemBranches === 'object') {
+      record.systemBranches = coerceSystemBranchesForStorage(req.body.systemBranches, record.systems);
+    }
+
     const saved = await persistRecord(record);
     res.json({ success: true, record: saved });
   } catch (error) {
@@ -6106,7 +6131,8 @@ app.post('/clients', requireAuth, requireAdmin, async (req, res) => {
       jobsite,
       status: '',
       saved_by: req.user.displayName || req.user.username,
-      systems: { storm: [], sanitary: [] }
+      systems: { storm: [], sanitary: [] },
+      systemBranches: { storm: true, sanitary: false }
     });
     res.status(201).json({ success: true, record: saved });
   } catch (error) {
