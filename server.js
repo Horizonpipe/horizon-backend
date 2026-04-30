@@ -2906,6 +2906,125 @@ function sanitizeDb3ImportedObject(value) {
   return Object.keys(out).length ? out : null;
 }
 
+/** Snapshot fields for “possible double entry” comparison (import queue vs placed segment). */
+function sanitizeDuplicateComparison(c) {
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return {};
+  const pick = (k, max) => cleanString(c[k]).slice(0, max);
+  return {
+    reference: pick('reference', 240),
+    upstream: pick('upstream', 240),
+    downstream: pick('downstream', 240),
+    dia: pick('dia', 120),
+    material: pick('material', 120),
+    shape: pick('shape', 120),
+    length: pick('length', 80),
+    street: pick('street', 400),
+    latestStatus: pick('latestStatus', 120),
+    latestNotes: pick('latestNotes', 2000),
+    recordedDate: pick('recordedDate', 32),
+    savedBy: pick('savedBy', 200)
+  };
+}
+
+function sanitizeDb3DuplicateOf(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const recordId = cleanString(raw.recordId).slice(0, 128);
+  const segmentId = cleanString(raw.segmentId).slice(0, 128);
+  if (!recordId || !segmentId) return null;
+  return {
+    recordId,
+    segmentId,
+    client: cleanString(raw.client).slice(0, 400),
+    city: cleanString(raw.city).slice(0, 400),
+    jobsite: cleanString(raw.jobsite).slice(0, 400),
+    street: cleanString(raw.street).slice(0, 400),
+    system: cleanString(raw.system).slice(0, 32),
+    comparison: sanitizeDuplicateComparison(raw.comparison)
+  };
+}
+
+function duplicateComparisonFromSegmentJson(seg) {
+  if (!seg || typeof seg !== 'object') return sanitizeDuplicateComparison({});
+  const versions = Array.isArray(seg.versions) ? seg.versions : [];
+  const last = versions.length ? versions[versions.length - 1] : {};
+  return sanitizeDuplicateComparison({
+    reference: seg.reference,
+    upstream: seg.upstream,
+    downstream: seg.downstream,
+    dia: seg.dia,
+    material: seg.material,
+    shape: seg.shape,
+    length: seg.length ?? seg.footage,
+    street: seg.street,
+    latestStatus: statusLabel(last.status),
+    latestNotes: last.notes,
+    recordedDate: last.recordedDate,
+    savedBy: last.savedBy
+  });
+}
+
+function buildDb3DuplicatePayloadFromPlacedRow(row) {
+  const seg = row.seg && typeof row.seg === 'object' ? row.seg : parseJsonObject(row.seg, {});
+  return sanitizeDb3DuplicateOf({
+    recordId: String(row.rid ?? ''),
+    segmentId: String(seg.id ?? ''),
+    client: row.client,
+    city: row.city,
+    jobsite: row.jobsite,
+    street: row.street,
+    system: row.sys,
+    comparison: duplicateComparisonFromSegmentJson(seg)
+  });
+}
+
+/**
+ * For each WinCan OBJ_Key (segment.reference), find a matching segment on a **non–import-queue** planner record
+ * (latest `updated_at` wins). Used for DB3 import queue staging.
+ * @param {string[]} referenceLowers lowercased trimmed references
+ * @returns {Promise<Map<string, ReturnType<typeof sanitizeDb3DuplicateOf>>>}
+ */
+async function findPlacedDuplicatePayloadsByReferences(referenceLowers) {
+  const map = new Map();
+  const uniq = [...new Set((referenceLowers || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean))];
+  if (!uniq.length) return map;
+  if (typeof pool?.query !== 'function') return map;
+  try {
+    const { rows: hits } = await pool.query(
+      `SELECT rid, client, city, jobsite, street, updated_at, sys, seg FROM (
+         SELECT pr.id AS rid, pr.client, pr.city, pr.jobsite, pr.street, pr.updated_at,
+                'storm'::text AS sys, seg
+         FROM planner_records pr,
+         LATERAL jsonb_array_elements(COALESCE(pr.data->'systems'->'storm', '[]'::jsonb)) seg
+         WHERE LOWER(BTRIM(pr.client)) <> LOWER(BTRIM($1))
+           AND LOWER(BTRIM(COALESCE(seg->>'reference',''))) = ANY($2::text[])
+       UNION ALL
+         SELECT pr.id, pr.client, pr.city, pr.jobsite, pr.street, pr.updated_at,
+                'sanitary'::text, seg
+         FROM planner_records pr,
+         LATERAL jsonb_array_elements(COALESCE(pr.data->'systems'->'sanitary', '[]'::jsonb)) seg
+         WHERE LOWER(BTRIM(pr.client)) <> LOWER(BTRIM($1))
+           AND LOWER(BTRIM(COALESCE(seg->>'reference',''))) = ANY($2::text[])
+       ) q`,
+      [PSR_IMPORT_QUEUE_CLIENT, uniq]
+    );
+    for (const row of hits) {
+      const seg = row.seg && typeof row.seg === 'object' ? row.seg : parseJsonObject(row.seg, {});
+      const refKey = String(seg.reference || '').trim().toLowerCase();
+      if (!refKey) continue;
+      const ts = Date.parse(row.updated_at) || 0;
+      const prev = map.get(refKey);
+      if (prev && prev._ts >= ts) continue;
+      const dup = buildDb3DuplicatePayloadFromPlacedRow(row);
+      if (dup) map.set(refKey, { _ts: ts, dup });
+    }
+  } catch (error) {
+    console.error('findPlacedDuplicatePayloadsByReferences:', error?.message || error);
+  }
+  const out = new Map();
+  for (const [k, v] of map) out.set(k, v.dup);
+  return out;
+}
+
 function normalizeSegment(raw = {}, userName = 'System') {
   const versions = Array.isArray(raw.versions) && raw.versions.length
     ? raw.versions.map((version) => defaultVersion(version.savedBy || userName, version))
@@ -2925,6 +3044,7 @@ function normalizeSegment(raw = {}, userName = 'System') {
     versions,
     selectedVersionId: raw.selectedVersionId || versions[versions.length - 1].id,
     db3Imported: sanitizeDb3ImportedObject(raw.db3Imported),
+    db3DuplicateOf: sanitizeDb3DuplicateOf(raw.db3DuplicateOf),
     linkedPortalDb3FileId: cleanString(raw.linkedPortalDb3FileId).slice(0, 128),
     linkedPortalDb3FolderPath: cleanString(raw.linkedPortalDb3FolderPath).slice(0, 800),
     linkedPortalDb3ClientId: cleanString(raw.linkedPortalDb3ClientId).slice(0, 128),
@@ -6675,10 +6795,19 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
       (record.systems[targetSystem] || []).forEach((segment) => existingRefs.add(String(segment.reference || '').toLowerCase()));
     });
 
-    const previewRows = rows.map((row) => ({
-      ...row,
-      duplicate: existingRefs.has(String(row.reference || '').toLowerCase())
-    }));
+    const refKeys = rows.map((row) => String(row?.reference || '').trim().toLowerCase()).filter(Boolean);
+    const placedDupMap = await findPlacedDuplicatePayloadsByReferences(refKeys);
+
+    const previewRows = rows.map((row) => {
+      const refKey = String(row?.reference || '').trim().toLowerCase();
+      const placedDup = refKey ? placedDupMap.get(refKey) : null;
+      return {
+        ...row,
+        duplicate: existingRefs.has(refKey),
+        placedDuplicate: !!placedDup,
+        placedDuplicateOf: placedDup || null
+      };
+    });
 
     res.json({ success: true, sourceKind: 'DB3', defaultJobsite: cleanString(previewRows[0]?.project || 'NOT SET'), rows: previewRows });
   } catch (error) {
@@ -6717,9 +6846,15 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
     }
 
     const refSet = new Set((record.systems[targetSystem] || []).map((segment) => String(segment.reference || '').toLowerCase()));
+    const queueImport = String(targetClient || '').trim().toLowerCase() === String(PSR_IMPORT_QUEUE_CLIENT).trim().toLowerCase();
+    const commitRefKeys = rows.map((r) => String(r?.reference || '').trim().toLowerCase()).filter(Boolean);
+    const placedAtCommit = queueImport ? await findPlacedDuplicatePayloadsByReferences(commitRefKeys) : new Map();
+
     rows.forEach((row) => {
       if (!row || row.duplicate) return;
       if (refSet.has(String(row.reference || '').toLowerCase())) return;
+      const refKey = String(row.reference || '').trim().toLowerCase();
+      const placedDup = queueImport ? placedAtCommit.get(refKey) || null : null;
       const segment = normalizeSegment({
         id: crypto.randomUUID(),
         reference: row.reference,
@@ -6733,11 +6868,12 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
         street: row.street,
         system: targetSystem,
         db3Imported: row.db3Imported,
+        db3DuplicateOf: placedDup || undefined,
         versions: [
           defaultVersion(req.user.displayName || req.user.username, {
             status: 'neutral',
             recordedDate: record.record_date,
-            notes: 'Imported from WinCan DB3.'
+            notes: placedDup ? 'Imported from WinCan DB3. Flagged: possible double entry (OBJ_Key exists on a placed jobsite).' : 'Imported from WinCan DB3.'
           })
         ]
       }, req.user.displayName || req.user.username);
