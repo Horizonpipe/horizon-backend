@@ -5,6 +5,8 @@ const { PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aw
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const ADMIN_ATTACHMENT_STORAGE_PREFIX = 'app-data/horizon-admin/attachments/';
+/** PipeSync Plan view pages (images or PDF) — same Wasabi bucket, distinct prefix for ACL hygiene. */
+const PIPESYNC_PLAN_PAGE_STORAGE_PREFIX = 'app-data/horizon-pipesync/plan-pages/';
 
 function sanitizeAdminAttachmentFilename(name) {
   const base = String(name || '').split(/[/\\]/).pop() || 'upload.bin';
@@ -17,6 +19,18 @@ function buildAdminAttachmentStorageKey(fileName) {
   return `${ADMIN_ATTACHMENT_STORAGE_PREFIX}${id}/${sanitizeAdminAttachmentFilename(fileName)}`;
 }
 
+function buildPipesyncPlanPageStorageKey(fileName) {
+  const id = crypto.randomUUID();
+  return `${PIPESYNC_PLAN_PAGE_STORAGE_PREFIX}${id}/${sanitizeAdminAttachmentFilename(fileName)}`;
+}
+
+function isValidPipesyncPlanPageStorageKey(key) {
+  if (typeof key !== 'string') return false;
+  if (!key.startsWith(PIPESYNC_PLAN_PAGE_STORAGE_PREFIX)) return false;
+  if (key.length >= 4096 || key.includes('..')) return false;
+  return true;
+}
+
 function isValidAdminAttachmentStorageKey(key) {
   if (typeof key !== 'string') return false;
   if (!key.startsWith(ADMIN_ATTACHMENT_STORAGE_PREFIX)) return false;
@@ -24,10 +38,11 @@ function isValidAdminAttachmentStorageKey(key) {
   return true;
 }
 
-/** @param {'daily-report'|'jobsite-asset'} fileKind */
+/** @param {'daily-report'|'jobsite-asset'|'pipesync-plan-view'} fileKind */
 function isAllowedAdminAttachmentContentType(mime, fileKind) {
   const m = (String(mime || '').trim().toLowerCase() || 'application/octet-stream').split(';')[0].trim();
-  if (fileKind === 'daily-report') return m.startsWith('image/');
+  if (fileKind === 'daily-report') return m.startsWith('image/') || m === 'application/pdf';
+  if (fileKind === 'pipesync-plan-view') return m.startsWith('image/') || m === 'application/pdf';
   return m.startsWith('image/') || m === 'application/pdf';
 }
 
@@ -144,8 +159,11 @@ async function hydrateAdminReportOrAssetRows(client, bucket, rows, filesField, v
 
 module.exports = {
   ADMIN_ATTACHMENT_STORAGE_PREFIX,
+  PIPESYNC_PLAN_PAGE_STORAGE_PREFIX,
   sanitizeAdminAttachmentFilename,
   buildAdminAttachmentStorageKey,
+  buildPipesyncPlanPageStorageKey,
+  isValidPipesyncPlanPageStorageKey,
   isValidAdminAttachmentStorageKey,
   isAllowedAdminAttachmentContentType,
   presignAdminAttachmentPut,

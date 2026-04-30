@@ -17,8 +17,11 @@ const { registerSignupRoutes } = require('./signup.routes');
 const { resolveCapabilities, canAccessAdminPanel, canManagePortalExtras } = require('./capabilities');
 const {
   buildAdminAttachmentStorageKey,
+  buildPipesyncPlanPageStorageKey,
   isAllowedAdminAttachmentContentType,
+  isValidPipesyncPlanPageStorageKey,
   presignAdminAttachmentPut,
+  presignAdminAttachmentGet,
   deleteAdminAttachmentKeys,
   collectAdminAttachmentStorageKeysFromFiles,
   storageKeysRemovedBetweenFileLists,
@@ -290,6 +293,7 @@ const WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATH_SET = new Set(
     '/api/files/folders/zip-manifest',
     '/api/files/presign-batch',
     '/admin/attachments/upload-presign',
+    '/pipesync/plan-view/upload-presign',
     ...String(process.env.WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATHS || '')
       .split(',')
       .map((s) => normalizeWasabiSnapshotHttpSkipPath(s))
@@ -635,6 +639,92 @@ async function hydrateJobsiteAssetsResponseRows(assets) {
     'files',
     ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
   );
+}
+
+async function hydratePlanBoardBranch(branch) {
+  if (!branch || typeof branch !== 'object' || !Array.isArray(branch.pages)) return branch;
+  if (!adminAttachmentsWasabiConfigured()) return branch;
+  const pages = [];
+  for (const p of branch.pages) {
+    if (!p || typeof p !== 'object') continue;
+    const copy = { ...p };
+    delete copy.viewUrl;
+    const sk = String(copy.storageKey || '').trim();
+    if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+      try {
+        const { url } = await presignAdminAttachmentGet(
+          wasabiStateClient,
+          WASABI_STATE_BUCKET,
+          sk,
+          ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+        );
+        copy.src = url;
+      } catch {
+        copy.src = '';
+      }
+    }
+    pages.push(copy);
+  }
+  return { ...branch, pages };
+}
+
+async function hydratePlanViewPayloadForResponse(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  if (payload.v === 2 && payload.imagePlan && payload.pdfMap) {
+    const imagePlan = await hydratePlanBoardBranch(payload.imagePlan);
+    const pdfMap = await hydratePlanBoardBranch(payload.pdfMap);
+    return { ...payload, v: 2, imagePlan, pdfMap };
+  }
+  return hydratePlanBoardBranch(payload);
+}
+
+function sanitizePlanBoardBranch(branch) {
+  if (!branch || typeof branch !== 'object') return branch;
+  let clone;
+  try {
+    clone = JSON.parse(JSON.stringify(branch));
+  } catch {
+    return branch;
+  }
+  if (!Array.isArray(clone.pages)) return clone;
+  clone.pages = clone.pages
+    .map((p) => {
+      if (!p || typeof p !== 'object') return null;
+      const o = { ...p };
+      delete o.viewUrl;
+      const sk = String(o.storageKey || '').trim();
+      if (String(o.kind) === 'pdf') {
+        if (!isValidPipesyncPlanPageStorageKey(sk)) return null;
+        delete o.src;
+        return o;
+      }
+      if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+        delete o.src;
+        return o;
+      }
+      if (sk) delete o.storageKey;
+      return o;
+    })
+    .filter(Boolean);
+  return clone;
+}
+
+function sanitizePlanViewPayloadForPersist(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  let clone;
+  try {
+    clone = JSON.parse(JSON.stringify(payload));
+  } catch {
+    return payload;
+  }
+  if (clone.v === 2 && clone.imagePlan && clone.pdfMap) {
+    return {
+      v: 2,
+      imagePlan: sanitizePlanBoardBranch(clone.imagePlan),
+      pdfMap: sanitizePlanBoardBranch(clone.pdfMap)
+    };
+  }
+  return sanitizePlanBoardBranch(clone);
 }
 
 let wasabiStateSnapshotBusy = false;
@@ -1016,6 +1106,15 @@ function cloneSnapshotRows(rows) {
   }
 }
 
+/** PipeSync Plan view markup — stored only in Wasabi `latest.json` under `data.pipesync_plan_views` (no Postgres table). */
+const PIPESYNC_PLAN_VIEW_TABLE = 'pipesync_plan_views';
+const PIPESYNC_PLAN_VIEW_MAX_BYTES = 14 * 1024 * 1024;
+
+function pipesyncPlanViewUsernameKey(user) {
+  const u = cleanString(user?.username || user?.displayName || '').toLowerCase();
+  return u ? u.slice(0, 200) : '';
+}
+
 /** Tables whose canonical copy is Wasabi when in wasabi-only mode — never overwrite from (empty) Postgres during snapshot export. */
 function wasabiSnapshotTablesPreservedFromLatest() {
   const set = new Set();
@@ -1065,6 +1164,25 @@ async function runWasabiStateSnapshot() {
       } catch (err) {
         data[tableName] = { error: String(err?.message || err) };
       }
+    }
+    // Wasabi-only rows (no Postgres mirror) — merge from current latest so periodic snapshots never erase plan markup.
+    try {
+      let mergeSource = previousSnapshot;
+      if (!mergeSource) {
+        try {
+          mergeSource = await loadWasabiLatestStateSnapshot(false);
+        } catch {
+          mergeSource = null;
+        }
+      }
+      const mergeTables = readWasabiSnapshotDataTables(mergeSource || {}, { strict: false });
+      if (Array.isArray(mergeTables[PIPESYNC_PLAN_VIEW_TABLE])) {
+        data[PIPESYNC_PLAN_VIEW_TABLE] = cloneSnapshotRows(mergeTables[PIPESYNC_PLAN_VIEW_TABLE]);
+      } else if (!Array.isArray(data[PIPESYNC_PLAN_VIEW_TABLE])) {
+        data[PIPESYNC_PLAN_VIEW_TABLE] = [];
+      }
+    } catch {
+      if (!Array.isArray(data[PIPESYNC_PLAN_VIEW_TABLE])) data[PIPESYNC_PLAN_VIEW_TABLE] = [];
     }
     const next = {
       generatedAt: nowIso(),
@@ -5960,6 +6078,119 @@ return res.json({ success: true, records: out });
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+app.get('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, res) => {
+  try {
+    const un = pipesyncPlanViewUsernameKey(req.user);
+    if (!un) {
+      return res.json({ success: true, payload: null, updated_at: null });
+    }
+    if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+      return res.json({ success: true, payload: null, updated_at: null, wasabi: false });
+    }
+    const snap = await loadWasabiLatestStateSnapshot(true);
+    const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
+    const rows = Array.isArray(tables[PIPESYNC_PLAN_VIEW_TABLE]) ? tables[PIPESYNC_PLAN_VIEW_TABLE] : [];
+    const row = rows.find((r) => String(r?.username || '').toLowerCase() === un);
+    let payload = row && row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload) ? row.payload : null;
+    if (payload) payload = await hydratePlanViewPayloadForResponse(payload);
+    return res.json({
+      success: true,
+      payload,
+      updated_at: row?.updated_at || null
+    });
+  } catch (error) {
+    console.error('GET PIPESYNC PLAN VIEW:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, res) => {
+  try {
+    if (!WASABI_WRITES_PRIMARY_ENABLED) {
+      return res.status(503).json({ success: false, error: 'Wasabi primary writes are disabled on this server.' });
+    }
+    if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+      return res.status(503).json({ success: false, error: 'Wasabi state storage is not configured.' });
+    }
+    const un = pipesyncPlanViewUsernameKey(req.user);
+    if (!un) {
+      return res.status(400).json({ success: false, error: 'Account has no username for plan view storage.' });
+    }
+    const payload = req.body?.payload;
+    if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) {
+      return res.status(400).json({ success: false, error: 'Body must be JSON { "payload": { ... } }.' });
+    }
+    const sanitized = sanitizePlanViewPayloadForPersist(payload);
+    const json = JSON.stringify(sanitized);
+    if (json.length > PIPESYNC_PLAN_VIEW_MAX_BYTES) {
+      return res.status(413).json({ success: false, error: 'Plan view data exceeds the maximum save size.' });
+    }
+    const now = nowIso();
+    await runWasabiStateWrite(`pipesync-plan-view:${un}`, async (data) => {
+      const rows = ensureSnapshotTable(data, PIPESYNC_PLAN_VIEW_TABLE);
+      const idx = rows.findIndex((r) => String(r?.username || '').toLowerCase() === un);
+      const row = { username: un, payload: sanitized, updated_at: now };
+      if (idx >= 0) rows[idx] = row;
+      else rows.push(row);
+    });
+    return res.json({ success: true, updated_at: now });
+  } catch (error) {
+    console.error('PUT PIPESYNC PLAN VIEW:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post(
+  '/pipesync/plan-view/upload-presign',
+  requireAuth,
+  requirePsrViewerAccess,
+  express.json({ limit: '64kb' }),
+  async (req, res) => {
+    try {
+      if (!adminAttachmentsWasabiConfigured()) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
+      }
+      const fileName = cleanString(req.body?.fileName);
+      const contentType = cleanString(req.body?.contentType || 'application/octet-stream');
+      const fileSize = Number(req.body?.fileSize);
+      if (!fileName) return res.status(400).json({ success: false, error: 'fileName is required' });
+      if (!Number.isFinite(fileSize) || fileSize < 1 || fileSize > ADMIN_ATTACHMENT_MAX_BYTES) {
+        return res.status(400).json({
+          success: false,
+          error: `fileSize must be between 1 and ${ADMIN_ATTACHMENT_MAX_BYTES} bytes`
+        });
+      }
+      if (!isAllowedAdminAttachmentContentType(contentType, 'pipesync-plan-view')) {
+        return res.status(400).json({ success: false, error: 'Only images and PDF files are allowed for plan view.' });
+      }
+      const storageKey = buildPipesyncPlanPageStorageKey(fileName);
+      const signed = await presignAdminAttachmentPut(
+        wasabiStateClient,
+        WASABI_STATE_BUCKET,
+        storageKey,
+        contentType,
+        ADMIN_ATTACHMENT_UPLOAD_TTL_SECONDS
+      );
+      let viewUrl = null;
+      try {
+        const getSigned = await presignAdminAttachmentGet(
+          wasabiStateClient,
+          WASABI_STATE_BUCKET,
+          storageKey,
+          ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+        );
+        viewUrl = getSigned.url;
+      } catch {
+        /* client can reopen plan view to refresh */
+      }
+      return res.json({ success: true, ...signed, viewUrl });
+    } catch (error) {
+      console.error('PIPESYNC PLAN VIEW UPLOAD PRESIGN:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
 
 app.post('/records', requireAuth, requirePsrDataEntryAccess, async (req, res) => {
   try {
