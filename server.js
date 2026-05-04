@@ -294,6 +294,7 @@ const WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATH_SET = new Set(
     '/api/files/presign-batch',
     '/admin/attachments/upload-presign',
     '/pipesync/plan-view/upload-presign',
+    '/pipesync/plan-view/read-url',
     ...String(process.env.WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATHS || '')
       .split(',')
       .map((s) => normalizeWasabiSnapshotHttpSkipPath(s))
@@ -6187,6 +6188,35 @@ app.post(
       return res.json({ success: true, ...signed, viewUrl });
     } catch (error) {
       console.error('PIPESYNC PLAN VIEW UPLOAD PRESIGN:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+/** Presign GET for an existing plan-board PDF (or image) object when the client has storageKey but no view URL. */
+app.post(
+  '/pipesync/plan-view/read-url',
+  requireAuth,
+  requirePsrViewerAccess,
+  express.json({ limit: '32kb' }),
+  async (req, res) => {
+    try {
+      if (!adminAttachmentsWasabiConfigured()) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
+      }
+      const storageKey = cleanString(req.body?.storageKey);
+      if (!storageKey || !isValidPipesyncPlanPageStorageKey(storageKey)) {
+        return res.status(400).json({ success: false, error: 'A valid plan page storageKey is required.' });
+      }
+      const { url } = await presignAdminAttachmentGet(
+        wasabiStateClient,
+        WASABI_STATE_BUCKET,
+        storageKey,
+        ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+      );
+      return res.json({ success: true, url: typeof url === 'string' ? url : '' });
+    } catch (error) {
+      console.error('PIPESYNC PLAN VIEW READ URL:', error);
       return res.status(500).json({ success: false, error: error.message });
     }
   }
