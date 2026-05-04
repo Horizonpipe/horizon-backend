@@ -683,13 +683,18 @@ async function hydratePlanBoardWorkspacePages(workspaces) {
 }
 
 async function hydratePlanBoardBranch(branch) {
-  if (!branch || typeof branch !== 'object' || !Array.isArray(branch.pages)) return branch;
+  if (!branch || typeof branch !== 'object') return branch;
   if (!adminAttachmentsWasabiConfigured()) return branch;
-  const pages = [];
-  for (const p of branch.pages) {
-    pages.push(await hydratePlanBoardPageRow(p));
+  const next = { ...branch };
+  if (Array.isArray(branch.pages)) {
+    const pages = [];
+    for (const p of branch.pages) {
+      pages.push(await hydratePlanBoardPageRow(p));
+    }
+    next.pages = pages;
+  } else if (!Array.isArray(next.pages)) {
+    next.pages = [];
   }
-  const next = { ...branch, pages };
   if (Array.isArray(branch.mapWorkspaces)) {
     next.mapWorkspaces = await hydratePlanBoardWorkspacePages(branch.mapWorkspaces);
   }
@@ -714,26 +719,29 @@ function sanitizePlanBoardBranch(branch) {
   } catch {
     return branch;
   }
-  if (!Array.isArray(clone.pages)) return clone;
-  clone.pages = clone.pages
-    .map((p) => {
-      if (!p || typeof p !== 'object') return null;
-      const o = { ...p };
-      delete o.viewUrl;
-      const sk = String(o.storageKey || '').trim();
-      if (String(o.kind) === 'pdf') {
-        if (!isValidPipesyncPlanPageStorageKey(sk)) return null;
-        delete o.src;
+  if (Array.isArray(clone.pages)) {
+    clone.pages = clone.pages
+      .map((p) => {
+        if (!p || typeof p !== 'object') return null;
+        const o = { ...p };
+        delete o.viewUrl;
+        const sk = String(o.storageKey || '').trim();
+        if (String(o.kind) === 'pdf') {
+          if (!isValidPipesyncPlanPageStorageKey(sk)) return null;
+          delete o.src;
+          return o;
+        }
+        if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+          delete o.src;
+          return o;
+        }
+        if (sk) delete o.storageKey;
         return o;
-      }
-      if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
-        delete o.src;
-        return o;
-      }
-      if (sk) delete o.storageKey;
-      return o;
-    })
-    .filter(Boolean);
+      })
+      .filter(Boolean);
+  } else {
+    clone.pages = [];
+  }
   if (Array.isArray(clone.mapWorkspaces)) {
     clone.mapWorkspaces = clone.mapWorkspaces
       .map((w) => {
