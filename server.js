@@ -642,31 +642,58 @@ async function hydrateJobsiteAssetsResponseRows(assets) {
   );
 }
 
+async function hydratePlanBoardPageRow(p) {
+  if (!p || typeof p !== 'object') return p;
+  const copy = { ...p };
+  delete copy.viewUrl;
+  const sk = String(copy.storageKey || '').trim();
+  if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+    try {
+      const { url } = await presignAdminAttachmentGet(
+        wasabiStateClient,
+        WASABI_STATE_BUCKET,
+        sk,
+        ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+      );
+      copy.src = url;
+    } catch {
+      copy.src = '';
+    }
+  }
+  return copy;
+}
+
+async function hydratePlanBoardWorkspacePages(workspaces) {
+  if (!Array.isArray(workspaces)) return workspaces;
+  const out = [];
+  for (const w of workspaces) {
+    if (!w || typeof w !== 'object') continue;
+    const wCopy = { ...w };
+    if (Array.isArray(wCopy.pages)) {
+      const wp = [];
+      for (const p of wCopy.pages) {
+        if (!p || typeof p !== 'object') continue;
+        wp.push(await hydratePlanBoardPageRow(p));
+      }
+      wCopy.pages = wp;
+    }
+    out.push(wCopy);
+  }
+  return out;
+}
+
 async function hydratePlanBoardBranch(branch) {
   if (!branch || typeof branch !== 'object' || !Array.isArray(branch.pages)) return branch;
   if (!adminAttachmentsWasabiConfigured()) return branch;
   const pages = [];
   for (const p of branch.pages) {
-    if (!p || typeof p !== 'object') continue;
-    const copy = { ...p };
-    delete copy.viewUrl;
-    const sk = String(copy.storageKey || '').trim();
-    if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
-      try {
-        const { url } = await presignAdminAttachmentGet(
-          wasabiStateClient,
-          WASABI_STATE_BUCKET,
-          sk,
-          ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
-        );
-        copy.src = url;
-      } catch {
-        copy.src = '';
-      }
-    }
-    pages.push(copy);
+    pages.push(await hydratePlanBoardPageRow(p));
   }
-  return { ...branch, pages };
+  const next = { ...branch, pages };
+  if (Array.isArray(branch.mapWorkspaces)) {
+    next.mapWorkspaces = await hydratePlanBoardWorkspacePages(branch.mapWorkspaces);
+  }
+  return next;
 }
 
 async function hydratePlanViewPayloadForResponse(payload) {
@@ -707,6 +734,36 @@ function sanitizePlanBoardBranch(branch) {
       return o;
     })
     .filter(Boolean);
+  if (Array.isArray(clone.mapWorkspaces)) {
+    clone.mapWorkspaces = clone.mapWorkspaces
+      .map((w) => {
+        if (!w || typeof w !== 'object') return w;
+        const wn = { ...w };
+        if (Array.isArray(wn.pages)) {
+          wn.pages = wn.pages
+            .map((p) => {
+              if (!p || typeof p !== 'object') return null;
+              const o = { ...p };
+              delete o.viewUrl;
+              const sk = String(o.storageKey || '').trim();
+              if (String(o.kind) === 'pdf') {
+                if (!isValidPipesyncPlanPageStorageKey(sk)) return null;
+                delete o.src;
+                return o;
+              }
+              if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+                delete o.src;
+                return o;
+              }
+              if (sk) delete o.storageKey;
+              return o;
+            })
+            .filter(Boolean);
+        }
+        return wn;
+      })
+      .filter(Boolean);
+  }
   return clone;
 }
 
