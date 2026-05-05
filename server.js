@@ -1932,8 +1932,36 @@ async function readRecordsFromWasabiSnapshotForUser(user) {
   // Same as record-by-id: do not drop the whole list when snapshot age exceeds threshold — merge with Postgres covers drift.
   if (!snapshot || !snapshot.data) return [];
   const rows = snapshotRows(snapshot, 'planner_records');
-  const normalized = rows.map((row) => normalizeRecordRow(row));
-  return normalized.filter((record) => userCanAccessPsrScope(user, record));
+  // Scope checks must use persisted planner fields (same as POST / Postgres), not display-only fields
+  // from normalizeRecordRow (e.g. jobsite coerced to NOT SET when it matches a segment street).
+  const filteredRaw = rows.filter((row) => userCanAccessPsrScope(user, row));
+  const filtered = filteredRaw.map((row) => normalizeRecordRow(row));
+  const normalizedThenFilterCount = rows
+    .map((row) => normalizeRecordRow(row))
+    .filter((record) => userCanAccessPsrScope(user, record)).length;
+  // #region agent log
+  fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+    body: JSON.stringify({
+      sessionId: '2228ee',
+      hypothesisId: 'D',
+      location: 'server.js:readRecordsFromWasabiSnapshotForUser',
+      message: 'wasabi planner_records scope filter (raw row vs normalize-then-filter)',
+      data: {
+        uid: String(user?.id || ''),
+        isAdmin: !!user?.isAdmin,
+        scopeEntryCount: Array.isArray(user?.psrScopes) ? user.psrScopes.length : 0,
+        rawRowCount: rows.length,
+        afterFilterCount: filtered.length,
+        normalizedThenFilterCount
+      },
+      timestamp: Date.now(),
+      runId: 'post-fix'
+    })
+  }).catch(() => {});
+  // #endregion
+  return filtered;
 }
 
 async function fetchRecordByIdFromWasabiSnapshot(id) {
@@ -2494,13 +2522,20 @@ function normalizeRecordRow(row) {
     }));
   });
 
+  const psrScopeClient = upperCleanString(row.client || data.client);
+  const psrScopeCity = upperCleanString(row.city || data.city);
+  const psrScopeJobsite = normalizeJobsiteName(rawJobsite, rawStreet);
+
   return {
     id: String(row.id),
     record_date: String(row.record_date || '').slice(0, 10),
-    client: upperCleanString(row.client || data.client),
-    city: upperCleanString(row.city || data.city),
+    client: psrScopeClient,
+    city: psrScopeCity,
     street: upperCleanString(fallbackStreet),
-    jobsite: looksLikeStreetOnly ? 'NOT SET' : normalizeJobsiteName(rawJobsite, rawStreet),
+    jobsite: looksLikeStreetOnly ? 'NOT SET' : psrScopeJobsite,
+    psrScopeClient,
+    psrScopeCity,
+    psrScopeJobsite,
     status: cleanString(row.status || data.status),
     saved_by: cleanString(row.saved_by || data.saved_by),
     systems,
@@ -2866,10 +2901,18 @@ function userCanAccessPsrScope(user, scope) {
   if (user?.isAdmin) return true;
   const scopes = dedupePsrScopes(user?.psrScopes || []);
   if (!scopes.length) return false;
+  const data =
+    scope && scope.data && typeof scope.data === 'object' && !Array.isArray(scope.data) ? scope.data : {};
   const recId = cleanString(scope?.id || scope?.recordId || '');
-  const client = upperCleanString(scope?.client);
-  const city = upperCleanString(scope?.city);
-  const jobsite = normalizeJobsiteName(scope?.jobsite, scope?.street);
+  /** Persisted planner row triple (matches POST / SQL). NOT display jobsite (e.g. segment UI may coerce jobsite to NOT SET). */
+  const client = upperCleanString(
+    scope?.psrScopeClient ?? scope?.authClientForPsrScope ?? scope?.client ?? data.client
+  );
+  const city = upperCleanString(scope?.psrScopeCity ?? scope?.authCityForPsrScope ?? scope?.city ?? data.city);
+  const persistedJobsite = cleanString(scope?.psrScopeJobsite ?? scope?.authJobsiteForPsrScope ?? '');
+  const jobsite = persistedJobsite
+    ? persistedJobsite
+    : normalizeJobsiteName(scope?.jobsite || data.jobsite, scope?.street || data.street);
   const tripleReady = !!(client && city && jobsite);
   return scopes.some((entry) => {
     const eRid = cleanString(entry.recordId || '');
@@ -4199,10 +4242,49 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
     return res.status(400).json({ success: false, error: 'Username is required' });
   }
 
+  let insertedPgId = null;
   try {
     const hash = await bcrypt.hash(password, 10);
+
+    const dupPg = await pool.query(
+      `SELECT 1 FROM users WHERE LOWER(TRIM(username)) = LOWER(TRIM($1)) LIMIT 1`,
+      [username]
+    );
+    if (dupPg.rows.length) {
+      return res.status(409).json({ success: false, error: 'Username already exists' });
+    }
+
     if (WASABI_WRITES_PRIMARY_ENABLED) {
-      let createdRow = null;
+      try {
+        const snapshot = await loadWasabiLatestStateSnapshot(true);
+        const usernameLower = String(username).trim().toLowerCase();
+        if (
+          snapshotRows(snapshot, 'users').some(
+            (u) => String(u.username || '').trim().toLowerCase() === usernameLower
+          )
+        ) {
+          return res.status(409).json({ success: false, error: 'Username already exists' });
+        }
+      } catch (preSnapErr) {
+        console.warn('[create-user] Could not pre-check Wasabi users list:', preSnapErr?.message || preSnapErr);
+      }
+    }
+
+    const result = await pool.query(
+      `INSERT INTO users (
+         username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup
+       )
+       VALUES ($1, $2, $3, $4, $5::jsonb, true, NULL, NULL, false, false)
+       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup`,
+      [username, displayName, hash, isAdmin, JSON.stringify(roles)]
+    );
+    insertedPgId = result.rows[0].id;
+
+    /**
+     * GET /users reads Postgres for the permissions UI. When Wasabi writes are primary, mirror new users into the
+     * snapshot using the same id as Postgres so PUT /users/:id stays aligned with the snapshot.
+     */
+    if (WASABI_WRITES_PRIMARY_ENABLED) {
       const wrote = await tryWasabiStateWrite('create-user', async (data) => {
         const users = ensureSnapshotTable(data, 'users');
         const usernameLower = String(username).trim().toLowerCase();
@@ -4212,13 +4294,8 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
           err.code = '23505';
           throw err;
         }
-        const numericIds = users
-          .map((u) => Number(u.id))
-          .filter((n) => Number.isFinite(n))
-          .sort((a, b) => b - a);
-        const nextId = numericIds.length ? numericIds[0] + 1 : 1;
-        createdRow = {
-          id: nextId,
+        users.push({
+          id: insertedPgId,
           username,
           display_name: displayName,
           password: hash,
@@ -4233,26 +4310,15 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
           email_verified: true,
           created_at: nowIso(),
           updated_at: nowIso()
-        };
-        users.push(createdRow);
-      });
-      if (wrote) {
-        const user = await attachScopesToUser(normalizeUser(createdRow));
-        return res.status(201).json({
-          success: true,
-          user,
-          message: 'User created with no access. Assign roles/portal scope to enable.'
         });
+      });
+      if (!wrote) {
+        console.warn(
+          '[create-user] Wasabi snapshot was not updated; user row exists in Postgres (admin list / GET /users).'
+        );
       }
     }
-    const result = await pool.query(
-      `INSERT INTO users (
-         username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup
-       )
-       VALUES ($1, $2, $3, $4, $5::jsonb, true, NULL, NULL, false, false)
-       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup`,
-      [username, displayName, hash, isAdmin, JSON.stringify(roles)]
-    );
+
     const user = await attachScopesToUser(normalizeUser(result.rows[0]));
     res.status(201).json({
       success: true,
@@ -4260,6 +4326,9 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
       message: 'User created with no access. Assign roles/portal scope to enable.'
     });
   } catch (error) {
+    if (insertedPgId) {
+      await pool.query('DELETE FROM users WHERE id = $1', [insertedPgId]).catch(() => {});
+    }
     console.error('CREATE USER ERROR:', error);
     if (error.code === '23505') {
       return res.status(409).json({ success: false, error: 'Username already exists' });
@@ -4658,13 +4727,55 @@ app.get('/records', requireAuth, requirePsrViewerAccess, async (req, res) => {
       } catch (error) {
         if (WASABI_RECORDS_PRIMARY_STRICT) throw error;
       }
-      return res.json({ success: true, records: sortPlannerRecordsForList(snapshotRecords) });
+      const out = sortPlannerRecordsForList(snapshotRecords);
+      // #region agent log
+      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+        body: JSON.stringify({
+          sessionId: '2228ee',
+          hypothesisId: 'A',
+          location: 'server.js:GET/records',
+          message: 'branch wasabi_only',
+          data: {
+            uid: String(req.user?.id || ''),
+            isAdmin: !!req.user?.isAdmin,
+            scopeEntryCount: Array.isArray(req.user?.psrScopes) ? req.user.psrScopes.length : 0,
+            recordCount: out.length
+          },
+          timestamp: Date.now(),
+          runId: 'pre-fix'
+        })
+      }).catch(() => {});
+      // #endregion
+      return res.json({ success: true, records: out });
     }
 
     const pgRecords = await readPlannerRecordsFromPostgresForUser(req.user);
 
     if (!WASABI_RECORDS_PRIMARY_ENABLED) {
-      return res.json({ success: true, records: sortPlannerRecordsForList(pgRecords) });
+      const out = sortPlannerRecordsForList(pgRecords);
+      // #region agent log
+      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+        body: JSON.stringify({
+          sessionId: '2228ee',
+          hypothesisId: 'A',
+          location: 'server.js:GET/records',
+          message: 'branch postgres_only',
+          data: {
+            uid: String(req.user?.id || ''),
+            isAdmin: !!req.user?.isAdmin,
+            scopeEntryCount: Array.isArray(req.user?.psrScopes) ? req.user.psrScopes.length : 0,
+            recordCount: out.length
+          },
+          timestamp: Date.now(),
+          runId: 'pre-fix'
+        })
+      }).catch(() => {});
+      // #endregion
+      return res.json({ success: true, records: out });
     }
 
     let snapshotRecords = [];
@@ -4675,7 +4786,30 @@ app.get('/records', requireAuth, requirePsrViewerAccess, async (req, res) => {
     }
 
     const merged = mergePlannerRecordsById(snapshotRecords, pgRecords);
-    return res.json({ success: true, records: sortPlannerRecordsForList(merged) });
+    const out = sortPlannerRecordsForList(merged);
+    // #region agent log
+    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+      body: JSON.stringify({
+        sessionId: '2228ee',
+        hypothesisId: 'A',
+        location: 'server.js:GET/records',
+        message: 'branch merge_wasabi_postgres',
+        data: {
+          uid: String(req.user?.id || ''),
+          isAdmin: !!req.user?.isAdmin,
+          scopeEntryCount: Array.isArray(req.user?.psrScopes) ? req.user.psrScopes.length : 0,
+          wasabiFilteredCount: snapshotRecords.length,
+          pgCount: pgRecords.length,
+          mergedCount: out.length
+        },
+        timestamp: Date.now(),
+        runId: 'pre-fix'
+      })
+    }).catch(() => {});
+    // #endregion
+    return res.json({ success: true, records: out });
   } catch (error) {
     console.error('GET RECORDS ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -5012,6 +5146,26 @@ app.post('/records/:id/segments', requireAuth, requirePsrDataEntryAccess, async 
     record.saved_by = req.user.displayName || req.user.username;
 
     const saved = await persistRecord(record);
+    // #region agent log
+    const _segN = (saved?.systems?.[system] || []).length;
+    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
+      body: JSON.stringify({
+        sessionId: '2228ee',
+        hypothesisId: 'C',
+        location: 'server.js:POST/records/:id/segments',
+        message: 'segment persisted',
+        data: {
+          recordIdLen: String(req.params.id || '').length,
+          system,
+          segmentCountInSystem: _segN
+        },
+        timestamp: Date.now(),
+        runId: 'pre-fix'
+      })
+    }).catch(() => {});
+    // #endregion
     res.status(201).json({ success: true, record: saved, segment });
   } catch (error) {
     console.error('ADD SEGMENT ERROR:', error);
