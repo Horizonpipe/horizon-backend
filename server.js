@@ -3,6 +3,9 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const zlib = require('zlib');
 const multer = require('multer');
 const initSqlJs = require('sql.js');
 const { Pool } = require('pg');
@@ -11,10 +14,25 @@ const { ensureOutlookSchema, registerOutlookRoutes } = require('./outlook');
 const { registerPortalFilesRoutes } = require('./portal-files.routes');
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
 const { registerSignupRoutes } = require('./signup.routes');
-const { resolveCapabilities, canAccessAdminPanel } = require('./capabilities');
+const { resolveCapabilities, canAccessAdminPanel, canManagePortalExtras } = require('./capabilities');
+const {
+  buildAdminAttachmentStorageKey,
+  buildPipesyncPlanPageStorageKey,
+  isAllowedAdminAttachmentContentType,
+  isValidPipesyncPlanPageStorageKey,
+  presignAdminAttachmentPut,
+  presignAdminAttachmentGet,
+  deleteAdminAttachmentKeys,
+  collectAdminAttachmentStorageKeysFromFiles,
+  storageKeysRemovedBetweenFileLists,
+  normalizeAdminFilesForPersist,
+  hydrateAdminReportOrAssetRows
+} = require('./admin-attachments-wasabi');
 
 const app = express();
 app.set('trust proxy', 1);
+/** Express defaults to weak ETags on res.json(); browsers cache GET /records etc. and revalidate with If-None-Match → 304 with an empty body. fetch() then fails or yields no JSON, and the planner clears after a silent refresh. */
+app.set('etag', false);
 
 /** Comma-separated list, or a single `*` to reflect any Origin (Bearer auth still required for data). */
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
@@ -55,6 +73,7 @@ const corsOptions = {
     'Authorization',
     'X-Session-Token',
     'X-HP-Portal-Mode',
+    'X-Horizon-Client',
     'Range',
     'Accept',
     'If-None-Match',
@@ -65,16 +84,69 @@ const corsOptions = {
     'Content-Length',
     'Content-Type',
     'Content-Range',
-    'Accept-Ranges'
+    'Accept-Ranges',
+    'Content-Encoding',
+    'Vary'
   ]
 };
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
+
+function clampHttpCompressionInt(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+/** When false, skip `compression` middleware entirely (Render CPU vs egress tradeoff). */
+const HTTP_COMPRESSION_ENABLED = String(process.env.HTTP_COMPRESSION || '1').trim() !== '0';
+/** Bytes; 0 = always attempt (tiny JSON may grow slightly — rare). Default 256 so repetitive file-list JSON is gzipped. */
+const HTTP_COMPRESSION_THRESHOLD = clampHttpCompressionInt(
+  process.env.HTTP_COMPRESSION_THRESHOLD,
+  0,
+  1024 * 1024,
+  256
+);
+/** zlib gzip level 1 (fast) … 9 (smaller). Default 6; use 7–8 for heavier JSON APIs if CPU allows. */
+const HTTP_COMPRESSION_LEVEL = clampHttpCompressionInt(process.env.HTTP_COMPRESSION_LEVEL, 1, 9, 6);
+
+/**
+ * Do not gzip Wasabi→client proxy streams (video/range); wastes CPU and can break length semantics.
+ * Presigned JSON and /api/files/tree still compress normally.
+ */
+function shouldSkipHttpCompressionForStreamingDownload(req) {
+  const method = String(req.method || 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD') return false;
+  const p = req.path || '';
+  if (p.startsWith('/api/files/download/')) return true;
+  if (/^\/api\/files\/share-view\/[^/]+\/download\//.test(p)) return true;
+  if (/^\/api\/guest\/share\/[^/]+\/download\//.test(p)) return true;
+  return false;
+}
+
 try {
   // eslint-disable-next-line global-require
   const compression = require('compression');
-  app.use(compression({ threshold: 1024 }));
+  if (HTTP_COMPRESSION_ENABLED) {
+    app.use(
+      compression({
+        threshold: HTTP_COMPRESSION_THRESHOLD,
+        level: HTTP_COMPRESSION_LEVEL,
+        chunkSize: 32 * 1024,
+        filter: (req, res) => {
+          if (req.headers['x-no-compression']) return false;
+          if (shouldSkipHttpCompressionForStreamingDownload(req)) return false;
+          return compression.filter(req, res);
+        }
+      })
+    );
+    console.info(
+      `[http] Response compression: gzip enabled (threshold=${HTTP_COMPRESSION_THRESHOLD}b, level=${HTTP_COMPRESSION_LEVEL}). Set HTTP_COMPRESSION=0 to disable.`
+    );
+  } else {
+    console.info('[http] Response compression disabled (HTTP_COMPRESSION=0).');
+  }
 } catch {
   console.warn('[http] Install optional `compression` (npm i) to gzip JSON/text API responses and cut HTTP egress.');
 }
@@ -86,7 +158,8 @@ app.use((req, res, next) => {
     const writable = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
     if (!writable) return;
     if (res.statusCode >= 500) return;
-    queueWasabiStateSnapshot(`${method} ${req.originalUrl || req.url || ''}`);
+    if (requestPathSkipsWasabiStateSnapshot(req)) return;
+    queueWasabiStateSnapshot(req);
   });
   next();
 });
@@ -154,24 +227,144 @@ const WASABI_STATE_BUCKET = String(process.env.WASABI_BUCKET || '').trim();
 const WASABI_STATE_PREFIX = String(process.env.WASABI_PIPESYNC_STATE_PREFIX || 'clients/portal-users/jobs/3/system-state')
   .trim()
   .replace(/\/+$/, '');
+/** Upper cap for timed snapshot interval (Render env); default 24h. Lower with `WASABI_STATE_SNAPSHOT_MAX_MS` if needed. */
+const WASABI_STATE_SNAPSHOT_MAX_MS = Math.max(
+  60000,
+  Math.min(86400000, Number(process.env.WASABI_STATE_SNAPSHOT_MAX_MS || 86400000))
+);
 const WASABI_STATE_SNAPSHOT_MS = Math.max(
   10000,
-  Math.min(300000, Number(process.env.WASABI_STATE_SNAPSHOT_MS || 60000))
+  Math.min(WASABI_STATE_SNAPSHOT_MAX_MS, Number(process.env.WASABI_STATE_SNAPSHOT_MS || 300000))
 );
 const WASABI_STATE_SNAPSHOT_ON_WRITE =
   String(process.env.WASABI_STATE_SNAPSHOT_ON_WRITE || '1').trim().toLowerCase() !== '0';
+/** PipeSync / staff APIs and everything not classified as portal or autosync (short debounce). */
 const WASABI_STATE_WRITE_DEBOUNCE_MS = Math.max(
   1000,
-  Math.min(60000, Number(process.env.WASABI_STATE_WRITE_DEBOUNCE_MS || 5000))
+  Math.min(60000, Number(process.env.WASABI_STATE_WRITE_DEBOUNCE_MS || 8000))
 );
-/** Duplicate full JSON to `history/snapshot-*.json` on each state write (doubles Wasabi upload). Set `0` to skip archives if you only need `latest.json`. */
+/**
+ * PipeShare + file explorer (`/api/files` mutations except fast-path rows below): long debounce so bursts of
+ * folder ops/uploads do not schedule full-state Wasabi exports often.
+ */
+const WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS = Math.max(
+  5000,
+  Math.min(600000, Number(process.env.WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS || 120000))
+);
+/** Data Auto Sync desktop (`X-Horizon-Client: horizon-data-autosync`): longest debounce (optional third tier). */
+const WASABI_STATE_WRITE_DEBOUNCE_AUTOSYNC_MS = Math.max(
+  5000,
+  Math.min(900000, Number(process.env.WASABI_STATE_WRITE_DEBOUNCE_AUTOSYNC_MS || 180000))
+);
+/** Duplicate full JSON to `history/snapshot-*.json` on each state write (doubles Wasabi upload). Set `1` to enable archives. Default `0` keeps Wasabi writes lighter. */
 const WASABI_STATE_ARCHIVE_SNAPSHOTS =
-  String(process.env.WASABI_STATE_ARCHIVE_SNAPSHOTS || '1').trim().toLowerCase() !== '0';
+  String(process.env.WASABI_STATE_ARCHIVE_SNAPSHOTS || '0').trim().toLowerCase() === '1';
+/** When true, gzip `latest.json` (and archives) before PUT; reads accept gzip or legacy plain JSON. Set `WASABI_STATE_SNAPSHOT_GZIP=0` to disable. */
+const WASABI_STATE_SNAPSHOT_GZIP =
+  String(process.env.WASABI_STATE_SNAPSHOT_GZIP || '1').trim().toLowerCase() !== '0';
 /** In-memory TTL for repeated reads of `latest.json` (non-force); lowers Wasabi download volume. */
 const WASABI_LATEST_STATE_CACHE_MS = Math.max(
   1000,
-  Math.min(300000, Number(process.env.WASABI_LATEST_STATE_CACHE_MS || 15000))
+  Math.min(300000, Number(process.env.WASABI_LATEST_STATE_CACHE_MS || 30000))
 );
+/** POST paths that must not trigger on-write Wasabi state snapshots (high volume, no app-table mutations). */
+function normalizeWasabiSnapshotHttpSkipPath(p) {
+  const s = String(p || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\/+$/, '');
+  return s || '/';
+}
+const WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATH_SET = new Set(
+  [
+    '/api/files/check-paths',
+    '/api/files/find-hash-paths',
+    '/api/files/upload/presign',
+    '/api/files/upload/multipart/init',
+    '/api/files/upload/multipart/sign-parts',
+    '/api/files/upload/multipart/complete',
+    '/api/files/upload/multipart/abort',
+    '/api/files/upload/register-sha256',
+    '/api/files/upload/resumable/init',
+    '/api/files/upload/resumable/sign-part',
+    '/api/files/upload/resumable/part-complete',
+    '/api/files/upload/resumable/complete',
+    '/api/files/upload/resumable/abort',
+    '/api/files/folders/zip-manifest',
+    '/api/files/presign-batch',
+    '/admin/attachments/upload-presign',
+    '/pipesync/plan-view/upload-presign',
+    '/pipesync/plan-view/read-url',
+    ...String(process.env.WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATHS || '')
+      .split(',')
+      .map((s) => normalizeWasabiSnapshotHttpSkipPath(s))
+      .filter((s) => s !== '/')
+  ].map((s) => normalizeWasabiSnapshotHttpSkipPath(s))
+);
+function requestPathSkipsWasabiStateSnapshot(req) {
+  const raw = String(req.originalUrl || req.url || '').split('?')[0].split('#')[0];
+  const n = normalizeWasabiSnapshotHttpSkipPath(raw);
+  if (WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATH_SET.has(n)) return true;
+  /* Desktop telemetry / heartbeats: no app-wide snapshot (indexing + uploads already skip most /api/files paths). */
+  if (n.startsWith('/auto-import-plugin/')) return true;
+  return false;
+}
+
+function readHorizonClientHeader(req) {
+  try {
+    const h = req.get && req.get('x-horizon-client');
+    return h ? String(h).trim().toLowerCase() : '';
+  } catch {
+    return '';
+  }
+}
+
+/** Portal ACL + share links: keep PipeSync-class debounce so permission editors see backups reasonably soon. */
+const WASABI_STATE_SNAPSHOT_PORTAL_FAST_DEBOUNCE_PATHS = String(
+  process.env.WASABI_STATE_SNAPSHOT_PORTAL_FAST_DEBOUNCE_PATHS ||
+    '/api/files/permissions,/api/files/shares,/api/files/share-view'
+)
+  .split(',')
+  .map((s) => normalizeWasabiSnapshotHttpSkipPath(s))
+  .filter((s) => s && s !== '/');
+
+/**
+ * Optional extra path prefixes (normalized) that must use PipeSync debounce (`WASABI_STATE_WRITE_DEBOUNCE_MS`).
+ * Leave unset: every route that is not `/api/files`, `/api/guest`, or a portal-fast path already uses PipeSync timing.
+ * Set when you introduce a new top-level API and want to force the short debounce explicitly.
+ */
+const WASABI_STATE_SNAPSHOT_PIPESYNC_DEBOUNCE_PREFIXES = String(
+  process.env.WASABI_STATE_SNAPSHOT_PIPESYNC_DEBOUNCE_PREFIXES || ''
+)
+  .split(',')
+  .map((s) => normalizeWasabiSnapshotHttpSkipPath(s))
+  .filter((s) => s && s !== '/');
+
+function wasabiSnapshotDebounceMsForRequest(req) {
+  const hc = readHorizonClientHeader(req);
+  if (
+    hc &&
+    (hc.includes('dataautosync') ||
+      hc.includes('horizon-data-autosync') ||
+      hc.includes('java-desktop') ||
+      hc === 'autosync')
+  ) {
+    return WASABI_STATE_WRITE_DEBOUNCE_AUTOSYNC_MS;
+  }
+  if (hc && (hc.includes('pipeshare') || hc.includes('file-explorer') || hc.includes('portal-files'))) {
+    return WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS;
+  }
+  const raw = String(req.originalUrl || req.url || '').split('?')[0].split('#')[0];
+  const p = normalizeWasabiSnapshotHttpSkipPath(raw);
+  for (const sp of WASABI_STATE_SNAPSHOT_PORTAL_FAST_DEBOUNCE_PATHS) {
+    if (p === sp || p.startsWith(`${sp}/`)) return WASABI_STATE_WRITE_DEBOUNCE_MS;
+  }
+  for (const hp of WASABI_STATE_SNAPSHOT_PIPESYNC_DEBOUNCE_PREFIXES) {
+    if (p === hp || p.startsWith(`${hp}/`)) return WASABI_STATE_WRITE_DEBOUNCE_MS;
+  }
+  if (p.startsWith('/api/files') || p.startsWith('/api/guest')) return WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS;
+  return WASABI_STATE_WRITE_DEBOUNCE_MS;
+}
 const WASABI_WRITES_PRIMARY_ENABLED =
   String(process.env.WASABI_WRITES_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
 const WASABI_WRITES_PRIMARY_STRICT =
@@ -197,6 +390,34 @@ const WASABI_SQL_MIRROR_MAX_BUFFER = Math.max(
   10,
   Math.min(500, Number(process.env.WASABI_SQL_MIRROR_MAX_BUFFER || 100))
 );
+/** Base table name for skip matching (`public.foo` → `foo`). */
+function sqlMirrorSkipBaseTable(raw) {
+  const t = String(raw || '')
+    .trim()
+    .replace(/"/g, '');
+  if (!t) return '';
+  const i = t.lastIndexOf('.');
+  return (i >= 0 ? t.slice(i + 1) : t).toLowerCase();
+}
+/**
+ * Comma-separated base table names whose INSERT/UPDATE/DELETE should not enqueue Wasabi SQL-mirror batches.
+ * Unset: default skips high-churn portal upload metadata (`portal_object_sha256`, resumable session tables).
+ * `none` or empty: mirror all mutations again.
+ */
+function buildWasabiSqlMirrorSkipTableSet() {
+  const raw = process.env.WASABI_SQL_MIRROR_SKIP_TABLES;
+  const defaults = ['portal_object_sha256', 'portal_upload_sessions', 'portal_upload_session_parts'];
+  if (raw === undefined) return new Set(defaults);
+  const trimmed = String(raw).trim();
+  if (!trimmed || trimmed.toLowerCase() === 'none') return new Set();
+  const out = new Set();
+  for (const piece of trimmed.split(',')) {
+    const b = sqlMirrorSkipBaseTable(piece);
+    if (b) out.add(b);
+  }
+  return out;
+}
+const WASABI_SQL_MIRROR_SKIP_TABLE_SET = buildWasabiSqlMirrorSkipTableSet();
 const WASABI_AUTH_FALLBACK_ENABLED =
   String(process.env.WASABI_AUTH_FALLBACK_ENABLED || '1').trim().toLowerCase() !== '0';
 const WASABI_AUTH_FALLBACK_CACHE_MS = Math.max(
@@ -287,6 +508,9 @@ const WASABI_SYNC_STATE_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
   5000,
   Math.min(15 * 60 * 1000, Number(process.env.WASABI_SYNC_STATE_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
 );
+/** In-process cache for GET /sync-state (PipeSync polls; avoids repeated meta queries). 0 disables. */
+const SYNC_STATE_HTTP_CACHE_MS = Math.max(0, Math.min(120000, Number(process.env.SYNC_STATE_HTTP_CACHE_MS ?? 4000)));
+let syncStateHttpCache = { expiresAt: 0, payload: null };
 const WASABI_USERS_PRIMARY_ENABLED =
   WASABI_ALL_READS_PRIMARY_ENABLED || String(process.env.WASABI_USERS_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
 const WASABI_USERS_PRIMARY_STRICT =
@@ -376,6 +600,199 @@ const WASABI_STATE_EXCLUDE_TABLES = new Set(
     .filter(Boolean)
 );
 const wasabiStateClient = createWasabiStateClient();
+
+const ADMIN_ATTACHMENT_MAX_BYTES = Math.max(
+  1024,
+  Math.min(50 * 1024 * 1024, Number(process.env.ADMIN_ATTACHMENT_MAX_BYTES || 25 * 1024 * 1024))
+);
+const ADMIN_ATTACHMENT_UPLOAD_TTL_SECONDS = Math.max(
+  60,
+  Math.min(86400, Number(process.env.ADMIN_ATTACHMENT_UPLOAD_TTL_SECONDS || 3600))
+);
+const ADMIN_ATTACHMENT_VIEW_TTL_SECONDS = Math.max(
+  300,
+  Math.min(604800, Number(process.env.ADMIN_ATTACHMENT_VIEW_TTL_SECONDS || 86400))
+);
+
+function adminAttachmentsWasabiConfigured() {
+  return !!(wasabiStateClient && WASABI_STATE_BUCKET);
+}
+
+async function hydrateDailyReportsResponseRows(reports) {
+  const list = Array.isArray(reports) ? reports : [];
+  if (!adminAttachmentsWasabiConfigured()) return list;
+  return hydrateAdminReportOrAssetRows(
+    wasabiStateClient,
+    WASABI_STATE_BUCKET,
+    list,
+    'files',
+    ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+  );
+}
+
+async function hydrateJobsiteAssetsResponseRows(assets) {
+  const list = Array.isArray(assets) ? assets : [];
+  if (!adminAttachmentsWasabiConfigured()) return list;
+  return hydrateAdminReportOrAssetRows(
+    wasabiStateClient,
+    WASABI_STATE_BUCKET,
+    list,
+    'files',
+    ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+  );
+}
+
+async function hydratePlanBoardPageRow(p) {
+  if (!p || typeof p !== 'object') return p;
+  const copy = { ...p };
+  delete copy.viewUrl;
+  const sk = String(copy.storageKey || '').trim();
+  if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+    try {
+      const { url } = await presignAdminAttachmentGet(
+        wasabiStateClient,
+        WASABI_STATE_BUCKET,
+        sk,
+        ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+      );
+      copy.src = url;
+    } catch {
+      copy.src = '';
+    }
+  }
+  return copy;
+}
+
+async function hydratePlanBoardWorkspacePages(workspaces) {
+  if (!Array.isArray(workspaces)) return workspaces;
+  const out = [];
+  for (const w of workspaces) {
+    if (!w || typeof w !== 'object') continue;
+    const wCopy = { ...w };
+    if (Array.isArray(wCopy.pages)) {
+      const wp = [];
+      for (const p of wCopy.pages) {
+        if (!p || typeof p !== 'object') continue;
+        wp.push(await hydratePlanBoardPageRow(p));
+      }
+      wCopy.pages = wp;
+    }
+    out.push(wCopy);
+  }
+  return out;
+}
+
+async function hydratePlanBoardBranch(branch) {
+  if (!branch || typeof branch !== 'object') return branch;
+  if (!adminAttachmentsWasabiConfigured()) return branch;
+  const next = { ...branch };
+  if (Array.isArray(branch.pages)) {
+    const pages = [];
+    for (const p of branch.pages) {
+      pages.push(await hydratePlanBoardPageRow(p));
+    }
+    next.pages = pages;
+  } else if (!Array.isArray(next.pages)) {
+    next.pages = [];
+  }
+  if (Array.isArray(branch.mapWorkspaces)) {
+    next.mapWorkspaces = await hydratePlanBoardWorkspacePages(branch.mapWorkspaces);
+  }
+  return next;
+}
+
+async function hydratePlanViewPayloadForResponse(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  if (payload.v === 2 && payload.imagePlan && payload.pdfMap) {
+    const imagePlan = await hydratePlanBoardBranch(payload.imagePlan);
+    const pdfMap = await hydratePlanBoardBranch(payload.pdfMap);
+    return { ...payload, v: 2, imagePlan, pdfMap };
+  }
+  return hydratePlanBoardBranch(payload);
+}
+
+function sanitizePlanBoardBranch(branch) {
+  if (!branch || typeof branch !== 'object') return branch;
+  let clone;
+  try {
+    clone = JSON.parse(JSON.stringify(branch));
+  } catch {
+    return branch;
+  }
+  if (Array.isArray(clone.pages)) {
+    clone.pages = clone.pages
+      .map((p) => {
+        if (!p || typeof p !== 'object') return null;
+        const o = { ...p };
+        delete o.viewUrl;
+        const sk = String(o.storageKey || '').trim();
+        if (String(o.kind) === 'pdf') {
+          if (!isValidPipesyncPlanPageStorageKey(sk)) return null;
+          delete o.src;
+          return o;
+        }
+        if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+          delete o.src;
+          return o;
+        }
+        if (sk) delete o.storageKey;
+        return o;
+      })
+      .filter(Boolean);
+  } else {
+    clone.pages = [];
+  }
+  if (Array.isArray(clone.mapWorkspaces)) {
+    clone.mapWorkspaces = clone.mapWorkspaces
+      .map((w) => {
+        if (!w || typeof w !== 'object') return w;
+        const wn = { ...w };
+        if (Array.isArray(wn.pages)) {
+          wn.pages = wn.pages
+            .map((p) => {
+              if (!p || typeof p !== 'object') return null;
+              const o = { ...p };
+              delete o.viewUrl;
+              const sk = String(o.storageKey || '').trim();
+              if (String(o.kind) === 'pdf') {
+                if (!isValidPipesyncPlanPageStorageKey(sk)) return null;
+                delete o.src;
+                return o;
+              }
+              if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+                delete o.src;
+                return o;
+              }
+              if (sk) delete o.storageKey;
+              return o;
+            })
+            .filter(Boolean);
+        }
+        return wn;
+      })
+      .filter(Boolean);
+  }
+  return clone;
+}
+
+function sanitizePlanViewPayloadForPersist(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  let clone;
+  try {
+    clone = JSON.parse(JSON.stringify(payload));
+  } catch {
+    return payload;
+  }
+  if (clone.v === 2 && clone.imagePlan && clone.pdfMap) {
+    return {
+      v: 2,
+      imagePlan: sanitizePlanBoardBranch(clone.imagePlan),
+      pdfMap: sanitizePlanBoardBranch(clone.pdfMap)
+    };
+  }
+  return sanitizePlanBoardBranch(clone);
+}
+
 let wasabiStateSnapshotBusy = false;
 let wasabiStateSnapshotTimer = null;
 let wasabiStateLastQueuedAt = 0;
@@ -424,6 +841,16 @@ async function bodyToBuffer(body) {
   return Buffer.concat(chunks);
 }
 
+function decodeWasabiStateSnapshotBody(raw, contentEncoding) {
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw || []);
+  const enc = String(contentEncoding || '').toLowerCase();
+  const gzipMagic = buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+  if (enc.includes('gzip') || gzipMagic) {
+    return zlib.gunzipSync(buf).toString('utf8');
+  }
+  return buf.toString('utf8');
+}
+
 async function loadWasabiLatestStateSnapshot(force = false) {
   if (!wasabiStateClient || !WASABI_STATE_BUCKET) return null;
   const now = Date.now();
@@ -437,7 +864,8 @@ async function loadWasabiLatestStateSnapshot(force = false) {
     })
   );
   const raw = await bodyToBuffer(out.Body);
-  const parsed = JSON.parse(raw.toString('utf8'));
+  const jsonText = decodeWasabiStateSnapshotBody(raw, out.ContentEncoding);
+  const parsed = JSON.parse(jsonText);
   wasabiLatestStateCache = parsed;
   wasabiLatestStateCacheAt = now;
   return parsed;
@@ -452,24 +880,32 @@ async function putWasabiStateObject(stateObject) {
     throw new Error('Wasabi state client is not configured');
   }
   const stamp = nowIso().replace(/[:.]/g, '-');
-  const payload = Buffer.from(JSON.stringify(stateObject), 'utf8');
+  const rawJson = Buffer.from(JSON.stringify(stateObject), 'utf8');
+  let payload = rawJson;
+  let contentEncoding;
+  if (WASABI_STATE_SNAPSHOT_GZIP) {
+    payload = zlib.gzipSync(rawJson);
+    contentEncoding = 'gzip';
+  }
   const latestKey = `${WASABI_STATE_PREFIX}/latest.json`;
   const archiveKey = `${WASABI_STATE_PREFIX}/history/snapshot-${stamp}.json`;
+  const putBase = {
+    Bucket: WASABI_STATE_BUCKET,
+    Body: payload,
+    ContentType: 'application/json'
+  };
+  if (contentEncoding) putBase.ContentEncoding = contentEncoding;
   await wasabiStateClient.send(
     new PutObjectCommand({
-      Bucket: WASABI_STATE_BUCKET,
-      Key: latestKey,
-      Body: payload,
-      ContentType: 'application/json'
+      ...putBase,
+      Key: latestKey
     })
   );
   if (WASABI_STATE_ARCHIVE_SNAPSHOTS) {
     await wasabiStateClient.send(
       new PutObjectCommand({
-        Bucket: WASABI_STATE_BUCKET,
-        Key: archiveKey,
-        Body: payload,
-        ContentType: 'application/json'
+        ...putBase,
+        Key: archiveKey
       })
     );
   }
@@ -477,12 +913,49 @@ async function putWasabiStateObject(stateObject) {
   wasabiLatestStateCacheAt = Date.now();
 }
 
+/**
+ * Read the mutable tables blob from a loaded Wasabi `latest.json`.
+ * JS treats `typeof null === 'object'`, so `data: null` must not become `{}` on incremental writes
+ * (that would replace the snapshot with an empty `data` object and make planner/PSR edits vanish after refresh).
+ */
+function readWasabiSnapshotDataTables(snapshot, options = {}) {
+  const strict = options.strict === true;
+  if (!snapshot || typeof snapshot !== 'object') return {};
+  const inner = snapshot.data;
+  if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+    return inner;
+  }
+  const skipMeta = new Set(['generatedAt', 'source', 'scope', 'reason', 'data']);
+  const legacy = {};
+  for (const key of Object.keys(snapshot)) {
+    if (skipMeta.has(key)) continue;
+    const v = snapshot[key];
+    if (Array.isArray(v)) legacy[key] = v;
+    else if (v && typeof v === 'object' && !Array.isArray(v)) legacy[key] = v;
+  }
+  if (Object.keys(legacy).length) {
+    console.warn('[wasabi-state] snapshot missing usable .data object; using top-level table keys as data');
+    return legacy;
+  }
+  if (Object.prototype.hasOwnProperty.call(snapshot, 'data') && snapshot.data === null) {
+    const msg =
+      'Wasabi latest.json has data:null with no recoverable table keys — refusing incremental write that would erase planner/auth state. Repair latest.json or run a full snapshot export.';
+    if (strict) throw new Error(msg);
+    console.warn(`[wasabi-state] ${msg}`);
+  }
+  return {};
+}
+
 function snapshotStateShape(snapshot) {
-  const data = snapshot && snapshot.data && typeof snapshot.data === 'object' ? snapshot.data : {};
+  const raw = snapshot && typeof snapshot === 'object' ? snapshot : {};
+  const data = readWasabiSnapshotDataTables(raw, { strict: true });
   return {
     generatedAt: nowIso(),
     source: 'horizon-backend',
-    scope: { clientId: 'portal-users', jobId: '3' },
+    scope:
+      raw.scope && typeof raw.scope === 'object' && !Array.isArray(raw.scope)
+        ? raw.scope
+        : { clientId: 'portal-users', jobId: '3' },
     data
   };
 }
@@ -529,10 +1002,11 @@ function snapshotMeta(snapshot) {
   const generatedAtIso = String(snapshot?.generatedAt || '');
   const generatedAtMs = Date.parse(generatedAtIso);
   const ageMs = Number.isFinite(generatedAtMs) ? Math.max(0, Date.now() - generatedAtMs) : null;
+  const tables = readWasabiSnapshotDataTables(snapshot || {}, { strict: false });
   return {
     generatedAt: Number.isFinite(generatedAtMs) ? new Date(generatedAtMs).toISOString() : null,
     ageMs,
-    hasData: !!(snapshot && snapshot.data && typeof snapshot.data === 'object')
+    hasData: Object.keys(tables).length > 0
   };
 }
 
@@ -590,7 +1064,7 @@ function wasabiReadDomains() {
 
 function evaluateWasabiRuntimeReadiness(snapshot) {
   const meta = snapshotMeta(snapshot);
-  const data = snapshot && snapshot.data && typeof snapshot.data === 'object' ? snapshot.data : {};
+  const data = readWasabiSnapshotDataTables(snapshot || {}, { strict: false });
   const tableCounts = Object.fromEntries(
     Object.entries(data)
       .filter(([, value]) => Array.isArray(value))
@@ -698,6 +1172,15 @@ function cloneSnapshotRows(rows) {
   }
 }
 
+/** PipeSync Plan view markup — stored only in Wasabi `latest.json` under `data.pipesync_plan_views` (no Postgres table). */
+const PIPESYNC_PLAN_VIEW_TABLE = 'pipesync_plan_views';
+const PIPESYNC_PLAN_VIEW_MAX_BYTES = 14 * 1024 * 1024;
+
+function pipesyncPlanViewUsernameKey(user) {
+  const u = cleanString(user?.username || user?.displayName || '').toLowerCase();
+  return u ? u.slice(0, 200) : '';
+}
+
 /** Tables whose canonical copy is Wasabi when in wasabi-only mode — never overwrite from (empty) Postgres during snapshot export. */
 function wasabiSnapshotTablesPreservedFromLatest() {
   const set = new Set();
@@ -731,14 +1214,15 @@ async function runWasabiStateSnapshot() {
       }
     }
     const data = {};
+    const prevData = readWasabiSnapshotDataTables(previousSnapshot || {}, { strict: false });
     for (const tableName of tables) {
       if (preserveFromLatest.has(tableName)) {
-        const prevRows =
-          previousSnapshot && previousSnapshot.data && Array.isArray(previousSnapshot.data[tableName])
-            ? previousSnapshot.data[tableName]
-            : [];
-        data[tableName] = cloneSnapshotRows(prevRows);
-        continue;
+        const prevRows = Array.isArray(prevData[tableName]) ? prevData[tableName] : null;
+        if (prevRows !== null) {
+          data[tableName] = cloneSnapshotRows(prevRows);
+          continue;
+        }
+        // No Wasabi rows yet for this preserved table — pull Postgres once instead of writing [] over latest.json.
       }
       try {
         const q = await pool.query(`SELECT * FROM ${tableName}`);
@@ -746,6 +1230,25 @@ async function runWasabiStateSnapshot() {
       } catch (err) {
         data[tableName] = { error: String(err?.message || err) };
       }
+    }
+    // Wasabi-only rows (no Postgres mirror) — merge from current latest so periodic snapshots never erase plan markup.
+    try {
+      let mergeSource = previousSnapshot;
+      if (!mergeSource) {
+        try {
+          mergeSource = await loadWasabiLatestStateSnapshot(false);
+        } catch {
+          mergeSource = null;
+        }
+      }
+      const mergeTables = readWasabiSnapshotDataTables(mergeSource || {}, { strict: false });
+      if (Array.isArray(mergeTables[PIPESYNC_PLAN_VIEW_TABLE])) {
+        data[PIPESYNC_PLAN_VIEW_TABLE] = cloneSnapshotRows(mergeTables[PIPESYNC_PLAN_VIEW_TABLE]);
+      } else if (!Array.isArray(data[PIPESYNC_PLAN_VIEW_TABLE])) {
+        data[PIPESYNC_PLAN_VIEW_TABLE] = [];
+      }
+    } catch {
+      if (!Array.isArray(data[PIPESYNC_PLAN_VIEW_TABLE])) data[PIPESYNC_PLAN_VIEW_TABLE] = [];
     }
     const next = {
       generatedAt: nowIso(),
@@ -778,16 +1281,18 @@ async function syncWasabiNow(reason = 'manual') {
   };
 }
 
-function queueWasabiStateSnapshot(reason) {
+function queueWasabiStateSnapshot(req) {
   if (!WASABI_STATE_SNAPSHOT_ON_WRITE) return;
   if (!wasabiStateClient || !WASABI_STATE_BUCKET) return;
+  const debounceMs = wasabiSnapshotDebounceMsForRequest(req);
   wasabiStateLastQueuedAt = Date.now();
-  wasabiStateLastReason = String(reason || '').trim() || 'mutation';
-  if (wasabiStateSnapshotTimer) return;
+  const path = String(req.originalUrl || req.url || '').split('?')[0] || '';
+  wasabiStateLastReason = `${String(req.method || '').toUpperCase()} ${path} @debounce=${debounceMs}ms`;
+  if (wasabiStateSnapshotTimer) clearTimeout(wasabiStateSnapshotTimer);
   wasabiStateSnapshotTimer = setTimeout(async () => {
     wasabiStateSnapshotTimer = null;
     await runWasabiStateSnapshot();
-  }, WASABI_STATE_WRITE_DEBOUNCE_MS);
+  }, debounceMs);
 }
 
 function currentWasabiStateStatus() {
@@ -795,10 +1300,15 @@ function currentWasabiStateStatus() {
     enabled: !!(wasabiStateClient && WASABI_STATE_BUCKET),
     onWrite: WASABI_STATE_SNAPSHOT_ON_WRITE,
     archiveSnapshots: WASABI_STATE_ARCHIVE_SNAPSHOTS,
+    snapshotGzip: WASABI_STATE_SNAPSHOT_GZIP,
     latestStateCacheMs: WASABI_LATEST_STATE_CACHE_MS,
     bucket: WASABI_STATE_BUCKET || null,
     prefix: WASABI_STATE_PREFIX,
     intervalMs: WASABI_STATE_SNAPSHOT_MS,
+    maxIntervalMs: WASABI_STATE_SNAPSHOT_MAX_MS,
+    writeDebounceMsPipesync: WASABI_STATE_WRITE_DEBOUNCE_MS,
+    writeDebounceMsPortal: WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS,
+    writeDebounceMsAutosync: WASABI_STATE_WRITE_DEBOUNCE_AUTOSYNC_MS,
     writeDebounceMs: WASABI_STATE_WRITE_DEBOUNCE_MS,
     includeAllTables: WASABI_STATE_INCLUDE_ALL_TABLES,
     excludedTables: Array.from(WASABI_STATE_EXCLUDE_TABLES),
@@ -979,6 +1489,8 @@ function currentWasabiSqlMirrorStatus() {
     prefix: WASABI_SQL_MIRROR_PREFIX,
     flushMs: WASABI_SQL_MIRROR_FLUSH_MS,
     maxBuffer: WASABI_SQL_MIRROR_MAX_BUFFER,
+    skipTables: Array.from(WASABI_SQL_MIRROR_SKIP_TABLE_SET).sort(),
+    skipTablesFromEnv: process.env.WASABI_SQL_MIRROR_SKIP_TABLES !== undefined,
     buffered: wasabiSqlMirrorEvents.length,
     busy: wasabiSqlMirrorBusy,
     totalFlushed: wasabiSqlMirrorTotalFlushed,
@@ -1050,36 +1562,42 @@ pool.query = function patchedPoolQuery(text, values, callback) {
   return rawPoolQuery(text, values)
     .then((result) => {
       if (mutation) {
-        queueWasabiSqlMirrorEvent({
-          id: crypto.randomUUID(),
-          at: new Date().toISOString(),
-          ok: true,
-          operation: mutation.operation,
-          table: mutation.table,
-          rowCount: Number(result?.rowCount || 0),
-          durationMs: Date.now() - startedAt,
-          sql: String(sqlText || '').slice(0, 500),
-          valuesCount: Array.isArray(values) ? values.length : 0,
-          values: normalizeMirrorParams(values)
-        });
+        const skipBase = sqlMirrorSkipBaseTable(mutation.table);
+        if (!WASABI_SQL_MIRROR_SKIP_TABLE_SET.has(skipBase)) {
+          queueWasabiSqlMirrorEvent({
+            id: crypto.randomUUID(),
+            at: new Date().toISOString(),
+            ok: true,
+            operation: mutation.operation,
+            table: mutation.table,
+            rowCount: Number(result?.rowCount || 0),
+            durationMs: Date.now() - startedAt,
+            sql: String(sqlText || '').slice(0, 500),
+            valuesCount: Array.isArray(values) ? values.length : 0,
+            values: normalizeMirrorParams(values)
+          });
+        }
       }
       return result;
     })
     .catch((error) => {
       if (mutation) {
-        queueWasabiSqlMirrorEvent({
-          id: crypto.randomUUID(),
-          at: new Date().toISOString(),
-          ok: false,
-          operation: mutation.operation,
-          table: mutation.table,
-          rowCount: 0,
-          durationMs: Date.now() - startedAt,
-          sql: String(sqlText || '').slice(0, 500),
-          valuesCount: Array.isArray(values) ? values.length : 0,
-          values: normalizeMirrorParams(values),
-          error: String(error?.message || error)
-        });
+        const skipBase = sqlMirrorSkipBaseTable(mutation.table);
+        if (!WASABI_SQL_MIRROR_SKIP_TABLE_SET.has(skipBase)) {
+          queueWasabiSqlMirrorEvent({
+            id: crypto.randomUUID(),
+            at: new Date().toISOString(),
+            ok: false,
+            operation: mutation.operation,
+            table: mutation.table,
+            rowCount: 0,
+            durationMs: Date.now() - startedAt,
+            sql: String(sqlText || '').slice(0, 500),
+            valuesCount: Array.isArray(values) ? values.length : 0,
+            values: normalizeMirrorParams(values),
+            error: String(error?.message || error)
+          });
+        }
       }
       throw error;
     });
@@ -1224,6 +1742,17 @@ function enforcePortalScopePolicyForUser(user, portalScopes) {
   return dedupePortalScopes(portalScopes);
 }
 
+function parseProductTutorialsSeen(row) {
+  const raw = row?.product_tutorials_seen ?? row?.productTutorialsSeen;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { pipeshare: false, pipesync: false };
+  }
+  return {
+    pipeshare: raw.pipeshare === true,
+    pipesync: raw.pipesync === true
+  };
+}
+
 function normalizeUser(row) {
   const id = row.id;
   const selfSignup = row?.self_signup === true;
@@ -1289,7 +1818,8 @@ function normalizeUser(row) {
     portalScopes: [],
     psrScopes: [],
     portalPermissionsAccessRaw,
-    portalPermissionsAccess
+    portalPermissionsAccess,
+    productTutorialsSeen: parseProductTutorialsSeen(row)
   };
 }
 
@@ -1928,7 +2458,8 @@ async function readPlannerRecordsFromPostgresForUser(user) {
 }
 
 async function readRecordsFromWasabiSnapshotForUser(user) {
-  const snapshot = await loadWasabiLatestStateSnapshot();
+  /** Force S3 read: each Node process caches latest.json; another dyno may have written — stale cache looks like "not saving". */
+  const snapshot = await loadWasabiLatestStateSnapshot(true);
   // Same as record-by-id: do not drop the whole list when snapshot age exceeds threshold — merge with Postgres covers drift.
   if (!snapshot || !snapshot.data) return [];
   const rows = snapshotRows(snapshot, 'planner_records');
@@ -1939,33 +2470,23 @@ async function readRecordsFromWasabiSnapshotForUser(user) {
   const normalizedThenFilterCount = rows
     .map((row) => normalizeRecordRow(row))
     .filter((record) => userCanAccessPsrScope(user, record)).length;
-  // #region agent log
-  fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-    body: JSON.stringify({
-      sessionId: '2228ee',
-      hypothesisId: 'D',
-      location: 'server.js:readRecordsFromWasabiSnapshotForUser',
-      message: 'wasabi planner_records scope filter (raw row vs normalize-then-filter)',
-      data: {
-        uid: String(user?.id || ''),
-        isAdmin: !!user?.isAdmin,
-        scopeEntryCount: Array.isArray(user?.psrScopes) ? user.psrScopes.length : 0,
-        rawRowCount: rows.length,
-        afterFilterCount: filtered.length,
-        normalizedThenFilterCount
-      },
-      timestamp: Date.now(),
-      runId: 'post-fix'
-    })
-  }).catch(() => {});
-  // #endregion
+dbgPsrFileLog({
+    hypothesisId: 'F',
+    location: 'readRecordsFromWasabiSnapshotForUser',
+    uid: String(user?.id || ''),
+    isAdmin: !!user?.isAdmin,
+    plannerStoreWasabiOnly: !!PLANNER_STORE_WASABI_ONLY,
+    recordsPrimary: !!WASABI_RECORDS_PRIMARY_ENABLED,
+    scopeEntryCount: Array.isArray(user?.psrScopes) ? user.psrScopes.length : 0,
+    rawRowCount: rows.length,
+    afterFilterCount: filtered.length,
+    normalizedThenFilterCount
+  });
   return filtered;
 }
 
 async function fetchRecordByIdFromWasabiSnapshot(id) {
-  const snapshot = await loadWasabiLatestStateSnapshot();
+  const snapshot = await loadWasabiLatestStateSnapshot(true);
   // Do not gate on snapshot age here: stale snapshot data beats a false 404 when Postgres was never
   // mirrored (Wasabi-primary creates) or when clocks / generatedAt skew.
   if (!snapshot || !snapshot.data) return null;
@@ -2165,6 +2686,31 @@ async function updateDailyReportById(id, patch) {
 }
 
 async function deleteDailyReportById(id) {
+  let filesToPurge = [];
+  try {
+    const snapRow = await readDailyReportByIdFromWasabiSnapshot(id);
+    if (snapRow && Array.isArray(snapRow.files)) filesToPurge = snapRow.files;
+  } catch {
+    /* ignore */
+  }
+  if (!filesToPurge.length && !WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    try {
+      const r = await pool.query('SELECT files FROM daily_reports WHERE id = $1', [id]);
+      if (r.rows[0]) {
+        filesToPurge = Array.isArray(r.rows[0].files) ? r.rows[0].files : parseJsonObject(r.rows[0].files, []);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  if (adminAttachmentsWasabiConfigured()) {
+    await deleteAdminAttachmentKeys(
+      wasabiStateClient,
+      WASABI_STATE_BUCKET,
+      collectAdminAttachmentStorageKeysFromFiles(filesToPurge)
+    );
+  }
+
   let deleted = false;
   const wrote = await tryWasabiStateWrite('delete-daily-report', async (data) => {
     const rows = ensureSnapshotTable(data, 'daily_reports');
@@ -2233,6 +2779,35 @@ async function createJobsiteAsset(assetInput) {
 }
 
 async function deleteJobsiteAssetById(id) {
+  let filesToPurge = [];
+  try {
+    const snapshot = await loadWasabiLatestStateSnapshot();
+    if (snapshot?.data) {
+      const rows = snapshotRows(snapshot, 'jobsite_assets');
+      const hit = rows.find((row) => String(row.id || '') === String(id || ''));
+      if (hit && Array.isArray(hit.files)) filesToPurge = hit.files;
+    }
+  } catch {
+    /* ignore */
+  }
+  if (!filesToPurge.length && !WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    try {
+      const r = await pool.query('SELECT files FROM jobsite_assets WHERE id = $1', [id]);
+      if (r.rows[0]) {
+        filesToPurge = Array.isArray(r.rows[0].files) ? r.rows[0].files : parseJsonObject(r.rows[0].files, []);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  if (adminAttachmentsWasabiConfigured()) {
+    await deleteAdminAttachmentKeys(
+      wasabiStateClient,
+      WASABI_STATE_BUCKET,
+      collectAdminAttachmentStorageKeysFromFiles(filesToPurge)
+    );
+  }
+
   let deleted = false;
   const wrote = await tryWasabiStateWrite('delete-jobsite-asset', async (data) => {
     const rows = ensureSnapshotTable(data, 'jobsite_assets');
@@ -2251,10 +2826,37 @@ async function deleteJobsiteAssetById(id) {
 }
 
 async function deleteJobsiteAssetsByClient(client) {
+  const target = String(client || '').toLowerCase();
+  const keysToDelete = [];
+  try {
+    const snapshot = await loadWasabiLatestStateSnapshot();
+    if (snapshot?.data) {
+      for (const row of snapshotRows(snapshot, 'jobsite_assets')) {
+        if (String(row.client || '').toLowerCase() !== target) continue;
+        keysToDelete.push(...collectAdminAttachmentStorageKeysFromFiles(row.files));
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  if (!WASABI_APP_DATA_STORE_WASABI_ONLY) {
+    try {
+      const r = await pool.query('SELECT files FROM jobsite_assets WHERE LOWER(client) = $1', [target]);
+      for (const row of r.rows) {
+        const files = Array.isArray(row.files) ? row.files : parseJsonObject(row.files, []);
+        keysToDelete.push(...collectAdminAttachmentStorageKeysFromFiles(files));
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  if (adminAttachmentsWasabiConfigured()) {
+    await deleteAdminAttachmentKeys(wasabiStateClient, WASABI_STATE_BUCKET, keysToDelete);
+  }
+
   let deletedCount = 0;
   const wrote = await tryWasabiStateWrite('delete-jobsite-assets-by-client', async (data) => {
     const rows = ensureSnapshotTable(data, 'jobsite_assets');
-    const target = String(client || '').toLowerCase();
     const next = rows.filter((row) => String(row.client || '').toLowerCase() !== target);
     deletedCount = rows.length - next.length;
     data.jobsite_assets = next;
@@ -2371,7 +2973,7 @@ function sortRecordsByUpdatedDesc(records) {
 }
 
 async function findPlannerRecordsByScopeFromWasabiSnapshot(client, city, jobsite) {
-  const snapshot = await loadWasabiLatestStateSnapshot();
+  const snapshot = await loadWasabiLatestStateSnapshot(true);
   if (!snapshot || !snapshot.data) return PLANNER_STORE_WASABI_ONLY ? [] : null;
   if (
     !PLANNER_STORE_WASABI_ONLY &&
@@ -2410,6 +3012,17 @@ async function findPlannerRecordsByScope(client, city, jobsite, options = {}) {
          AND LOWER(jobsite) = LOWER($3)`;
   const result = await pool.query(sql, [client, city, jobsite]);
   return result.rows.map(normalizeRecordRow);
+}
+
+function dbgPsrFileLog(payload) {
+  try {
+    fs.appendFileSync(
+      path.join(__dirname, 'debug-2228ee.log'),
+      `${JSON.stringify({ sessionId: '2228ee', timestamp: Date.now(), ...payload })}\n`
+    );
+  } catch {
+    // ignore disk errors (read-only deploy dir, etc.)
+  }
 }
 
 function parseJsonObject(value, fallback = {}) {
@@ -2461,6 +3074,141 @@ function defaultVersion(userName = 'System', payload = {}) {
   };
 }
 
+function sanitizeDb3ImportedObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    const key = String(k || '')
+      .trim()
+      .slice(0, 120);
+    if (!key || /^__proto__$/i.test(key)) continue;
+    if (v == null) continue;
+    const str = typeof v === 'number' && Number.isFinite(v) ? String(v) : String(v).trim();
+    if (!str) continue;
+    out[key.toUpperCase()] = str.slice(0, 4000);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/** Snapshot fields for “possible double entry” comparison (import queue vs placed segment). */
+function sanitizeDuplicateComparison(c) {
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return {};
+  const pick = (k, max) => cleanString(c[k]).slice(0, max);
+  return {
+    reference: pick('reference', 240),
+    upstream: pick('upstream', 240),
+    downstream: pick('downstream', 240),
+    dia: pick('dia', 120),
+    material: pick('material', 120),
+    shape: pick('shape', 120),
+    length: pick('length', 80),
+    street: pick('street', 400),
+    latestStatus: pick('latestStatus', 120),
+    latestNotes: pick('latestNotes', 2000),
+    recordedDate: pick('recordedDate', 32),
+    savedBy: pick('savedBy', 200)
+  };
+}
+
+function sanitizeDb3DuplicateOf(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const recordId = cleanString(raw.recordId).slice(0, 128);
+  const segmentId = cleanString(raw.segmentId).slice(0, 128);
+  if (!recordId || !segmentId) return null;
+  return {
+    recordId,
+    segmentId,
+    client: cleanString(raw.client).slice(0, 400),
+    city: cleanString(raw.city).slice(0, 400),
+    jobsite: cleanString(raw.jobsite).slice(0, 400),
+    street: cleanString(raw.street).slice(0, 400),
+    system: cleanString(raw.system).slice(0, 32),
+    comparison: sanitizeDuplicateComparison(raw.comparison)
+  };
+}
+
+function duplicateComparisonFromSegmentJson(seg) {
+  if (!seg || typeof seg !== 'object') return sanitizeDuplicateComparison({});
+  const versions = Array.isArray(seg.versions) ? seg.versions : [];
+  const last = versions.length ? versions[versions.length - 1] : {};
+  return sanitizeDuplicateComparison({
+    reference: seg.reference,
+    upstream: seg.upstream,
+    downstream: seg.downstream,
+    dia: seg.dia,
+    material: seg.material,
+    shape: seg.shape,
+    length: seg.length ?? seg.footage,
+    street: seg.street,
+    latestStatus: statusLabel(last.status),
+    latestNotes: last.notes,
+    recordedDate: last.recordedDate,
+    savedBy: last.savedBy
+  });
+}
+
+function buildDb3DuplicatePayloadFromPlacedRow(row) {
+  const seg = row.seg && typeof row.seg === 'object' ? row.seg : parseJsonObject(row.seg, {});
+  return sanitizeDb3DuplicateOf({
+    recordId: String(row.rid ?? ''),
+    segmentId: String(seg.id ?? ''),
+    client: row.client,
+    city: row.city,
+    jobsite: row.jobsite,
+    street: row.street,
+    system: row.sys,
+    comparison: duplicateComparisonFromSegmentJson(seg)
+  });
+}
+
+/**
+ * For each WinCan OBJ_Key (segment.reference), find a matching segment on a **non–import-queue** planner record
+ * (latest `updated_at` wins). Used for DB3 import queue staging.
+ * @param {string[]} referenceLowers lowercased trimmed references
+ * @returns {Promise<Map<string, ReturnType<typeof sanitizeDb3DuplicateOf>>>}
+ */
+async function findPlacedDuplicatePayloadsByReferences(referenceLowers) {
+  const map = new Map();
+  const uniq = [...new Set((referenceLowers || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean))];
+  if (!uniq.length) return map;
+  if (typeof pool?.query !== 'function') return map;
+  try {
+    const { rows: hits } = await pool.query(
+      `SELECT rid, client, city, jobsite, street, updated_at, sys, seg FROM (
+         SELECT pr.id AS rid, pr.client, pr.city, pr.jobsite, pr.street, pr.updated_at,
+                'storm'::text AS sys, seg
+         FROM planner_records pr,
+         LATERAL jsonb_array_elements(COALESCE(pr.data->'systems'->'storm', '[]'::jsonb)) seg
+         WHERE LOWER(BTRIM(pr.client)) <> LOWER(BTRIM($1))
+           AND LOWER(BTRIM(COALESCE(seg->>'reference',''))) = ANY($2::text[])
+       UNION ALL
+         SELECT pr.id, pr.client, pr.city, pr.jobsite, pr.street, pr.updated_at,
+                'sanitary'::text, seg
+         FROM planner_records pr,
+         LATERAL jsonb_array_elements(COALESCE(pr.data->'systems'->'sanitary', '[]'::jsonb)) seg
+         WHERE LOWER(BTRIM(pr.client)) <> LOWER(BTRIM($1))
+           AND LOWER(BTRIM(COALESCE(seg->>'reference',''))) = ANY($2::text[])
+       ) q`,
+      [PSR_IMPORT_QUEUE_CLIENT, uniq]
+    );
+    for (const row of hits) {
+      const seg = row.seg && typeof row.seg === 'object' ? row.seg : parseJsonObject(row.seg, {});
+      const refKey = String(seg.reference || '').trim().toLowerCase();
+      if (!refKey) continue;
+      const ts = Date.parse(row.updated_at) || 0;
+      const prev = map.get(refKey);
+      if (prev && prev._ts >= ts) continue;
+      const dup = buildDb3DuplicatePayloadFromPlacedRow(row);
+      if (dup) map.set(refKey, { _ts: ts, dup });
+    }
+  } catch (error) {
+    console.error('findPlacedDuplicatePayloadsByReferences:', error?.message || error);
+  }
+  const out = new Map();
+  for (const [k, v] of map) out.set(k, v.dup);
+  return out;
+}
+
 function normalizeSegment(raw = {}, userName = 'System') {
   const versions = Array.isArray(raw.versions) && raw.versions.length
     ? raw.versions.map((version) => defaultVersion(version.savedBy || userName, version))
@@ -2472,12 +3220,19 @@ function normalizeSegment(raw = {}, userName = 'System') {
     downstream: upperCleanString(raw.downstream),
     dia: upperCleanString(raw.dia),
     material: upperCleanString(raw.material),
+    shape: upperCleanString(raw.shape),
     length: cleanString(raw.length ?? raw.footage),
     footage: cleanString(raw.footage ?? raw.length),
     street: upperCleanString(raw.street),
     system: cleanString(raw.system),
     versions,
-    selectedVersionId: raw.selectedVersionId || versions[versions.length - 1].id
+    selectedVersionId: raw.selectedVersionId || versions[versions.length - 1].id,
+    db3Imported: sanitizeDb3ImportedObject(raw.db3Imported),
+    db3DuplicateOf: sanitizeDb3DuplicateOf(raw.db3DuplicateOf),
+    linkedPortalDb3FileId: cleanString(raw.linkedPortalDb3FileId).slice(0, 128),
+    linkedPortalDb3FolderPath: cleanString(raw.linkedPortalDb3FolderPath).slice(0, 800),
+    linkedPortalDb3ClientId: cleanString(raw.linkedPortalDb3ClientId).slice(0, 128),
+    linkedPortalDb3JobId: cleanString(raw.linkedPortalDb3JobId).slice(0, 128)
   };
 }
 
@@ -2495,6 +3250,37 @@ function normalizeJobsiteName(jobsite, street = '') {
   if (!j) return 'NOT SET';
   if (s && j.toLowerCase() === s.toLowerCase()) return 'NOT SET';
   return j;
+}
+
+/** PipeSync planner client code for WinCan imports staged under “Imported — ready to sort”. */
+const PSR_IMPORT_QUEUE_CLIENT = '__HP_IMPORT_QUEUE__';
+
+function resolveWincanImportScope(body, rows) {
+  let targetClient = cleanString(body?.targetClient);
+  let targetCity = cleanString(body?.targetCity);
+  if (!targetClient) targetClient = PSR_IMPORT_QUEUE_CLIENT;
+  if (!targetCity) targetCity = '';
+  let targetJobsite = normalizeJobsiteName(body?.targetJobsite || 'NOT SET');
+  const projectRow = Array.isArray(rows) ? rows.find((r) => r && cleanString(r.project)) : null;
+  const projectName = projectRow ? cleanString(projectRow.project) : '';
+  if ((!targetJobsite || targetJobsite === 'NOT SET') && projectName) {
+    targetJobsite = normalizeJobsiteName(projectName);
+  }
+  const targetSystem = cleanString(body?.targetSystem || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
+  return { targetClient, targetCity, targetJobsite, targetSystem };
+}
+
+/** Persisted under planner record `data.systemBranches` — which top-level folders show under a jobsite. */
+function coerceSystemBranchesForStorage(branches, systems) {
+  const st = (systems?.storm || []).length > 0;
+  const sa = (systems?.sanitary || []).length > 0;
+  const b = branches && typeof branches === 'object' ? branches : {};
+  let storm = b.storm !== false;
+  let sanitary = b.sanitary === true;
+  if (st) storm = true;
+  if (sa) sanitary = true;
+  if (!storm && !sanitary && !st && !sa) storm = true;
+  return { storm, sanitary };
 }
 
 function normalizeRecordRow(row) {
@@ -2522,6 +3308,8 @@ function normalizeRecordRow(row) {
     }));
   });
 
+  const systemBranches = coerceSystemBranchesForStorage(data.systemBranches, systems);
+
   const psrScopeClient = upperCleanString(row.client || data.client);
   const psrScopeCity = upperCleanString(row.city || data.city);
   const psrScopeJobsite = normalizeJobsiteName(rawJobsite, rawStreet);
@@ -2539,18 +3327,33 @@ function normalizeRecordRow(row) {
     status: cleanString(row.status || data.status),
     saved_by: cleanString(row.saved_by || data.saved_by),
     systems,
+    systemBranches,
     created_at: row.created_at,
     updated_at: row.updated_at
   };
 }
 
 function serializeRecordData(record) {
-  return {
-    systems: {
-      storm: (record.systems?.storm || []).map((segment) => normalizeSegment(segment, record.saved_by || 'System')),
-      sanitary: (record.systems?.sanitary || []).map((segment) => normalizeSegment(segment, record.saved_by || 'System'))
-    }
+  const systems = {
+    storm: (record.systems?.storm || []).map((segment) => normalizeSegment(segment, record.saved_by || 'System')),
+    sanitary: (record.systems?.sanitary || []).map((segment) => normalizeSegment(segment, record.saved_by || 'System'))
   };
+  return {
+    systems,
+    systemBranches: coerceSystemBranchesForStorage(record.systemBranches || {}, systems)
+  };
+}
+
+/** Jobsite persisted to Wasabi/Postgres must use the scope key (psrScopeJobsite), not display jobsite coerced to NOT SET. */
+function persistedPlannerJobsiteForWrite(record) {
+  const street = upperCleanString(record?.street);
+  const display = cleanString(record?.jobsite ?? '');
+  const scope = cleanString(record?.psrScopeJobsite ?? record?.authJobsiteForPsrScope ?? '');
+  const displayIsUnset = !display || display.toUpperCase() === 'NOT SET';
+  if (scope && displayIsUnset) {
+    return normalizeJobsiteName(scope, street);
+  }
+  return normalizeJobsiteName(record?.jobsite, street);
 }
 
 async function mirrorSessionToPostgres(token, userId, keepSession) {
@@ -2623,7 +3426,8 @@ async function readFreshUserFromPostgresById(userId) {
   if (!id) return null;
   const result = await pool.query(
     `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-            portal_permissions_access, portal_files_access_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified
+            portal_permissions_access, portal_files_access_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
+            product_tutorials_seen
      FROM users
      WHERE CAST(id AS text) = $1
      LIMIT 1`,
@@ -2673,7 +3477,8 @@ async function readSessionFromPostgres(token) {
   const result = await pool.query(
     `SELECT s.token, s.user_id, s.keep_session, s.expires_at, u.id, u.username, u.display_name, u.password,
             u.is_admin, u.roles, u.must_change_password, u.portal_files_client_id, u.portal_files_job_id,
-            u.portal_permissions_access, u.portal_files_access_granted, u.self_signup, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified
+            u.portal_permissions_access, u.portal_files_access_granted, u.self_signup, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified,
+            u.product_tutorials_seen
      FROM auth_sessions s
      JOIN users u ON CAST(u.id AS text) = s.user_id
      WHERE s.token = $1
@@ -2888,6 +3693,25 @@ const requireDataAutoSyncEmployeeAccess = requireAnyRole(
   ['dataAutoSyncEmployee'],
   'DataAutoSync employee access is not enabled for this account'
 );
+
+/** Same users who can use portal Data Auto Sync (not only the dataAutoSyncEmployee role bit). */
+function requireDataAutoSyncDesktopHeartbeatAccess(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ success: false, error: 'Authentication required' });
+  }
+  const u = req.user;
+  const roles = normalizeRoles(u.roles);
+  if (roles.dataAutoSyncEmployee === true) return next();
+  if (u.dataAutoSyncEmployee === true) return next();
+  if (canManagePortalExtras(u)) return next();
+  if (u.portalFilesAccessGranted === true) return next();
+  if (u.isAdmin === true) return next();
+  return res.status(403).json({
+    success: false,
+    error:
+      'Desktop status requires Data Auto Sync access (dataAutoSyncEmployee, portal admin, portalFilesAccessGranted, or administrator).'
+  });
+}
 const requirePricingAccess = requireAnyRole(
   ['pricingView'],
   'Pricing access is not enabled for this account'
@@ -2902,7 +3726,9 @@ function userCanAccessPsrScope(user, scope) {
   const scopes = dedupePsrScopes(user?.psrScopes || []);
   if (!scopes.length) return false;
   const data =
-    scope && scope.data && typeof scope.data === 'object' && !Array.isArray(scope.data) ? scope.data : {};
+    scope && scope.data && typeof scope.data === 'object' && !Array.isArray(scope.data)
+      ? scope.data
+      : parseJsonObject(scope?.data, {});
   const recId = cleanString(scope?.id || scope?.recordId || '');
   /** Persisted planner row triple (matches POST / SQL). NOT display jobsite (e.g. segment UI may coerce jobsite to NOT SET). */
   const client = upperCleanString(
@@ -3004,27 +3830,394 @@ function materialLabel(code) {
   return map[upper] || upper || '';
 }
 
+function sqliteTableList(db) {
+  try {
+    const r = db.exec("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
+    return (r[0]?.values || []).map((row) => String(row[0] || '')).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function pickSqliteTable(actualNames, ...wanted) {
+  const set = new Set(actualNames);
+  const byLower = new Map(actualNames.map((n) => [n.toLowerCase(), n]));
+  for (const w of wanted) {
+    if (set.has(w)) return w;
+    const hit = byLower.get(String(w).toLowerCase());
+    if (hit) return hit;
+  }
+  return '';
+}
+
+function sqlIdentQuoted(name) {
+  return `"${String(name).replace(/"/g, '""')}"`;
+}
+
+/**
+ * When SECTION is missing, infer common mis-uploads (WinCan catalog / META DB vs pipe project DB).
+ * @param {string[]} tables
+ */
+function explainMissingSectionDb3(tables) {
+  const lower = new Set(tables.map((t) => String(t).toLowerCase()));
+  const hasMeta = [...lower].some((t) => t.startsWith('meta'));
+  const hasDirectory = lower.has('directory');
+  const hasRehab = lower.has('rehabilitation');
+  const hasEquipment = lower.has('equipment');
+  const hasWorkgroup = lower.has('workgroup');
+  const looksCatalogOrSupport =
+    (hasMeta && (hasDirectory || lower.has('metaclass') || lower.has('metaobj'))) ||
+    (hasEquipment && hasRehab && !lower.has('node')) ||
+    (hasWorkgroup && hasEquipment && !lower.has('node'));
+
+  if (looksCatalogOrSupport) {
+    return (
+      ' This file looks like a WinCan catalog, workgroup, equipment, or support database (META*, DIRECTORY, REHABILITATION, etc.) — not a pipe inspection project. ' +
+      'Use the WinCan **project** .db3 for the jobsite run (the database that opens with your pipe sections; it must contain SECTION and NODE tables). ' +
+      'That file is usually beside your inspection videos in the job folder, not the global WinCan catalog database.'
+    );
+  }
+  return '';
+}
+
+/** WinCan SECTION columns already surfaced on the main import row — omit from `db3Imported` to avoid duplication. */
+const DB3_SECTION_CORE_PHYSICAL_COLS = new Set(
+  [
+    'OBJ_KEY',
+    'OBJ_LENGTH',
+    'OBJ_CITY',
+    'OBJ_STREET',
+    'OBJ_FROMNODE_REF',
+    'OBJ_TONODE_REF',
+    'OBJ_MATERIAL',
+    'OBJ_SHAPE',
+    'OBJ_SIZE1',
+    'OBJ_SIZE2',
+    'OBJ_PK',
+    'OBJ_ID',
+    'OBJ_GUID'
+  ].map((s) => s.toUpperCase())
+);
+
+/**
+ * @param {any} db sql.js Database
+ * @param {string} tableName
+ * @returns {{ name: string, type: string }[]}
+ */
+function sqlitePragmaColumns(db, tableName) {
+  const out = [];
+  let stmt;
+  try {
+    stmt = db.prepare(`PRAGMA table_info(${sqlIdentQuoted(tableName)})`);
+    while (stmt.step()) {
+      const o = stmt.getAsObject();
+      const name = String(o.name || '');
+      const type = String(o.type || '').toUpperCase();
+      if (!name) continue;
+      if (type.includes('BLOB')) continue;
+      out.push({ name, type });
+    }
+  } catch {
+    return [];
+  } finally {
+    try {
+      stmt?.free();
+    } catch {
+      /* ignore */
+    }
+  }
+  return out;
+}
+
+/**
+ * Extra SECTION columns as SQL select list + parallel original column names for alias decode.
+ * @param {any} db sql.js Database
+ * @param {string} sectionTable
+ * @returns {{ sql: string, aliasNames: string[] }}
+ */
+function buildDb3SectionExtraSelect(db, sectionTable) {
+  const cols = sqlitePragmaColumns(db, sectionTable);
+  const parts = [];
+  /** @type {string[]} */
+  const aliasNames = [];
+  for (const { name } of cols) {
+    if (DB3_SECTION_CORE_PHYSICAL_COLS.has(name.toUpperCase())) continue;
+    const idx = aliasNames.length;
+    parts.push(`s.${sqlIdentQuoted(name)} AS ${sqlIdentQuoted(`__db3_${idx}`)}`);
+    aliasNames.push(name);
+  }
+  if (!parts.length) return { sql: '', aliasNames: [] };
+  return { sql: parts.join(', '), aliasNames };
+}
+
+/**
+ * @param {Record<string, unknown>} raw
+ * @param {string[]} aliasNames
+ * @returns {Record<string, string>}
+ */
+function extractDb3ImportedFromRow(raw, aliasNames) {
+  if (!raw || !Array.isArray(aliasNames) || !aliasNames.length) return {};
+  const out = {};
+  const keys = Object.keys(raw);
+  for (let i = 0; i < aliasNames.length; i++) {
+    const want = `__db3_${i}`;
+    const hit = keys.find((k) => k.toLowerCase() === want.toLowerCase());
+    if (!hit) continue;
+    const v = raw[hit];
+    if (v == null || v === '') continue;
+    const col = aliasNames[i];
+    const key = String(col).toUpperCase();
+    const str = typeof v === 'number' && Number.isFinite(v) ? String(v) : String(v).trim();
+    if (!str) continue;
+    out[key] = str.slice(0, 4000);
+  }
+  return out;
+}
+
+/**
+ * SECTION.OBJ_Key → primary key for joining SECINSP (WinCan variants).
+ * @param {any} db
+ * @param {string} sectionTable
+ * @param {string} reference
+ * @returns {string|number|null}
+ */
+function resolveSectionPrimaryKeyForReference(db, sectionTable, reference) {
+  const S = sqlIdentQuoted(sectionTable);
+  const ref = cleanString(reference);
+  if (!ref) return null;
+  const secCols = sqlitePragmaColumns(db, sectionTable).map((c) => c.name.toUpperCase());
+  const pkCol = secCols.includes('OBJ_PK') ? 'OBJ_PK' : secCols.includes('OBJ_ID') ? 'OBJ_ID' : '';
+  if (!pkCol) return null;
+  let stmt;
+  try {
+    stmt = db.prepare(`SELECT ${sqlIdentQuoted(pkCol)} AS spk FROM ${S} WHERE OBJ_Key = ? LIMIT 1`);
+    stmt.bind([ref]);
+    if (stmt.step()) {
+      const v = stmt.getAsObject().spk;
+      stmt.free();
+      if (v != null && String(v).trim() !== '') return v;
+    } else {
+      stmt.free();
+    }
+  } catch {
+    try {
+      stmt?.free();
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+/**
+ * Merge first matching SECINSP row into db3Imported (inspector, certificate, etc. often live here).
+ * Does not overwrite keys already populated from SECTION extras.
+ * @param {any} db
+ * @param {string} sectionTable
+ * @param {string} secinspTable
+ * @param {string} reference SECTION.OBJ_Key
+ * @param {Record<string, string>} imported
+ */
+function mergeSecinspRowIntoDb3Imported(db, sectionTable, secinspTable, reference, imported) {
+  const out = imported && typeof imported === 'object' ? { ...imported } : {};
+  if (!secinspTable) return out;
+  const spk = resolveSectionPrimaryKeyForReference(db, sectionTable, reference);
+  if (spk == null) return out;
+  const cols = sqlitePragmaColumns(db, secinspTable);
+  if (!cols.length) return out;
+  const wantFks = [
+    'INS_Section_FK',
+    'INS_SECTION_FK',
+    'INS_SectionId',
+    'INS_SECTION_ID',
+    'INS_SECTION_OBJ_PK',
+    'INS_SEC_FK',
+    'INS_SECTIONREF',
+    'INS_SECTION_REF',
+    'OBJ_ID',
+    'OBJ_PK',
+    'INS_ObjectId',
+    'INS_OBJECTID'
+  ];
+  /** @type {string[]} */
+  const fkCols = [];
+  for (const w of wantFks) {
+    const hit = cols.find((c) => String(c.name).toUpperCase() === w.toUpperCase());
+    if (hit && !fkCols.includes(hit.name)) fkCols.push(hit.name);
+  }
+  if (!fkCols.length) {
+    for (const c of cols) {
+      const u = String(c.name).toUpperCase();
+      if (u.includes('SECTION') && (u.includes('FK') || u.includes('REF'))) fkCols.push(c.name);
+    }
+  }
+  if (!fkCols.length) return out;
+  const SI = sqlIdentQuoted(secinspTable);
+  const where = fkCols.map((c) => `${sqlIdentQuoted(c)} = ?`).join(' OR ');
+  const ref = cleanString(reference);
+
+  /**
+   * @param {Record<string, unknown>} row
+   */
+  const applyRow = (row) => {
+    for (const [k, v] of Object.entries(row)) {
+      if (v == null || v === '') continue;
+      const ku = String(k).toUpperCase();
+      if (out[ku] && String(out[ku]).trim() !== '') continue;
+      const str = typeof v === 'number' && Number.isFinite(v) ? String(v) : String(v).trim();
+      if (!str) continue;
+      out[ku] = str.slice(0, 4000);
+    }
+  };
+
+  /**
+   * @param {string|number|null|undefined} bindVal
+   */
+  const mergeForBind = (bindVal) => {
+    if (bindVal == null || bindVal === '') return;
+    let stmt;
+    try {
+      stmt = db.prepare(`SELECT * FROM ${SI} WHERE ${where}`);
+      stmt.bind(fkCols.map(() => bindVal));
+      while (stmt.step()) {
+        applyRow(stmt.getAsObject());
+      }
+      stmt.free();
+    } catch {
+      try {
+        stmt?.free();
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+
+  try {
+    mergeForBind(spk);
+    /* Some WinCan builds store the section OBJ_Key string in SECINSP FK columns instead of OBJ_PK. */
+    if (ref && String(spk) !== String(ref)) mergeForBind(ref);
+  } catch {
+    /* ignore */
+  }
+  return out;
+}
+
+/**
+ * Merge SECINSP rows where a text column holds SECTION.OBJ_Key (string link).
+ * @param {any} db
+ * @param {string} secinspTable
+ * @param {string} reference SECTION.OBJ_Key
+ * @param {Record<string, string>} imported
+ */
+function mergeSecinspBySectionObjKeyColumn(db, secinspTable, reference, imported) {
+  const out = imported && typeof imported === 'object' ? { ...imported } : {};
+  const ref = cleanString(reference);
+  if (!ref || !secinspTable) return out;
+  const cols = sqlitePragmaColumns(db, secinspTable);
+  const keyCols = cols
+    .map((c) => c.name)
+    .filter((name) => {
+      const u = String(name).toUpperCase();
+      if (u === 'SECTION_KEY' || u === 'INS_SECTIONKEY' || u === 'SECTION_OBJ_KEY') return true;
+      if (u.includes('SECTION') && u.includes('KEY') && !u.includes('FOREIGN') && !u.includes('PRIM')) return true;
+      return false;
+    });
+  if (!keyCols.length) return out;
+  const SI = sqlIdentQuoted(secinspTable);
+  for (const kcol of keyCols) {
+    let stmt;
+    try {
+      stmt = db.prepare(`SELECT * FROM ${SI} WHERE ${sqlIdentQuoted(kcol)} = ?`);
+      stmt.bind([ref]);
+      while (stmt.step()) {
+        const row = stmt.getAsObject();
+        for (const [k, v] of Object.entries(row)) {
+          if (v == null || v === '') continue;
+          const ku = String(k).toUpperCase();
+          if (out[ku] && String(out[ku]).trim() !== '') continue;
+          const str = typeof v === 'number' && Number.isFinite(v) ? String(v) : String(v).trim();
+          if (!str) continue;
+          out[ku] = str.slice(0, 4000);
+        }
+      }
+      stmt.free();
+    } catch {
+      try {
+        stmt?.free();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return out;
+}
+
+function injectDb3ExtrasBeforeOrderBy(sql, extraSql) {
+  if (!extraSql) return sql;
+  const trimmed = String(sql || '').trimEnd();
+  const m = /\sORDER\s+BY\s/i.exec(trimmed);
+  if (m && m.index >= 0) {
+    return `${trimmed.slice(0, m.index)}, ${extraSql}${trimmed.slice(m.index)}`;
+  }
+  return `${trimmed}, ${extraSql}`;
+}
+
+function mapDb3SectionRow(row, projectName) {
+  const dia = row.size2
+    ? `${String(row.size1).replace(/\.0+$/, '')}/${String(row.size2).replace(/\.0+$/, '')}`
+    : String(row.size1 || '').replace(/\.0+$/, '');
+  return {
+    project: projectName || 'NOT SET',
+    reference: cleanString(row.reference),
+    length: Number(row.length || 0).toFixed(3),
+    city: cleanString(row.city),
+    street: cleanString(row.street),
+    upstream: cleanString(row.upstream),
+    downstream: cleanString(row.downstream),
+    material: materialLabel(row.material_code),
+    shape: shapeLabel(row.shape_code, row.size1, row.size2),
+    dia
+  };
+}
+
 async function parseDb3(buffer) {
   const SQL = await sqlJsPromise;
   const db = new SQL.Database(new Uint8Array(buffer));
+  const tables = sqliteTableList(db);
+  const sectionT = pickSqliteTable(tables, 'SECTION');
+  if (!sectionT) {
+    db.close();
+    const preview = tables.slice(0, 40).join(', ') || '(none)';
+    const hint = explainMissingSectionDb3(tables);
+    throw new Error(
+      `Not a WinCan-style pipe DB3: missing SECTION table.${hint} Tables in file: ${preview}${tables.length > 40 ? ' …' : ''}`
+    );
+  }
+  const extraFrag = buildDb3SectionExtraSelect(db, sectionT);
+  const nodeT = pickSqliteTable(tables, 'NODE');
+  const secinspT = pickSqliteTable(tables, 'SECINSP');
+  const projectT = pickSqliteTable(tables, 'PROJECT');
 
   let projectName = '';
-  try {
-    const projectStmt = db.prepare(`
-      SELECT COALESCE(MAX(PRJ_Key), '') AS project_name
-      FROM PROJECT
-    `);
-    if (projectStmt.step()) {
-      const row = projectStmt.getAsObject();
-      projectName = cleanString(row.project_name);
+  if (projectT) {
+    try {
+      const projectStmt = db.prepare(
+        `SELECT COALESCE(MAX(PRJ_Key), '') AS project_name FROM ${sqlIdentQuoted(projectT)}`
+      );
+      if (projectStmt.step()) {
+        const row = projectStmt.getAsObject();
+        projectName = cleanString(row.project_name);
+      }
+      projectStmt.free();
+    } catch {
+      projectName = '';
     }
-    projectStmt.free();
-  } catch (error) {
-    projectName = '';
   }
 
-  const query = `
-    SELECT
+  const S = sqlIdentQuoted(sectionT);
+  const N = nodeT ? sqlIdentQuoted(nodeT) : '';
+
+  const coreCols = `
       s.OBJ_Key AS reference,
       COALESCE(si.inspected_length, s.OBJ_Length, 0) AS length,
       COALESCE(s.OBJ_City, '') AS city,
@@ -3034,41 +4227,123 @@ async function parseDb3(buffer) {
       COALESCE(s.OBJ_Material, '') AS material_code,
       COALESCE(s.OBJ_Shape, '') AS shape_code,
       COALESCE(s.OBJ_Size1, '') AS size1,
-      COALESCE(s.OBJ_Size2, '') AS size2
-    FROM SECTION s
-    LEFT JOIN (
-      SELECT INS_Section_FK, MAX(COALESCE(INS_InspectedLength, INS_EstimatedLength, 0)) AS inspected_length
-      FROM SECINSP
-      GROUP BY INS_Section_FK
-    ) si ON si.INS_Section_FK = s.OBJ_PK
-    LEFT JOIN NODE n1 ON n1.OBJ_PK = s.OBJ_FromNode_REF
-    LEFT JOIN NODE n2 ON n2.OBJ_PK = s.OBJ_ToNode_REF
-    ORDER BY s.OBJ_Key
-  `;
+      COALESCE(s.OBJ_Size2, '') AS size2`;
 
-  const stmt = db.prepare(query);
-  const rows = [];
-  while (stmt.step()) {
-    const row = stmt.getAsObject();
-    const dia = row.size2
-      ? `${String(row.size1).replace(/\.0+$/, '')}/${String(row.size2).replace(/\.0+$/, '')}`
-      : String(row.size1 || '').replace(/\.0+$/, '');
-    rows.push({
-      project: projectName || 'NOT SET',
-      reference: cleanString(row.reference),
-      length: Number(row.length || 0).toFixed(3),
-      city: cleanString(row.city),
-      street: cleanString(row.street),
-      upstream: cleanString(row.upstream),
-      downstream: cleanString(row.downstream),
-      material: materialLabel(row.material_code),
-      shape: shapeLabel(row.shape_code, row.size1, row.size2),
-      dia
-    });
+  const coreColsNoInsp = `
+      s.OBJ_Key AS reference,
+      COALESCE(s.OBJ_Length, 0) AS length,
+      COALESCE(s.OBJ_City, '') AS city,
+      COALESCE(s.OBJ_Street, '') AS street,
+      COALESCE(n1.OBJ_Key, '') AS upstream,
+      COALESCE(n2.OBJ_Key, '') AS downstream,
+      COALESCE(s.OBJ_Material, '') AS material_code,
+      COALESCE(s.OBJ_Shape, '') AS shape_code,
+      COALESCE(s.OBJ_Size1, '') AS size1,
+      COALESCE(s.OBJ_Size2, '') AS size2`;
+
+  const coreColsBare = `
+      s.OBJ_Key AS reference,
+      COALESCE(s.OBJ_Length, 0) AS length,
+      COALESCE(s.OBJ_City, '') AS city,
+      COALESCE(s.OBJ_Street, '') AS street,
+      '' AS upstream,
+      '' AS downstream,
+      COALESCE(s.OBJ_Material, '') AS material_code,
+      COALESCE(s.OBJ_Shape, '') AS shape_code,
+      COALESCE(s.OBJ_Size1, '') AS size1,
+      COALESCE(s.OBJ_Size2, '') AS size2`;
+
+  /** @type {string[]} */
+  const sqlVariants = [];
+  if (secinspT && nodeT) {
+    const SI = sqlIdentQuoted(secinspT);
+    sqlVariants.push(`
+    SELECT ${coreCols}
+    FROM ${S} s
+    LEFT JOIN (
+      SELECT INS_Section_FK AS si_fk, MAX(COALESCE(INS_InspectedLength, INS_EstimatedLength, 0)) AS inspected_length
+      FROM ${SI}
+      GROUP BY INS_Section_FK
+    ) si ON si.si_fk = s.OBJ_PK
+    LEFT JOIN ${N} n1 ON n1.OBJ_PK = s.OBJ_FromNode_REF
+    LEFT JOIN ${N} n2 ON n2.OBJ_PK = s.OBJ_ToNode_REF
+    ORDER BY s.OBJ_Key`);
+    sqlVariants.push(`
+    SELECT ${coreCols}
+    FROM ${S} s
+    LEFT JOIN (
+      SELECT OBJ_ID AS si_fk, MAX(COALESCE(INS_InspectedLength, INS_EstimatedLength, 0)) AS inspected_length
+      FROM ${SI}
+      GROUP BY OBJ_ID
+    ) si ON si.si_fk = s.OBJ_ID
+    LEFT JOIN ${N} n1 ON n1.OBJ_PK = s.OBJ_FromNode_REF
+    LEFT JOIN ${N} n2 ON n2.OBJ_PK = s.OBJ_ToNode_REF
+    ORDER BY s.OBJ_Key`);
+    sqlVariants.push(`
+    SELECT ${coreCols}
+    FROM ${S} s
+    LEFT JOIN (
+      SELECT OBJ_ID AS si_fk, MAX(COALESCE(INS_InspectedLength, INS_EstimatedLength, 0)) AS inspected_length
+      FROM ${SI}
+      GROUP BY OBJ_ID
+    ) si ON si.si_fk = s.OBJ_PK
+    LEFT JOIN ${N} n1 ON n1.OBJ_PK = s.OBJ_FromNode_REF
+    LEFT JOIN ${N} n2 ON n2.OBJ_PK = s.OBJ_ToNode_REF
+    ORDER BY s.OBJ_Key`);
   }
-  stmt.free();
+  if (nodeT) {
+    sqlVariants.push(`
+    SELECT ${coreColsNoInsp}
+    FROM ${S} s
+    LEFT JOIN ${N} n1 ON n1.OBJ_PK = s.OBJ_FromNode_REF
+    LEFT JOIN ${N} n2 ON n2.OBJ_PK = s.OBJ_ToNode_REF
+    ORDER BY s.OBJ_Key`);
+  }
+  sqlVariants.push(`
+    SELECT ${coreColsBare}
+    FROM ${S} s
+    ORDER BY s.OBJ_Key`);
+
+  let lastErr = 'no query variant succeeded';
+  for (const sql of sqlVariants) {
+    const sqlWithExtras = injectDb3ExtrasBeforeOrderBy(sql, extraFrag.sql);
+    let stmt;
+    try {
+      stmt = db.prepare(sqlWithExtras);
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e);
+      continue;
+    }
+    try {
+      const rows = [];
+      while (stmt.step()) {
+        const raw = stmt.getAsObject();
+        const mapped = mapDb3SectionRow(raw, projectName);
+        let imported = extractDb3ImportedFromRow(raw, extraFrag.aliasNames);
+        imported = mergeSecinspRowIntoDb3Imported(db, sectionT, secinspT || '', mapped.reference, imported);
+        imported = mergeSecinspBySectionObjKeyColumn(db, secinspT || '', mapped.reference, imported);
+        if (Object.keys(imported).length) {
+          mapped.db3Imported = imported;
+        }
+        rows.push(mapped);
+      }
+      stmt.free();
+      db.close();
+      return rows;
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e);
+      try {
+        stmt.free();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
   db.close();
-  return rows;
+  throw new Error(
+    lastErr ||
+      'Could not read SECTION rows from this DB3 (unsupported WinCan schema or missing OBJ_Key / length columns).'
+  );
 }
 
 async function ensureSchema() {
@@ -3107,7 +4382,8 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_access_granted BOOLEAN NOT NULL DEFAULT false`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS self_signup BOOLEAN NOT NULL DEFAULT false`
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS self_signup BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS product_tutorials_seen JSONB NOT NULL DEFAULT '{}'::jsonb`
   ];
   for (const query of userAlters) await pool.query(query);
   await pool.query(`
@@ -3772,12 +5048,25 @@ app.post('/admin/app-data-migrate-postgres-to-wasabi', requireAuth, requireAdmin
 
 app.get('/sync-state', requireAuth, async (req, res) => {
   try {
+    const syncStateNow = Date.now();
+    if (
+      SYNC_STATE_HTTP_CACHE_MS > 0 &&
+      syncStateHttpCache.payload &&
+      syncStateHttpCache.expiresAt > syncStateNow
+    ) {
+      res.set('X-Sync-State-Cache', 'hit');
+      return res.json(syncStateHttpCache.payload);
+    }
     if (WASABI_SYNC_STATE_PRIMARY_ENABLED) {
       try {
         const snapshotState = await readSyncStateFromWasabiSnapshot();
         if (snapshotState) {
           const signature = crypto.createHash('sha256').update(JSON.stringify(snapshotState)).digest('hex');
-          return res.json({ success: true, signature, state: snapshotState });
+          const out = { success: true, signature, state: snapshotState };
+          if (SYNC_STATE_HTTP_CACHE_MS > 0) {
+            syncStateHttpCache = { expiresAt: Date.now() + SYNC_STATE_HTTP_CACHE_MS, payload: out };
+          }
+          return res.json(out);
         }
         if (WASABI_SYNC_STATE_PRIMARY_STRICT) {
           const empty = {
@@ -3790,7 +5079,11 @@ app.get('/sync-state', requireAuth, async (req, res) => {
             emails: { count: 0, updated_at: new Date(0).toISOString() }
           };
           const signature = crypto.createHash('sha256').update(JSON.stringify(empty)).digest('hex');
-          return res.json({ success: true, signature, state: empty });
+          const out = { success: true, signature, state: empty };
+          if (SYNC_STATE_HTTP_CACHE_MS > 0) {
+            syncStateHttpCache = { expiresAt: Date.now() + SYNC_STATE_HTTP_CACHE_MS, payload: out };
+          }
+          return res.json(out);
         }
       } catch (error) {
         if (WASABI_SYNC_STATE_PRIMARY_STRICT) throw error;
@@ -3841,7 +5134,11 @@ app.get('/sync-state', requireAuth, async (req, res) => {
       emails: emails.rows[0]
     };
     const signature = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
-    res.json({ success: true, signature, state: payload });
+    const out = { success: true, signature, state: payload };
+    if (SYNC_STATE_HTTP_CACHE_MS > 0) {
+      syncStateHttpCache = { expiresAt: Date.now() + SYNC_STATE_HTTP_CACHE_MS, payload: out };
+    }
+    res.json(out);
   } catch (error) {
     console.error('SYNC STATE ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -4011,7 +5308,7 @@ app.post('/login', async (req, res) => {
     try {
       const result = await pool.query(
         `SELECT id, username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-                email, email_verified, portal_files_access_granted, portal_permissions_access, self_signup
+                email, email_verified, portal_files_access_granted, portal_permissions_access, self_signup, product_tutorials_seen
          FROM users u
          WHERE LOWER(TRIM(u.username)) = LOWER(TRIM($1))
             OR LOWER(TRIM(COALESCE(u.display_name, u.username))) = LOWER(TRIM($1))
@@ -4092,6 +5389,70 @@ app.get('/session', requireAuth, async (req, res) => {
   res.json({ success: true, user: req.user, capabilities: resolveCapabilities(req.user) });
 });
 
+/**
+ * Mark guided product tutorial completion per account (PipeShare / PipeSync).
+ * Body: `{ product: 'pipeshare' | 'pipesync', completed?: boolean }` — `completed` defaults to true; false removes the flag so the tour can auto-run again.
+ */
+app.post('/me/product-tutorials-seen', requireAuth, async (req, res) => {
+  const product = cleanString(req.body?.product).toLowerCase();
+  if (product !== 'pipeshare' && product !== 'pipesync') {
+    return res.status(400).json({ success: false, error: 'product must be pipeshare or pipesync' });
+  }
+  const completed = req.body?.completed !== false;
+  const userId = String(req.user?.id || '').trim();
+  if (!userId) {
+    return res.status(400).json({ success: false, error: 'Missing user id' });
+  }
+  try {
+    if (completed) {
+      await pool.query(
+        `UPDATE users
+         SET product_tutorials_seen = COALESCE(product_tutorials_seen, '{}'::jsonb) || $2::jsonb,
+             updated_at = NOW()
+         WHERE CAST(id AS text) = $1`,
+        [userId, JSON.stringify({ [product]: true })]
+      );
+    } else {
+      await pool.query(
+        `UPDATE users
+         SET product_tutorials_seen = COALESCE(product_tutorials_seen, '{}'::jsonb) - $2::text,
+             updated_at = NOW()
+         WHERE CAST(id AS text) = $1`,
+        [userId, product]
+      );
+    }
+    const fresh = await readFreshUserFromPostgresById(userId);
+    if (!fresh) {
+      return res.status(404).json({ success: false, error: 'User not found after update' });
+    }
+    res.json({ success: true, user: fresh });
+  } catch (error) {
+    console.error('[me/product-tutorials-seen]', error);
+    res.status(500).json({ success: false, error: error.message || 'Server error' });
+  }
+});
+
+/** Admin: clear guided-tutorial flags for another account (both products). */
+app.post('/users/:id/product-tutorials-reset', requireAuth, requireAdminPanelAccess, async (req, res) => {
+  const id = cleanString(req.params.id);
+  if (!id) {
+    return res.status(400).json({ success: false, error: 'User id is required' });
+  }
+  try {
+    await pool.query(`UPDATE users SET product_tutorials_seen = '{}'::jsonb, updated_at = NOW() WHERE CAST(id AS text) = $1`, [
+      id
+    ]);
+    const fresh = await readFreshUserFromPostgresById(id);
+    if (!fresh) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+    res.json({ success: true, user: fresh });
+  } catch (error) {
+    console.error('[users/:id/product-tutorials-reset]', error);
+    res.status(500).json({ success: false, error: error.message || 'Server error' });
+  }
+});
+
 app.get('/data-auto-sync/access', requireAuth, requireDataAutoSyncEmployeeAccess, async (req, res) => {
   res.json({ success: true, allowed: true });
 });
@@ -4100,17 +5461,73 @@ app.get('/data-auto-sync/access', requireAuth, requireDataAutoSyncEmployeeAccess
 app.post('/auto-import-plugin/push', requireAuth, requireDataAutoSyncEmployeeAccess, async (req, res) => {
   try {
     const body = req.body || {};
-    const source = String(body.source || '').trim();
+    const source = String(body.source || 'desktop').trim() || 'desktop';
     const rows = Array.isArray(body.rows) ? body.rows : [];
+    const rowCount = rows.length;
+
+    /**
+     * The DAS monitor reads `auto_import_projects` + `auto_import_logs` from Postgres first. This route used to be
+     * a no-op JSON ack, so the queue + live log stayed empty even when uploads "worked". Persist a log line (and
+     * optionally touch a project row when `db3Path` is sent) on **live Postgres** so the portal monitor reflects activity.
+     */
+    const logId = crypto.randomUUID();
+    const msg =
+      cleanString(body.message || '').slice(0, 2000) ||
+      (rowCount ? `Push received: ${rowCount} row(s)` : 'Push received (ping)');
+    const payloadJson = JSON.stringify({
+      rowCount,
+      username: req.user?.username || '',
+      db3Path: body.db3Path != null ? String(body.db3Path).slice(0, 800) : ''
+    });
+    try {
+      await pool.query(
+        `INSERT INTO auto_import_logs (id, project_id, source, level, message, payload)
+         VALUES ($1, NULL, $2, 'info', $3, $4::jsonb)`,
+        [logId, source.slice(0, 64), msg, payloadJson]
+      );
+    } catch (e) {
+      console.warn('[auto-import-plugin/push] log insert skipped:', e?.message || e);
+    }
+
+    const db3Raw = cleanString(body.db3Path || '');
+    if (db3Raw) {
+      try {
+        const absPath = path.resolve(db3Raw);
+        const sourceKey = crypto.createHash('sha1').update(absPath).digest('hex');
+        const displayName = cleanString(body.displayName || '') || path.basename(absPath);
+        const existing = await pool.query('SELECT id FROM auto_import_projects WHERE source_key = $1 LIMIT 1', [
+          sourceKey
+        ]);
+        if (existing.rows[0]) {
+          await pool.query(
+            `UPDATE auto_import_projects
+             SET display_name = COALESCE(NULLIF($2::text, ''), display_name),
+                 db3_path = $3,
+                 last_seen_at = NOW(),
+                 updated_at = NOW()
+             WHERE source_key = $1`,
+            [sourceKey, displayName, absPath]
+          );
+        } else {
+          const projectId = crypto.randomUUID();
+          await pool.query(
+            `INSERT INTO auto_import_projects (
+              id, source_key, display_name, db3_path, status, last_seen_at, metadata, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, 'idle', NOW(), '{}'::jsonb, NOW(), NOW())`,
+            [projectId, sourceKey, displayName, absPath]
+          );
+        }
+      } catch (e) {
+        console.warn('[auto-import-plugin/push] project touch skipped:', e?.message || e);
+      }
+    }
 
     return res.json({
       success: true,
-      message: rows.length
-        ? 'Auto import payload received.'
-        : 'Auto import test received.',
+      message: rowCount ? 'Auto import payload received.' : 'Auto import test received.',
       received: {
         source,
-        rowCount: rows.length
+        rowCount
       }
     });
   } catch (error) {
@@ -4728,54 +6145,14 @@ app.get('/records', requireAuth, requirePsrViewerAccess, async (req, res) => {
         if (WASABI_RECORDS_PRIMARY_STRICT) throw error;
       }
       const out = sortPlannerRecordsForList(snapshotRecords);
-      // #region agent log
-      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-        body: JSON.stringify({
-          sessionId: '2228ee',
-          hypothesisId: 'A',
-          location: 'server.js:GET/records',
-          message: 'branch wasabi_only',
-          data: {
-            uid: String(req.user?.id || ''),
-            isAdmin: !!req.user?.isAdmin,
-            scopeEntryCount: Array.isArray(req.user?.psrScopes) ? req.user.psrScopes.length : 0,
-            recordCount: out.length
-          },
-          timestamp: Date.now(),
-          runId: 'pre-fix'
-        })
-      }).catch(() => {});
-      // #endregion
-      return res.json({ success: true, records: out });
+return res.json({ success: true, records: out });
     }
 
     const pgRecords = await readPlannerRecordsFromPostgresForUser(req.user);
 
     if (!WASABI_RECORDS_PRIMARY_ENABLED) {
       const out = sortPlannerRecordsForList(pgRecords);
-      // #region agent log
-      fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-        body: JSON.stringify({
-          sessionId: '2228ee',
-          hypothesisId: 'A',
-          location: 'server.js:GET/records',
-          message: 'branch postgres_only',
-          data: {
-            uid: String(req.user?.id || ''),
-            isAdmin: !!req.user?.isAdmin,
-            scopeEntryCount: Array.isArray(req.user?.psrScopes) ? req.user.psrScopes.length : 0,
-            recordCount: out.length
-          },
-          timestamp: Date.now(),
-          runId: 'pre-fix'
-        })
-      }).catch(() => {});
-      // #endregion
-      return res.json({ success: true, records: out });
+return res.json({ success: true, records: out });
     }
 
     let snapshotRecords = [];
@@ -4787,37 +6164,159 @@ app.get('/records', requireAuth, requirePsrViewerAccess, async (req, res) => {
 
     const merged = mergePlannerRecordsById(snapshotRecords, pgRecords);
     const out = sortPlannerRecordsForList(merged);
-    // #region agent log
-    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-      body: JSON.stringify({
-        sessionId: '2228ee',
-        hypothesisId: 'A',
-        location: 'server.js:GET/records',
-        message: 'branch merge_wasabi_postgres',
-        data: {
-          uid: String(req.user?.id || ''),
-          isAdmin: !!req.user?.isAdmin,
-          scopeEntryCount: Array.isArray(req.user?.psrScopes) ? req.user.psrScopes.length : 0,
-          wasabiFilteredCount: snapshotRecords.length,
-          pgCount: pgRecords.length,
-          mergedCount: out.length
-        },
-        timestamp: Date.now(),
-        runId: 'pre-fix'
-      })
-    }).catch(() => {});
-    // #endregion
-    return res.json({ success: true, records: out });
+return res.json({ success: true, records: out });
   } catch (error) {
     console.error('GET RECORDS ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
+app.get('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, res) => {
+  try {
+    const un = pipesyncPlanViewUsernameKey(req.user);
+    if (!un) {
+      return res.json({ success: true, payload: null, updated_at: null });
+    }
+    if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+      return res.json({ success: true, payload: null, updated_at: null, wasabi: false });
+    }
+    const snap = await loadWasabiLatestStateSnapshot(true);
+    const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
+    const rows = Array.isArray(tables[PIPESYNC_PLAN_VIEW_TABLE]) ? tables[PIPESYNC_PLAN_VIEW_TABLE] : [];
+    const row = rows.find((r) => String(r?.username || '').toLowerCase() === un);
+    let payload = row && row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload) ? row.payload : null;
+    if (payload) payload = await hydratePlanViewPayloadForResponse(payload);
+    return res.json({
+      success: true,
+      payload,
+      updated_at: row?.updated_at || null
+    });
+  } catch (error) {
+    console.error('GET PIPESYNC PLAN VIEW:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, res) => {
+  try {
+    if (!WASABI_WRITES_PRIMARY_ENABLED) {
+      return res.status(503).json({ success: false, error: 'Wasabi primary writes are disabled on this server.' });
+    }
+    if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+      return res.status(503).json({ success: false, error: 'Wasabi state storage is not configured.' });
+    }
+    const un = pipesyncPlanViewUsernameKey(req.user);
+    if (!un) {
+      return res.status(400).json({ success: false, error: 'Account has no username for plan view storage.' });
+    }
+    const payload = req.body?.payload;
+    if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) {
+      return res.status(400).json({ success: false, error: 'Body must be JSON { "payload": { ... } }.' });
+    }
+    const sanitized = sanitizePlanViewPayloadForPersist(payload);
+    const json = JSON.stringify(sanitized);
+    if (json.length > PIPESYNC_PLAN_VIEW_MAX_BYTES) {
+      return res.status(413).json({ success: false, error: 'Plan view data exceeds the maximum save size.' });
+    }
+    const now = nowIso();
+    await runWasabiStateWrite(`pipesync-plan-view:${un}`, async (data) => {
+      const rows = ensureSnapshotTable(data, PIPESYNC_PLAN_VIEW_TABLE);
+      const idx = rows.findIndex((r) => String(r?.username || '').toLowerCase() === un);
+      const row = { username: un, payload: sanitized, updated_at: now };
+      if (idx >= 0) rows[idx] = row;
+      else rows.push(row);
+    });
+    return res.json({ success: true, updated_at: now });
+  } catch (error) {
+    console.error('PUT PIPESYNC PLAN VIEW:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post(
+  '/pipesync/plan-view/upload-presign',
+  requireAuth,
+  requirePsrViewerAccess,
+  express.json({ limit: '64kb' }),
+  async (req, res) => {
+    try {
+      if (!adminAttachmentsWasabiConfigured()) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
+      }
+      const fileName = cleanString(req.body?.fileName);
+      const contentType = cleanString(req.body?.contentType || 'application/octet-stream');
+      const fileSize = Number(req.body?.fileSize);
+      if (!fileName) return res.status(400).json({ success: false, error: 'fileName is required' });
+      if (!Number.isFinite(fileSize) || fileSize < 1 || fileSize > ADMIN_ATTACHMENT_MAX_BYTES) {
+        return res.status(400).json({
+          success: false,
+          error: `fileSize must be between 1 and ${ADMIN_ATTACHMENT_MAX_BYTES} bytes`
+        });
+      }
+      if (!isAllowedAdminAttachmentContentType(contentType, 'pipesync-plan-view')) {
+        return res.status(400).json({ success: false, error: 'Only images and PDF files are allowed for plan view.' });
+      }
+      const storageKey = buildPipesyncPlanPageStorageKey(fileName);
+      const signed = await presignAdminAttachmentPut(
+        wasabiStateClient,
+        WASABI_STATE_BUCKET,
+        storageKey,
+        contentType,
+        ADMIN_ATTACHMENT_UPLOAD_TTL_SECONDS
+      );
+      let viewUrl = null;
+      try {
+        const getSigned = await presignAdminAttachmentGet(
+          wasabiStateClient,
+          WASABI_STATE_BUCKET,
+          storageKey,
+          ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+        );
+        viewUrl = getSigned.url;
+      } catch {
+        /* client can reopen plan view to refresh */
+      }
+      return res.json({ success: true, ...signed, viewUrl });
+    } catch (error) {
+      console.error('PIPESYNC PLAN VIEW UPLOAD PRESIGN:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+/** Presign GET for an existing plan-board PDF (or image) object when the client has storageKey but no view URL. */
+app.post(
+  '/pipesync/plan-view/read-url',
+  requireAuth,
+  requirePsrViewerAccess,
+  express.json({ limit: '32kb' }),
+  async (req, res) => {
+    try {
+      if (!adminAttachmentsWasabiConfigured()) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
+      }
+      const storageKey = cleanString(req.body?.storageKey);
+      if (!storageKey || !isValidPipesyncPlanPageStorageKey(storageKey)) {
+        return res.status(400).json({ success: false, error: 'A valid plan page storageKey is required.' });
+      }
+      const { url } = await presignAdminAttachmentGet(
+        wasabiStateClient,
+        WASABI_STATE_BUCKET,
+        storageKey,
+        ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+      );
+      return res.json({ success: true, url: typeof url === 'string' ? url : '' });
+    } catch (error) {
+      console.error('PIPESYNC PLAN VIEW READ URL:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
 app.post('/records', requireAuth, requirePsrDataEntryAccess, async (req, res) => {
   try {
+    const showStorm = req.body?.createStorm !== false;
+    const showSanitary = !!req.body?.createSanitary;
     const record = {
       record_date: cleanString(req.body?.record_date || req.body?.date || new Date().toISOString().slice(0, 10)),
       client: upperCleanString(req.body?.client),
@@ -4827,9 +6326,10 @@ app.post('/records', requireAuth, requirePsrDataEntryAccess, async (req, res) =>
       status: '',
       saved_by: req.user.displayName || req.user.username,
       systems: {
-        storm: req.body?.createStorm === false ? [] : [],
-        sanitary: req.body?.createSanitary ? [] : []
-      }
+        storm: [],
+        sanitary: []
+      },
+      systemBranches: { storm: showStorm, sanitary: showSanitary }
     };
     if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
 
@@ -4862,6 +6362,7 @@ async function fetchRecordById(id) {
 
 async function persistRecord(record) {
   let savedRow = null;
+  const jobsiteWrite = persistedPlannerJobsiteForWrite(record);
   const wasabiWrote = await tryWasabiStateWrite('persist-record', async (data) => {
     const rows = ensureSnapshotTable(data, 'planner_records');
     const idx = rows.findIndex((row) => String(row.id || '') === String(record.id || ''));
@@ -4874,7 +6375,7 @@ async function persistRecord(record) {
         client: upperCleanString(record.client),
         city: upperCleanString(record.city),
         street: upperCleanString(record.street),
-        jobsite: normalizeJobsiteName(record.jobsite, record.street),
+        jobsite: jobsiteWrite,
         status: cleanString(record.status || ''),
         saved_by: cleanString(record.saved_by || ''),
         data: serializeRecordData(record),
@@ -4889,7 +6390,7 @@ async function persistRecord(record) {
         client: upperCleanString(record.client),
         city: upperCleanString(record.city),
         street: upperCleanString(record.street),
-        jobsite: normalizeJobsiteName(record.jobsite, record.street),
+        jobsite: jobsiteWrite,
         status: cleanString(record.status || ''),
         saved_by: cleanString(record.saved_by || ''),
         data: serializeRecordData(record),
@@ -4898,22 +6399,27 @@ async function persistRecord(record) {
       rows[idx] = savedRow;
     }
   });
-  if (wasabiWrote && savedRow) {
-    return normalizeRecordRow(savedRow);
-  }
   if (PLANNER_STORE_WASABI_ONLY) {
+    if (wasabiWrote && savedRow) return normalizeRecordRow(savedRow);
     throw new Error('Planner data is stored only in Wasabi; persist write failed. Check WASABI_WRITES_PRIMARY_ENABLED and bucket credentials.');
   }
+  /**
+   * Hybrid mode: GET /records uses Postgres whenever WASABI_RECORDS_PRIMARY_ENABLED is off (the default).
+   * A successful Wasabi write used to return here without mirroring to Postgres, so edits existed only in
+   * latest.json and disappeared on the next read. Always upsert Postgres when not Wasabi-only canonical.
+   */
+  const pgSource = wasabiWrote && savedRow ? normalizeRecordRow(savedRow) : record;
+  const jobsiteForPg = persistedPlannerJobsiteForWrite(pgSource);
   const payload = [
-    record.record_date,
-    record.client,
-    record.city,
-    record.street,
-    normalizeJobsiteName(record.jobsite, record.street),
-    record.status || '',
-    record.saved_by || '',
-    JSON.stringify(serializeRecordData(record)),
-    String(record.id)
+    cleanString(pgSource.record_date),
+    pgSource.client,
+    pgSource.city,
+    upperCleanString(pgSource.street),
+    jobsiteForPg,
+    cleanString(pgSource.status || ''),
+    cleanString(pgSource.saved_by || ''),
+    JSON.stringify(serializeRecordData(pgSource)),
+    String(pgSource.id)
   ];
   const result = await pool.query(
     `UPDATE planner_records
@@ -4934,7 +6440,7 @@ async function persistRecord(record) {
     return normalizeRecordRow(result.rows[0]);
   }
   // Wasabi-only or pre-migration row: no PG row to UPDATE — upsert when id is a UUID.
-  if (!isPlannerRecordUuid(record.id)) {
+  if (!isPlannerRecordUuid(pgSource.id)) {
     throw new Error('Record not found');
   }
   const ins = await pool.query(
@@ -5015,12 +6521,13 @@ async function deletePlannerRecordById(id) {
     });
     data.planner_records = next;
   });
-  if (wasabiWrote) return deletedId;
   if (PLANNER_STORE_WASABI_ONLY) {
-    return null;
+    return wasabiWrote ? deletedId : null;
   }
+  /** Hybrid: mirror delete to Postgres; Wasabi-only returns above. */
   const result = await pool.query('DELETE FROM planner_records WHERE CAST(id AS text) = $1 RETURNING id', [String(id)]);
-  return result.rows.length ? result.rows[0].id : null;
+  if (result.rows.length) return result.rows[0].id;
+  return deletedId;
 }
 
 async function deletePlannerRecordsByClient(client) {
@@ -5032,10 +6539,10 @@ async function deletePlannerRecordsByClient(client) {
     deletedCount = rows.length - next.length;
     data.planner_records = next;
   });
-  if (wasabiWrote) return deletedCount;
   if (PLANNER_STORE_WASABI_ONLY) {
-    return 0;
+    return wasabiWrote ? deletedCount : 0;
   }
+  /** Hybrid: always remove matching rows from Postgres as well. */
   const result = await pool.query('DELETE FROM planner_records WHERE client = $1 RETURNING id', [client]);
   return Number(result.rowCount || 0);
 }
@@ -5054,6 +6561,10 @@ app.put('/records/:id', requireAuth, requirePsrDataEntryAccess, async (req, res)
     record.status = cleanString(req.body?.status || record.status);
     record.saved_by = cleanString(req.body?.saved_by || req.body?.savedBy || req.user.displayName || req.user.username);
     if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
+
+    if (req.body?.systemBranches && typeof req.body.systemBranches === 'object') {
+      record.systemBranches = coerceSystemBranchesForStorage(req.body.systemBranches, record.systems);
+    }
 
     const saved = await persistRecord(record);
     res.json({ success: true, record: saved });
@@ -5092,7 +6603,8 @@ app.post('/clients', requireAuth, requireAdmin, async (req, res) => {
       jobsite,
       status: '',
       saved_by: req.user.displayName || req.user.username,
-      systems: { storm: [], sanitary: [] }
+      systems: { storm: [], sanitary: [] },
+      systemBranches: { storm: true, sanitary: false }
     });
     res.status(201).json({ success: true, record: saved });
   } catch (error) {
@@ -5146,27 +6658,7 @@ app.post('/records/:id/segments', requireAuth, requirePsrDataEntryAccess, async 
     record.saved_by = req.user.displayName || req.user.username;
 
     const saved = await persistRecord(record);
-    // #region agent log
-    const _segN = (saved?.systems?.[system] || []).length;
-    fetch('http://127.0.0.1:7466/ingest/245b56ea-bc5d-432c-b4d8-fb874565b909', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '2228ee' },
-      body: JSON.stringify({
-        sessionId: '2228ee',
-        hypothesisId: 'C',
-        location: 'server.js:POST/records/:id/segments',
-        message: 'segment persisted',
-        data: {
-          recordIdLen: String(req.params.id || '').length,
-          system,
-          segmentCountInSystem: _segN
-        },
-        timestamp: Date.now(),
-        runId: 'pre-fix'
-      })
-    }).catch(() => {});
-    // #endregion
-    res.status(201).json({ success: true, record: saved, segment });
+res.status(201).json({ success: true, record: saved, segment });
   } catch (error) {
     console.error('ADD SEGMENT ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -5254,6 +6746,34 @@ app.put('/records/:id/segments/:segmentId', requireAuth, requirePsrDataEntryAcce
       footage: cleanString(segmentPatch.footage !== undefined ? segmentPatch.footage : (segmentPatch.length !== undefined ? segmentPatch.length : found.footage)),
       street: upperCleanString(segmentPatch.street !== undefined ? segmentPatch.street : found.street)
     });
+    if (segmentPatch.linkedPortalDb3FileId !== undefined) {
+      found.linkedPortalDb3FileId = cleanString(segmentPatch.linkedPortalDb3FileId).slice(0, 128);
+      found.linkedPortalDb3FolderPath = cleanString(segmentPatch.linkedPortalDb3FolderPath).slice(0, 800);
+      found.linkedPortalDb3ClientId = cleanString(segmentPatch.linkedPortalDb3ClientId).slice(0, 128);
+      found.linkedPortalDb3JobId = cleanString(segmentPatch.linkedPortalDb3JobId).slice(0, 128);
+    }
+
+    if (segmentPatch.db3ImportedPartial !== undefined && segmentPatch.db3ImportedPartial !== null) {
+      const partial =
+        typeof segmentPatch.db3ImportedPartial === 'object' && !Array.isArray(segmentPatch.db3ImportedPartial)
+          ? segmentPatch.db3ImportedPartial
+          : parseJsonObject(segmentPatch.db3ImportedPartial, {});
+      const allowed = new Set(['HP_EDIT_INSPECTED_BY', 'HP_EDIT_CERTIFICATE_NO']);
+      const cur = found.db3Imported && typeof found.db3Imported === 'object' ? { ...found.db3Imported } : {};
+      for (const [k, v] of Object.entries(partial)) {
+        const ku = String(k || '')
+          .trim()
+          .toUpperCase();
+        if (!allowed.has(ku)) continue;
+        const str =
+          typeof v === 'number' && Number.isFinite(v)
+            ? String(v)
+            : String(v == null ? '' : v).trim();
+        if (!str) delete cur[ku];
+        else cur[ku] = str.slice(0, 4000);
+      }
+      found.db3Imported = sanitizeDb3ImportedObject(cur);
+    }
 
     if (Object.keys(versionPatch).length) {
       const nextVersion = defaultVersion(req.body?.saveBy || req.user.displayName || req.user.username, {
@@ -5402,17 +6922,52 @@ app.delete('/pricing-rates/:dia', requireAuth, requireAdmin, async (req, res) =>
   }
 });
 
+app.post('/admin/attachments/upload-presign', requireAuth, requireAdmin, express.json({ limit: '64kb' }), async (req, res) => {
+  try {
+    if (!adminAttachmentsWasabiConfigured()) {
+      return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
+    }
+    const fileName = cleanString(req.body?.fileName);
+    const contentType = cleanString(req.body?.contentType || 'application/octet-stream');
+    const fileSize = Number(req.body?.fileSize);
+    const fileKind =
+      String(req.body?.fileKind || 'jobsite-asset').trim().toLowerCase() === 'daily-report' ? 'daily-report' : 'jobsite-asset';
+    if (!fileName) return res.status(400).json({ success: false, error: 'fileName is required' });
+    if (!Number.isFinite(fileSize) || fileSize < 1 || fileSize > ADMIN_ATTACHMENT_MAX_BYTES) {
+      return res.status(400).json({
+        success: false,
+        error: `fileSize must be between 1 and ${ADMIN_ATTACHMENT_MAX_BYTES} bytes`
+      });
+    }
+    if (!isAllowedAdminAttachmentContentType(contentType, fileKind)) {
+      return res.status(400).json({ success: false, error: 'Unsupported content type for this upload kind' });
+    }
+    const storageKey = buildAdminAttachmentStorageKey(fileName);
+    const signed = await presignAdminAttachmentPut(
+      wasabiStateClient,
+      WASABI_STATE_BUCKET,
+      storageKey,
+      contentType,
+      ADMIN_ATTACHMENT_UPLOAD_TTL_SECONDS
+    );
+    return res.json({ success: true, ...signed });
+  } catch (error) {
+    console.error('ADMIN ATTACHMENT PRESIGN ERROR:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/daily-reports', requireAuth, requireAdmin, async (req, res) => {
   try {
     if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
       const reports = (await readDailyReportsFromWasabiSnapshot()) || [];
-      return res.json({ success: true, reports });
+      return res.json({ success: true, reports: await hydrateDailyReportsResponseRows(reports) });
     }
     if (WASABI_REPORTS_PRIMARY_ENABLED) {
       try {
         const snapshotReports = await readDailyReportsFromWasabiSnapshot();
         if (snapshotReports) {
-          return res.json({ success: true, reports: snapshotReports });
+          return res.json({ success: true, reports: await hydrateDailyReportsResponseRows(snapshotReports) });
         }
         if (WASABI_REPORTS_PRIMARY_STRICT) {
           return res.json({ success: true, reports: [] });
@@ -5424,16 +6979,16 @@ app.get('/daily-reports', requireAuth, requireAdmin, async (req, res) => {
 
     const result = await pool.query('SELECT * FROM daily_reports ORDER BY report_date DESC, updated_at DESC');
     const reports = result.rows.map((row) => ({ ...row, files: Array.isArray(row.files) ? row.files : parseJsonObject(row.files, []) }));
-    res.json({ success: true, reports });
+    res.json({ success: true, reports: await hydrateDailyReportsResponseRows(reports) });
   } catch (error) {
     console.error('GET DAILY REPORTS ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-app.post('/daily-reports', requireAuth, requireAdmin, upload.array('files'), async (req, res) => {
+app.post('/daily-reports', requireAuth, requireAdmin, express.json({ limit: '20mb' }), async (req, res) => {
   try {
-    const files = (req.files || []).map(fileToStoredJson);
+    const files = normalizeAdminFilesForPersist(req.body?.files);
     const created = await createDailyReport({
       title: cleanString(req.body?.title),
       report_date: cleanString(req.body?.report_date || new Date().toISOString().slice(0, 10)),
@@ -5441,14 +6996,15 @@ app.post('/daily-reports', requireAuth, requireAdmin, upload.array('files'), asy
       files,
       created_by: req.user.displayName || req.user.username
     });
-    res.status(201).json({ success: true, report: created });
+    const hydrated = (await hydrateDailyReportsResponseRows([created]))[0] || created;
+    res.status(201).json({ success: true, report: hydrated });
   } catch (error) {
     console.error('CREATE DAILY REPORT ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-app.put('/daily-reports/:id', requireAuth, requireAdmin, upload.array('files'), async (req, res) => {
+app.put('/daily-reports/:id', requireAuth, requireAdmin, express.json({ limit: '20mb' }), async (req, res) => {
   try {
     let current = null;
     if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
@@ -5474,15 +7030,20 @@ app.put('/daily-reports/:id', requireAuth, requireAdmin, upload.array('files'), 
     const currentFiles = Array.isArray(current.files) ? current.files : parseJsonObject(current.files, []);
     const keepIds = new Set([].concat(req.body?.keepFileIds || []).filter(Boolean));
     const keptFiles = keepIds.size ? currentFiles.filter((file) => keepIds.has(file.id)) : currentFiles;
-    const addedFiles = (req.files || []).map(fileToStoredJson);
-    const nextFiles = [...keptFiles, ...addedFiles];
+    const addedFiles = Array.isArray(req.body?.files) ? req.body.files : [];
+    const nextFiles = normalizeAdminFilesForPersist([...keptFiles, ...addedFiles]);
+    const removedKeys = storageKeysRemovedBetweenFileLists(currentFiles, nextFiles);
+    if (adminAttachmentsWasabiConfigured() && removedKeys.length) {
+      await deleteAdminAttachmentKeys(wasabiStateClient, WASABI_STATE_BUCKET, removedKeys);
+    }
     const updated = await updateDailyReportById(req.params.id, {
       title: cleanString(req.body?.title),
       report_date: cleanString(req.body?.report_date || current.report_date),
       notes: cleanString(req.body?.notes),
       files: nextFiles
     });
-    res.json({ success: true, report: updated });
+    const hydrated = (await hydrateDailyReportsResponseRows([updated]))[0] || updated;
+    res.json({ success: true, report: hydrated });
   } catch (error) {
     console.error('UPDATE DAILY REPORT ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -5504,13 +7065,13 @@ app.get('/jobsite-assets', requireAuth, requireFootageAccess, async (req, res) =
   try {
     if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
       const assets = (await readJobsiteAssetsFromWasabiSnapshotForUser(req.user)) || [];
-      return res.json({ success: true, assets });
+      return res.json({ success: true, assets: await hydrateJobsiteAssetsResponseRows(assets) });
     }
     if (WASABI_ASSETS_PRIMARY_ENABLED) {
       try {
         const snapshotAssets = await readJobsiteAssetsFromWasabiSnapshotForUser(req.user);
         if (snapshotAssets) {
-          return res.json({ success: true, assets: snapshotAssets });
+          return res.json({ success: true, assets: await hydrateJobsiteAssetsResponseRows(snapshotAssets) });
         }
         if (WASABI_ASSETS_PRIMARY_STRICT) {
           return res.json({ success: true, assets: [] });
@@ -5528,16 +7089,16 @@ app.get('/jobsite-assets', requireAuth, requireFootageAccess, async (req, res) =
       scopeFilter.params
     );
     const assets = result.rows.map((row) => ({ ...row, files: Array.isArray(row.files) ? row.files : parseJsonObject(row.files, []) }));
-    res.json({ success: true, assets });
+    res.json({ success: true, assets: await hydrateJobsiteAssetsResponseRows(assets) });
   } catch (error) {
     console.error('GET JOBSITE ASSETS ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-app.post('/jobsite-assets', requireAuth, requireAdmin, upload.array('files'), async (req, res) => {
+app.post('/jobsite-assets', requireAuth, requireAdmin, express.json({ limit: '20mb' }), async (req, res) => {
   try {
-    const files = (req.files || []).map(fileToStoredJson);
+    const files = normalizeAdminFilesForPersist(req.body?.files);
     const created = await createJobsiteAsset({
       client: req.body?.assetClient || req.body?.client,
       city: req.body?.assetCity || req.body?.city,
@@ -5550,7 +7111,8 @@ app.post('/jobsite-assets', requireAuth, requireAdmin, upload.array('files'), as
       files,
       created_by: req.user.displayName || req.user.username
     });
-    res.status(201).json({ success: true, asset: created });
+    const hydrated = (await hydrateJobsiteAssetsResponseRows([created]))[0] || created;
+    res.status(201).json({ success: true, asset: hydrated });
   } catch (error) {
     console.error('CREATE JOBSITE ASSET ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -5577,26 +7139,27 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
     }
 
     const rows = await parseDb3(req.file.buffer);
-    const targetClient = cleanString(req.body?.targetClient);
-    const targetCity = cleanString(req.body?.targetCity);
-    const targetJobsite = normalizeJobsiteName(req.body?.targetJobsite || 'NOT SET');
-    const targetSystem = cleanString(req.body?.targetSystem || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
+    const { targetClient, targetCity, targetJobsite, targetSystem } = resolveWincanImportScope(req.body, rows);
 
-    const existingRecords = await findPlannerRecordsByScope(
-      targetClient || '',
-      targetCity || '',
-      targetJobsite || 'NOT SET',
-      { latestOnly: false }
-    );
+    const existingRecords = await findPlannerRecordsByScope(targetClient, targetCity, targetJobsite, { latestOnly: false });
     const existingRefs = new Set();
     existingRecords.forEach((record) => {
       (record.systems[targetSystem] || []).forEach((segment) => existingRefs.add(String(segment.reference || '').toLowerCase()));
     });
 
-    const previewRows = rows.map((row) => ({
-      ...row,
-      duplicate: existingRefs.has(String(row.reference || '').toLowerCase())
-    }));
+    const refKeys = rows.map((row) => String(row?.reference || '').trim().toLowerCase()).filter(Boolean);
+    const placedDupMap = await findPlacedDuplicatePayloadsByReferences(refKeys);
+
+    const previewRows = rows.map((row) => {
+      const refKey = String(row?.reference || '').trim().toLowerCase();
+      const placedDup = refKey ? placedDupMap.get(refKey) : null;
+      return {
+        ...row,
+        duplicate: existingRefs.has(refKey),
+        placedDuplicate: !!placedDup,
+        placedDuplicateOf: placedDup || null
+      };
+    });
 
     res.json({ success: true, sourceKind: 'DB3', defaultJobsite: cleanString(previewRows[0]?.project || 'NOT SET'), rows: previewRows });
   } catch (error) {
@@ -5608,12 +7171,12 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
 app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) => {
   try {
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
-    const targetClient = cleanString(req.body?.targetClient);
-    const targetCity = cleanString(req.body?.targetCity);
-    const targetJobsite = normalizeJobsiteName(req.body?.targetJobsite || 'NOT SET');
-    const targetSystem = cleanString(req.body?.targetSystem || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
-    if (!targetClient || !targetCity || !targetJobsite) {
-      return res.status(400).json({ success: false, error: 'Target client, city, and jobsite are required' });
+    const { targetClient, targetCity, targetJobsite, targetSystem } = resolveWincanImportScope(req.body, rows);
+    if (!targetJobsite || targetJobsite === 'NOT SET') {
+      return res.status(400).json({
+        success: false,
+        error: 'Could not determine jobsite. Enter a jobsite name or ensure the WinCan DB3 project name is set.'
+      });
     }
 
     let record;
@@ -5635,9 +7198,15 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
     }
 
     const refSet = new Set((record.systems[targetSystem] || []).map((segment) => String(segment.reference || '').toLowerCase()));
+    const queueImport = String(targetClient || '').trim().toLowerCase() === String(PSR_IMPORT_QUEUE_CLIENT).trim().toLowerCase();
+    const commitRefKeys = rows.map((r) => String(r?.reference || '').trim().toLowerCase()).filter(Boolean);
+    const placedAtCommit = queueImport ? await findPlacedDuplicatePayloadsByReferences(commitRefKeys) : new Map();
+
     rows.forEach((row) => {
       if (!row || row.duplicate) return;
       if (refSet.has(String(row.reference || '').toLowerCase())) return;
+      const refKey = String(row.reference || '').trim().toLowerCase();
+      const placedDup = queueImport ? placedAtCommit.get(refKey) || null : null;
       const segment = normalizeSegment({
         id: crypto.randomUUID(),
         reference: row.reference,
@@ -5645,15 +7214,18 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
         downstream: row.downstream,
         dia: row.dia,
         material: row.material,
+        shape: row.shape,
         length: row.length,
         footage: row.length,
         street: row.street,
         system: targetSystem,
+        db3Imported: row.db3Imported,
+        db3DuplicateOf: placedDup || undefined,
         versions: [
           defaultVersion(req.user.displayName || req.user.username, {
             status: 'neutral',
             recordedDate: record.record_date,
-            notes: 'Imported from WinCan DB3.'
+            notes: placedDup ? 'Imported from WinCan DB3. Flagged: possible double entry (OBJ_Key exists on a placed jobsite).' : 'Imported from WinCan DB3.'
           })
         ]
       }, req.user.displayName || req.user.username);
@@ -5724,7 +7296,7 @@ async function runAutoImportWasabiQuery(text, params = []) {
 
   let snapshotCache = null;
   async function requireFreshSnapshot() {
-    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot();
+    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot(true);
     if (!snapshotLooksFresh(snapshotCache, WASABI_AUTO_IMPORT_PRIMARY_MAX_SNAPSHOT_AGE_MS)) {
       throw new Error('Auto import snapshot is missing or stale');
     }
@@ -5807,6 +7379,14 @@ async function runAutoImportWasabiQuery(text, params = []) {
     const limit = Math.max(1, Number(params[1] || 200));
     const rows = [...snapshotRows(snapshot, 'auto_import_logs')]
       .filter((row) => String(row.project_id || '') === projectId || row.project_id == null)
+      .sort((a, b) => tsMs(b?.created_at) - tsMs(a?.created_at))
+      .slice(0, limit);
+    return pgRows(rows);
+  }
+  if (sql.startsWith('select * from auto_import_logs order by created_at desc limit')) {
+    const snapshot = await requireFreshSnapshot();
+    const limit = Math.max(1, Number(params[0] || 200));
+    const rows = [...snapshotRows(snapshot, 'auto_import_logs')]
       .sort((a, b) => tsMs(b?.created_at) - tsMs(a?.created_at))
       .slice(0, limit);
     return pgRows(rows);
@@ -6078,7 +7658,7 @@ async function runAutoImportWasabiQuery(text, params = []) {
 
 async function queryAutoImportWithWasabiFallback(text, params = []) {
   const normalizedSql = normalizeSqlForAutoImport(text);
-  if (!WASABI_AUTO_IMPORT_PRIMARY_ENABLED) {
+  if (!WASABI_AUTO_IMPORT_PRIMARY_ENABLED || !WASABI_WRITES_PRIMARY_ENABLED) {
     return pool.query(text, params);
   }
   try {
@@ -6168,6 +7748,25 @@ function portalShareDataLivePostgresSql(text) {
   return false;
 }
 
+/**
+ * When WASABI_PORTAL_DATA_PRIMARY is on, mutating portal SQL is applied inside latest.json only.
+ * PipeShare reads `portal_path_grants` (and share-link rows used by guests) from **live Postgres** (`aclPool`),
+ * so Wasabi-only writes would look successful yet vanish on refresh — same class of bug as planner Postgres mirror.
+ * Upload session tables are excluded: `queryPortalDataWithWasabiFallback` always forwards them to Postgres first.
+ */
+function portalBusinessDataSqlMirrorPostgresAfterWasabi(text) {
+  const sql = normalizeSqlForPortalData(text);
+  if (!sql || sql === 'begin' || sql === 'commit' || sql === 'rollback') return false;
+  if (!/^(insert|update|delete)\s/.test(sql)) return false;
+  if (sql.includes('portal_upload_sessions') || sql.includes('portal_upload_session_parts')) return false;
+  return (
+    sql.includes('portal_path_grants') ||
+    sql.includes('portal_share_links') ||
+    sql.includes('portal_share_access_log') ||
+    sql.includes('portal_share_guest_sessions')
+  );
+}
+
 async function runPortalDataWasabiQuery(text, params = []) {
   const sql = normalizeSqlForPortalData(text);
   if (!sql) return null;
@@ -6186,7 +7785,7 @@ async function runPortalDataWasabiQuery(text, params = []) {
 
   let snapshotCache = null;
   async function requireFreshSnapshot() {
-    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot();
+    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot(true);
     if (!snapshotLooksFresh(snapshotCache, WASABI_PORTAL_DATA_PRIMARY_MAX_SNAPSHOT_AGE_MS)) {
       throw new Error('Portal data snapshot is missing or stale');
     }
@@ -6667,14 +8266,21 @@ async function queryPortalDataWithWasabiFallback(text, params = []) {
   if (portalShareDataLivePostgresSql(text)) {
     return pool.query(text, params);
   }
-  const normalizedSql = normalizeSqlForPortalData(text);
-  if (!WASABI_PORTAL_DATA_PRIMARY_ENABLED) {
+  if (!WASABI_PORTAL_DATA_PRIMARY_ENABLED || !WASABI_WRITES_PRIMARY_ENABLED) {
     return pool.query(text, params);
   }
+  const normalizedSql = normalizeSqlForPortalData(text);
   try {
     const result = await runPortalDataWasabiQuery(text, params);
     if (result) {
       wasabiPortalDataHandledByWasabi += 1;
+      if (portalBusinessDataSqlMirrorPostgresAfterWasabi(text)) {
+        try {
+          await pool.query(text, params);
+        } catch (mirrorErr) {
+          console.warn('[wasabi-portal-data] postgres mirror after Wasabi write failed:', mirrorErr?.message || mirrorErr);
+        }
+      }
       return result;
     }
     if (WASABI_PORTAL_DATA_PRIMARY_STRICT) {
@@ -6726,7 +8332,7 @@ async function runOutlookDataWasabiQuery(text, params = []) {
 
   let snapshotCache = null;
   async function requireFreshSnapshot() {
-    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot();
+    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot(true);
     if (!snapshotLooksFresh(snapshotCache, WASABI_OUTLOOK_PRIMARY_MAX_SNAPSHOT_AGE_MS)) {
       throw new Error('Outlook snapshot is missing or stale');
     }
@@ -6795,7 +8401,7 @@ async function runOutlookDataWasabiQuery(text, params = []) {
 
 async function queryOutlookDataWithWasabiFallback(text, params = []) {
   const normalizedSql = normalizeSqlForOutlookData(text);
-  if (!WASABI_OUTLOOK_PRIMARY_ENABLED) {
+  if (!WASABI_OUTLOOK_PRIMARY_ENABLED || !WASABI_WRITES_PRIMARY_ENABLED) {
     return pool.query(text, params);
   }
   try {
@@ -6850,7 +8456,7 @@ async function runSignupDataWasabiQuery(text, params = []) {
 
   let snapshotCache = null;
   async function requireFreshSnapshot() {
-    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot();
+    if (!snapshotCache) snapshotCache = await loadWasabiLatestStateSnapshot(true);
     if (!snapshotLooksFresh(snapshotCache, WASABI_SIGNUP_PRIMARY_MAX_SNAPSHOT_AGE_MS)) {
       throw new Error('Signup snapshot is missing or stale');
     }
@@ -6991,7 +8597,7 @@ async function runSignupDataWasabiQuery(text, params = []) {
 
 async function querySignupDataWithWasabiFallback(text, params = []) {
   const normalizedSql = normalizeSqlForSignupData(text);
-  if (!WASABI_SIGNUP_PRIMARY_ENABLED) {
+  if (!WASABI_SIGNUP_PRIMARY_ENABLED || !WASABI_WRITES_PRIMARY_ENABLED) {
     return pool.query(text, params);
   }
   try {
@@ -7155,6 +8761,7 @@ const autoImportPlugin = createAutoImportPlugin({
   pool,
   query: queryAutoImportWithWasabiFallback,
   requireMike: requireDataAutoSyncEmployeeAccess,
+  requireDesktopHeartbeat: requireDataAutoSyncDesktopHeartbeatAccess,
   requireAuth,
   writeSegment: async (jobsiteId, payload, savedBy) => {
     const record = await fetchRecordById(String(jobsiteId));
@@ -7273,7 +8880,7 @@ ensureSchema()
         `[wasabi-state] snapshots enabled: bucket=${WASABI_STATE_BUCKET} prefix=${WASABI_STATE_PREFIX} every=${WASABI_STATE_SNAPSHOT_MS}ms`
       );
       console.log(
-        `[wasabi-sql-mirror] enabled=${WASABI_SQL_MIRROR_ENABLED ? 'yes' : 'no'} prefix=${WASABI_SQL_MIRROR_PREFIX} flush=${WASABI_SQL_MIRROR_FLUSH_MS}ms buffer=${WASABI_SQL_MIRROR_MAX_BUFFER}`
+        `[wasabi-sql-mirror] enabled=${WASABI_SQL_MIRROR_ENABLED ? 'yes' : 'no'} prefix=${WASABI_SQL_MIRROR_PREFIX} flush=${WASABI_SQL_MIRROR_FLUSH_MS}ms buffer=${WASABI_SQL_MIRROR_MAX_BUFFER} skipTables=${Array.from(WASABI_SQL_MIRROR_SKIP_TABLE_SET).sort().join(',') || '(none)'}`
       );
     } else {
       console.warn('[wasabi-state] snapshots disabled: configure WASABI_* and WASABI_BUCKET');

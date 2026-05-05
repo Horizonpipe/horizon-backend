@@ -130,6 +130,13 @@ function registerSignupRoutes(app, deps) {
     throw new Error('registerSignupRoutes requires either pool.query or deps.query.');
   }
 
+  const smtpConfigured = !!(process.env.SMTP_URL || '').trim() || !!(process.env.SMTP_HOST || '').trim();
+  if (!smtpConfigured) {
+    console.warn(
+      '[signup] SMTP is not configured (set SMTP_URL or SMTP_HOST, and usually SMTP_FROM / credentials). /signup/request returns 503 until mail is configured.'
+    );
+  }
+
   app.post('/account/request-approval', async (req, res) => {
     const identifierRaw = cleanString(req.body?.emailOrUsername || req.body?.email || req.body?.username);
     const identifier = identifierRaw.toLowerCase();

@@ -11,6 +11,8 @@ function createAutoImportPlugin(options = {}) {
     pool: poolOption,
     query,
     requireMike,
+    /** Optional; when set, used only for desktop heartbeat routes (align with portal Data Auto Sync users). */
+    requireDesktopHeartbeat,
     requireAuth,
     writeSegment,
     buildVersion,
@@ -28,7 +30,35 @@ function createAutoImportPlugin(options = {}) {
     throw new Error('createAutoImportPlugin requires either pool.query or options.query.');
   }
   const pool = { query: dbQuery };
+  /**
+   * Heartbeats, init DDL, and **portal DAS monitor reads** must hit live Postgres when `options.query` is the
+   * Wasabi auto-import adapter (snapshot can lag or omit rows that uploads/heartbeat just wrote).
+   */
+  const directPgQuery =
+    poolOption && typeof poolOption.query === 'function' ? poolOption.query.bind(poolOption) : null;
+  async function runPostgresAutoImportSql(text, params = []) {
+    if (directPgQuery) return directPgQuery(text, params);
+    return pool.query(text, params);
+  }
+
+  /**
+   * DAS monitor reads: live Postgres first (matches heartbeat + immediate writes). If the table is empty there
+   * but Wasabi-primary has populated the snapshot adapter, fall back to `pool.query` so the UI is not blank.
+   */
+  async function readAutoImportMonitorSql(text, params = []) {
+    const pg = await runPostgresAutoImportSql(text, params);
+    if (pg && Array.isArray(pg.rows) && pg.rows.length > 0) return pg;
+    try {
+      const viaAdapter = await pool.query(text, params);
+      if (viaAdapter && Array.isArray(viaAdapter.rows) && viaAdapter.rows.length > 0) return viaAdapter;
+    } catch {
+      /* ignore */
+    }
+    return pg || { rows: [] };
+  }
   if (typeof requireMike !== 'function') throw new Error('createAutoImportPlugin requires requireMike middleware.');
+  const desktopHeartbeatGate =
+    typeof requireDesktopHeartbeat === 'function' ? requireDesktopHeartbeat : requireMike;
   if (typeof requireAuth !== 'function') throw new Error('createAutoImportPlugin requires requireAuth middleware.');
   if (typeof writeSegment !== 'function') throw new Error('createAutoImportPlugin requires writeSegment(jobsiteId, payload, savedBy).');
   if (typeof buildVersion !== 'function') throw new Error('createAutoImportPlugin requires buildVersion(payload).');
@@ -45,23 +75,64 @@ function createAutoImportPlugin(options = {}) {
   const upload = multer({ storage, limits: { fileSize: 60 * 1024 * 1024 } });
 
   const router = express.Router();
-  const desktopHeartbeatByUser = new Map();
   const HEARTBEAT_TTL_MS = (() => {
     const raw = Number(process.env.AUTO_IMPORT_HEARTBEAT_TTL_MS);
-    if (!Number.isFinite(raw)) return 45_000;
+    /** Default 90s so slower desktop poll intervals do not flash "offline" while uploads still work. */
+    if (!Number.isFinite(raw)) return 90_000;
     return Math.max(10_000, Math.min(300_000, Math.floor(raw)));
   })();
+  /** GET /monitor-snapshot: coalesce identical viewers (0 disables). */
+  const MONITOR_SNAPSHOT_CACHE_MS = Math.max(
+    0,
+    Math.min(60_000, Number(process.env.AUTO_IMPORT_MONITOR_SNAPSHOT_CACHE_MS ?? 3500))
+  );
+  const monitorSnapshotCache = new Map();
+  /** POST /desktop-heartbeat: min interval between Postgres upserts per user_key (0 = every POST). */
+  const HEARTBEAT_MIN_WRITE_MS = Math.max(
+    0,
+    Math.min(300_000, Number(process.env.AUTO_IMPORT_HEARTBEAT_MIN_WRITE_MS ?? 10_000))
+  );
+  const lastHeartbeatWriteMs = new Map();
 
-  function heartbeatKey(req) {
-    const id = req?.user?.id;
-    const un = req?.user?.username;
-    if (id != null && String(id).trim()) return String(id).trim();
-    if (un != null && String(un).trim()) return String(un).trim().toLowerCase();
-    return 'anon';
+  function rememberMonitorSnapshot(cacheKey, body) {
+    if (MONITOR_SNAPSHOT_CACHE_MS <= 0) return;
+    monitorSnapshotCache.set(cacheKey, { exp: Date.now() + MONITOR_SNAPSHOT_CACHE_MS, body });
+    if (monitorSnapshotCache.size > 500) {
+      const drop = Math.ceil(monitorSnapshotCache.size / 2);
+      let n = 0;
+      for (const k of monitorSnapshotCache.keys()) {
+        monitorSnapshotCache.delete(k);
+        if (++n >= drop) break;
+      }
+    }
+  }
+
+  /**
+   * Desktop JWT and browser session must resolve the same logical user; some clients only have
+   * numeric `id`, others only `username` in the persisted session. We read/write heartbeats under
+   * every stable key so GET sees POSTs regardless of which field the gateway attached first.
+   * @returns {string[]}
+   */
+  function heartbeatKeys(req) {
+    const u = req?.user;
+    if (!u) return ['anon'];
+    const keys = [];
+    const pushKey = (raw) => {
+      const k = String(raw || '').trim();
+      if (!k) return;
+      if (!keys.includes(k)) keys.push(k);
+    };
+    const id = u.id != null ? String(u.id).trim() : '';
+    const un = u.username != null ? String(u.username).trim().toLowerCase() : '';
+    const em = u.email != null ? String(u.email).trim().toLowerCase() : '';
+    pushKey(id);
+    if (un) pushKey(un);
+    if (em) pushKey(em);
+    return keys.length ? keys : ['anon'];
   }
 
   async function initSchema() {
-    await pool.query(`
+    await runPostgresAutoImportSql(`
       CREATE TABLE IF NOT EXISTS auto_import_projects (
         id TEXT PRIMARY KEY,
         source_key TEXT NOT NULL UNIQUE,
@@ -143,6 +214,18 @@ function createAutoImportPlugin(options = {}) {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_auto_import_logs_project_created ON auto_import_logs(project_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS auto_import_desktop_heartbeats (
+        user_key TEXT PRIMARY KEY,
+        at_ms BIGINT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'connected',
+        source TEXT NOT NULL DEFAULT 'desktop',
+        detail TEXT NOT NULL DEFAULT '',
+        username TEXT NOT NULL DEFAULT '',
+        display_name TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_auto_import_desktop_hb_updated ON auto_import_desktop_heartbeats(updated_at DESC);
     `);
   }
 
@@ -173,10 +256,19 @@ function createAutoImportPlugin(options = {}) {
 
   async function logEvent(projectId, source, level, message, payload = {}) {
     try {
-      await pool.query(
+      const rawPid = projectId == null ? '' : String(projectId).trim();
+      const pid = !rawPid || rawPid === '__global__' ? null : clean(rawPid);
+      await runPostgresAutoImportSql(
         `INSERT INTO auto_import_logs (id, project_id, source, level, message, payload)
          VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
-        [uid(), projectId || null, clean(source || 'server') || 'server', clean(level || 'info') || 'info', clean(message), JSON.stringify(payload || {})]
+        [
+          uid(),
+          pid,
+          clean(source || 'server') || 'server',
+          clean(level || 'info') || 'info',
+          clean(message),
+          JSON.stringify(payload || {})
+        ]
       );
     } catch (e) {
       logger.warn?.('AUTO IMPORT LOG WRITE FAILED:', e?.message || e);
@@ -424,7 +516,145 @@ function createAutoImportPlugin(options = {}) {
     return { changed, inserted, updated, omitted };
   }
 
-  router.get('/health', requireMike, async (req, res) => {
+  async function latestHeartbeatRow(keys) {
+    const r = await runPostgresAutoImportSql(
+      `SELECT at_ms, state, source, detail FROM auto_import_desktop_heartbeats
+       WHERE user_key = ANY($1::text[])
+       ORDER BY at_ms DESC NULLS LAST
+       LIMIT 1`,
+      [keys]
+    );
+    return r.rows[0] || null;
+  }
+
+  function summarizeHeartbeat(rec, nowMs) {
+    const atMs = rec ? Number(rec.at_ms) : NaN;
+    const ageMs = rec && Number.isFinite(atMs) ? Math.max(0, nowMs - atMs) : Number.POSITIVE_INFINITY;
+    const connected = !!(rec && ageMs <= HEARTBEAT_TTL_MS && String(rec.state || '').toLowerCase() !== 'offline');
+    return {
+      connected,
+      state: connected ? rec.state || 'connected' : 'offline',
+      lastSeenAt: rec && Number.isFinite(atMs) ? new Date(atMs).toISOString() : null,
+      ageMs: Number.isFinite(ageMs) ? ageMs : null,
+      ttlMs: HEARTBEAT_TTL_MS,
+      source: rec?.source || null,
+      detail: rec?.detail || ''
+    };
+  }
+
+  /**
+   * Single low-churn JSON for the portal DAS monitor: **live Postgres only** (no Wasabi snapshot adapter).
+   */
+  router.get('/monitor-snapshot', desktopHeartbeatGate, async (req, res) => {
+    const keys = heartbeatKeys(req);
+    const cacheKey = keys.join('|');
+    const nowMs = Date.now();
+    if (MONITOR_SNAPSHOT_CACHE_MS > 0) {
+      const hit = monitorSnapshotCache.get(cacheKey);
+      if (hit && hit.exp > nowMs) {
+        res.set('X-Monitor-Snapshot-Cache', 'hit');
+        return res.json(hit.body);
+      }
+    }
+    try {
+      const [rec, projR, logR] = await Promise.all([
+        latestHeartbeatRow(keys),
+        runPostgresAutoImportSql(
+          `SELECT id, display_name, status, detection_mode, last_seen_at, last_scan_at, updated_at, created_at
+           FROM auto_import_projects
+           ORDER BY COALESCE(last_seen_at, created_at) DESC NULLS LAST
+           LIMIT 12`
+        ),
+        runPostgresAutoImportSql(
+          `SELECT id, project_id, source, level, message, created_at
+           FROM auto_import_logs
+           WHERE project_id IS NULL
+           ORDER BY created_at DESC NULLS LAST
+           LIMIT 40`
+        )
+      ]);
+      const hb = summarizeHeartbeat(rec, nowMs);
+      let projects = (projR.rows || []).map((p) => ({ ...p, binding: null }));
+      if ((!projects || projects.length === 0) && hb.connected) {
+        const u = req?.user || {};
+        const label = clean(u.displayName || u.username || u.email || 'Auto sync desktop');
+        const atIso = hb.lastSeenAt || new Date(nowMs).toISOString();
+        projects = [
+          {
+            id: '__autosync_desktop__',
+            display_name: label || 'Auto sync desktop',
+            status: String(hb.state || 'online').toUpperCase(),
+            detection_mode: 'DATA_AUTOSYNC',
+            last_seen_at: atIso,
+            last_scan_at: atIso,
+            updated_at: atIso,
+            created_at: atIso,
+            binding: null
+          }
+        ];
+      }
+      let logs = logR.rows || [];
+      const hbDetail = String(hb.detail || '').trim();
+      if (hbDetail) {
+        const atIso = hb.lastSeenAt || new Date(nowMs).toISOString();
+        const dup =
+          logs.length > 0 &&
+          String(logs[0]?.message || '').trim() === hbDetail &&
+          Math.abs(Date.parse(String(logs[0]?.created_at || '')) - Date.parse(atIso)) < 5000;
+        if (!dup) {
+          logs = [
+            {
+              id: 'heartbeat-detail',
+              project_id: null,
+              source: 'desktop',
+              level: 'info',
+              message: hbDetail,
+              created_at: atIso
+            },
+            ...logs
+          ].slice(0, 40);
+        }
+      }
+      let desktopRecent = false;
+      for (const r of logs) {
+        const src = String(r?.source || '').toLowerCase();
+        if (src !== 'desktop' && src !== 'java-desktop') continue;
+        const t = Date.parse(String(r?.created_at || ''));
+        if (Number.isFinite(t) && nowMs - t <= 90000) {
+          desktopRecent = true;
+          break;
+        }
+      }
+      let newestProjectTs = 0;
+      for (const p of projects) {
+        for (const k of ['last_seen_at', 'last_scan_at', 'updated_at', 'created_at']) {
+          const t = Date.parse(String(p[k] || ''));
+          if (Number.isFinite(t)) newestProjectTs = Math.max(newestProjectTs, t);
+        }
+      }
+      const projectRecent = newestProjectTs > 0 && nowMs - newestProjectTs <= 120000;
+      const monitorConnected = hb.connected || desktopRecent || projectRecent;
+      const body = {
+        success: true,
+        store: 'postgres',
+        heartbeat: hb,
+        monitor: {
+          connected: monitorConnected,
+          projectCount: projects.length,
+          logCount: logs.length
+        },
+        projects,
+        logs
+      };
+      rememberMonitorSnapshot(cacheKey, body);
+      res.json(body);
+    } catch (error) {
+      logger.error?.('auto-import monitor-snapshot:', error?.code || '', error?.message || error);
+      return res.status(500).json({ success: false, error: 'Monitor snapshot failed.' });
+    }
+  });
+
+  router.get('/health', desktopHeartbeatGate, async (req, res) => {
     res.json({
       success: true,
       service: 'auto-import-plugin',
@@ -433,18 +663,55 @@ function createAutoImportPlugin(options = {}) {
     });
   });
 
-  router.post('/desktop-heartbeat', requireMike, express.json(), async (req, res) => {
-    const key = heartbeatKey(req);
+  router.post('/desktop-heartbeat', desktopHeartbeatGate, express.json(), async (req, res) => {
+    const keys = heartbeatKeys(req);
     const nowMs = Date.now();
     const state = clean(req.body?.state || 'connected').toLowerCase() || 'connected';
-    desktopHeartbeatByUser.set(key, {
-      atMs: nowMs,
-      state,
-      source: clean(req.body?.source || 'desktop') || 'desktop',
-      detail: clean(req.body?.detail || ''),
-      username: clean(req.user?.username || ''),
-      displayName: clean(req.user?.displayName || '')
-    });
+    let source = clean(req.body?.source || 'desktop') || 'desktop';
+    if (String(source).toLowerCase() === 'java-desktop') source = 'desktop';
+    const detail = clean(req.body?.detail || req.body?.message || '');
+    const username = clean(req.user?.username || '');
+    const displayName = clean(req.user?.displayName || '');
+    try {
+      for (const key of keys) {
+        if (HEARTBEAT_MIN_WRITE_MS > 0) {
+          const prev = lastHeartbeatWriteMs.get(key) || 0;
+          if (nowMs - prev < HEARTBEAT_MIN_WRITE_MS) {
+            continue;
+          }
+          lastHeartbeatWriteMs.set(key, nowMs);
+        }
+        await runPostgresAutoImportSql(
+          `INSERT INTO auto_import_desktop_heartbeats (user_key, at_ms, state, source, detail, username, display_name, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+           ON CONFLICT (user_key) DO UPDATE SET
+             at_ms = EXCLUDED.at_ms,
+             state = EXCLUDED.state,
+             source = EXCLUDED.source,
+             detail = EXCLUDED.detail,
+             username = EXCLUDED.username,
+             display_name = EXCLUDED.display_name,
+             updated_at = NOW()`,
+          [key, nowMs, state, source, detail, username, displayName]
+        );
+      }
+      if (lastHeartbeatWriteMs.size > 5000) {
+        const drop = Math.ceil(lastHeartbeatWriteMs.size / 2);
+        let n = 0;
+        for (const k of lastHeartbeatWriteMs.keys()) {
+          lastHeartbeatWriteMs.delete(k);
+          if (++n >= drop) break;
+        }
+      }
+    } catch (error) {
+      logger.error?.(
+        'auto-import desktop-heartbeat UPSERT failed:',
+        error?.code || '',
+        error?.message || error,
+        error?.detail || ''
+      );
+      return res.status(500).json({ success: false, error: 'Heartbeat persistence failed.' });
+    }
     res.json({
       success: true,
       connected: true,
@@ -453,29 +720,26 @@ function createAutoImportPlugin(options = {}) {
     });
   });
 
-  router.get('/desktop-heartbeat', requireMike, async (req, res) => {
-    const key = heartbeatKey(req);
-    const rec = desktopHeartbeatByUser.get(key) || null;
+  router.get('/desktop-heartbeat', desktopHeartbeatGate, async (req, res) => {
+    const keys = heartbeatKeys(req);
     const nowMs = Date.now();
-    const ageMs = rec ? Math.max(0, nowMs - Number(rec.atMs || 0)) : Number.POSITIVE_INFINITY;
-    const connected = !!(rec && ageMs <= HEARTBEAT_TTL_MS && String(rec.state || '').toLowerCase() !== 'offline');
-    res.json({
-      success: true,
-      connected,
-      state: connected ? rec.state || 'connected' : 'offline',
-      lastSeenAt: rec ? new Date(rec.atMs).toISOString() : null,
-      ageMs: Number.isFinite(ageMs) ? ageMs : null,
-      ttlMs: HEARTBEAT_TTL_MS,
-      source: rec?.source || null,
-      detail: rec?.detail || ''
-    });
+    try {
+      const rec = await latestHeartbeatRow(keys);
+      res.json({ success: true, ...summarizeHeartbeat(rec, nowMs) });
+    } catch (error) {
+      logger.error?.('auto-import desktop-heartbeat SELECT failed:', error?.code || '', error?.message || error);
+      return res.status(500).json({ success: false, error: 'Heartbeat read failed.' });
+    }
   });
 
-  router.get('/projects', requireMike, async (req, res, next) => {
+  /** Same gate as desktop heartbeat + portal DAS monitor (not only `dataAutoSyncEmployee`). */
+  router.get('/projects', desktopHeartbeatGate, async (req, res, next) => {
     try {
       const [projects, bindings] = await Promise.all([
-        pool.query('SELECT * FROM auto_import_projects ORDER BY COALESCE(last_seen_at, created_at) DESC, display_name ASC'),
-        pool.query('SELECT * FROM auto_import_bindings ORDER BY updated_at DESC')
+        readAutoImportMonitorSql(
+          'SELECT * FROM auto_import_projects ORDER BY COALESCE(last_seen_at, created_at) DESC, display_name ASC'
+        ),
+        readAutoImportMonitorSql('SELECT * FROM auto_import_bindings ORDER BY updated_at DESC')
       ]);
       const bindingMap = new Map(bindings.rows.map((row) => [row.project_id, row]));
       res.json({
@@ -756,19 +1020,49 @@ function createAutoImportPlugin(options = {}) {
     }
   });
 
-  router.get('/logs/:projectId', requireMike, async (req, res, next) => {
+  /** Same gate as `/projects` monitor reads — must match `requireDataAutoSyncDesktopHeartbeatAccess` on the server. */
+  router.get('/logs/:projectId', desktopHeartbeatGate, async (req, res, next) => {
     try {
       const limit = Math.max(20, Math.min(500, Number(req.query.limit || 200)));
-      const result = await pool.query(
-        `SELECT * FROM auto_import_logs
-         WHERE project_id = $1 OR project_id IS NULL
-         ORDER BY created_at DESC
-         LIMIT $2`,
-        [req.params.projectId, limit]
-      );
+      const projectId = clean(req.params.projectId) || '__global__';
+      let result;
+      if (projectId === '__global__') {
+        result = await readAutoImportMonitorSql(
+          `SELECT * FROM auto_import_logs
+           WHERE project_id IS NULL
+           ORDER BY created_at DESC
+           LIMIT $1`,
+          [limit]
+        );
+      } else {
+        result = await readAutoImportMonitorSql(
+          `SELECT * FROM auto_import_logs
+           WHERE project_id = $1 OR project_id IS NULL
+           ORDER BY created_at DESC
+           LIMIT $2`,
+          [projectId, limit]
+        );
+      }
       res.json({ success: true, logs: result.rows.reverse() });
     } catch (error) {
       next(error);
+    }
+  });
+
+  /** Data Auto Sync / Java desktop: append portal-visible monitor lines (`project_id` null). Same auth as heartbeat. */
+  router.post('/logs/__global__', desktopHeartbeatGate, express.json({ limit: '32kb' }), async (req, res) => {
+    try {
+      let source = clean(req.body?.source || 'desktop') || 'desktop';
+      if (String(source).toLowerCase() === 'java-desktop') source = 'desktop';
+      const level = clean(req.body?.level || 'info').toLowerCase() || 'info';
+      const message = clean(req.body?.message || '');
+      if (!message) return res.status(400).json({ success: false, error: 'message is required.' });
+      if (message.length > 8000) return res.status(400).json({ success: false, error: 'message too long.' });
+      await logEvent(null, source, level, message, req.body?.payload && typeof req.body.payload === 'object' ? req.body.payload : {});
+      res.json({ success: true });
+    } catch (error) {
+      logger.error?.('auto-import logs __global__ POST:', error?.message || error);
+      return res.status(500).json({ success: false, error: 'Log write failed.' });
     }
   });
 

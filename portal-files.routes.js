@@ -7,15 +7,15 @@
  *
  * Heavy GET traffic (video, large downloads) should use `/api/files/presign/:id`,
  * `/api/files/share-view/:token/presign/:id`, or `/api/guest/share/:token/presign/:id`
- * so browsers fetch object bytes directly from Wasabi (configure bucket CORS for your portal origins).
+ * so browsers fetch object bytes directly from Wasabi (configure bucket CORS for your portal origins, including GET/HEAD with Range for progressive video).
  * Multipart resumable chunks still POST through this service unless extended with presigned part URLs.
+ * Folder ZIP: use `GET /folders/zip-manifest` + `POST /presign-batch` + browser zip (bytes: Wasabi → browser only).
  */
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const archiver = require('archiver');
 const express = require('express');
 const {
   filterTreeForSharePayload,
@@ -44,8 +44,8 @@ const { canManagePortalExtras } = require('./capabilities');
 const CATEGORIES = new Set(['videos', 'db3', 'pdf', 'photos']);
 const FOLDER_MARKER = '.hp-folder';
 const DATA_AUTO_SYNC_MODE = 'dataautosync';
-/** Client / non-employee AUTOSYNC accounts are pinned to this job folder (default 8). */
-const DATA_AUTO_SYNC_JOB_ID = String(process.env.DATA_AUTO_SYNC_CLIENT_JOB_ID || '8').trim() || '8';
+/** Client / non-employee AUTOSYNC accounts are pinned to this job folder (default 2; override with DATA_AUTO_SYNC_CLIENT_JOB_ID). */
+const DATA_AUTO_SYNC_JOB_ID = String(process.env.DATA_AUTO_SYNC_CLIENT_JOB_ID || '2').trim() || '2';
 /** `roles.dataAutoSyncEmployee` users who are not portal admins are pinned to this folder (default 2). */
 const DATA_AUTO_SYNC_EMPLOYEE_JOB_ID = String(process.env.DATA_AUTO_SYNC_EMPLOYEE_JOB_ID || '2').trim() || '2';
 /** When no explicit jobId is provided, portal admins start on this folder. */
@@ -53,6 +53,12 @@ const DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID =
   String(process.env.DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID || '8').trim() || '8';
 const PORTAL_FOLDER_COPY_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_COPY_CONCURRENCY', 8, 1, 32);
 const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCURRENCY', 8, 1, 32);
+/** Max items per {@code POST /check-paths} (JSON body stays well under express 4mb). */
+const PORTAL_CHECK_PATHS_MAX = clampIntEnv('PORTAL_CHECK_PATHS_MAX', 800, 50, 2000);
+/** Parallel S3 HeadObject calls per check-paths request (Wasabi handles many concurrent small reads). */
+const PORTAL_CHECK_PATHS_HEAD_CONCURRENCY = clampIntEnv('PORTAL_CHECK_PATHS_HEAD_CONCURRENCY', 32, 1, 64);
+/** Max SHA-256 digests per {@code POST /find-hashes-paths} (Data Auto Sync bulk dedupe; JSON body limit). */
+const PORTAL_FIND_HASHES_BULK_MAX = clampIntEnv('PORTAL_FIND_HASHES_BULK_MAX', 120, 8, 200);
 
 /**
  * When the job has path grants, users with **no** matching `portal_path_grants` rows see an empty tree (strict).
@@ -82,6 +88,30 @@ function clampIntEnv(name, fallback, min, max) {
   const raw = Number(process.env[name]);
   if (!Number.isFinite(raw)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(raw)));
+}
+
+/**
+ * @template T, R
+ * @param {T[]} items
+ * @param {number} concurrency
+ * @param {(item: T) => Promise<R>} fn
+ * @returns {Promise<R[]>}
+ */
+async function mapWithConcurrency(items, concurrency, fn) {
+  if (!items.length) return [];
+  const results = new Array(items.length);
+  let next = 0;
+  const n = items.length;
+  const workers = Math.min(Math.max(1, Math.floor(concurrency)), n);
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= n) return;
+      results[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: workers }, () => worker()));
+  return results;
 }
 
 /**
@@ -359,6 +389,32 @@ async function ensurePortalResumeSchema(pool) {
   return portalResumeSchemaReady;
 }
 
+let portalObjectSha256SchemaReady = null;
+
+/** SHA-256 for presigned PUT / browser-agnostic multipart (no `portal_upload_sessions` row). */
+async function ensurePortalObjectSha256Schema(pool) {
+  if (!portalObjectSha256SchemaReady) {
+    portalObjectSha256SchemaReady = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS portal_object_sha256 (
+          object_key TEXT PRIMARY KEY,
+          client_id TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          sha256 TEXT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(
+        `CREATE INDEX IF NOT EXISTS idx_portal_object_sha256_scope ON portal_object_sha256 (client_id, job_id)`
+      );
+    })().catch((e) => {
+      portalObjectSha256SchemaReady = null;
+      throw e;
+    });
+  }
+  return portalObjectSha256SchemaReady;
+}
+
 function resumableChunkSize(raw) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return 8 * 1024 * 1024;
@@ -458,7 +514,8 @@ function sanitizeFilename(name) {
 function sanitizeFolderSegment(name) {
   const t = String(name ?? '').trim();
   if (!t || t === '.' || t === '..') throw new Error('Invalid folder name');
-  if (t.includes('/') || t.includes('\\') || t.includes('..')) throw new Error('Invalid folder name');
+  /** Slashes only — do not reject `..` as substring (e.g. `A..J.J` job folder names). Traversal is blocked in {@link normalizeRelPath}. */
+  if (t.includes('/') || t.includes('\\')) throw new Error('Invalid folder name');
   const cleaned = t.replace(/[^\w.\- ()\[\]]+/g, '_').slice(0, 120);
   if (!cleaned) throw new Error('Invalid folder name');
   if (cleaned === FOLDER_MARKER) throw new Error('Reserved folder name');
@@ -650,6 +707,7 @@ function basenameRel(rel) {
   return i === -1 ? n : n.slice(i + 1);
 }
 
+/** Safe single path segment / zip archive entry (client-side ZIP manifest). */
 function safeZipSegment(seg) {
   return String(seg || '')
     .replace(/\\/g, '/')
@@ -657,6 +715,7 @@ function safeZipSegment(seg) {
     .trim();
 }
 
+/** Safe relative path inside a zip tree. */
 function safeZipEntryPath(relPath) {
   const bits = String(relPath || '')
     .replace(/\\/g, '/')
@@ -671,9 +730,19 @@ function copySourceHeader(bucket, key) {
   return `${bucket}/${key.split('/').map(encodeURIComponent).join('/')}`;
 }
 
-async function listAllKeys(s3, bucket, prefix) {
+/**
+ * @param {import('@aws-sdk/client-s3').S3Client} s3
+ * @param {string} bucket
+ * @param {string} prefix
+ * @param {number} [maxKeys] When finite, stop listing after this many objects (still one in-flight page may exceed slightly).
+ * @returns {Promise<{ keys: Array<{ Key: string, Size: number, LastModified?: Date, ETag?: string }>, truncated: boolean }>}
+ */
+async function listAllKeysCapped(s3, bucket, prefix, maxKeys = Number.POSITIVE_INFINITY) {
   const keys = [];
   let pageToken;
+  let truncated = false;
+  const cap = Number(maxKeys);
+  const hasCap = Number.isFinite(cap) && cap >= 1 && cap < 1e12;
   do {
     const resp = await s3.send(
       new ListObjectsV2Command({
@@ -683,11 +752,65 @@ async function listAllKeys(s3, bucket, prefix) {
       })
     );
     for (const obj of resp.Contents || []) {
-      if (obj.Key) keys.push({ Key: obj.Key, Size: obj.Size ?? 0, LastModified: obj.LastModified });
+      if (!obj.Key) continue;
+      const rawEtag = obj.ETag != null ? String(obj.ETag).replace(/^"+|"+$/g, '') : '';
+      keys.push({
+        Key: obj.Key,
+        Size: obj.Size ?? 0,
+        LastModified: obj.LastModified,
+        ...(rawEtag ? { ETag: rawEtag } : {})
+      });
+      if (hasCap && keys.length >= cap) {
+        truncated = true;
+        pageToken = undefined;
+        break;
+      }
+    }
+    if (truncated) break;
+    pageToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+  } while (pageToken);
+  return { keys, truncated };
+}
+
+async function listAllKeys(s3, bucket, prefix) {
+  const { keys } = await listAllKeysCapped(s3, bucket, prefix, Number.POSITIVE_INFINITY);
+  return keys;
+}
+
+/**
+ * Distinct job ids that have at least one object under {@code clients/{clientId}/jobs/{jobId}/}.
+ * Uses {@code Delimiter: '/'} so Wasabi returns one common prefix per job folder (fast), not every object key.
+ * @param {import('@aws-sdk/client-s3').S3Client} s3
+ * @param {string} bucket
+ * @param {string} jobsPrefix e.g. {@code clients/acme/jobs/}
+ * @returns {Promise<Set<string>>}
+ */
+async function listJobIdsUnderClientJobsPrefix(s3, bucket, jobsPrefix) {
+  const p = String(jobsPrefix || '').replace(/\\/g, '/');
+  const base = p.endsWith('/') ? p : `${p}/`;
+  const jobIds = new Set();
+  let pageToken;
+  do {
+    const resp = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: base,
+        Delimiter: '/',
+        ContinuationToken: pageToken
+      })
+    );
+    for (const cp of resp.CommonPrefixes || []) {
+      const full = String(cp.Prefix || '');
+      if (!full.startsWith(base)) continue;
+      let rest = full.slice(base.length).replace(/\/+$/, '');
+      const slash = rest.indexOf('/');
+      if (slash >= 0) rest = rest.slice(0, slash);
+      const jobId = rest.trim();
+      if (jobId) jobIds.add(jobId);
     }
     pageToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
   } while (pageToken);
-  return keys;
+  return jobIds;
 }
 
 function isFolderMarkerKey(relKey) {
@@ -712,7 +835,7 @@ function buildTreeFromKeys(jobPref, entries) {
 
   const files = [];
 
-  for (const { Key: key, Size: size, LastModified: lm } of entries) {
+  for (const { Key: key, Size: size, LastModified: lm, ETag: etag } of entries) {
     if (!key.startsWith(jobPref)) continue;
     const r = rel(key);
     if (!r) continue;
@@ -747,7 +870,8 @@ function buildTreeFromKeys(jobPref, entries) {
       parentPath,
       name,
       size,
-      lastModified: lm ? lm.toISOString() : null
+      lastModified: lm ? lm.toISOString() : null,
+      ...(etag ? { etag: String(etag) } : {})
     });
   }
 
@@ -780,12 +904,68 @@ function portalUsersPeerReadEnabled() {
   return v === '1' || v === 'true' || v === 'yes' || v === 'on';
 }
 
+/** Aligns with `normalizePsrScopeEntry` in server.js (portal-files cannot import server — avoid circular require). */
+function portalPsrClean(s) {
+  return String(s || '').trim();
+}
+function portalPsrUpper(s) {
+  return portalPsrClean(s).toUpperCase();
+}
+function portalNormalizeJobsiteLabel(jobsite, street) {
+  const j = portalPsrUpper(jobsite);
+  const st = portalPsrUpper(street);
+  if (!j) return '';
+  if (st && j.toLowerCase() === st.toLowerCase()) return '';
+  return j;
+}
+function portalNormalizePsrScopeEntry(value) {
+  if (!value || typeof value !== 'object') return null;
+  const recordId = portalPsrClean(value.recordId || value.record_id || value.jobsiteId || value.record || '');
+  const client = portalPsrUpper(value.client);
+  const city = portalPsrUpper(value.city);
+  const jobsite = portalNormalizeJobsiteLabel(value.jobsite, value.street);
+  if (!client || !city || !jobsite) return null;
+  return { recordId: recordId || null, client, city, jobsite };
+}
+/**
+ * Portal `(clientId, jobId)` pairs are keyed like planner rows: `job_id` is often the planner UUID or the jobsite label.
+ * PSR-only accounts may lack `user.portalScopes[]` rows even when `user.psrScopes[]` grants the same job folder.
+ */
+function portalJobAllowedByPsrScopes(user, clientId, jobId) {
+  if (!user || user.portalFilesAccessGranted !== true) return false;
+  const c = portalPsrClean(clientId);
+  const j = portalPsrClean(jobId);
+  if (!c || !j) return false;
+  const list = Array.isArray(user.psrScopes) ? user.psrScopes : [];
+  for (const raw of list) {
+    const entry = portalNormalizePsrScopeEntry(raw);
+    if (!entry) continue;
+    if (entry.client !== portalPsrUpper(c)) continue;
+    if (entry.recordId && entry.recordId === j) return true;
+    if (entry.jobsite && entry.jobsite.toLowerCase() === j.toLowerCase()) return true;
+  }
+  return false;
+}
+
+function portalPsrScopesTouchClient(user, clientId) {
+  const want = portalPsrUpper(clientId);
+  if (!want) return false;
+  const list = Array.isArray(user?.psrScopes) ? user.psrScopes : [];
+  for (const raw of list) {
+    const entry = portalNormalizePsrScopeEntry(raw);
+    if (entry && entry.client === want) return true;
+  }
+  return false;
+}
+
 async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) {
   if (userIsPortalAdmin(user)) return true;
   if (!user || user.portalFilesAccessGranted !== true) return false;
   const c = String(clientId || '').trim();
   const j = String(jobId || '').trim();
   if (!c || !j) return false;
+
+  if (portalJobAllowedByPsrScopes(user, c, j)) return true;
 
   const optWide = options.allowClientWideDataAutoSync;
   let allowClientWideDataAutoSync = false;
@@ -918,12 +1098,36 @@ function relPathMatchesGrant(relPath, pathPrefix, recursive) {
   return false;
 }
 
+/**
+ * Longest matching path_prefix wins; ties prefer non-recursive (file-scoped) rows.
+ * @param {Array<{ path_prefix: string, recursive: boolean, access_mode?: string }>} grants
+ * @param {string} relPath
+ * @returns {{ path_prefix: string, recursive: boolean, access_mode: string } | null}
+ */
+function bestPathGrantForRelPath(grants, relPath) {
+  const rp = normalizeRelPath(relPath || '');
+  if (!rp) return null;
+  let best = null;
+  let bestScore = -1;
+  for (const g of grants) {
+    if (!relPathMatchesGrant(rp, g.path_prefix, g.recursive)) continue;
+    const p = normalizeRelPath(g.path_prefix ?? '');
+    const score = p.length * 10 + (g.recursive === false ? 2 : 1);
+    if (score > bestScore) {
+      bestScore = score;
+      best = g;
+    }
+  }
+  return best;
+}
+
 function normalizeGrantAccessMode(mode) {
   const m = String(mode || '')
     .trim()
     .toLowerCase();
   if (m === 'view') return 'view';
   if (m === 'view_download') return 'view_download';
+  if (m === 'off' || m === 'none') return 'off';
   return 'full';
 }
 
@@ -931,11 +1135,12 @@ function isValidGrantAccessMode(mode) {
   const m = String(mode || '')
     .trim()
     .toLowerCase();
-  return m === 'full' || m === 'view' || m === 'view_download';
+  return m === 'full' || m === 'view' || m === 'view_download' || m === 'off' || m === 'none';
 }
 
 function grantModeAllows(mode, required) {
   const m = normalizeGrantAccessMode(mode);
+  if (m === 'off') return false;
   if (required === 'view') return true;
   if (required === 'download') return m === 'full' || m === 'view_download';
   return m === 'full';
@@ -950,19 +1155,145 @@ async function assertPortalPathRel(grantPool, user, clientId, jobId, relPath, re
   if (!anyGrants) return true;
   const grants = await loadUserPathGrants(grantPool, clientId, jobId, user);
   if (!grants.length) {
+    if (portalJobAllowedByPsrScopes(user, String(clientId), String(jobId))) {
+      return true;
+    }
     return bypassPathGrantsForLenientPortalClient(user, grants);
   }
   const rp = normalizeRelPath(relPath);
-  return grants.some(
-    (g) => relPathMatchesGrant(rp, g.path_prefix, g.recursive) && grantModeAllows(g.access_mode, required)
-  );
+  const best = bestPathGrantForRelPath(grants, rp);
+  if (!best) return false;
+  return grantModeAllows(best.access_mode, required);
+}
+
+/**
+ * Whether {@code relPath} would appear in {@code GET /api/files/tree} for this user (path grants, DAS user folder, PSR).
+ * Used by lightweight POST helpers so they cannot probe keys outside the visible tree.
+ */
+async function assertRelPathMatchesPortalTreeVisibility(grantPool, req, clientId, jobId, treePortalMode, relPath) {
+  if (userIsPortalAdmin(req.user)) return true;
+  const rp = normalizeRelPath(relPath || '');
+  if (!rp) return false;
+  const isDas = treePortalMode === DATA_AUTO_SYNC_MODE;
+  const jobHasPathGrants = await portalJobHasPathGrants(grantPool, clientId, jobId);
+  const permEditorTree = readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
+  if (!jobHasPathGrants || permEditorTree) {
+    if (isDas) {
+      const ur = normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user));
+      if (ur && rp !== ur && !rp.startsWith(`${ur}/`)) return false;
+    }
+    return true;
+  }
+  const treeUserGrants = await loadUserPathGrants(grantPool, clientId, jobId, req.user);
+  if (bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) return true;
+  if (treeUserGrants.length) {
+    const best = bestPathGrantForRelPath(treeUserGrants, rp);
+    return Boolean(best && normalizeGrantAccessMode(best.access_mode) !== 'off');
+  }
+  if (portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) return true;
+  if (isDas) {
+    const ur = normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user));
+    if (ur) return rp === ur || rp.startsWith(`${ur}/`);
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Same rules as {@link assertRelPathMatchesPortalTreeVisibility} but loads grants once per request.
+ * Used by {@code POST /check-paths} so large batches do not re-hit the DB for every path.
+ */
+async function createPortalPathVisibilityChecker(grantPool, req, clientId, jobId, treePortalMode) {
+  if (userIsPortalAdmin(req.user)) {
+    return { check: () => true };
+  }
+  const isDas = treePortalMode === DATA_AUTO_SYNC_MODE;
+  const jobHasPathGrants = await portalJobHasPathGrants(grantPool, clientId, jobId);
+  const permEditorTree = readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
+  if (!jobHasPathGrants || permEditorTree) {
+    const ur = isDas ? normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user)) : '';
+    return {
+      check(relPath) {
+        const rp = normalizeRelPath(relPath || '');
+        if (!rp) return false;
+        if (isDas && ur && rp !== ur && !rp.startsWith(`${ur}/`)) return false;
+        return true;
+      }
+    };
+  }
+  const treeUserGrants = await loadUserPathGrants(grantPool, clientId, jobId, req.user);
+  if (bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) {
+    return { check: () => true };
+  }
+  if (treeUserGrants.length) {
+    return {
+      check(relPath) {
+        const rp = normalizeRelPath(relPath || '');
+        if (!rp) return false;
+        const best = bestPathGrantForRelPath(treeUserGrants, rp);
+        return Boolean(best && normalizeGrantAccessMode(best.access_mode) !== 'off');
+      }
+    };
+  }
+  if (portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) {
+    return { check: () => true };
+  }
+  if (isDas) {
+    const ur = normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user));
+    return {
+      check(relPath) {
+        const rp = normalizeRelPath(relPath || '');
+        if (!rp) return false;
+        if (ur) return rp === ur || rp.startsWith(`${ur}/`);
+        return false;
+      }
+    };
+  }
+  return { check: () => false };
+}
+
+/** Keep only files (and ancestor folders) under a relative path prefix — used for Data Auto Sync tree when job has grants but the user has no explicit grant rows yet. */
+function filterTreeToDescendantPrefix(tree, prefixRel) {
+  const p = normalizeRelPath(prefixRel || '');
+  if (!p) return { folders: tree.folders || [], files: tree.files || [] };
+  const files = (tree.files || []).filter((f) => {
+    const rp = normalizeRelPath(f.path || '');
+    return rp === p || rp.startsWith(`${p}/`);
+  });
+  const keepFolders = new Set();
+  for (const f of files) {
+    let cur = f.parentPath || '';
+    while (cur) {
+      keepFolders.add(normalizeRelPath(cur));
+      cur = parentRelPath(cur);
+    }
+    keepFolders.add(p);
+    let up = p;
+    while (up) {
+      keepFolders.add(up);
+      up = parentRelPath(up);
+    }
+  }
+  const folders = (tree.folders || []).filter((fol) => keepFolders.has(normalizeRelPath(fol.path || '')));
+  return { folders, files };
+}
+
+/** Match Java {@code FileRelativizer.sanitizeUserFolder} for per-user portal folders. */
+function dataAutosyncPortalUserFolderPrefix(user) {
+  const raw = String(user?.displayName || user?.username || '').trim();
+  if (!raw) return '';
+  const safe = raw.replace(/[^A-Za-z0-9 _-]/g, '').trim();
+  if (!safe) return '';
+  return safe.length > 72 ? safe.slice(0, 72) : safe;
 }
 
 function filterTreeByPathGrants(tree, grants, jobHasAnyGrant) {
   if (!jobHasAnyGrant) return tree;
   if (!grants.length) return { folders: [], files: [] };
-  const allows = (rp) =>
-    grants.some((g) => relPathMatchesGrant(normalizeRelPath(rp), g.path_prefix, g.recursive));
+  const allows = (rp) => {
+    const best = bestPathGrantForRelPath(grants, normalizeRelPath(rp));
+    return Boolean(best && normalizeGrantAccessMode(best.access_mode) !== 'off');
+  };
   const files = (tree.files || []).filter((f) => allows(f.path));
   const keepFolders = new Set();
   for (const f of files) {
@@ -977,6 +1308,7 @@ function filterTreeByPathGrants(tree, grants, jobHasAnyGrant) {
     if (!p) {
       return tree;
     }
+    if (normalizeGrantAccessMode(g.access_mode) === 'off') continue;
     keepFolders.add(p);
     let cur = p;
     while (cur) {
@@ -1092,6 +1424,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     poolOption && typeof poolOption.query === 'function'
       ? { query: (text, params) => poolOption.query(text, params) }
       : pool;
+  /** Resumable upload metadata must always use live Postgres (never `queryPortalDataWithWasabiFallback`). */
+  const uploadMetaPool =
+    poolOption && typeof poolOption.query === 'function'
+      ? { query: (text, params) => poolOption.query(text, params) }
+      : pool;
   registerPortalShareLinkRoutes(app, { pool, query: dbQuery, requireAuth, requireAdmin });
 
   const s3 = createWasabiClient();
@@ -1110,9 +1447,85 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   /** Browser → Wasabi direct GET (video/blob). Match portal-api / horizon-frontend `PORTAL_PRESIGN_TTL_SECONDS`. */
   const PORTAL_PRESIGN_TTL_SECONDS = Math.max(60, Math.min(604800, Number(process.env.PORTAL_PRESIGN_TTL_SECONDS || 3600)));
   const PORTAL_PRESIGN_DISABLED = String(process.env.PORTAL_PRESIGN_DISABLED || '0').trim() === '1';
+  /** Client-built folder ZIP: manifest entry cap (browser memory). */
+  const PORTAL_FOLDER_ZIP_MANIFEST_MAX_FILES = Math.max(
+    1,
+    Math.min(5000, Number(process.env.PORTAL_FOLDER_ZIP_MANIFEST_MAX_FILES || 400))
+  );
+  const PORTAL_FOLDER_ZIP_MANIFEST_MAX_BYTES = Math.max(
+    1024 * 1024,
+    Math.min(
+      8 * 1024 * 1024 * 1024,
+      Number(process.env.PORTAL_FOLDER_ZIP_MANIFEST_MAX_BYTES || 3 * 1024 * 1024 * 1024)
+    )
+  );
+  const PORTAL_PRESIGN_BATCH_MAX = Math.max(1, Math.min(100, Number(process.env.PORTAL_PRESIGN_BATCH_MAX || 40)));
+  const PORTAL_FOLDER_ZIP_CLIENT_ENABLED =
+    String(process.env.PORTAL_FOLDER_ZIP_CLIENT_ENABLED ?? '1').trim().toLowerCase() !== '0';
+  /**
+   * When `PORTAL_PROXY_FILE_DOWNLOAD=0`, `GET|HEAD …/download/:id` proxy streaming (Wasabi→Render→client) is disabled.
+   * Default `1` keeps legacy behavior. Set `0` on Render to force presigned GET (`/presign/:id`, share/guest presign routes).
+   */
+  const PORTAL_PROXY_FILE_DOWNLOAD =
+    String(process.env.PORTAL_PROXY_FILE_DOWNLOAD ?? '1').trim().toLowerCase() !== '0';
+
+  function portalProxyDownloadAllowedOrJson(res) {
+    if (PORTAL_PROXY_FILE_DOWNLOAD) return true;
+    res.status(410).json({
+      error: 'Proxy download disabled',
+      code: 'USE_PRESIGN',
+      hint:
+        'Use GET /api/files/presign/:id, /api/files/share-view/:token/presign/:id, or /api/guest/share/:token/presign/:id so bytes stream directly from Wasabi.'
+    });
+    return false;
+  }
+
+  /**
+   * When `PORTAL_RESUMABLE_PROXY_CHUNK=0`, `POST …/upload/resumable/chunk` (multipart body through Render) is disabled.
+   * Default `1` keeps legacy behavior. Set `0` on Render and use `POST …/upload/resumable/sign-part` + direct PUT to Wasabi.
+   */
+  const PORTAL_RESUMABLE_PROXY_CHUNK =
+    String(process.env.PORTAL_RESUMABLE_PROXY_CHUNK ?? '1').trim().toLowerCase() !== '0';
+
+  /**
+   * Optional: resumable `/upload/resumable/complete` re-downloads the full object from Wasabi to verify SHA-256.
+   * **Off by default** (no full-object read through Render). Enabling is deliberate: you must set **both**
+   * `PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY=1` and `PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY_CONFIRM=1`.
+   * A lone `PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY=1` does nothing — avoids accidental dashboard toggles.
+   * When off: trust the client-provided digest (already required) and only `HeadObject` for size.
+   */
+  const PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY =
+    String(process.env.PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY || '0').trim() === '1' &&
+    String(process.env.PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY_CONFIRM || '0').trim() === '1';
+  /**
+   * When stream-verify is off: after `CompleteMultipartUpload`, skip `HeadObject` and trust `portal_upload_sessions.file_size`.
+   * Default on — avoids an extra service-initiated Wasabi read per resumable finalize.
+   */
+  const PORTAL_RESUMABLE_COMPLETE_SKIP_HEAD_VERIFY =
+    String(process.env.PORTAL_RESUMABLE_COMPLETE_SKIP_HEAD_VERIFY ?? '1').trim().toLowerCase() !== '0';
+
+  /**
+   * `GET /tree` and `GET /` list S3 keys under a prefix. Hard caps avoid multi-minute listings and multi‑hundred‑MB JSON
+   * responses that exhaust Node memory and Render egress. Root listing (no `pathPrefix`) uses the lower root cap.
+   */
+  const PORTAL_TREE_MAX_OBJECTS = clampIntEnv('PORTAL_TREE_MAX_OBJECTS', 250000, 2000, 2_000_000);
+  const PORTAL_TREE_MAX_OBJECTS_ROOT = clampIntEnv(
+    'PORTAL_TREE_MAX_OBJECTS_ROOT',
+    25000,
+    500,
+    PORTAL_TREE_MAX_OBJECTS
+  );
+  /** Skip Postgres hash merge into tree when raw object count exceeds this (0 = never skip). */
+  const PORTAL_TREE_MERGE_HASH_MAX_FILES = clampIntEnv('PORTAL_TREE_MERGE_HASH_MAX_FILES', 5000, 0, 2_000_000);
 
   /** Browser → Wasabi direct PUT / multipart parts. Set `PORTAL_UPLOAD_PRESIGN=0` to disable (client uses proxy upload). */
   const PORTAL_UPLOAD_PRESIGN_ENABLED = String(process.env.PORTAL_UPLOAD_PRESIGN || '1').trim().toLowerCase() !== '0';
+  /**
+   * After presigned `POST …/upload/multipart/complete`, use integer `fileSize` from the JSON body when present instead of `HeadObject`.
+   * Desktop autosync sends this; browsers that omit it still get a Head for size. Default on.
+   */
+  const PORTAL_PRESIGN_MULTIPART_TRUST_CLIENT_FILE_SIZE =
+    String(process.env.PORTAL_PRESIGN_MULTIPART_TRUST_CLIENT_FILE_SIZE ?? '1').trim().toLowerCase() !== '0';
   const PORTAL_UPLOAD_PRESIGN_MAX_BYTES = Math.max(
     1024 * 1024,
     Math.min(5368709120, Number(process.env.PORTAL_UPLOAD_PRESIGN_MAX_BYTES || 5368709120))
@@ -1148,6 +1561,71 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   const r = express.Router();
   r.use(requireAuth);
+
+  /**
+   * Persist client-reported full-object SHA-256 (presigned uploads; trusted like resumable flow).
+   */
+  async function upsertPortalObjectSha256FromClient(key, clientId, jobId, rawSha256) {
+    const bodySha256 = normalizeSha256Hex(rawSha256);
+    if (bodySha256.length !== 64) return;
+    await ensurePortalObjectSha256Schema(uploadMetaPool);
+    await uploadMetaPool.query(
+      `INSERT INTO portal_object_sha256 (object_key, client_id, job_id, sha256, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (object_key) DO UPDATE SET
+         sha256 = EXCLUDED.sha256,
+         client_id = EXCLUDED.client_id,
+         job_id = EXCLUDED.job_id,
+         updated_at = NOW()`,
+      [String(key), String(clientId), String(jobId), bodySha256]
+    );
+  }
+
+  /**
+   * Attach SHA-256 from `portal_upload_sessions` (resumable) and `portal_object_sha256` (presigned)
+   * onto tree file nodes for client-side hash dedupe.
+   */
+  async function mergeCompletedUploadSha256IntoTree(clientId, jobId, tree) {
+    const files = tree && Array.isArray(tree.files) ? tree.files : [];
+    try {
+      await ensurePortalResumeSchema(uploadMetaPool);
+      await ensurePortalObjectSha256Schema(uploadMetaPool);
+      const r = await uploadMetaPool.query(
+        `SELECT DISTINCT ON (object_key) object_key, sha256
+         FROM portal_upload_sessions
+         WHERE client_id = $1 AND job_id = $2 AND status = 'completed'
+           AND sha256 IS NOT NULL AND btrim(sha256) <> ''
+         ORDER BY object_key, completed_at DESC NULLS LAST, updated_at DESC`,
+        [String(clientId), String(jobId)]
+      );
+      const rows = r.rows || [];
+      const rObj = await uploadMetaPool.query(
+        `SELECT object_key, sha256 FROM portal_object_sha256 WHERE client_id = $1 AND job_id = $2`,
+        [String(clientId), String(jobId)]
+      );
+      const objRows = rObj.rows || [];
+      const byKey = new Map();
+      for (const row of rows) {
+        const k = String(row.object_key || '');
+        const h = normalizeSha256Hex(row.sha256);
+        if (k && h.length === 64) byKey.set(k, h);
+      }
+      for (const row of objRows) {
+        const k = String(row.object_key || '');
+        const h = normalizeSha256Hex(row.sha256);
+        if (k && h.length === 64) byKey.set(k, h);
+      }
+      for (const f of files) {
+        const key = String(f.key || '');
+        const h = byKey.get(key);
+        if (h) {
+          f.sha256 = h;
+        }
+      }
+    } catch (e) {
+      console.warn('[portal-files] mergeCompletedUploadSha256IntoTree:', e?.message || e);
+    }
+  }
 
   r.get('/storage-health', async (req, res) => {
     try {
@@ -1196,16 +1674,32 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (jobHasPathGrants && !permEditorList) {
         const loaded = await loadUserPathGrants(aclPool, clientId, jobId, req.user);
         if (!bypassPathGrantsForLenientPortalClient(req.user, loaded)) {
-          userGrants = loaded;
+          if (loaded.length) {
+            userGrants = loaded;
+          } else if (!portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) {
+            userGrants = loaded;
+          }
         }
       }
       const out = [];
-      const keys = await listAllKeys(s3, bucket, prefix);
-      for (const obj of keys) {
+      const maxListFlat =
+        permEditorList ? PORTAL_TREE_MAX_OBJECTS : Math.min(PORTAL_TREE_MAX_OBJECTS, PORTAL_TREE_MAX_OBJECTS_ROOT);
+      const { keys: keysFlat, truncated: truncatedFlat } = await listAllKeysCapped(s3, bucket, prefix, maxListFlat);
+      if (truncatedFlat) {
+        return res.status(413).json({
+          error: 'File catalog exceeds the configured maximum object count for this request',
+          code: 'PORTAL_FILE_LIST_TOO_LARGE',
+          maxObjects: maxListFlat,
+          hint:
+            'Use GET /api/files/tree?pathPrefix=… for a subtree, raise PORTAL_TREE_MAX_OBJECTS_ROOT, or use the permissions editor scope when listing the full job.'
+        });
+      }
+      for (const obj of keysFlat) {
         const rel = obj.Key.slice(prefix.length);
         if (!rel || isFolderMarkerKey(rel)) continue;
-        if (userGrants && !userGrants.some((g) => relPathMatchesGrant(rel, g.path_prefix, g.recursive))) {
-          continue;
+        if (userGrants) {
+          const best = bestPathGrantForRelPath(userGrants, rel);
+          if (!best || normalizeGrantAccessMode(best.access_mode) === 'off') continue;
         }
         out.push({
           id: keyToId(obj.Key),
@@ -1233,20 +1727,72 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
-      const keys = await listAllKeys(s3, bucket, prefix);
-      let tree = buildTreeFromKeys(prefix, keys);
-      const jobHasPathGrantsTree = await portalJobHasPathGrants(aclPool, clientId, jobId);
+      let listPrefix = prefix;
+      const subtreeRaw = String(req.query.pathPrefix ?? req.query.prefix ?? '').trim();
+      if (subtreeRaw) {
+        let rel;
+        try {
+          rel = normalizeRelPath(subtreeRaw);
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          return res.status(400).json({ error: m });
+        }
+        if (rel) listPrefix = `${prefix}${rel}/`;
+      }
+      const hasPathScope = Boolean(subtreeRaw);
       const permEditorTree =
         readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
+      const maxList =
+        permEditorTree || hasPathScope
+          ? PORTAL_TREE_MAX_OBJECTS
+          : Math.min(PORTAL_TREE_MAX_OBJECTS, PORTAL_TREE_MAX_OBJECTS_ROOT);
+      const { keys, truncated: listingTruncated } = await listAllKeysCapped(s3, bucket, listPrefix, maxList);
+      if (listingTruncated) {
+        return res.status(413).json({
+          error: 'File catalog for this folder exceeds the configured maximum object count',
+          code: 'TREE_LISTING_TOO_LARGE',
+          maxObjects: maxList,
+          pathPrefix: hasPathScope ? String(subtreeRaw || '') : '',
+          hint: hasPathScope
+            ? `Raise PORTAL_TREE_MAX_OBJECTS (scoped cap is ${maxList}), split the folder in storage, or narrow pathPrefix.`
+            : 'Add ?pathPrefix=<portal-relative-folder> to list one subtree (Horizon File Explorer sends this when you open a folder), or raise PORTAL_TREE_MAX_OBJECTS_ROOT / PORTAL_TREE_MAX_OBJECTS.'
+        });
+      }
+      let tree = buildTreeFromKeys(prefix, keys);
+      const treePortalMode = readPortalMode(req, req.query);
+      const isDataAutoSyncTreeList = treePortalMode === DATA_AUTO_SYNC_MODE;
+      const jobHasPathGrantsTree = await portalJobHasPathGrants(aclPool, clientId, jobId);
       /** @type {Array<{ path_prefix: string, recursive: boolean, access_mode: string }>} */
       let treeUserGrants = [];
       let appliedPathGrantFilter = false;
       if (jobHasPathGrantsTree && !permEditorTree) {
         treeUserGrants = await loadUserPathGrants(aclPool, clientId, jobId, req.user);
         if (!bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) {
-          tree = filterTreeByPathGrants(tree, treeUserGrants, true);
-          appliedPathGrantFilter = true;
+          if (treeUserGrants.length) {
+            tree = filterTreeByPathGrants(tree, treeUserGrants, true);
+            appliedPathGrantFilter = true;
+          } else if (!portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) {
+            if (isDataAutoSyncTreeList) {
+              const userRoot = dataAutosyncPortalUserFolderPrefix(req.user);
+              if (userRoot) {
+                tree = filterTreeToDescendantPrefix(tree, userRoot);
+                appliedPathGrantFilter = true;
+              } else {
+                tree = filterTreeByPathGrants(tree, treeUserGrants, true);
+                appliedPathGrantFilter = true;
+              }
+            } else {
+              tree = filterTreeByPathGrants(tree, treeUserGrants, true);
+              appliedPathGrantFilter = true;
+            }
+          }
         }
+      }
+      const forceHashes = String(req.query.includeHashes ?? '').trim() === '1';
+      const skipHashMerge =
+        !forceHashes && PORTAL_TREE_MERGE_HASH_MAX_FILES > 0 && keys.length > PORTAL_TREE_MERGE_HASH_MAX_FILES;
+      if (!skipHashMerge) {
+        await mergeCompletedUploadSha256IntoTree(clientId, jobId, tree);
       }
       return res.json(tree);
     } catch (e) {
@@ -1255,11 +1801,245 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     }
   });
 
-  r.get('/jobs', async (req, res) => {
+  /**
+   * Lightweight existence + size check for Data Auto Sync / desktop (avoids downloading the full `/tree` JSON).
+   * Body: `{ clientId, jobId, portalMode?: "dataautosync", items: [{ path, size }] }` — path is portal-relative
+   * (same as tree `path`). Uses S3 HeadObject per item; batch size capped by PORTAL_CHECK_PATHS_MAX (default 800),
+   * parallel heads by PORTAL_CHECK_PATHS_HEAD_CONCURRENCY (default 16). Tune via env on Render if needed.
+   */
+  r.post('/check-paths', express.json({ limit: '4mb' }), async (req, res) => {
     try {
-      if (!userIsPortalAdmin(req.user)) {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      if (scope.error) return res.status(400).json({ error: scope.error });
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
+      const treePortalMode = readPortalMode(req, body);
+      const rawItems = Array.isArray(body.items) ? body.items : [];
+      const max = PORTAL_CHECK_PATHS_MAX;
+      if (rawItems.length > max) {
+        return res.status(400).json({ error: `At most ${max} paths per request.` });
+      }
+      const pref = jobPrefix(String(clientId), String(jobId));
+      const pathGate = await createPortalPathVisibilityChecker(aclPool, req, clientId, jobId, treePortalMode);
+      /** @type {{ pathRel: string, key: string, expected: number }[]} */
+      const work = [];
+      for (const raw of rawItems) {
+        let pathRel;
+        try {
+          pathRel = normalizeRelPath(raw?.path ?? raw?.remotePath ?? '');
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          return res.status(400).json({ error: m });
+        }
+        if (!pathRel) continue;
+        if (!pathGate.check(pathRel)) {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+        const key = pref + pathRel;
+        const expected = raw?.size != null ? Number(raw.size) : NaN;
+        work.push({ pathRel, key, expected });
+      }
+
+      const headOne = async (w) => {
+        try {
+          const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: w.key }));
+          const cl = Number(head.ContentLength ?? 0);
+          if (Number.isFinite(w.expected) && w.expected >= 0 && cl !== w.expected) {
+            return { kind: 'mismatch', pathRel: w.pathRel, expectedSize: w.expected, actualSize: cl };
+          }
+          return { kind: 'present', pathRel: w.pathRel, size: cl };
+        } catch (e) {
+          const code = e?.$metadata?.httpStatusCode;
+          const name = String(e?.name || '');
+          if (code === 404 || name === 'NotFound' || String(e?.Code || '') === '404') {
+            return {
+              kind: 'missing',
+              pathRel: w.pathRel,
+              expectedSize: Number.isFinite(w.expected) ? w.expected : null
+            };
+          }
+          throw e;
+        }
+      };
+
+      const rowResults = await mapWithConcurrency(work, PORTAL_CHECK_PATHS_HEAD_CONCURRENCY, headOne);
+      const present = [];
+      const missing = [];
+      const sizeMismatch = [];
+      for (const r of rowResults) {
+        if (r.kind === 'present') present.push({ path: r.pathRel, size: r.size });
+        else if (r.kind === 'missing') {
+          missing.push({ path: r.pathRel, expectedSize: r.expectedSize });
+        } else {
+          sizeMismatch.push({
+            path: r.pathRel,
+            expectedSize: r.expectedSize,
+            actualSize: r.actualSize
+          });
+        }
+      }
+      return res.json({ success: true, present, missing, sizeMismatch });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  /**
+   * DB-only: list portal-relative paths registered with the given SHA-256 (global dedupe without loading `/tree`).
+   * Body: `{ clientId, jobId, portalMode?: "dataautosync", sha256 }`.
+   */
+  r.post('/find-hash-paths', express.json({ limit: '32kb' }), async (req, res) => {
+    try {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      if (scope.error) return res.status(400).json({ error: scope.error });
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const hash = normalizeSha256Hex(String(body.sha256 ?? body.hash ?? ''));
+      if (hash.length !== 64) {
+        return res.status(400).json({ error: 'sha256 must be 64 hex characters.' });
+      }
+      const treePortalMode = readPortalMode(req, body);
+      const pref = jobPrefix(String(clientId), String(jobId));
+      await ensurePortalObjectSha256Schema(uploadMetaPool);
+      await ensurePortalResumeSchema(uploadMetaPool);
+      const keys = new Set();
+      const q1 = await uploadMetaPool.query(
+        `SELECT object_key FROM portal_object_sha256
+         WHERE client_id = $1 AND job_id = $2 AND lower(sha256) = lower($3)
+         LIMIT 80`,
+        [String(clientId), String(jobId), hash]
+      );
+      for (const row of q1.rows || []) {
+        const k = String(row.object_key || '');
+        if (k.startsWith(pref)) keys.add(k.slice(pref.length));
+      }
+      const q2 = await uploadMetaPool.query(
+        `SELECT object_key FROM portal_upload_sessions
+         WHERE client_id = $1 AND job_id = $2 AND status = 'completed'
+           AND sha256 IS NOT NULL AND lower(btrim(sha256)) = lower($3)
+         ORDER BY completed_at DESC NULLS LAST
+         LIMIT 80`,
+        [String(clientId), String(jobId), hash]
+      );
+      for (const row of q2.rows || []) {
+        const k = String(row.object_key || '');
+        if (k.startsWith(pref)) keys.add(k.slice(pref.length));
+      }
+      const allowed = [];
+      for (const rel of keys) {
+        if (await assertRelPathMatchesPortalTreeVisibility(aclPool, req, clientId, jobId, treePortalMode, rel)) {
+          allowed.push(rel);
+        }
+      }
+      return res.json({ success: true, paths: allowed });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  /**
+   * DB-only: resolve many SHA-256 digests in one request (Data Auto Sync — fewer HTTP round-trips than N×
+   * {@code POST /find-hash-paths}). Body: `{ clientId, jobId, portalMode?, hashes: string[] }` (max
+   * PORTAL_FIND_HASHES_BULK_MAX). Response: `{ success, results: [{ hash, paths: string[] }] }` — only
+   * digests that have at least one visible portal-relative path.
+   */
+  r.post('/find-hashes-paths', express.json({ limit: '512kb' }), async (req, res) => {
+    try {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      if (scope.error) return res.status(400).json({ error: scope.error });
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const treePortalMode = readPortalMode(req, body);
+      const pref = jobPrefix(String(clientId), String(jobId));
+      const rawHashes = Array.isArray(body.hashes) ? body.hashes : [];
+      const max = PORTAL_FIND_HASHES_BULK_MAX;
+      if (rawHashes.length > max) {
+        return res.status(400).json({ error: `At most ${max} hashes per request.` });
+      }
+      const uniq = [];
+      const seen = new Set();
+      for (const r of rawHashes) {
+        const h = normalizeSha256Hex(String(r ?? ''));
+        if (h.length !== 64) continue;
+        const hl = h.toLowerCase();
+        if (seen.has(hl)) continue;
+        seen.add(hl);
+        uniq.push(hl);
+      }
+      if (uniq.length === 0) {
+        return res.json({ success: true, results: [] });
+      }
+      await ensurePortalObjectSha256Schema(uploadMetaPool);
+      await ensurePortalResumeSchema(uploadMetaPool);
+
+      /** @type {Map<string, Set<string>>} */
+      const byHash = new Map();
+      for (const hl of uniq) {
+        byHash.set(hl, new Set());
+      }
+      const keyToRel = (fullKey) => {
+        const k = String(fullKey || '');
+        if (!k.startsWith(pref)) return null;
+        return k.slice(pref.length);
+      };
+      const q1 = await uploadMetaPool.query(
+        `SELECT lower(sha256) AS hx, object_key FROM portal_object_sha256
+         WHERE client_id = $1 AND job_id = $2 AND lower(sha256) = ANY($3::text[])`,
+        [String(clientId), String(jobId), uniq]
+      );
+      for (const row of q1.rows || []) {
+        const hx = String(row.hx || '').toLowerCase();
+        const rel = keyToRel(row.object_key);
+        if (!rel || !byHash.has(hx)) continue;
+        byHash.get(hx).add(rel);
+      }
+      const q2 = await uploadMetaPool.query(
+        `SELECT lower(btrim(sha256)) AS hx, object_key FROM portal_upload_sessions
+         WHERE client_id = $1 AND job_id = $2 AND status = 'completed'
+           AND sha256 IS NOT NULL AND lower(btrim(sha256)) = ANY($3::text[])`,
+        [String(clientId), String(jobId), uniq]
+      );
+      for (const row of q2.rows || []) {
+        const hx = String(row.hx || '').toLowerCase();
+        const rel = keyToRel(row.object_key);
+        if (!rel || !byHash.has(hx)) continue;
+        byHash.get(hx).add(rel);
+      }
+
+      const results = [];
+      for (const hl of uniq) {
+        const rels = byHash.get(hl);
+        if (!rels || rels.size === 0) continue;
+        const allowed = [];
+        for (const rel of rels) {
+          if (await assertRelPathMatchesPortalTreeVisibility(aclPool, req, clientId, jobId, treePortalMode, rel)) {
+            allowed.push(rel);
+          }
+        }
+        if (allowed.length > 0) {
+          results.push({ hash: hl, paths: allowed });
+        }
+      }
+      return res.json({ success: true, results });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  r.get('/jobs', async (req, res) => {
+    try {
       const scope = resolvePortalScope(req, req.query, { requireJob: false });
       if (scope.error) {
         return res.status(400).json({ error: 'clientId query param is required' });
@@ -1268,19 +2048,22 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!clientId) {
         return res.status(400).json({ error: 'clientId query param is required' });
       }
+      const admin = userIsPortalAdmin(req.user);
+      const portalClientOk =
+        req.user?.portalFilesAccessGranted === true &&
+        Array.isArray(req.user.portalScopes) &&
+        req.user.portalScopes.some((s) => String(s?.clientId || '').trim() === clientId);
+      const psrClientOk =
+        req.user?.portalFilesAccessGranted === true && portalPsrScopesTouchClient(req.user, clientId);
+      const legacyClientOk =
+        req.user?.portalFilesAccessGranted === true &&
+        String(req.user?.portalFilesClientId || '').trim() === clientId;
+      if (!admin && !portalClientOk && !psrClientOk && !legacyClientOk) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
       const probePrefix = jobPrefix(clientId, '__hp_jobs_probe__');
       const prefix = probePrefix.replace(/__hp_jobs_probe__\/$/, '');
-      const keys = await listAllKeys(s3, bucket, prefix);
-      const set = new Set();
-      for (const obj of keys) {
-        const key = String(obj?.Key || '');
-        if (!key.startsWith(prefix)) continue;
-        const rel = key.slice(prefix.length);
-        const slash = rel.indexOf('/');
-        if (slash <= 0) continue;
-        const jobId = rel.slice(0, slash).trim();
-        if (jobId) set.add(jobId);
-      }
+      const set = await listJobIdsUnderClientJobsPrefix(s3, bucket, prefix);
       const scoped = Array.isArray(req.user?.portalScopes) ? req.user.portalScopes : [];
       for (const s of scoped) {
         if (String(s?.clientId || '').trim() !== clientId) continue;
@@ -1290,6 +2073,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const legacyJob = String(req.user?.portalFilesJobId || '').trim();
       const legacyClient = String(req.user?.portalFilesClientId || '').trim();
       if (legacyJob && legacyClient === clientId) set.add(legacyJob);
+      const psrList = Array.isArray(req.user?.psrScopes) ? req.user.psrScopes : [];
+      for (const raw of psrList) {
+        const e = portalNormalizePsrScopeEntry(raw);
+        if (!e || e.client !== portalPsrUpper(clientId)) continue;
+        if (e.recordId) set.add(e.recordId);
+        if (e.jobsite) set.add(e.jobsite);
+      }
       const jobs = [...set].sort((a, b) => {
         const an = Number(a);
         const bn = Number(b);
@@ -1361,7 +2151,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
         const rec = g.recursive !== false;
         if (g.accessMode != null && !isValidGrantAccessMode(g.accessMode)) {
-          return res.status(400).json({ error: 'Invalid accessMode. Allowed: full, view, view_download' });
+          return res.status(400).json({ error: 'Invalid accessMode. Allowed: full, view, view_download, off' });
         }
         const accessMode = normalizeGrantAccessMode(g.accessMode || g.access_mode || 'full');
         await aclPool.query(
@@ -1426,9 +2216,22 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const payload = row.payload || {};
       const prefix = jobPrefix(String(row.client_id), String(row.job_id));
-      const keys = await listAllKeys(s3, bucket, prefix);
+      let listPrefix = prefix;
+      const subtreeRaw = String(req.query.pathPrefix ?? req.query.prefix ?? '').trim();
+      if (subtreeRaw) {
+        let rel;
+        try {
+          rel = normalizeRelPath(subtreeRaw);
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          return res.status(400).json({ error: m });
+        }
+        if (rel) listPrefix = `${prefix}${rel}/`;
+      }
+      const keys = await listAllKeys(s3, bucket, listPrefix);
       const full = buildTreeFromKeys(prefix, keys);
       const filtered = filterTreeForSharePayload(full, payload);
+      await mergeCompletedUploadSha256IntoTree(String(row.client_id), String(row.job_id), filtered);
       return res.json(filtered);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -1439,6 +2242,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   /** Sign-in share: download one file (Bearer or ?access_token= for video tags). */
   r.get('/share-view/:token/download/:id', async (req, res) => {
     try {
+      if (!portalProxyDownloadAllowedOrJson(res)) return;
       const auth = await shareViewAuthObjectKey(req, req.params.token, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'share');
@@ -1454,6 +2258,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   r.head('/share-view/:token/download/:id', async (req, res) => {
     try {
+      if (!portalProxyDownloadAllowedOrJson(res)) return;
       const auth = await shareViewAuthObjectKey(req, req.params.token, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'share');
@@ -2191,20 +2996,45 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (s3Parts.length === 0 || s3Parts.length !== rawParts.length) {
         return res.status(400).json({ error: 'Each part must include partNumber and etag' });
       }
-      await s3.send(
-        new CompleteMultipartUploadCommand({
-          Bucket: bucket,
-          Key: key,
-          UploadId: uid,
-          MultipartUpload: { Parts: s3Parts }
-        })
-      );
-      let size = 0;
       try {
-        const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
-        size = Number(head.ContentLength || 0);
-      } catch {
-        /* ignore */
+        await s3.send(
+          new CompleteMultipartUploadCommand({
+            Bucket: bucket,
+            Key: key,
+            UploadId: uid,
+            MultipartUpload: { Parts: s3Parts }
+          })
+        );
+      } catch (completeErr) {
+        const headProbe = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key })).catch(() => null);
+        const len = headProbe ? Number(headProbe.ContentLength || 0) : 0;
+        if (!headProbe || !Number.isFinite(len) || len <= 0) {
+          throw completeErr;
+        }
+        /* Idempotent retry: object already finalized from a prior successful CompleteMultipartUpload. */
+      }
+      try {
+        await upsertPortalObjectSha256FromClient(key, parsed.clientId, parsed.jobId, req.body?.sha256);
+      } catch (e) {
+        console.warn('[portal-files] upsertPortalObjectSha256FromClient (multipart complete):', e?.message || e);
+      }
+      let size = 0;
+      const clientSize = Number(req.body?.fileSize);
+      if (
+        PORTAL_PRESIGN_MULTIPART_TRUST_CLIENT_FILE_SIZE &&
+        Number.isFinite(clientSize) &&
+        clientSize >= 0 &&
+        clientSize <= Number.MAX_SAFE_INTEGER &&
+        Math.floor(clientSize) === clientSize
+      ) {
+        size = clientSize;
+      } else {
+        try {
+          const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+          size = Number(head.ContentLength || 0);
+        } catch {
+          /* ignore */
+        }
       }
       const pref = jobPrefix(parsed.clientId, parsed.jobId);
       const rel = key.slice(pref.length);
@@ -2216,6 +3046,34 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         path: rel,
         parentPath: parentRelPath(rel)
       });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(400).json({ error: msg });
+    }
+  });
+
+  /** JSON: { key, sha256 } — after presigned PUT so tree merge can expose `sha256` (multipart sends digest on complete). */
+  r.post('/upload/register-sha256', express.json({ limit: '64kb' }), async (req, res) => {
+    try {
+      const body = req.body || {};
+      const key = String(body.key || '').trim();
+      const h = normalizeSha256Hex(body.sha256 || '');
+      if (!key.startsWith('clients/')) {
+        return res.status(400).json({ error: 'key is required' });
+      }
+      if (h.length !== 64) {
+        return res.status(400).json({ error: 'sha256 must be a 64-char hex digest' });
+      }
+      const parsed = parseJobFromObjectKey(key);
+      if (!parsed) return res.status(400).json({ error: 'Invalid key' });
+      if (!(await assertPortalJobAccessForRequest(pool, req, parsed.clientId, parsed.jobId))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (!(await assertWritablePresignPath(req, parsed.clientId, parsed.jobId, key))) {
+        return res.status(403).json({ error: 'Forbidden for this path' });
+      }
+      await upsertPortalObjectSha256FromClient(key, parsed.clientId, parsed.jobId, h);
+      return res.status(204).end();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(400).json({ error: msg });
@@ -2251,13 +3109,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       return res.status(404).json({ error: 'Direct upload presign is disabled' });
     }
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const sessionId = String(req.body?.sessionId || '').trim();
       const partNumber = Number(req.body?.partNumber);
       if (!sessionId || !Number.isInteger(partNumber) || partNumber < 1) {
         return res.status(400).json({ error: 'sessionId and integer partNumber are required' });
       }
-      const sRes = await pool.query(
+      const sRes = await uploadMetaPool.query(
         `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
         [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
       );
@@ -2303,7 +3161,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       return res.status(404).json({ error: 'Direct upload presign is disabled' });
     }
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const sessionId = String(req.body?.sessionId || '').trim();
       const partNumber = Number(req.body?.partNumber);
       const etagIn = String(req.body?.etag || '').replace(/^"+|"+$/g, '');
@@ -2319,7 +3177,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (chunkSha256 && chunkSha256.length !== 64) {
         return res.status(400).json({ error: 'chunkSha256 must be a 64-char hex digest when provided' });
       }
-      const sRes = await pool.query(
+      const sRes = await uploadMetaPool.query(
         `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
         [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
       );
@@ -2343,15 +3201,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(409).json({ error: `Part size mismatch (expected ${expected}, got ${sizeIn})` });
       }
       const shaStored = chunkSha256 && chunkSha256.length === 64 ? chunkSha256 : null;
-      await pool.query(
+      await uploadMetaPool.query(
         `INSERT INTO portal_upload_session_parts (session_id, part_number, etag, sha256, size)
          VALUES ($1,$2,$3,$4,$5)
          ON CONFLICT (session_id, part_number)
          DO UPDATE SET etag = EXCLUDED.etag, sha256 = EXCLUDED.sha256, size = EXCLUDED.size, created_at = NOW()`,
         [sessionId, partNumber, etagIn, shaStored, sizeIn]
       );
-      await pool.query(`UPDATE portal_upload_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
-      const parts = await pool.query(
+      await uploadMetaPool.query(`UPDATE portal_upload_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
+      const parts = await uploadMetaPool.query(
         `SELECT part_number, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
         [sessionId]
       );
@@ -2535,7 +3393,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   r.get('/upload/resumable/active', async (req, res) => {
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const scope = resolvePortalScope(req, req.query, { requireJob: false });
       const clientId = scope.error ? '' : scope.clientId;
       const jobId = scope.error ? '' : scope.jobId;
@@ -2549,7 +3407,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         vals.push(String(jobId));
         where.push(`job_id = $${vals.length}`);
       }
-      const out = await pool.query(
+      const out = await uploadMetaPool.query(
         `SELECT id, client_id, job_id, folder_path, file_name, file_size, mime_type, object_key, chunk_size, updated_at
          FROM portal_upload_sessions
          WHERE ${where.join(' AND ')}
@@ -2559,7 +3417,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       );
       const rows = [];
       for (const s of out.rows) {
-        const p = await pool.query(
+        const p = await uploadMetaPool.query(
           `SELECT part_number, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
           [s.id]
         );
@@ -2589,7 +3447,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   r.post('/upload/resumable/init', express.json({ limit: '256kb' }), async (req, res) => {
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const body = req.body || {};
       const scope = resolvePortalScope(req, body);
       const { folderPath, fileName, fileSize, mimeType, chunkSize, sha256 } = body;
@@ -2622,7 +3480,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
 
       const userId = String(req.user?.id ?? req.user?.username ?? '');
-      const existing = await pool.query(
+      const existing = await uploadMetaPool.query(
         `SELECT id, multipart_upload_id, chunk_size, object_key, file_size, file_name, mime_type, sha256
          FROM portal_upload_sessions
          WHERE user_id = $1 AND client_id = $2 AND job_id = $3
@@ -2638,7 +3496,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         if (sessionSha256 && expectedFileSha256 && sessionSha256 !== expectedFileSha256) {
           return res.status(409).json({ error: 'Existing resumable session hash mismatch for this file' });
         }
-        const p = await pool.query(
+        const p = await uploadMetaPool.query(
           `SELECT part_number, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
           [s.id]
         );
@@ -2664,7 +3522,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!uploadId) {
         throw new Error('Failed to start multipart upload');
       }
-      const created = await pool.query(
+      const created = await uploadMetaPool.query(
         `INSERT INTO portal_upload_sessions
          (user_id, client_id, job_id, folder_path, file_name, file_size, mime_type, object_key, multipart_upload_id, chunk_size, sha256, status)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'uploading')
@@ -2697,11 +3555,23 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     }
   });
 
-  r.post('/upload/resumable/chunk', portalChunkUpload.single('chunk'), async (req, res) => {
+  r.post(
+    '/upload/resumable/chunk',
+    (req, res, next) => {
+      if (PORTAL_RESUMABLE_PROXY_CHUNK) return next();
+      res.status(410).json({
+        error: 'Proxy resumable chunk upload disabled',
+        code: 'USE_PRESIGN',
+        hint:
+          'Use POST /api/files/upload/resumable/sign-part with a JSON body { sessionId, partNumber }, PUT bytes to the returned URL, then POST /api/files/upload/resumable/part-complete.'
+      });
+    },
+    portalChunkUpload.single('chunk'),
+    async (req, res) => {
     const f = req.file;
     if (!f) return res.status(400).json({ error: 'Missing file field "chunk"' });
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const sessionId = String(req.body?.sessionId || '').trim();
       const partNumber = Number(req.body?.partNumber);
       const chunkSha256 = normalizeSha256Hex(req.body?.chunkSha256 || '');
@@ -2714,7 +3584,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!f.buffer || !Number.isFinite(Number(f.size || 0)) || Number(f.size || 0) <= 0) {
         return res.status(400).json({ error: 'Uploaded chunk body is empty' });
       }
-      const sRes = await pool.query(
+      const sRes = await uploadMetaPool.query(
         `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
         [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
       );
@@ -2751,15 +3621,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       );
       const etag = String(partResp.ETag || '').replace(/^"+|"+$/g, '');
       if (!etag) throw new Error('Missing ETag for uploaded part');
-      await pool.query(
+      await uploadMetaPool.query(
         `INSERT INTO portal_upload_session_parts (session_id, part_number, etag, sha256, size)
          VALUES ($1,$2,$3,$4,$5)
          ON CONFLICT (session_id, part_number)
          DO UPDATE SET etag = EXCLUDED.etag, sha256 = EXCLUDED.sha256, size = EXCLUDED.size, created_at = NOW()`,
         [sessionId, partNumber, etag, actualChunkSha256, Math.floor(Number(f.size || 0))]
       );
-      await pool.query(`UPDATE portal_upload_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
-      const parts = await pool.query(
+      await uploadMetaPool.query(`UPDATE portal_upload_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
+      const parts = await uploadMetaPool.query(
         `SELECT part_number, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
         [sessionId]
       );
@@ -2774,11 +3644,12 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
     }
-  });
+  }
+  );
 
   r.post('/upload/resumable/complete', express.json({ limit: '128kb' }), async (req, res) => {
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const sessionId = String(req.body?.sessionId || '').trim();
       const totalParts = Number(req.body?.totalParts);
       const bodySha256 = normalizeSha256Hex(req.body?.sha256 || '');
@@ -2788,7 +3659,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (bodySha256 && bodySha256.length !== 64) {
         return res.status(400).json({ error: 'sha256 must be a 64-char hex digest' });
       }
-      const sRes = await pool.query(
+      const sRes = await uploadMetaPool.query(
         `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
         [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
       );
@@ -2810,7 +3681,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (expectedFileSha256.length !== 64) {
         return res.status(400).json({ error: 'sha256 is required to finalize resumable uploads' });
       }
-      const parts = await pool.query(
+      const parts = await uploadMetaPool.query(
         `SELECT part_number, etag, size FROM portal_upload_session_parts WHERE session_id = $1 ORDER BY part_number`,
         [sessionId]
       );
@@ -2835,30 +3706,58 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           MultipartUpload: { Parts: use }
         })
       );
-      const finalObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
-      if (!finalObj.Body || typeof finalObj.Body.pipe !== 'function') {
-        throw new Error('Missing completed object body for hash verification');
-      }
-      const actualFileSha256 = normalizeSha256Hex(await sha256HexForReadable(finalObj.Body));
-      if (actualFileSha256 !== expectedFileSha256) {
-        try {
-          await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
-        } catch (_) {
-          /* ignore delete failure after hash mismatch */
+      let actualFileSha256 = expectedFileSha256;
+      if (PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY) {
+        const finalObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+        if (!finalObj.Body || typeof finalObj.Body.pipe !== 'function') {
+          throw new Error('Missing completed object body for hash verification');
         }
-        await pool.query(
-          `UPDATE portal_upload_sessions
-           SET status = 'failed', sha256 = $2, updated_at = NOW()
-           WHERE id = $1`,
-          [sessionId, actualFileSha256]
-        );
-        return res.status(409).json({
-          error: 'Final file hash mismatch',
-          expected: expectedFileSha256,
-          actual: actualFileSha256
-        });
+        actualFileSha256 = normalizeSha256Hex(await sha256HexForReadable(finalObj.Body));
+        if (actualFileSha256 !== expectedFileSha256) {
+          try {
+            await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+          } catch (_) {
+            /* ignore delete failure after hash mismatch */
+          }
+          await uploadMetaPool.query(
+            `UPDATE portal_upload_sessions
+             SET status = 'failed', sha256 = $2, updated_at = NOW()
+             WHERE id = $1`,
+            [sessionId, actualFileSha256]
+          );
+          return res.status(409).json({
+            error: 'Final file hash mismatch',
+            expected: expectedFileSha256,
+            actual: actualFileSha256
+          });
+        }
+      } else {
+        const expectedSize = Math.floor(Number(sessionRow.file_size || 0));
+        if (!Number.isFinite(expectedSize) || expectedSize <= 0) {
+          throw new Error('Invalid session file_size for finalize');
+        }
+        if (!PORTAL_RESUMABLE_COMPLETE_SKIP_HEAD_VERIFY) {
+          const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+          const contentLen = Number(head.ContentLength);
+          if (!Number.isFinite(contentLen) || contentLen !== expectedSize) {
+            try {
+              await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+            } catch (_) {
+              /* ignore */
+            }
+            await uploadMetaPool.query(
+              `UPDATE portal_upload_sessions SET status = 'failed', updated_at = NOW() WHERE id = $1`,
+              [sessionId]
+            );
+            return res.status(409).json({
+              error: 'Completed object size mismatch',
+              expectedBytes: expectedSize,
+              actualBytes: Number.isFinite(contentLen) ? contentLen : null
+            });
+          }
+        }
       }
-      await pool.query(
+      await uploadMetaPool.query(
         `UPDATE portal_upload_sessions
          SET status = 'completed', sha256 = $2, completed_at = NOW(), updated_at = NOW()
          WHERE id = $1`,
@@ -2881,10 +3780,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   r.post('/upload/resumable/abort', express.json({ limit: '64kb' }), async (req, res) => {
     try {
-      await ensurePortalResumeSchema(pool);
+      await ensurePortalResumeSchema(uploadMetaPool);
       const sessionId = String(req.body?.sessionId || '').trim();
       if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
-      const sRes = await pool.query(
+      const sRes = await uploadMetaPool.query(
         `SELECT * FROM portal_upload_sessions WHERE id = $1 AND user_id = $2 LIMIT 1`,
         [sessionId, String(req.user?.id ?? req.user?.username ?? '')]
       );
@@ -2906,7 +3805,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           /* ignore provider-side missing upload */
         }
       }
-      await pool.query(`UPDATE portal_upload_sessions SET status = 'aborted', updated_at = NOW() WHERE id = $1`, [
+      await uploadMetaPool.query(`UPDATE portal_upload_sessions SET status = 'aborted', updated_at = NOW() WHERE id = $1`, [
         sessionId
       ]);
       return res.status(204).send();
@@ -3184,6 +4083,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   async function handlePortalFileDownload(req, res) {
     try {
+      if (!portalProxyDownloadAllowedOrJson(res)) return;
       const auth = await portalAuthDownloadKey(req, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'portal');
@@ -3249,8 +4149,20 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     }
   });
 
-  r.get('/folders/download', async (req, res) => {
+  /**
+   * JSON manifest for browser-built folder ZIPs: each file is downloaded with `GET /presign/:id`
+   * or `POST /presign-batch` (bytes go Wasabi → browser only; this route returns metadata + sizes only).
+   */
+  r.get('/folders/zip-manifest', async (req, res) => {
     try {
+      if (!PORTAL_FOLDER_ZIP_CLIENT_ENABLED) {
+        return res.status(404).json({ error: 'Client folder ZIP manifest is disabled' });
+      }
+      if (PORTAL_PRESIGN_DISABLED) {
+        return res.status(503).json({
+          error: 'Presigned GET is disabled; enable GET /api/files/presign for client-side folder ZIP.'
+        });
+      }
       if (!userCanPortalCapability(req.user, 'download')) {
         return res.status(403).json({ error: 'Portal download is not enabled for this account' });
       }
@@ -3273,56 +4185,136 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
       const pref = jobPrefix(String(clientId), String(jobId));
       const prefix = `${pref}${folderRel}/`;
-      const keys = await listAllKeys(s3, bucket, prefix);
-      if (!keys.length) {
-        return res.status(404).json({ error: 'Folder not found' });
-      }
-
-      /** @type {Array<{ key: string, rel: string }>} */
-      const files = [];
-      for (const entry of keys) {
-        const rel = entry.Key.slice(pref.length);
-        if (!rel || isFolderMarkerKey(rel)) continue;
-        if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, rel, 'download'))) continue;
-        const subRel = rel.slice(folderRel.length + 1);
-        const zipRel = safeZipEntryPath(subRel);
-        if (!zipRel) continue;
-        files.push({ key: entry.Key, rel: zipRel });
-      }
-
       const rootName = safeZipSegment(basenameRel(folderRel) || 'folder') || 'folder';
-      const downloadName = `${rootName}.zip`;
-      res.setHeader('Content-Type', 'application/zip');
-      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(downloadName)}"`);
-      res.setHeader('Cache-Control', 'private, max-age=60');
 
-      const zip = archiver('zip', { zlib: { level: 9 } });
-      zip.on('warning', (warn) => {
-        console.warn('[portal-files] zip warning', warn);
+      /** @type {Array<{ id: string, entry: string, size: number }>} */
+      const files = [];
+      let totalBytes = 0;
+      let pageToken;
+      do {
+        const resp = await s3.send(
+          new ListObjectsV2Command({
+            Bucket: bucket,
+            Prefix: prefix,
+            ContinuationToken: pageToken,
+            MaxKeys: 1000
+          })
+        );
+        for (const obj of resp.Contents || []) {
+          if (!obj.Key) continue;
+          const rel = obj.Key.slice(pref.length);
+          if (!rel || isFolderMarkerKey(rel)) continue;
+          if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, rel, 'download'))) continue;
+          const subRel = rel.slice(folderRel.length + 1);
+          const zipRel = safeZipEntryPath(subRel);
+          if (!zipRel) continue;
+          const size = Number(obj.Size || 0);
+          totalBytes += size;
+          if (totalBytes > PORTAL_FOLDER_ZIP_MANIFEST_MAX_BYTES) {
+            return res.status(413).json({
+              code: 'FOLDER_ZIP_TOO_LARGE',
+              error: 'Folder exceeds the size limit for browser ZIP download.',
+              maxBytes: PORTAL_FOLDER_ZIP_MANIFEST_MAX_BYTES
+            });
+          }
+          files.push({
+            id: keyToId(obj.Key),
+            entry: `${rootName}/${zipRel}`,
+            size
+          });
+          if (files.length > PORTAL_FOLDER_ZIP_MANIFEST_MAX_FILES) {
+            return res.status(413).json({
+              code: 'FOLDER_ZIP_TOO_MANY_FILES',
+              error: 'Folder has too many files for browser ZIP download.',
+              maxFiles: PORTAL_FOLDER_ZIP_MANIFEST_MAX_FILES
+            });
+          }
+        }
+        pageToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+      } while (pageToken);
+
+      return res.json({
+        rootName,
+        folderRel,
+        totalBytes,
+        fileCount: files.length,
+        presignBatchMax: PORTAL_PRESIGN_BATCH_MAX,
+        files
       });
-      zip.on('error', (err) => {
-        if (!res.headersSent) res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-        else res.destroy(err);
-      });
-      zip.pipe(res);
-
-      if (!files.length) {
-        zip.append('', { name: `${rootName}/` });
-        await zip.finalize();
-        return;
-      }
-
-      for (const file of files) {
-        const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: file.key }));
-        if (!obj.Body || typeof obj.Body.pipe !== 'function') continue;
-        zip.append(obj.Body, { name: `${rootName}/${file.rel}` });
-      }
-      await zip.finalize();
-      return;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
     }
+  });
+
+  /**
+   * Batch presigned Wasabi GET URLs (small JSON only). Used with `/folders/zip-manifest` so the
+   * browser can fetch object bytes directly from storage.
+   */
+  r.post('/presign-batch', express.json({ limit: '512kb' }), async (req, res) => {
+    try {
+      if (PORTAL_PRESIGN_DISABLED) {
+        return res.status(404).json({ error: 'Presigned playback disabled' });
+      }
+      const raw = req.body && typeof req.body === 'object' && Array.isArray(req.body.ids) ? req.body.ids : [];
+      const ids = [];
+      const seen = new Set();
+      for (const x of raw) {
+        const id = String(x || '').trim();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        ids.push(id);
+        if (ids.length > PORTAL_PRESIGN_BATCH_MAX) {
+          return res.status(400).json({ error: `At most ${PORTAL_PRESIGN_BATCH_MAX} ids per request` });
+        }
+      }
+      if (!ids.length) {
+        return res.status(400).json({ error: 'Non-empty ids array required' });
+      }
+
+      /** @type {Array<{ id: string, url: string, expiresIn: number }>} */
+      const items = [];
+      /** @type {Array<{ id: string, status: number, error: string }>} */
+      const failures = [];
+      for (const fileId of ids) {
+        try {
+          const auth = await portalAuthDownloadKey(req, fileId);
+          if (!auth.ok) {
+            failures.push({
+              id: fileId,
+              status: auth.status,
+              error: String(auth.body?.error || 'Forbidden')
+            });
+            continue;
+          }
+          const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: auth.Key }), {
+            expiresIn: PORTAL_PRESIGN_TTL_SECONDS
+          });
+          items.push({ id: fileId, url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
+        } catch (e) {
+          failures.push({
+            id: fileId,
+            status: 500,
+            error: e instanceof Error ? e.message : String(e)
+          });
+        }
+      }
+      return res.json({ items, failures, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  /**
+   * Legacy folder ZIP (streamed via this host). Removed — use zip-manifest + presign-batch in the browser.
+   */
+  r.get('/folders/download', (req, res) => {
+    return res.status(410).json({
+      code: 'FOLDER_ZIP_DISABLED',
+      error:
+        'Server-streamed folder ZIP is disabled. Use the portal folder download (browser ZIP via /folders/zip-manifest + presign), or download individual files / desktop sync.'
+    });
   });
 
   r.get('/download/:id', handlePortalFileDownload);
@@ -3540,9 +4532,22 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const payload = row.payload || {};
       const prefix = jobPrefix(String(row.client_id), String(row.job_id));
-      const keys = await listAllKeys(s3, bucket, prefix);
+      let listPrefix = prefix;
+      const subtreeRaw = String(req.query.pathPrefix ?? req.query.prefix ?? '').trim();
+      if (subtreeRaw) {
+        let rel;
+        try {
+          rel = normalizeRelPath(subtreeRaw);
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          return res.status(400).json({ error: m });
+        }
+        if (rel) listPrefix = `${prefix}${rel}/`;
+      }
+      const keys = await listAllKeys(s3, bucket, listPrefix);
       const full = buildTreeFromKeys(prefix, keys);
       const filtered = filterTreeForSharePayload(full, payload);
+      await mergeCompletedUploadSha256IntoTree(String(row.client_id), String(row.job_id), filtered);
       return res.json(filtered);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -3552,6 +4557,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   guest.get('/share/:token/download/:id', async (req, res) => {
     try {
+      if (!portalProxyDownloadAllowedOrJson(res)) return;
       const auth = await guestShareAuthObjectKey(req, req.params.token, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'share');
@@ -3567,6 +4573,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   guest.head('/share/:token/download/:id', async (req, res) => {
     try {
+      if (!portalProxyDownloadAllowedOrJson(res)) return;
       const auth = await guestShareAuthObjectKey(req, req.params.token, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       return await sendPortalS3ObjectWithRanges(req, res, auth.Key, 'share');

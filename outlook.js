@@ -113,12 +113,22 @@ async function fetchJson(url, options = {}) {
   return data;
 }
 
+function graphClientRequestId() {
+  try {
+    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  } catch {
+    /* ignore */
+  }
+  return crypto.randomBytes(8).toString('hex');
+}
+
 async function graphRequest(accessToken, path, options = {}) {
   const headers = {
     Authorization: `Bearer ${accessToken}`,
     ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     ...(options.headers || {})
   };
+  if (!headers['client-request-id']) headers['client-request-id'] = graphClientRequestId();
   return fetchJson(`https://graph.microsoft.com/v1.0${path}`, { ...options, headers });
 }
 
@@ -252,12 +262,16 @@ async function saveTokenRecord(db, userId, tokenData, profile = {}) {
   );
 }
 
-async function getValidAccessToken(db, userId) {
+async function getValidAccessToken(db, userId, opts = {}) {
+  const forceRefresh = !!(opts && opts.forceRefresh);
   const row = await readStoredToken(db, userId);
   if (!row) return null;
   const expiresAt = row.expires_at ? new Date(row.expires_at).getTime() : 0;
-  if (expiresAt > Date.now() + 30 * 1000 && row.access_token) return row.access_token;
-  if (!row.refresh_token) return null;
+  if (!forceRefresh && expiresAt > Date.now() + 30 * 1000 && row.access_token) return row.access_token;
+  if (!row.refresh_token) {
+    if (row.access_token) return clean(row.access_token);
+    return null;
+  }
   const refreshed = await refreshAccessToken(row.refresh_token);
   const profile = { mail: row.email_address, userPrincipalName: row.email_address, displayName: row.display_name };
   await saveTokenRecord(db, userId, refreshed, profile);
@@ -346,10 +360,33 @@ function registerOutlookRoutes(app, { pool, query, requireAuth, corsOrigins = []
   mountGet('/messages', requireAuth, async (req, res) => {
     try {
       if (!configured()) return res.status(400).json({ success: false, error: 'Outlook integration is not configured' });
-      const token = await getValidAccessToken(db, req.user.id);
-      if (!token) return res.status(401).json({ success: false, error: 'Outlook is not connected for this user' });
       const folder = normalizeFolder(req.query.folder);
-      const data = await graphRequest(token, `/me/mailFolders/${encodeURIComponent(folder)}/messages?$top=50&$orderby=receivedDateTime desc&$select=id,subject,receivedDateTime,bodyPreview,from,toRecipients,isRead,hasAttachments,importance`);
+      const select =
+        'id,subject,receivedDateTime,bodyPreview,from,toRecipients,isRead,hasAttachments,importance';
+      const listPath = (folderId) =>
+        `/me/mailFolders/${encodeURIComponent(folderId)}/messages?$top=50&$orderby=receivedDateTime desc&$select=${select}`;
+
+      let lastError = null;
+      let data = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const forceRefresh = attempt > 0;
+        const token = await getValidAccessToken(db, req.user.id, { forceRefresh });
+        if (!token) return res.status(401).json({ success: false, error: 'Outlook is not connected for this user' });
+        try {
+          if (attempt > 0) await new Promise((r) => setTimeout(r, 300 * attempt));
+          const folderId = await resolveFolderId(token, folder);
+          if (!folderId) throw new Error(`Mail folder '${folder}' not found`);
+          data = await graphRequest(token, listPath(folderId));
+          lastError = null;
+          break;
+        } catch (err) {
+          lastError = err;
+          const msg = String(err?.message || '');
+          const transient =
+            /stale|snapshot|timeout|503|429|try again|throttl|temporar|mailboxinfo|service unavailable/i.test(msg);
+          if (!transient || attempt === 2) throw err;
+        }
+      }
       const messages = Array.isArray(data.value) ? data.value.map(normalizeMessageSummary) : [];
       res.json({ success: true, folder, messages });
     } catch (error) {
