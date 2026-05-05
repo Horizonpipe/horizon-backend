@@ -8783,6 +8783,7 @@ const autoImportPlugin = createAutoImportPlugin({
   requireMike: requireDataAutoSyncEmployeeAccess,
   requireDesktopHeartbeat: requireDataAutoSyncDesktopHeartbeatAccess,
   requireAuth,
+  fetchPlannerRecord: fetchRecordById,
   writeSegment: async (jobsiteId, payload, savedBy) => {
     const record = await fetchRecordById(String(jobsiteId));
     if (!record) throw new Error(`Planner record not found for jobsite id ${jobsiteId}`);

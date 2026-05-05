@@ -16,6 +16,8 @@ function createAutoImportPlugin(options = {}) {
     requireAuth,
     writeSegment,
     buildVersion,
+    /** Load a normalized planner record (same shape as {@code fetchRecordById}) for segment matching during DB3 sync. */
+    fetchPlannerRecord,
     uid = () => crypto.randomUUID(),
     nowIso = () => new Date().toISOString(),
     uploadDir = path.join(process.cwd(), 'uploads', 'auto-import-plugin'),
@@ -62,6 +64,9 @@ function createAutoImportPlugin(options = {}) {
   if (typeof requireAuth !== 'function') throw new Error('createAutoImportPlugin requires requireAuth middleware.');
   if (typeof writeSegment !== 'function') throw new Error('createAutoImportPlugin requires writeSegment(jobsiteId, payload, savedBy).');
   if (typeof buildVersion !== 'function') throw new Error('createAutoImportPlugin requires buildVersion(payload).');
+  if (typeof fetchPlannerRecord !== 'function') {
+    throw new Error('createAutoImportPlugin requires fetchPlannerRecord(jobsiteId) for structure-aware DB3 sync.');
+  }
 
   fs.mkdirSync(uploadDir, { recursive: true });
 
@@ -279,16 +284,138 @@ function createAutoImportPlugin(options = {}) {
     return `${clean(row.system || 'storm')}|${clean(row.reference).toLowerCase()}`;
   }
 
+  /** Order-independent key for matching ST-204–ST-402 with ST-402–ST-204. */
+  function structurePairKey(upstream, downstream) {
+    const u = clean(upstream).toLowerCase();
+    const d = clean(downstream).toLowerCase();
+    if (!u || !d) return null;
+    return u <= d ? `${u}\u0001${d}` : `${d}\u0001${u}`;
+  }
+
   function rowHashFor(row) {
+    const pair = structurePairKey(row.upstream, row.downstream);
     return sha(JSON.stringify({
-      reference: clean(row.reference),
-      upstream: clean(row.upstream),
-      downstream: clean(row.downstream),
+      reference: clean(row.reference).toLowerCase(),
+      structurePair: pair || '',
       dia: clean(row.dia),
       material: clean(row.material),
       length: Number(row.length || 0),
       footage: Number(row.footage || row.length || 0)
     }));
+  }
+
+  function systemKeyFromBinding(binding) {
+    const st = clean(binding.system_type || 'storm').toLowerCase();
+    return st === 'sanitary' ? 'sanitary' : 'storm';
+  }
+
+  function findExistingSegment(segments, row) {
+    if (!Array.isArray(segments) || !segments.length) return null;
+    const ref = clean(row.reference).toLowerCase();
+    if (ref) {
+      const byRef = segments.find((s) => clean(s.reference).toLowerCase() === ref);
+      if (byRef) return byRef;
+    }
+    const pair = structurePairKey(row.upstream, row.downstream);
+    if (!pair) return null;
+    return segments.find((s) => structurePairKey(s.upstream, s.downstream) === pair) || null;
+  }
+
+  function cloneJson(value) {
+    try {
+      return JSON.parse(JSON.stringify(value));
+    } catch {
+      return null;
+    }
+  }
+
+  function numFootage(seg, row) {
+    const n = Number(seg?.footage ?? seg?.length ?? row?.footage ?? row?.length ?? 0);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function buildPayloadForRow(project, binding, row, existing, username) {
+    const system = binding.system_type || 'storm';
+    const nextLen = Number(row.length || 0);
+    const nextFoot = Number(row.footage || row.length || 0);
+    const savedBy = username || 'System';
+    const today = nowIso().slice(0, 10);
+
+    if (!existing) {
+      return {
+        id: uid(),
+        system,
+        reference: row.reference,
+        upstream: row.upstream || '',
+        downstream: row.downstream || '',
+        dia: row.dia || '',
+        material: row.material || '',
+        length: nextLen,
+        footage: nextFoot,
+        versions: [
+          buildVersion({
+            status: 'neutral',
+            notes: 'Auto Sync',
+            recordedDate: today,
+            savedBy
+          }),
+          buildVersion({
+            status: 'complete',
+            notes: 'autosync complete',
+            recordedDate: today,
+            savedBy
+          })
+        ]
+      };
+    }
+
+    const versions = cloneJson(existing.versions) || [];
+    const prevFoot = numFootage(existing, null);
+    const footageChanged = Math.abs(prevFoot - nextFoot) > 0.0001;
+    const diaChanged = clean(existing.dia) !== clean(row.dia);
+    const matChanged = clean(existing.material) !== clean(row.material);
+    const last = versions.length ? versions[versions.length - 1] : {};
+    const carryStatus = clean(last.status || 'complete') || 'complete';
+
+    if (footageChanged) {
+      versions.push(
+        buildVersion({
+          status: carryStatus,
+          notes: 'footage added from auto sync',
+          recordedDate: today,
+          savedBy
+        })
+      );
+    } else if (diaChanged || matChanged) {
+      versions.push(
+        buildVersion({
+          status: carryStatus,
+          notes: 'Auto sync: DB3 metadata updated.',
+          recordedDate: today,
+          savedBy
+        })
+      );
+    }
+
+    return {
+      id: existing.id,
+      system,
+      reference: existing.reference,
+      upstream: existing.upstream || '',
+      downstream: existing.downstream || '',
+      dia: row.dia || existing.dia || '',
+      material: row.material || existing.material || '',
+      length: nextLen,
+      footage: nextFoot,
+      versions: versions.length ? versions : [
+        buildVersion({
+          status: 'neutral',
+          notes: `Auto imported from ${project.display_name}`,
+          recordedDate: today,
+          savedBy
+        })
+      ]
+    };
   }
 
   async function parseDb3(filePath) {
@@ -420,6 +547,8 @@ function createAutoImportPlugin(options = {}) {
     let updated = 0;
     let omitted = 0;
 
+    const systemKey = systemKeyFromBinding(binding);
+
     for (const row of rows) {
       const rowKey = rowKeyFor(row);
       const rowHash = rowHashFor(row);
@@ -438,23 +567,13 @@ function createAutoImportPlugin(options = {}) {
         continue;
       }
 
-      const payload = {
-        id: uid(),
-        system: binding.system_type || 'storm',
-        reference: row.reference,
-        upstream: row.upstream || '',
-        downstream: row.downstream || '',
-        dia: row.dia || '',
-        material: row.material || '',
-        length: Number(row.length || row.footage || 0),
-        footage: Number(row.footage || row.length || 0),
-        versions: [buildVersion({
-          status: 'neutral',
-          notes: `Auto imported from ${project.display_name}`,
-          recordedDate: nowIso().slice(0, 10),
-          savedBy: username || 'System'
-        })]
-      };
+      const record = await fetchPlannerRecord(String(targetJobsiteId));
+      if (!record || !record.systems) {
+        throw new Error(`Planner record not found for jobsite id ${targetJobsiteId}`);
+      }
+      const segments = record.systems[systemKey] || [];
+      const existing = findExistingSegment(segments, row);
+      const payload = buildPayloadForRow(project, binding, row, existing, username || 'System');
       await writeSegment(targetJobsiteId, payload, username || 'System');
       changed += 1;
 
