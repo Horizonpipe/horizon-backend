@@ -1699,9 +1699,10 @@ function userHasAnyAssignedAccess(row) {
   const roles = normalizeRoles(row?.roles);
   const hasRoleAccess = Object.values(roles).some((v) => v === true);
   const hasPortalFiles = row?.portal_files_access_granted === true;
+  const hasAutosyncMaster = row?.autosync_master_granted === true;
   const hasPortalPermissionUi =
     !!row?.portal_permissions_access || portalPermissionsWhitelistHas(row?.username);
-  return hasRoleAccess || hasPortalFiles || hasPortalPermissionUi;
+  return hasRoleAccess || hasPortalFiles || hasAutosyncMaster || hasPortalPermissionUi;
 }
 
 /** Legacy per-user prefix (kept only when explicitly re-enabled). */
@@ -1738,7 +1739,7 @@ function portalPermissionsWhitelistHas(username) {
 }
 
 function enforcePortalScopePolicyForUser(user, portalScopes) {
-  if (!user || user.portalFilesAccessGranted !== true) return [];
+  if (!user || (user.portalFilesAccessGranted !== true && user.autosyncMasterGranted !== true)) return [];
   return dedupePortalScopes(portalScopes);
 }
 
@@ -1768,10 +1769,13 @@ function normalizeUser(row) {
   const hasExplicitScope = !!(explicitClient && explicitJob);
   /** Self-signup users start false until an admin enables portal file access. */
   const portalFilesAccessGranted = row.portal_files_access_granted === true;
+  const autosyncMasterGranted =
+    row.autosync_master_granted === true || row.autosyncMasterGranted === true;
+  const portalScopeDefaultsOk = portalFilesAccessGranted || autosyncMasterGranted;
 
   let portalFilesClientId;
   let portalFilesJobId;
-  if (!portalFilesAccessGranted) {
+  if (!portalScopeDefaultsOk) {
     portalFilesClientId = undefined;
     portalFilesJobId = undefined;
   } else if (hasExplicitScope) {
@@ -1813,6 +1817,7 @@ function normalizeUser(row) {
     mustChangePassword: !!row.must_change_password,
     selfSignup,
     portalFilesAccessGranted,
+    autosyncMasterGranted,
     portalFilesClientId,
     portalFilesJobId,
     portalScopes: [],
@@ -3426,7 +3431,7 @@ async function readFreshUserFromPostgresById(userId) {
   if (!id) return null;
   const result = await pool.query(
     `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-            portal_permissions_access, portal_files_access_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
+            portal_permissions_access, portal_files_access_granted, autosync_master_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
             product_tutorials_seen
      FROM users
      WHERE CAST(id AS text) = $1
@@ -3705,11 +3710,12 @@ function requireDataAutoSyncDesktopHeartbeatAccess(req, res, next) {
   if (u.dataAutoSyncEmployee === true) return next();
   if (canManagePortalExtras(u)) return next();
   if (u.portalFilesAccessGranted === true) return next();
+  if (u.autosyncMasterGranted === true) return next();
   if (u.isAdmin === true) return next();
   return res.status(403).json({
     success: false,
     error:
-      'Desktop status requires Data Auto Sync access (dataAutoSyncEmployee, portal admin, portalFilesAccessGranted, or administrator).'
+      'Desktop status requires Data Auto Sync access (dataAutoSyncEmployee, portal admin, portalFilesAccessGranted, autosyncMasterGranted, or administrator).'
   });
 }
 const requirePricingAccess = requireAnyRole(
@@ -4382,6 +4388,7 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_access_granted BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS autosync_master_granted BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS self_signup BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS product_tutorials_seen JSONB NOT NULL DEFAULT '{}'::jsonb`
   ];
@@ -5150,7 +5157,7 @@ app.get('/users', requireAuth, async (req, res) => {
     const currentUser = req.user;
     /** Permissions UI must reflect Postgres immediately after saves — do not prefer stale Wasabi snapshots here. */
     const result = await pool.query(
-      `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup
+      `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup
        FROM users
        ORDER BY LOWER(COALESCE(display_name, username)), LOWER(username)`
     );
@@ -5308,7 +5315,7 @@ app.post('/login', async (req, res) => {
     try {
       const result = await pool.query(
         `SELECT id, username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-                email, email_verified, portal_files_access_granted, portal_permissions_access, self_signup, product_tutorials_seen
+                email, email_verified, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup, product_tutorials_seen
          FROM users u
          WHERE LOWER(TRIM(u.username)) = LOWER(TRIM($1))
             OR LOWER(TRIM(COALESCE(u.display_name, u.username))) = LOWER(TRIM($1))
@@ -5692,7 +5699,7 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
          username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup
        )
        VALUES ($1, $2, $3, $4, $5::jsonb, true, NULL, NULL, false, false)
-       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup`,
+       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, self_signup`,
       [username, displayName, hash, isAdmin, JSON.stringify(roles)]
     );
     insertedPgId = result.rows[0].id;
@@ -5722,6 +5729,7 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
           portal_files_client_id: null,
           portal_files_job_id: null,
           portal_files_access_granted: false,
+          autosync_master_granted: false,
           self_signup: false,
           portal_permissions_access: false,
           email_verified: true,
@@ -5772,6 +5780,10 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
     req.body || {},
     'portalFilesAccessGranted'
   );
+  const hasAutosyncMasterPayload = Object.prototype.hasOwnProperty.call(
+    req.body || {},
+    'autosyncMasterGranted'
+  );
   const hasSelfSignupPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'selfSignup');
   const hasPortalPermissionsPayload = Object.prototype.hasOwnProperty.call(
     req.body || {},
@@ -5783,7 +5795,7 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
   try {
     let current = null;
     const currentResult = await pool.query(
-      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup FROM users WHERE id = $1 LIMIT 1',
+      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup FROM users WHERE id = $1 LIMIT 1',
       [id]
     );
     if (currentResult.rows.length) {
@@ -5802,6 +5814,7 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
             portal_files_client_id: snapshotUser.portalFilesClientId,
             portal_files_job_id: snapshotUser.portalFilesJobId,
             portal_files_access_granted: snapshotUser.portalFilesAccessGranted,
+            autosync_master_granted: snapshotUser.autosyncMasterGranted === true,
             portal_permissions_access: snapshotUser.portalPermissionsAccessRaw ?? snapshotUser.portalPermissionsAccess,
             self_signup: snapshotUser.selfSignup
           };
@@ -5867,19 +5880,23 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
     } else if (hasPortalScopeInPayload && portalFilesClientId && portalFilesJobId) {
       nextPortalFilesAccessGranted = true;
     }
+    let nextAutosyncMasterGranted = current.autosync_master_granted === true;
+    if (hasAutosyncMasterPayload) {
+      nextAutosyncMasterGranted = !!req.body.autosyncMasterGranted;
+    }
     let nextSelfSignup = current.self_signup === true;
     if (hasSelfSignupPayload) {
       nextSelfSignup = !!req.body.selfSignup;
     }
     // When an admin approves/assigns access, this account should no longer be treated as locked self-signup.
-    if (nextPortalFilesAccessGranted === true || nextIsAdmin === true) {
+    if (nextPortalFilesAccessGranted === true || nextAutosyncMasterGranted === true || nextIsAdmin === true) {
       nextSelfSignup = false;
     }
 
     const nextPortalPermissionsAccess = hasPortalPermissionsPayload
       ? !!req.body.portalPermissionsAccess
       : current.portal_permissions_access === true;
-    if (nextPortalFilesAccessGranted !== true) {
+    if (nextPortalFilesAccessGranted !== true && !nextAutosyncMasterGranted) {
       nextPortalScopes = [];
       nextPortalFilesClientId = null;
       nextPortalFilesJobId = null;
@@ -5910,9 +5927,10 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
              portal_files_access_granted = $6,
              self_signup = $7,
              portal_permissions_access = $8,
+             autosync_master_granted = $9,
              updated_at = NOW()
-         WHERE id = $9
-         RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup`,
+         WHERE id = $10
+         RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup`,
         [
           nextDisplayName,
           nextIsAdmin,
@@ -5922,6 +5940,7 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
           nextPortalFilesAccessGranted,
           nextSelfSignup,
           nextPortalPermissionsAccess,
+          nextAutosyncMasterGranted,
           id
         ]
       );
@@ -5967,7 +5986,7 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
                must_change_password = false,
                updated_at = NOW()
            WHERE id = $2
-           RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, portal_permissions_access, self_signup`,
+           RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup`,
           [passwordHash, id]
         );
         updatedRow = pwResult.rows[0];
@@ -5991,6 +6010,7 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
           portal_files_client_id: nextPortalFilesClientId || null,
           portal_files_job_id: nextPortalFilesJobId || null,
           portal_files_access_granted: nextPortalFilesAccessGranted === true,
+          autosync_master_granted: nextAutosyncMasterGranted === true,
           self_signup: nextSelfSignup === true,
           portal_permissions_access: nextPortalPermissionsAccess === true,
           updated_at: nowIso()

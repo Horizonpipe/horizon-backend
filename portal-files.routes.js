@@ -73,13 +73,18 @@ function portalLenientPathGrantsEnabled() {
   return false;
 }
 
+/** PipeShare + Data Auto Sync file APIs; Auto Sync Master is an admin-granted privilege separate from full portal files. */
+function userHasPortalFilesOrAutosyncMaster(user) {
+  return user?.portalFilesAccessGranted === true || user?.autosyncMasterGranted === true;
+}
+
 /**
  * @param {import('express').Request['user'] | null | undefined} user
  * @param {Array<{ path_prefix: string, recursive: boolean, access_mode: string }>} userGrants
  */
 function bypassPathGrantsForLenientPortalClient(user, userGrants) {
   if (!portalLenientPathGrantsEnabled()) return false;
-  if (!user || user.portalFilesAccessGranted !== true) return false;
+  if (!user || !userHasPortalFilesOrAutosyncMaster(user)) return false;
   if (userCanManagePortalExtras(user)) return false;
   return !userGrants.length;
 }
@@ -186,10 +191,7 @@ function resolvePortalScope(req, source, options = {}) {
   const isDataAutoSync = mode === DATA_AUTO_SYNC_MODE;
   if (isDataAutoSync) {
     const u = req?.user;
-    const dasOk =
-      userCanDataAutoSync(u) ||
-      userIsPortalAdmin(u) ||
-      u?.portalFilesAccessGranted === true;
+    const dasOk = userCanDataAutoSync(u) || userIsPortalAdmin(u) || userHasPortalFilesOrAutosyncMaster(u);
     if (!dasOk) {
       return { error: 'DataAutoSync access is not enabled for this account' };
     }
@@ -932,7 +934,7 @@ function portalNormalizePsrScopeEntry(value) {
  * PSR-only accounts may lack `user.portalScopes[]` rows even when `user.psrScopes[]` grants the same job folder.
  */
 function portalJobAllowedByPsrScopes(user, clientId, jobId) {
-  if (!user || user.portalFilesAccessGranted !== true) return false;
+  if (!user || !userHasPortalFilesOrAutosyncMaster(user)) return false;
   const c = portalPsrClean(clientId);
   const j = portalPsrClean(jobId);
   if (!c || !j) return false;
@@ -960,7 +962,7 @@ function portalPsrScopesTouchClient(user, clientId) {
 
 async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) {
   if (userIsPortalAdmin(user)) return true;
-  if (!user || user.portalFilesAccessGranted !== true) return false;
+  if (!user || !userHasPortalFilesOrAutosyncMaster(user)) return false;
   const c = String(clientId || '').trim();
   const j = String(jobId || '').trim();
   if (!c || !j) return false;
@@ -1208,6 +1210,9 @@ async function createPortalPathVisibilityChecker(grantPool, req, clientId, jobId
     return { check: () => true };
   }
   const isDas = treePortalMode === DATA_AUTO_SYNC_MODE;
+  if (isDas && req.user?.autosyncMasterGranted === true) {
+    return { check: () => true };
+  }
   const jobHasPathGrants = await portalJobHasPathGrants(grantPool, clientId, jobId);
   const permEditorTree = readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
   if (!jobHasPathGrants || permEditorTree) {
@@ -1336,7 +1341,11 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
   const r = express.Router();
   r.use(requireAuth);
   r.use((req, res, next) => {
-    if (readPortalMode(req) === DATA_AUTO_SYNC_MODE && !userCanDataAutoSync(req.user)) {
+    if (
+      readPortalMode(req) === DATA_AUTO_SYNC_MODE &&
+      !userCanDataAutoSync(req.user) &&
+      !userHasPortalFilesOrAutosyncMaster(req.user)
+    ) {
       return res.status(403).json({ error: 'DataAutoSync employee access is not enabled for this account' });
     }
     return next();
@@ -2050,13 +2059,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const admin = userIsPortalAdmin(req.user);
       const portalClientOk =
-        req.user?.portalFilesAccessGranted === true &&
+        userHasPortalFilesOrAutosyncMaster(req.user) &&
         Array.isArray(req.user.portalScopes) &&
         req.user.portalScopes.some((s) => String(s?.clientId || '').trim() === clientId);
       const psrClientOk =
-        req.user?.portalFilesAccessGranted === true && portalPsrScopesTouchClient(req.user, clientId);
+        userHasPortalFilesOrAutosyncMaster(req.user) && portalPsrScopesTouchClient(req.user, clientId);
       const legacyClientOk =
-        req.user?.portalFilesAccessGranted === true &&
+        userHasPortalFilesOrAutosyncMaster(req.user) &&
         String(req.user?.portalFilesClientId || '').trim() === clientId;
       if (!admin && !portalClientOk && !psrClientOk && !legacyClientOk) {
         return res.status(403).json({ error: 'Forbidden' });
