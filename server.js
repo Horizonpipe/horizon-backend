@@ -18,8 +18,10 @@ const { resolveCapabilities, canAccessAdminPanel, canManagePortalExtras } = requ
 const {
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,
+  buildPipesyncPlanWorkspaceSaveStorageKey,
   isAllowedAdminAttachmentContentType,
   isValidPipesyncPlanPageStorageKey,
+  isValidPipesyncPlanWorkspaceSaveStorageKey,
   presignAdminAttachmentPut,
   presignAdminAttachmentGet,
   deleteAdminAttachmentKeys,
@@ -295,6 +297,9 @@ const WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATH_SET = new Set(
     '/admin/attachments/upload-presign',
     '/pipesync/plan-view/upload-presign',
     '/pipesync/plan-view/read-url',
+    '/pipesync/plan-view/workspace-saves/active',
+    '/pipesync/plan-view/workspace-saves/mine',
+    '/pipesync/plan-view/workspace-saves/mine/latest',
     ...String(process.env.WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATHS || '')
       .split(',')
       .map((s) => normalizeWasabiSnapshotHttpSkipPath(s))
@@ -1175,6 +1180,10 @@ function cloneSnapshotRows(rows) {
 /** PipeSync Plan view markup — stored only in Wasabi `latest.json` under `data.pipesync_plan_views` (no Postgres table). */
 const PIPESYNC_PLAN_VIEW_TABLE = 'pipesync_plan_views';
 const PIPESYNC_PLAN_VIEW_MAX_BYTES = 14 * 1024 * 1024;
+const PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE = 'pipesync_plan_workspace_saves';
+const PIPESYNC_PLAN_WORKSPACE_SAVE_MAX_BYTES = 14 * 1024 * 1024;
+const PIPESYNC_PLAN_WORKSPACE_SAVE_MAX_PER_USER_BOARD = 40;
+const PIPESYNC_PLAN_WORKSPACE_BOARDS = new Set(['planView', 'pdfMapView']);
 
 function pipesyncPlanViewUsernameKey(user) {
   const u = cleanString(user?.username || user?.displayName || '').toLowerCase();
@@ -6191,6 +6200,102 @@ return res.json({ success: true, records: out });
   }
 });
 
+function normalizePlanWorkspaceBoardKey(raw) {
+  const b = String(raw || '').trim();
+  return PIPESYNC_PLAN_WORKSPACE_BOARDS.has(b) ? b : '';
+}
+
+function readPlanWorkspaceActiveMap(data) {
+  const o = data?.pipesync_plan_workspace_active;
+  if (!o || typeof o !== 'object' || Array.isArray(o)) {
+    return { planView: null, pdfMapView: null };
+  }
+  return {
+    planView: o.planView && typeof o.planView === 'object' ? o.planView : null,
+    pdfMapView: o.pdfMapView && typeof o.pdfMapView === 'object' ? o.pdfMapView : null
+  };
+}
+
+function planWorkspaceEntryIsNewer(candidate, incumbent) {
+  if (!candidate?.saved_at) return false;
+  if (!incumbent?.saved_at) return true;
+  return String(candidate.saved_at) > String(incumbent.saved_at);
+}
+
+async function putPipesyncPlanWorkspaceSaveBlob(storageKey, bodyObj) {
+  if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+    throw new Error('Wasabi object storage is not configured.');
+  }
+  const json = JSON.stringify(bodyObj);
+  if (json.length > PIPESYNC_PLAN_WORKSPACE_SAVE_MAX_BYTES) {
+    throw new Error('Workspace save exceeds the maximum size.');
+  }
+  await wasabiStateClient.send(
+    new PutObjectCommand({
+      Bucket: WASABI_STATE_BUCKET,
+      Key: storageKey,
+      Body: Buffer.from(json, 'utf8'),
+      ContentType: 'application/json'
+    })
+  );
+}
+
+async function readPipesyncPlanWorkspaceSaveBlob(storageKey) {
+  if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+    throw new Error('Wasabi object storage is not configured.');
+  }
+  if (!isValidPipesyncPlanWorkspaceSaveStorageKey(storageKey)) {
+    throw new Error('Invalid workspace save storage key.');
+  }
+  const out = await wasabiStateClient.send(
+    new GetObjectCommand({
+      Bucket: WASABI_STATE_BUCKET,
+      Key: storageKey
+    })
+  );
+  const raw = await bodyToBuffer(out.Body);
+  const parsed = JSON.parse(raw.toString('utf8'));
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Workspace save blob is not valid JSON.');
+  }
+  return parsed;
+}
+
+async function loadHydratedWorkspaceBoardFromEntry(entry) {
+  if (!entry?.storage_key || !isValidPipesyncPlanWorkspaceSaveStorageKey(entry.storage_key)) return null;
+  try {
+    const snap = await readPipesyncPlanWorkspaceSaveBlob(entry.storage_key);
+    const board = snap?.board && typeof snap.board === 'object' ? snap.board : null;
+    if (!board) return null;
+    return hydratePlanBoardBranch(board);
+  } catch (err) {
+    console.warn('Workspace save hydrate failed:', entry?.id, err?.message || err);
+    return null;
+  }
+}
+
+function prunePlanWorkspaceSaveIndex(rows, username, board) {
+  const un = String(username || '').toLowerCase();
+  const mine = rows
+    .filter((r) => r && String(r.username || '').toLowerCase() === un && r.board === board)
+    .sort((a, b) => String(b.saved_at || '').localeCompare(String(a.saved_at || '')));
+  const dropIds = new Set(mine.slice(PIPESYNC_PLAN_WORKSPACE_SAVE_MAX_PER_USER_BOARD).map((r) => r.id));
+  return rows.filter((r) => !dropIds.has(r.id));
+}
+
+function mergePlanViewPayloadBranch(existingPayload, boardKey, sanitizedBoard) {
+  let payload =
+    existingPayload && typeof existingPayload === 'object' && !Array.isArray(existingPayload)
+      ? JSON.parse(JSON.stringify(existingPayload))
+      : { v: 2, imagePlan: {}, pdfMapView: {} };
+  if (payload.v !== 2 || !payload.imagePlan || !payload.pdfMap) {
+    payload = { v: 2, imagePlan: {}, pdfMapView: {} };
+  }
+  if (boardKey === 'planView') payload.imagePlan = sanitizedBoard;
+  else payload.pdfMap = sanitizedBoard;
+  return sanitizePlanViewPayloadForPersist(payload);
+}
+
 app.get('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, res) => {
   try {
     const un = pipesyncPlanViewUsernameKey(req.user);
@@ -6328,6 +6433,265 @@ app.post(
       return res.json({ success: true, url: typeof url === 'string' ? url : '' });
     } catch (error) {
       console.error('PIPESYNC PLAN VIEW READ URL:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+/** Newest workspace checkpoint per board across all users (for collaborative auto-load). */
+app.get(
+  '/pipesync/plan-view/workspace-saves/active',
+  requireAuth,
+  requirePsrViewerAccess,
+  async (req, res) => {
+    try {
+      if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+        return res.json({ success: true, planView: null, pdfMapView: null, wasabi: false });
+      }
+      const snap = await loadWasabiLatestStateSnapshot(true);
+      const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
+      const active = readPlanWorkspaceActiveMap(tables);
+      const planViewEntry = active.planView;
+      const pdfMapViewEntry = active.pdfMapView;
+      const [planViewBoard, pdfMapViewBoard] = await Promise.all([
+        loadHydratedWorkspaceBoardFromEntry(planViewEntry),
+        loadHydratedWorkspaceBoardFromEntry(pdfMapViewEntry)
+      ]);
+      return res.json({
+        success: true,
+        planView: planViewEntry
+          ? {
+              id: planViewEntry.id,
+              username: planViewEntry.username,
+              saved_at: planViewEntry.saved_at,
+              board: planViewBoard
+            }
+          : null,
+        pdfMapView: pdfMapViewEntry
+          ? {
+              id: pdfMapViewEntry.id,
+              username: pdfMapViewEntry.username,
+              saved_at: pdfMapViewEntry.saved_at,
+              board: pdfMapViewBoard
+            }
+          : null
+      });
+    } catch (error) {
+      console.error('GET PLAN WORKSPACE ACTIVE:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+/** Current user's workspace save history for one board. */
+app.get(
+  '/pipesync/plan-view/workspace-saves/mine',
+  requireAuth,
+  requirePsrViewerAccess,
+  async (req, res) => {
+    try {
+      const un = pipesyncPlanViewUsernameKey(req.user);
+      const board = normalizePlanWorkspaceBoardKey(req.query?.board);
+      if (!un) return res.json({ success: true, saves: [] });
+      if (!board) {
+        return res.status(400).json({ success: false, error: 'Query board must be planView or pdfMapView.' });
+      }
+      if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+        return res.json({ success: true, saves: [], wasabi: false });
+      }
+      const snap = await loadWasabiLatestStateSnapshot(true);
+      const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
+      const rows = Array.isArray(tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE])
+        ? tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE]
+        : [];
+      const saves = rows
+        .filter((r) => r && String(r.username || '').toLowerCase() === un && r.board === board)
+        .sort((a, b) => String(b.saved_at || '').localeCompare(String(a.saved_at || '')))
+        .map((r) => ({
+          id: r.id,
+          board: r.board,
+          saved_at: r.saved_at,
+          username: r.username,
+          bytes: Number(r.bytes) || 0
+        }));
+      return res.json({ success: true, saves });
+    } catch (error) {
+      console.error('GET PLAN WORKSPACE MINE:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+/** Current user's most recent workspace save for one board (hydrated board body). */
+app.get(
+  '/pipesync/plan-view/workspace-saves/mine/latest',
+  requireAuth,
+  requirePsrViewerAccess,
+  async (req, res) => {
+    try {
+      const un = pipesyncPlanViewUsernameKey(req.user);
+      const board = normalizePlanWorkspaceBoardKey(req.query?.board);
+      if (!un) return res.json({ success: true, save: null });
+      if (!board) {
+        return res.status(400).json({ success: false, error: 'Query board must be planView or pdfMapView.' });
+      }
+      if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+        return res.json({ success: true, save: null, wasabi: false });
+      }
+      const snap = await loadWasabiLatestStateSnapshot(true);
+      const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
+      const rows = Array.isArray(tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE])
+        ? tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE]
+        : [];
+      const entry = rows
+        .filter((r) => r && String(r.username || '').toLowerCase() === un && r.board === board)
+        .sort((a, b) => String(b.saved_at || '').localeCompare(String(a.saved_at || '')))[0];
+      if (!entry) return res.json({ success: true, save: null });
+      const hydrated = await loadHydratedWorkspaceBoardFromEntry(entry);
+      return res.json({
+        success: true,
+        save: {
+          id: entry.id,
+          board: entry.board,
+          saved_at: entry.saved_at,
+          username: entry.username,
+          boardData: hydrated
+        }
+      });
+    } catch (error) {
+      console.error('GET PLAN WORKSPACE MINE LATEST:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+/** Load one workspace save by id (owner only). */
+app.get(
+  '/pipesync/plan-view/workspace-saves/:saveId',
+  requireAuth,
+  requirePsrViewerAccess,
+  async (req, res) => {
+    try {
+      const un = pipesyncPlanViewUsernameKey(req.user);
+      const saveId = String(req.params?.saveId || '').trim();
+      if (!un) return res.status(401).json({ success: false, error: 'Not signed in.' });
+      if (!saveId) return res.status(400).json({ success: false, error: 'saveId is required.' });
+      if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured.' });
+      }
+      const snap = await loadWasabiLatestStateSnapshot(true);
+      const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
+      const rows = Array.isArray(tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE])
+        ? tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE]
+        : [];
+      const entry = rows.find((r) => r && r.id === saveId);
+      if (!entry || String(entry.username || '').toLowerCase() !== un) {
+        return res.status(404).json({ success: false, error: 'Workspace save not found.' });
+      }
+      const hydrated = await loadHydratedWorkspaceBoardFromEntry(entry);
+      if (!hydrated) {
+        return res.status(404).json({ success: false, error: 'Workspace save data is missing or invalid.' });
+      }
+      return res.json({
+        success: true,
+        save: {
+          id: entry.id,
+          board: entry.board,
+          saved_at: entry.saved_at,
+          username: entry.username,
+          boardData: hydrated
+        }
+      });
+    } catch (error) {
+      console.error('GET PLAN WORKSPACE SAVE:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+/** Persist a workspace checkpoint to Wasabi (per-user history + global newest pointer). */
+app.post(
+  '/pipesync/plan-view/workspace-saves',
+  requireAuth,
+  requirePsrViewerAccess,
+  express.json({ limit: '16mb' }),
+  async (req, res) => {
+    try {
+      if (!WASABI_WRITES_PRIMARY_ENABLED) {
+        return res.status(503).json({ success: false, error: 'Wasabi primary writes are disabled on this server.' });
+      }
+      if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured.' });
+      }
+      const un = pipesyncPlanViewUsernameKey(req.user);
+      if (!un) {
+        return res.status(400).json({ success: false, error: 'Account has no username for plan view storage.' });
+      }
+      const boardKey = normalizePlanWorkspaceBoardKey(req.body?.boardKey || req.body?.board);
+      const boardRaw = req.body?.board;
+      if (!boardKey) {
+        return res.status(400).json({ success: false, error: 'boardKey must be planView or pdfMapView.' });
+      }
+      if (!boardRaw || typeof boardRaw !== 'object' || Array.isArray(boardRaw)) {
+        return res.status(400).json({ success: false, error: 'Body must include a board object snapshot.' });
+      }
+      const sanitizedBoard = sanitizePlanBoardBranch(boardRaw);
+      const blobJson = JSON.stringify({ savedAt: nowIso(), boardKey, board: sanitizedBoard });
+      if (blobJson.length > PIPESYNC_PLAN_WORKSPACE_SAVE_MAX_BYTES) {
+        return res.status(413).json({ success: false, error: 'Workspace save exceeds the maximum size.' });
+      }
+      const saveId = crypto.randomUUID();
+      const storageKey = buildPipesyncPlanWorkspaceSaveStorageKey(saveId);
+      const savedAt = nowIso();
+      await putPipesyncPlanWorkspaceSaveBlob(storageKey, {
+        savedAt,
+        boardKey,
+        username: un,
+        board: sanitizedBoard
+      });
+      const indexRow = {
+        id: saveId,
+        username: un,
+        board: boardKey,
+        saved_at: savedAt,
+        storage_key: storageKey,
+        bytes: blobJson.length
+      };
+      await runWasabiStateWrite(`pipesync-plan-workspace-save:${un}:${boardKey}`, async (data) => {
+        const rows = ensureSnapshotTable(data, PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE);
+        rows.push(indexRow);
+        data[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE] = prunePlanWorkspaceSaveIndex(rows, un, boardKey);
+        const active = readPlanWorkspaceActiveMap(data);
+        const incumbent = active[boardKey];
+        if (planWorkspaceEntryIsNewer(indexRow, incumbent)) {
+          active[boardKey] = {
+            id: saveId,
+            username: un,
+            board: boardKey,
+            saved_at: savedAt,
+            storage_key: storageKey
+          };
+          data.pipesync_plan_workspace_active = active;
+        }
+        const planRows = ensureSnapshotTable(data, PIPESYNC_PLAN_VIEW_TABLE);
+        const pIdx = planRows.findIndex((r) => String(r?.username || '').toLowerCase() === un);
+        const prevPayload = pIdx >= 0 && planRows[pIdx]?.payload ? planRows[pIdx].payload : null;
+        const mergedPayload = mergePlanViewPayloadBranch(prevPayload, boardKey, sanitizedBoard);
+        const planRow = { username: un, payload: mergedPayload, updated_at: savedAt };
+        if (pIdx >= 0) planRows[pIdx] = planRow;
+        else planRows.push(planRow);
+      });
+      return res.json({
+        success: true,
+        save: {
+          id: saveId,
+          board: boardKey,
+          saved_at: savedAt,
+          username: un
+        }
+      });
+    } catch (error) {
+      console.error('POST PLAN WORKSPACE SAVE:', error);
       return res.status(500).json({ success: false, error: error.message });
     }
   }

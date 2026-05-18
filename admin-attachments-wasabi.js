@@ -7,6 +7,8 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const ADMIN_ATTACHMENT_STORAGE_PREFIX = 'app-data/horizon-admin/attachments/';
 /** PipeSync Plan view pages (images or PDF) — same Wasabi bucket, distinct prefix for ACL hygiene. */
 const PIPESYNC_PLAN_PAGE_STORAGE_PREFIX = 'app-data/horizon-pipesync/plan-pages/';
+/** Versioned workspace checkpoints (board layout, masks, crops) — JSON blobs keyed by save id. */
+const PIPESYNC_PLAN_WORKSPACE_SAVE_PREFIX = 'app-data/horizon-pipesync/plan-workspace-saves/';
 
 function sanitizeAdminAttachmentFilename(name) {
   const base = String(name || '').split(/[/\\]/).pop() || 'upload.bin';
@@ -27,6 +29,22 @@ function buildPipesyncPlanPageStorageKey(fileName) {
 function isValidPipesyncPlanPageStorageKey(key) {
   if (typeof key !== 'string') return false;
   if (!key.startsWith(PIPESYNC_PLAN_PAGE_STORAGE_PREFIX)) return false;
+  if (key.length >= 4096 || key.includes('..')) return false;
+  return true;
+}
+
+function buildPipesyncPlanWorkspaceSaveStorageKey(saveId) {
+  const id = String(saveId || '').trim();
+  if (!id || !/^[0-9a-f-]{36}$/i.test(id)) {
+    throw new Error('Invalid workspace save id');
+  }
+  return `${PIPESYNC_PLAN_WORKSPACE_SAVE_PREFIX}${id}.json`;
+}
+
+function isValidPipesyncPlanWorkspaceSaveStorageKey(key) {
+  if (typeof key !== 'string') return false;
+  if (!key.startsWith(PIPESYNC_PLAN_WORKSPACE_SAVE_PREFIX)) return false;
+  if (!key.endsWith('.json')) return false;
   if (key.length >= 4096 || key.includes('..')) return false;
   return true;
 }
@@ -160,10 +178,13 @@ async function hydrateAdminReportOrAssetRows(client, bucket, rows, filesField, v
 module.exports = {
   ADMIN_ATTACHMENT_STORAGE_PREFIX,
   PIPESYNC_PLAN_PAGE_STORAGE_PREFIX,
+  PIPESYNC_PLAN_WORKSPACE_SAVE_PREFIX,
   sanitizeAdminAttachmentFilename,
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,
+  buildPipesyncPlanWorkspaceSaveStorageKey,
   isValidPipesyncPlanPageStorageKey,
+  isValidPipesyncPlanWorkspaceSaveStorageKey,
   isValidAdminAttachmentStorageKey,
   isAllowedAdminAttachmentContentType,
   presignAdminAttachmentPut,
