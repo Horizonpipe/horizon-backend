@@ -3491,7 +3491,7 @@ async function readSessionFromPostgres(token) {
   const result = await pool.query(
     `SELECT s.token, s.user_id, s.keep_session, s.expires_at, u.id, u.username, u.display_name, u.password,
             u.is_admin, u.roles, u.must_change_password, u.portal_files_client_id, u.portal_files_job_id,
-            u.portal_permissions_access, u.portal_files_access_granted, u.self_signup, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified,
+            u.portal_permissions_access, u.portal_files_access_granted, u.autosync_master_granted, u.self_signup, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified,
             u.product_tutorials_seen
      FROM auth_sessions s
      JOIN users u ON CAST(u.id AS text) = s.user_id
