@@ -1636,6 +1636,89 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     }
   }
 
+  function normalizeInspectionBindingType(raw) {
+    const t = String(raw || '')
+      .trim()
+      .toLowerCase();
+    if (t === 'primary' || t === 'override') return t;
+    return '';
+  }
+
+  function normalizeInspectionBindingFolderPath(raw) {
+    const input = raw == null ? '' : String(raw);
+    if (!input.trim()) return '';
+    return normalizeRelPath(input);
+  }
+
+  async function ensurePortalInspectionBindingsSchema(dbPool) {
+    await dbPool.query(`
+      CREATE TABLE IF NOT EXISTS portal_inspection_bindings (
+        client_id TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        folder_path TEXT NOT NULL DEFAULT '',
+        binding_type TEXT NOT NULL,
+        db3_file_id TEXT NOT NULL,
+        updated_by_username TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (client_id, job_id, folder_path, binding_type),
+        CHECK (binding_type IN ('primary', 'override'))
+      )
+    `);
+    await dbPool.query(
+      `CREATE INDEX IF NOT EXISTS idx_portal_inspection_bindings_scope
+       ON portal_inspection_bindings (client_id, job_id, updated_at DESC)`
+    );
+  }
+
+  async function listPortalInspectionBindings(dbPool, clientId, jobId) {
+    await ensurePortalInspectionBindingsSchema(dbPool);
+    const r = await dbPool.query(
+      `SELECT folder_path, binding_type, db3_file_id
+       FROM portal_inspection_bindings
+       WHERE client_id = $1 AND job_id = $2`,
+      [String(clientId), String(jobId)]
+    );
+    return Array.isArray(r.rows) ? r.rows : [];
+  }
+
+  async function savePortalInspectionBinding(
+    dbPool,
+    clientId,
+    jobId,
+    folderPath,
+    bindingType,
+    db3FileId,
+    updatedByUsername
+  ) {
+    await ensurePortalInspectionBindingsSchema(dbPool);
+    if (!db3FileId) {
+      await dbPool.query(
+        `DELETE FROM portal_inspection_bindings
+         WHERE client_id = $1 AND job_id = $2 AND folder_path = $3 AND binding_type = $4`,
+        [String(clientId), String(jobId), String(folderPath || ''), String(bindingType)]
+      );
+      return;
+    }
+    await dbPool.query(
+      `INSERT INTO portal_inspection_bindings
+        (client_id, job_id, folder_path, binding_type, db3_file_id, updated_by_username, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW())
+       ON CONFLICT (client_id, job_id, folder_path, binding_type)
+       DO UPDATE SET
+         db3_file_id = EXCLUDED.db3_file_id,
+         updated_by_username = EXCLUDED.updated_by_username,
+         updated_at = NOW()`,
+      [
+        String(clientId),
+        String(jobId),
+        String(folderPath || ''),
+        String(bindingType),
+        String(db3FileId),
+        String(updatedByUsername || '')
+      ]
+    );
+  }
+
   r.get('/storage-health', async (req, res) => {
     try {
       if (!userIsPortalAdmin(req.user)) {
@@ -1807,6 +1890,119 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(400).json({ error: msg });
+    }
+  });
+
+  r.get('/inspection-bindings', async (req, res) => {
+    try {
+      const scope = resolvePortalScope(req, req.query);
+      if (scope.error) return res.status(400).json({ error: scope.error });
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const treePortalMode = readPortalMode(req, req.query);
+      const pathGate = await createPortalPathVisibilityChecker(aclPool, req, clientId, jobId, treePortalMode);
+      const rows = await listPortalInspectionBindings(uploadMetaPool, clientId, jobId);
+      const primary = {};
+      const override = {};
+      for (const row of rows) {
+        const folderPath = String(row.folder_path || '').trim();
+        if (folderPath && !pathGate.check(folderPath)) continue;
+        const type = normalizeInspectionBindingType(row.binding_type);
+        const db3FileId = String(row.db3_file_id || '').trim();
+        if (!type || !db3FileId) continue;
+        if (type === 'primary') primary[folderPath] = db3FileId;
+        else override[folderPath] = db3FileId;
+      }
+      return res.json({ primary, override });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  r.put('/inspection-bindings', express.json({ limit: '64kb' }), async (req, res) => {
+    try {
+      if (!userCanPortalCapability(req.user, 'edit')) {
+        return res.status(403).json({ error: 'Portal edit is not enabled for this account' });
+      }
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      if (scope.error) return res.status(400).json({ error: scope.error });
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const bindingType = normalizeInspectionBindingType(body.bindingType || body.type || '');
+      if (!bindingType) {
+        return res.status(400).json({ error: 'bindingType must be primary or override' });
+      }
+      let folderPath = '';
+      try {
+        folderPath = normalizeInspectionBindingFolderPath(body.folderPath || body.path || '');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return res.status(400).json({ error: msg });
+      }
+      if (folderPath) {
+        const treePortalMode = readPortalMode(req, body);
+        const visible = await assertRelPathMatchesPortalTreeVisibility(
+          aclPool,
+          req,
+          clientId,
+          jobId,
+          treePortalMode,
+          folderPath
+        );
+        if (!visible) return res.status(403).json({ error: 'Forbidden' });
+        const canEditPath = await assertPortalPathRel(aclPool, req.user, clientId, jobId, folderPath, 'full');
+        if (!canEditPath) return res.status(403).json({ error: 'Forbidden' });
+      }
+      const db3FileIdRaw = body.db3FileId ?? body.value ?? null;
+      const db3FileId = db3FileIdRaw == null ? '' : String(db3FileIdRaw).trim();
+      if (db3FileId) {
+        const key = idToKey(db3FileId);
+        if (!key.startsWith('clients/')) return res.status(400).json({ error: 'Invalid db3FileId' });
+        const parsed = parseJobFromObjectKey(key);
+        if (!parsed || parsed.clientId !== String(clientId) || parsed.jobId !== String(jobId)) {
+          return res.status(400).json({ error: 'db3FileId must belong to the same client/job scope' });
+        }
+        const pref = jobPrefix(String(clientId), String(jobId));
+        const relPath = key.slice(pref.length);
+        if (!/\.db3$/i.test(path.basename(relPath))) {
+          return res.status(400).json({ error: 'db3FileId must reference a .db3 file' });
+        }
+        const canViewDb3 = await assertPortalPathRel(aclPool, req.user, clientId, jobId, relPath, 'view');
+        if (!canViewDb3) return res.status(403).json({ error: 'Forbidden' });
+        try {
+          await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+        } catch (he) {
+          const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
+          if (hn === 'NotFound' || hn === 'NoSuchKey' || he?.$metadata?.httpStatusCode === 404) {
+            return res.status(404).json({ error: 'DB3 file not found' });
+          }
+          throw he;
+        }
+      }
+      await savePortalInspectionBinding(
+        uploadMetaPool,
+        clientId,
+        jobId,
+        folderPath,
+        bindingType,
+        db3FileId || null,
+        req.user?.username || ''
+      );
+      return res.json({
+        success: true,
+        folderPath,
+        bindingType,
+        db3FileId: db3FileId || null
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
     }
   });
 
