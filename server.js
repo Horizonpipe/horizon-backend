@@ -236,10 +236,10 @@ const WASABI_STATE_SNAPSHOT_MAX_MS = Math.max(
 );
 const WASABI_STATE_SNAPSHOT_MS = Math.max(
   10000,
-  Math.min(WASABI_STATE_SNAPSHOT_MAX_MS, Number(process.env.WASABI_STATE_SNAPSHOT_MS || 3600000))
+  Math.min(WASABI_STATE_SNAPSHOT_MAX_MS, Number(process.env.WASABI_STATE_SNAPSHOT_MS || 300000))
 );
 const WASABI_STATE_SNAPSHOT_ON_WRITE =
-  String(process.env.WASABI_STATE_SNAPSHOT_ON_WRITE || '0').trim().toLowerCase() !== '0';
+  String(process.env.WASABI_STATE_SNAPSHOT_ON_WRITE || '1').trim().toLowerCase() !== '0';
 /** PipeSync / staff APIs and everything not classified as portal or autosync (short debounce). */
 const WASABI_STATE_WRITE_DEBOUNCE_MS = Math.max(
   1000,
@@ -251,7 +251,7 @@ const WASABI_STATE_WRITE_DEBOUNCE_MS = Math.max(
  */
 const WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS = Math.max(
   5000,
-  Math.min(600000, Number(process.env.WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS || 300000))
+  Math.min(600000, Number(process.env.WASABI_STATE_WRITE_DEBOUNCE_PORTAL_MS || 120000))
 );
 /** Data Auto Sync desktop (`X-Horizon-Client: horizon-data-autosync`): longest debounce (optional third tier). */
 const WASABI_STATE_WRITE_DEBOUNCE_AUTOSYNC_MS = Math.max(
@@ -267,7 +267,7 @@ const WASABI_STATE_SNAPSHOT_GZIP =
 /** In-memory TTL for repeated reads of `latest.json` (non-force); lowers Wasabi download volume. */
 const WASABI_LATEST_STATE_CACHE_MS = Math.max(
   1000,
-  Math.min(300000, Number(process.env.WASABI_LATEST_STATE_CACHE_MS || 120000))
+  Math.min(300000, Number(process.env.WASABI_LATEST_STATE_CACHE_MS || 30000))
 );
 /** POST paths that must not trigger on-write Wasabi state snapshots (high volume, no app-table mutations). */
 function normalizeWasabiSnapshotHttpSkipPath(p) {
@@ -6305,7 +6305,7 @@ app.get('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, 
     if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
       return res.json({ success: true, payload: null, updated_at: null, wasabi: false });
     }
-    const snap = await loadWasabiLatestStateSnapshot(false);
+    const snap = await loadWasabiLatestStateSnapshot(true);
     const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
     const rows = Array.isArray(tables[PIPESYNC_PLAN_VIEW_TABLE]) ? tables[PIPESYNC_PLAN_VIEW_TABLE] : [];
     const row = rows.find((r) => String(r?.username || '').toLowerCase() === un);
@@ -6445,28 +6445,14 @@ app.get(
   requirePsrViewerAccess,
   async (req, res) => {
     try {
-      const un = pipesyncPlanViewUsernameKey(req.user);
       if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
         return res.json({ success: true, planView: null, pdfMapView: null, wasabi: false });
       }
-      const snap = await loadWasabiLatestStateSnapshot(false);
+      const snap = await loadWasabiLatestStateSnapshot(true);
       const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
-      const rows = Array.isArray(tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE])
-        ? tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE]
-        : [];
-      const pickLatestForBoard = (boardKey) =>
-        rows
-          .filter((r) => r && String(r.username || '').toLowerCase() === un && r.board === boardKey)
-          .sort((a, b) => String(b.saved_at || '').localeCompare(String(a.saved_at || '')))[0] || null;
-
-      // Per-user active workspace is the default for cross-device continuity.
-      let planViewEntry = pickLatestForBoard('planView');
-      let pdfMapViewEntry = pickLatestForBoard('pdfMapView');
-      if (!planViewEntry || !pdfMapViewEntry) {
-        const legacyActive = readPlanWorkspaceActiveMap(tables);
-        if (!planViewEntry) planViewEntry = legacyActive.planView;
-        if (!pdfMapViewEntry) pdfMapViewEntry = legacyActive.pdfMapView;
-      }
+      const active = readPlanWorkspaceActiveMap(tables);
+      const planViewEntry = active.planView;
+      const pdfMapViewEntry = active.pdfMapView;
       const [planViewBoard, pdfMapViewBoard] = await Promise.all([
         loadHydratedWorkspaceBoardFromEntry(planViewEntry),
         loadHydratedWorkspaceBoardFromEntry(pdfMapViewEntry)
@@ -6513,7 +6499,7 @@ app.get(
       if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
         return res.json({ success: true, saves: [], wasabi: false });
       }
-      const snap = await loadWasabiLatestStateSnapshot(false);
+      const snap = await loadWasabiLatestStateSnapshot(true);
       const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
       const rows = Array.isArray(tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE])
         ? tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE]
@@ -6552,7 +6538,7 @@ app.get(
       if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
         return res.json({ success: true, save: null, wasabi: false });
       }
-      const snap = await loadWasabiLatestStateSnapshot(false);
+      const snap = await loadWasabiLatestStateSnapshot(true);
       const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
       const rows = Array.isArray(tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE])
         ? tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE]
@@ -6593,7 +6579,7 @@ app.get(
       if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
         return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured.' });
       }
-      const snap = await loadWasabiLatestStateSnapshot(false);
+      const snap = await loadWasabiLatestStateSnapshot(true);
       const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
       const rows = Array.isArray(tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE])
         ? tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE]
