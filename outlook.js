@@ -318,7 +318,18 @@ function registerOutlookRoutes(app, { pool, query, requireAuth, corsOrigins = []
         expiresAt: row?.expires_at || null
       });
     } catch (error) {
-      res.status(500).json({ success: false, error: error.message });
+      console.warn('OUTLOOK STATUS DEGRADED:', error?.message || error);
+      res.json({
+        success: true,
+        configured: configured(),
+        connected: false,
+        email: '',
+        displayName: '',
+        expiresAt: null,
+        available: false,
+        degraded: true,
+        reason: 'Outlook status is temporarily unavailable'
+      });
     }
   });
 
