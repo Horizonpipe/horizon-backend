@@ -1476,7 +1476,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
    * Default `1` keeps legacy behavior. Set `0` on Render to force presigned GET (`/presign/:id`, share/guest presign routes).
    */
   const PORTAL_PROXY_FILE_DOWNLOAD =
-    String(process.env.PORTAL_PROXY_FILE_DOWNLOAD ?? '1').trim().toLowerCase() !== '0';
+    String(process.env.PORTAL_PROXY_FILE_DOWNLOAD ?? '0').trim().toLowerCase() !== '0';
 
   function portalProxyDownloadAllowedOrJson(res) {
     if (PORTAL_PROXY_FILE_DOWNLOAD) return true;
@@ -1494,7 +1494,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
    * Default `1` keeps legacy behavior. Set `0` on Render and use `POST …/upload/resumable/sign-part` + direct PUT to Wasabi.
    */
   const PORTAL_RESUMABLE_PROXY_CHUNK =
-    String(process.env.PORTAL_RESUMABLE_PROXY_CHUNK ?? '1').trim().toLowerCase() !== '0';
+    String(process.env.PORTAL_RESUMABLE_PROXY_CHUNK ?? '0').trim().toLowerCase() !== '0';
 
   /**
    * Optional: resumable `/upload/resumable/complete` re-downloads the full object from Wasabi to verify SHA-256.
