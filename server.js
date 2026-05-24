@@ -1180,6 +1180,9 @@ function cloneSnapshotRows(rows) {
 /** PipeSync Plan view markup — stored only in Wasabi `latest.json` under `data.pipesync_plan_views` (no Postgres table). */
 const PIPESYNC_PLAN_VIEW_TABLE = 'pipesync_plan_views';
 const PIPESYNC_PLAN_VIEW_MAX_BYTES = 14 * 1024 * 1024;
+const PIPESYNC_PRICING_STATE_TABLE = 'pipesync_pricing_state';
+const PIPESYNC_PRICING_STATE_MAX_BYTES = 768 * 1024;
+const PIPESYNC_PRICING_SNAPSHOTS_MAX = 48;
 const PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE = 'pipesync_plan_workspace_saves';
 const PIPESYNC_PLAN_WORKSPACE_SAVE_MAX_BYTES = 14 * 1024 * 1024;
 const PIPESYNC_PLAN_WORKSPACE_SAVE_MAX_PER_USER_BOARD = 40;
@@ -1188,6 +1191,61 @@ const PIPESYNC_PLAN_WORKSPACE_BOARDS = new Set(['planView', 'pdfMapView']);
 function pipesyncPlanViewUsernameKey(user) {
   const u = cleanString(user?.username || user?.displayName || '').toLowerCase();
   return u ? u.slice(0, 200) : '';
+}
+
+function sanitizePricingHourlyForPersist(raw) {
+  const o = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  return {
+    vacRate: String(o.vacRate ?? '').slice(0, 60),
+    cameraRate: String(o.cameraRate ?? '').slice(0, 60),
+    vacHours: String(o.vacHours ?? '').slice(0, 60),
+    cameraHours: String(o.cameraHours ?? '').slice(0, 60)
+  };
+}
+
+function sanitizePricingSnapshotFiltersForPersist(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw)) {
+    if (!k) continue;
+    const key = String(k).slice(0, 80);
+    if (!key) continue;
+    if (typeof v === 'boolean') {
+      out[key] = v;
+      continue;
+    }
+    out[key] = String(v ?? '').slice(0, 160);
+  }
+  return out;
+}
+
+function sanitizePricingSnapshotForPersist(raw) {
+  const o = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const pickFinite = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
+  };
+  const savedAtRaw = String(o.savedAt || '').trim();
+  const savedAtParsed = Date.parse(savedAtRaw);
+  return {
+    id: String(o.id || '').slice(0, 120) || crypto.randomUUID(),
+    label: String(o.label || '').slice(0, 180),
+    savedAt: Number.isFinite(savedAtParsed) ? new Date(savedAtParsed).toISOString() : nowIso(),
+    filters: sanitizePricingSnapshotFiltersForPersist(o.filters),
+    hourly: sanitizePricingHourlyForPersist(o.hourly),
+    capturedFootRevenue: pickFinite(o.capturedFootRevenue),
+    capturedTruckTotal: pickFinite(o.capturedTruckTotal),
+    capturedCombined: pickFinite(o.capturedCombined)
+  };
+}
+
+function sanitizePricingStatePayloadForPersist(payload) {
+  const o = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+  const snapshotsRaw = Array.isArray(o.snapshots) ? o.snapshots : [];
+  return {
+    hourly: sanitizePricingHourlyForPersist(o.hourly),
+    snapshots: snapshotsRaw.slice(0, PIPESYNC_PRICING_SNAPSHOTS_MAX).map(sanitizePricingSnapshotForPersist)
+  };
 }
 
 /** Tables whose canonical copy is Wasabi when in wasabi-only mode — never overwrite from (empty) Postgres during snapshot export. */
@@ -1256,8 +1314,14 @@ async function runWasabiStateSnapshot() {
       } else if (!Array.isArray(data[PIPESYNC_PLAN_VIEW_TABLE])) {
         data[PIPESYNC_PLAN_VIEW_TABLE] = [];
       }
+      if (Array.isArray(mergeTables[PIPESYNC_PRICING_STATE_TABLE])) {
+        data[PIPESYNC_PRICING_STATE_TABLE] = cloneSnapshotRows(mergeTables[PIPESYNC_PRICING_STATE_TABLE]);
+      } else if (!Array.isArray(data[PIPESYNC_PRICING_STATE_TABLE])) {
+        data[PIPESYNC_PRICING_STATE_TABLE] = [];
+      }
     } catch {
       if (!Array.isArray(data[PIPESYNC_PLAN_VIEW_TABLE])) data[PIPESYNC_PLAN_VIEW_TABLE] = [];
+      if (!Array.isArray(data[PIPESYNC_PRICING_STATE_TABLE])) data[PIPESYNC_PRICING_STATE_TABLE] = [];
     }
     const next = {
       generatedAt: nowIso(),
@@ -7317,6 +7381,87 @@ app.delete('/pricing-rates/:dia', requireAuth, requireAdmin, async (req, res) =>
   } catch (error) {
     console.error('DELETE PRICING RATE ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/pipesync/pricing-state', requireAuth, requirePricingAccess, async (req, res) => {
+  try {
+    const un = pipesyncPlanViewUsernameKey(req.user);
+    if (!un) {
+      return res.json({ success: true, payload: null, updated_at: null });
+    }
+    if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+      return res.json({ success: true, payload: null, updated_at: null, wasabi: false });
+    }
+    const snap = await loadWasabiLatestStateSnapshot(false);
+    const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
+    const rows = Array.isArray(tables[PIPESYNC_PRICING_STATE_TABLE]) ? tables[PIPESYNC_PRICING_STATE_TABLE] : [];
+    const row = rows.find((r) => String(r?.username || '').toLowerCase() === un);
+    const payload = row?.payload ? sanitizePricingStatePayloadForPersist(row.payload) : null;
+    return res.json({
+      success: true,
+      payload,
+      updated_at: row?.updated_at || null
+    });
+  } catch (error) {
+    console.error('GET PIPESYNC PRICING STATE:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/pipesync/pricing-state', requireAuth, requirePricingAccess, async (req, res) => {
+  try {
+    if (!WASABI_WRITES_PRIMARY_ENABLED) {
+      return res.status(503).json({ success: false, error: 'Wasabi primary writes are disabled on this server.' });
+    }
+    if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+      return res.status(503).json({ success: false, error: 'Wasabi state storage is not configured.' });
+    }
+    const un = pipesyncPlanViewUsernameKey(req.user);
+    if (!un) {
+      return res.status(400).json({ success: false, error: 'Account has no username for pricing storage.' });
+    }
+    const payload = req.body?.payload;
+    if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) {
+      return res.status(400).json({ success: false, error: 'Body must be JSON { "payload": { ... } }.' });
+    }
+    const ifMissingOnly = req.body?.ifMissing === true;
+    const sanitized = sanitizePricingStatePayloadForPersist(payload);
+    const json = JSON.stringify(sanitized);
+    if (json.length > PIPESYNC_PRICING_STATE_MAX_BYTES) {
+      return res.status(413).json({ success: false, error: 'Pricing state exceeds the maximum save size.' });
+    }
+
+    const now = nowIso();
+    let didWrite = false;
+    let resolvedRow = null;
+    await runWasabiStateWrite(`pipesync-pricing-state:${un}`, async (data) => {
+      const rows = ensureSnapshotTable(data, PIPESYNC_PRICING_STATE_TABLE);
+      const idx = rows.findIndex((r) => String(r?.username || '').toLowerCase() === un);
+      const existing = idx >= 0 ? rows[idx] : null;
+      if (ifMissingOnly && existing) {
+        resolvedRow = existing;
+        return;
+      }
+      const row = { username: un, payload: sanitized, updated_at: now };
+      if (idx >= 0) rows[idx] = row;
+      else rows.push(row);
+      didWrite = true;
+      resolvedRow = row;
+    });
+
+    if (!didWrite) {
+      return res.json({
+        success: true,
+        seeded: false,
+        payload: resolvedRow?.payload ? sanitizePricingStatePayloadForPersist(resolvedRow.payload) : null,
+        updated_at: resolvedRow?.updated_at || null
+      });
+    }
+    return res.json({ success: true, seeded: ifMissingOnly ? true : undefined, payload: sanitized, updated_at: now });
+  } catch (error) {
+    console.error('PUT PIPESYNC PRICING STATE:', error);
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
