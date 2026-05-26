@@ -668,6 +668,56 @@ async function hydratePlanBoardPageRow(p) {
   return copy;
 }
 
+async function hydratePlanBoardLegacyPieceRow(p) {
+  if (!p || typeof p !== 'object') return p;
+  const copy = { ...p };
+  delete copy.viewUrl;
+  const sk = String(copy.storageKey || '').trim();
+  if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+    try {
+      const { url } = await presignAdminAttachmentGet(
+        wasabiStateClient,
+        WASABI_STATE_BUCKET,
+        sk,
+        ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+      );
+      copy.viewUrl = url;
+    } catch {
+      copy.viewUrl = '';
+    }
+  }
+  return copy;
+}
+
+async function hydratePlanBoardLegacyPlanRow(d) {
+  if (!d || typeof d !== 'object') return d;
+  const copy = { ...d };
+  delete copy.viewUrl;
+  const sk = String(copy.storageKey || '').trim();
+  if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+    try {
+      const { url } = await presignAdminAttachmentGet(
+        wasabiStateClient,
+        WASABI_STATE_BUCKET,
+        sk,
+        ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+      );
+      copy.viewUrl = url;
+    } catch {
+      copy.viewUrl = '';
+    }
+  }
+  if (Array.isArray(copy.pieces)) {
+    const pieces = [];
+    for (const p of copy.pieces) {
+      if (!p || typeof p !== 'object') continue;
+      pieces.push(await hydratePlanBoardLegacyPieceRow(p));
+    }
+    copy.pieces = pieces;
+  }
+  return copy;
+}
+
 async function hydratePlanBoardWorkspacePages(workspaces) {
   if (!Array.isArray(workspaces)) return workspaces;
   const out = [];
@@ -702,6 +752,14 @@ async function hydratePlanBoardBranch(branch) {
   }
   if (Array.isArray(branch.mapWorkspaces)) {
     next.mapWorkspaces = await hydratePlanBoardWorkspacePages(branch.mapWorkspaces);
+  }
+  if (Array.isArray(branch.legacyPlans)) {
+    const legacyPlans = [];
+    for (const d of branch.legacyPlans) {
+      if (!d || typeof d !== 'object') continue;
+      legacyPlans.push(await hydratePlanBoardLegacyPlanRow(d));
+    }
+    next.legacyPlans = legacyPlans;
   }
   return next;
 }
@@ -774,6 +832,32 @@ function sanitizePlanBoardBranch(branch) {
             .filter(Boolean);
         }
         return wn;
+      })
+      .filter(Boolean);
+  }
+  if (Array.isArray(clone.legacyPlans)) {
+    clone.legacyPlans = clone.legacyPlans
+      .map((d) => {
+        if (!d || typeof d !== 'object') return null;
+        const o = { ...d };
+        delete o.viewUrl;
+        const sk = String(o.storageKey || '').trim();
+        if (!isValidPipesyncPlanPageStorageKey(sk)) return null;
+        if (Array.isArray(o.pieces)) {
+          o.pieces = o.pieces
+            .map((p) => {
+              if (!p || typeof p !== 'object') return null;
+              const piece = { ...p };
+              delete piece.viewUrl;
+              const psk = String(piece.storageKey || '').trim();
+              if (!isValidPipesyncPlanPageStorageKey(psk)) return null;
+              return piece;
+            })
+            .filter(Boolean);
+        } else {
+          o.pieces = [];
+        }
+        return o;
       })
       .filter(Boolean);
   }
