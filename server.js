@@ -1929,6 +1929,77 @@ function parsePortalWorkspaceLayouts(row) {
   return out;
 }
 
+const USER_PREFS_MAX_DEPTH = 8;
+const USER_PREFS_MAX_KEYS = 400;
+const USER_PREFS_MAX_STRING = 8000;
+const USER_PREFS_MAX_ARRAY = 64;
+
+function sanitizeUserPrefsValue(value, depth = 0, stats = null) {
+  const counter = stats || { keys: 0 };
+  if (depth > USER_PREFS_MAX_DEPTH) return undefined;
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string') {
+    return value.length > USER_PREFS_MAX_STRING ? value.slice(0, USER_PREFS_MAX_STRING) : value;
+  }
+  if (Array.isArray(value)) {
+    const out = [];
+    for (const item of value.slice(0, USER_PREFS_MAX_ARRAY)) {
+      if (counter.keys > USER_PREFS_MAX_KEYS) break;
+      const next = sanitizeUserPrefsValue(item, depth + 1, counter);
+      if (next !== undefined) out.push(next);
+    }
+    return out;
+  }
+  if (typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (counter.keys > USER_PREFS_MAX_KEYS) break;
+      const key = String(k).slice(0, 64);
+      if (!key) continue;
+      counter.keys += 1;
+      const next = sanitizeUserPrefsValue(v, depth + 1, counter);
+      if (next !== undefined) out[key] = next;
+    }
+    return out;
+  }
+  return undefined;
+}
+
+function parseUserPrefs(row) {
+  const raw = row?.user_prefs ?? row?.userPrefs;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const sanitized = sanitizeUserPrefsValue(raw, 0, { keys: 0 });
+  return sanitized && typeof sanitized === 'object' && !Array.isArray(sanitized) ? sanitized : {};
+}
+
+function deepMergePlainObjects(base, patch, depth = 0) {
+  const out = base && typeof base === 'object' && !Array.isArray(base) ? { ...base } : {};
+  const p = patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
+  if (depth >= USER_PREFS_MAX_DEPTH) return out;
+  for (const [k, v] of Object.entries(p)) {
+    const key = String(k).slice(0, 64);
+    if (!key) continue;
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      out[key] = deepMergePlainObjects(
+        out[key] && typeof out[key] === 'object' && !Array.isArray(out[key]) ? out[key] : {},
+        v,
+        depth + 1
+      );
+    } else {
+      out[key] = v;
+    }
+  }
+  return out;
+}
+
+function mergeUserPrefsPatch(current, patch) {
+  const merged = deepMergePlainObjects(parseUserPrefs({ user_prefs: current }), patch);
+  merged.savedAt = Date.now();
+  return parseUserPrefs({ user_prefs: merged });
+}
+
 function normalizeUser(row) {
   const id = row.id;
   const selfSignup = row?.self_signup === true;
@@ -2000,7 +2071,8 @@ function normalizeUser(row) {
     portalPermissionsAccessRaw,
     portalPermissionsAccess,
     productTutorialsSeen: parseProductTutorialsSeen(row),
-    portalWorkspaceLayouts: parsePortalWorkspaceLayouts(row)
+    portalWorkspaceLayouts: parsePortalWorkspaceLayouts(row),
+    userPrefs: parseUserPrefs(row)
   };
 }
 
@@ -3608,7 +3680,7 @@ async function readFreshUserFromPostgresById(userId) {
   const result = await pool.query(
     `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
             portal_permissions_access, portal_files_access_granted, autosync_master_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
-            product_tutorials_seen, portal_workspace_layouts
+            product_tutorials_seen, portal_workspace_layouts, user_prefs
      FROM users
      WHERE CAST(id AS text) = $1
      LIMIT 1`,
@@ -3659,7 +3731,7 @@ async function readSessionFromPostgres(token) {
     `SELECT s.token, s.user_id, s.keep_session, s.expires_at, u.id, u.username, u.display_name, u.password,
             u.is_admin, u.roles, u.must_change_password, u.portal_files_client_id, u.portal_files_job_id,
             u.portal_permissions_access, u.portal_files_access_granted, u.autosync_master_granted, u.self_signup, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified,
-            u.product_tutorials_seen, u.portal_workspace_layouts
+            u.product_tutorials_seen, u.portal_workspace_layouts, u.user_prefs
      FROM auth_sessions s
      JOIN users u ON CAST(u.id AS text) = s.user_id
      WHERE s.token = $1
@@ -4567,7 +4639,8 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS autosync_master_granted BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS self_signup BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS product_tutorials_seen JSONB NOT NULL DEFAULT '{}'::jsonb`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_workspace_layouts JSONB NOT NULL DEFAULT '{}'::jsonb`
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_workspace_layouts JSONB NOT NULL DEFAULT '{}'::jsonb`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS user_prefs JSONB NOT NULL DEFAULT '{}'::jsonb`
   ];
   for (const query of userAlters) await pool.query(query);
   await pool.query(`
@@ -5492,7 +5565,7 @@ app.post('/login', async (req, res) => {
     try {
       const result = await pool.query(
         `SELECT id, username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-                email, email_verified, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup, product_tutorials_seen
+                email, email_verified, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup, product_tutorials_seen, user_prefs
          FROM users u
          WHERE LOWER(TRIM(u.username)) = LOWER(TRIM($1))
             OR LOWER(TRIM(COALESCE(u.display_name, u.username))) = LOWER(TRIM($1))
@@ -5571,6 +5644,51 @@ app.post('/login', async (req, res) => {
 
 app.get('/session', requireAuth, async (req, res) => {
   res.json({ success: true, user: req.user, capabilities: resolveCapabilities(req.user) });
+});
+
+app.get('/me/user-prefs', requireAuth, async (req, res) => {
+  const prefs = req.user?.userPrefs && typeof req.user.userPrefs === 'object' ? req.user.userPrefs : {};
+  res.json({ success: true, prefs });
+});
+
+app.patch('/me/user-prefs', requireAuth, async (req, res) => {
+  const userId = String(req.user?.id || '').trim();
+  if (!userId) {
+    return res.status(400).json({ success: false, error: 'Missing user id' });
+  }
+  const patch = req.body?.patch;
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+    return res.status(400).json({ success: false, error: 'patch object is required' });
+  }
+  try {
+    const current = parseUserPrefs({ user_prefs: req.user?.userPrefs });
+    const merged = mergeUserPrefsPatch(current, patch);
+    await pool.query(
+      `UPDATE users
+       SET user_prefs = $2::jsonb,
+           updated_at = NOW()
+       WHERE CAST(id AS text) = $1`,
+      [userId, JSON.stringify(merged)]
+    );
+    await tryWasabiStateWrite('patch-user-prefs', async (data) => {
+      const users = ensureSnapshotTable(data, 'users');
+      const idx = users.findIndex((u) => String(u.id || '') === userId);
+      if (idx < 0) return;
+      users[idx] = {
+        ...users[idx],
+        user_prefs: merged,
+        updated_at: nowIso()
+      };
+    });
+    const fresh = await readFreshUserFromPostgresById(userId);
+    if (!fresh) {
+      return res.status(404).json({ success: false, error: 'User not found after update' });
+    }
+    res.json({ success: true, user: fresh, prefs: fresh.userPrefs || merged });
+  } catch (error) {
+    console.error('[me/user-prefs]', error);
+    res.status(500).json({ success: false, error: error.message || 'Server error' });
+  }
 });
 
 /**
