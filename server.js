@@ -12,8 +12,10 @@ const { Pool } = require('pg');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { ensureOutlookSchema, registerOutlookRoutes } = require('./outlook');
 const { registerPortalFilesRoutes } = require('./portal-files.routes');
+const { registerCompanyPermissionsRoutes } = require('./company-permissions.routes');
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
 const { registerSignupRoutes } = require('./signup.routes');
+const { loadUserCompanyMembership, normalizeAppFeatures } = require('./company-permissions.service');
 const { resolveCapabilities, canAccessAdminPanel, canManagePortalExtras } = require('./capabilities');
 const {
   buildAdminAttachmentStorageKey,
@@ -2272,10 +2274,37 @@ async function readScopesForUserIds(userIds) {
   return byUser;
 }
 
+async function attachCompanyToUsers(users) {
+  const list = Array.isArray(users) ? users : [];
+  if (!list.length) return list;
+  const ids = list.map((u) => String(u.id || '')).filter(Boolean);
+  const r = await pool.query(
+    `SELECT m.user_id, m.company_id, m.role_key, c.name AS company_name, c.app_features, c.customer_enabled
+     FROM user_company_membership m
+     JOIN companies c ON c.id = m.company_id
+     WHERE m.user_id = ANY($1::text[])`,
+    [ids]
+  );
+  const byUser = new Map();
+  for (const row of r.rows) {
+    byUser.set(String(row.user_id), {
+      companyId: row.company_id,
+      companyName: row.company_name,
+      roleKey: row.role_key,
+      appFeatures: normalizeAppFeatures(row.app_features),
+      customerEnabled: row.customer_enabled === true
+    });
+  }
+  return list.map((u) => ({
+    ...u,
+    companyMembership: byUser.get(String(u.id || '')) || null
+  }));
+}
+
 async function attachScopesToUsers(users) {
   const list = Array.isArray(users) ? users : [];
   const map = await readScopesForUserIds(list.map((u) => u.id));
-  return list.map((u) => {
+  const withScopes = list.map((u) => {
     const entry = map.get(String(u.id || '')) || { portalScopes: [], psrScopes: [] };
     return {
       ...u,
@@ -2283,6 +2312,7 @@ async function attachScopesToUsers(users) {
       psrScopes: dedupePsrScopes(entry.psrScopes)
     };
   });
+  return attachCompanyToUsers(withScopes);
 }
 
 async function attachScopesToUser(user) {
@@ -5033,6 +5063,123 @@ async function ensureSchema() {
     console.warn('[schema] portal_share_links kind constraint migrate:', e instanceof Error ? e.message : e);
   }
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS companies (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name TEXT NOT NULL UNIQUE,
+      slug TEXT NOT NULL DEFAULT '',
+      app_features JSONB NOT NULL DEFAULT '{"pipeshare":true,"pipesync":true,"autosync":false,"planview":true}'::jsonb,
+      customer_enabled BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_companies_slug ON companies (lower(slug))`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS company_roles (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      role_key TEXT NOT NULL,
+      enabled BOOLEAN NOT NULL DEFAULT true,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (company_id, role_key)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_company_roles_company ON company_roles (company_id)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS company_folder_grants (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      role_key TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      path_prefix TEXT NOT NULL DEFAULT '',
+      enabled BOOLEAN NOT NULL DEFAULT true,
+      can_view BOOLEAN NOT NULL DEFAULT true,
+      can_edit BOOLEAN NOT NULL DEFAULT false,
+      can_delete BOOLEAN NOT NULL DEFAULT false,
+      can_upload BOOLEAN NOT NULL DEFAULT false,
+      can_download BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (company_id, role_key, client_id, job_id, path_prefix)
+    )
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_company_folder_grants_lookup ON company_folder_grants (company_id, role_key, client_id, job_id)`
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_company_membership (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      role_key TEXT NOT NULL DEFAULT 'employee',
+      override_folder_grants JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_company_membership_company ON user_company_membership (company_id)`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS trash_bin_entries (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID REFERENCES companies(id) ON DELETE SET NULL,
+      client_id TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      item_type TEXT NOT NULL CHECK (item_type IN ('file', 'folder')),
+      item_id TEXT,
+      rel_path TEXT NOT NULL DEFAULT '',
+      original_parent_path TEXT NOT NULL DEFAULT '',
+      skeleton_path TEXT NOT NULL DEFAULT '',
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      deleted_by_user_id TEXT,
+      deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      restored_at TIMESTAMPTZ
+    )
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_trash_bin_entries_active ON trash_bin_entries (deleted_at DESC) WHERE restored_at IS NULL`
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS company_plan_share_links (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      token TEXT NOT NULL UNIQUE,
+      created_by_user_id TEXT,
+      payload JSONB NOT NULL DEFAULT '{"folderPaths":[],"planView":true}'::jsonb,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_company_plan_share_links_company ON company_plan_share_links (company_id)`);
+
+  const companyCountResult = await pool.query('SELECT COUNT(*)::int AS count FROM companies');
+  if (companyCountResult.rows[0].count === 0) {
+    const seedCompanies = ['Horizon Pipe', 'AJJ', 'JUM', 'Dirt Works'];
+    for (const name of seedCompanies) {
+      const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      const inserted = await pool.query(
+        `INSERT INTO companies (name, slug) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING RETURNING id`,
+        [name, slug]
+      );
+      if (inserted.rows[0]?.id) {
+        for (const roleKey of ['admin', 'employee', 'customer']) {
+          await pool.query(
+            `INSERT INTO company_roles (company_id, role_key, enabled) VALUES ($1, $2, $3) ON CONFLICT (company_id, role_key) DO NOTHING`,
+            [inserted.rows[0].id, roleKey, roleKey !== 'customer']
+          );
+        }
+      }
+    }
+  }
+
   await ensureOutlookSchema({ pool, query: queryOutlookDataWithWasabiFallback });
 
   const countResult = await pool.query('SELECT COUNT(*)::int AS count FROM users');
@@ -6152,6 +6299,7 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
   );
   const hasPortalScopesPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'portalScopes');
   const hasPsrScopesPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'psrScopes');
+  const hasCompanyPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'companyId');
 
   try {
     let current = null;
@@ -6419,6 +6567,22 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
 
     const pgRow = await persistUserUpdateToPostgres();
     const updatedResult = { rows: [pgRow] };
+
+    if (hasCompanyPayload) {
+      const companyId = cleanString(req.body?.companyId);
+      const companyRoleKey = cleanString(req.body?.companyRoleKey || req.body?.roleKey || 'employee').toLowerCase();
+      if (!companyId) {
+        await pool.query('DELETE FROM user_company_membership WHERE user_id = $1', [String(id)]);
+      } else {
+        await pool.query(
+          `INSERT INTO user_company_membership (user_id, company_id, role_key, override_folder_grants)
+           VALUES ($1, $2, $3, '[]'::jsonb)
+           ON CONFLICT (user_id)
+           DO UPDATE SET company_id = EXCLUDED.company_id, role_key = EXCLUDED.role_key, updated_at = NOW()`,
+          [String(id), companyId, companyRoleKey || 'employee']
+        );
+      }
+    }
 
     const user = await attachScopesToUser(normalizeUser(updatedResult.rows[0]));
     res.json({ success: true, user });
@@ -9578,6 +9742,7 @@ registerOutlookRoutes(app, {
   corsOrigins: CORS_ORIGINS
 });
 registerPortalFilesRoutes(app, { pool, query: queryPortalDataWithWasabiFallback, requireAuth, requireAdmin });
+registerCompanyPermissionsRoutes(app, { pool, requireAuth, requireAdminPanelAccess });
 registerSignupRoutes(app, {
   pool,
   query: querySignupDataWithWasabiFallback,

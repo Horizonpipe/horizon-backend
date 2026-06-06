@@ -40,6 +40,13 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { Upload } = require('@aws-sdk/lib-storage');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
 const { canManagePortalExtras } = require('./capabilities');
+const {
+  loadEffectivePathGrantsForUser,
+  jobHasAnyEffectivePathGrants,
+  recordTrashBinEntry,
+  loadUserCompanyMembership,
+  buildSkeletonPath
+} = require('./company-permissions.service');
 
 const CATEGORIES = new Set(['videos', 'db3', 'pdf', 'photos']);
 const FOLDER_MARKER = '.hp-folder';
@@ -1044,6 +1051,35 @@ async function loadUserPathGrants(grantPool, clientId, jobId, user) {
   return r.rows;
 }
 
+async function loadCombinedUserPathGrants(grantPool, clientId, jobId, user) {
+  return loadEffectivePathGrantsForUser(grantPool, user, clientId, jobId, loadUserPathGrants);
+}
+
+async function portalOrCompanyJobHasPathGrants(grantPool, user, clientId, jobId) {
+  return jobHasAnyEffectivePathGrants(grantPool, user, clientId, jobId, portalJobHasPathGrants);
+}
+
+async function recordPortalTrashDelete(grantPool, user, clientId, jobId, itemType, relPath, itemId, metadata) {
+  try {
+    const membership = user?.id ? await loadUserCompanyMembership(grantPool, user.id) : null;
+    const parentPath = parentRelPath(normalizeRelPath(relPath));
+    await recordTrashBinEntry(grantPool, {
+      companyId: membership?.companyId || null,
+      clientId,
+      jobId,
+      itemType,
+      itemId,
+      relPath,
+      originalParentPath: parentPath,
+      skeletonPath: buildSkeletonPath(clientId, jobId, relPath),
+      metadata: metadata || {},
+      deletedByUserId: user?.id || null
+    });
+  } catch (err) {
+    console.warn('[portal-files] trash bin record failed:', err instanceof Error ? err.message : err);
+  }
+}
+
 /** When true, `GET /api/files` and `/tree` skip path-grant filtering so permission editors see the full job tree. */
 function readPermissionsEditorQuery(req) {
   const v = String(req.query?.permissionsEditor || req.query?.permEditor || '')
@@ -1153,9 +1189,9 @@ async function assertPortalPathRel(grantPool, user, clientId, jobId, relPath, re
   if (userIsPortalAdmin(user)) return true;
   const jobOk = await assertPortalJobAccess(grantPool, user, String(clientId), String(jobId));
   if (!jobOk) return false;
-  const anyGrants = await portalJobHasPathGrants(grantPool, clientId, jobId);
+  const anyGrants = await portalOrCompanyJobHasPathGrants(grantPool, user, clientId, jobId);
   if (!anyGrants) return true;
-  const grants = await loadUserPathGrants(grantPool, clientId, jobId, user);
+  const grants = await loadCombinedUserPathGrants(grantPool, clientId, jobId, user);
   if (!grants.length) {
     if (portalJobAllowedByPsrScopes(user, String(clientId), String(jobId))) {
       return true;
@@ -1177,7 +1213,7 @@ async function assertRelPathMatchesPortalTreeVisibility(grantPool, req, clientId
   const rp = normalizeRelPath(relPath || '');
   if (!rp) return false;
   const isDas = treePortalMode === DATA_AUTO_SYNC_MODE;
-  const jobHasPathGrants = await portalJobHasPathGrants(grantPool, clientId, jobId);
+  const jobHasPathGrants = await portalOrCompanyJobHasPathGrants(grantPool, req.user, clientId, jobId);
   const permEditorTree = readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
   if (!jobHasPathGrants || permEditorTree) {
     if (isDas) {
@@ -1186,7 +1222,7 @@ async function assertRelPathMatchesPortalTreeVisibility(grantPool, req, clientId
     }
     return true;
   }
-  const treeUserGrants = await loadUserPathGrants(grantPool, clientId, jobId, req.user);
+  const treeUserGrants = await loadCombinedUserPathGrants(grantPool, clientId, jobId, req.user);
   if (bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) return true;
   if (treeUserGrants.length) {
     const best = bestPathGrantForRelPath(treeUserGrants, rp);
@@ -1213,7 +1249,7 @@ async function createPortalPathVisibilityChecker(grantPool, req, clientId, jobId
   if (isDas && req.user?.autosyncMasterGranted === true) {
     return { check: () => true };
   }
-  const jobHasPathGrants = await portalJobHasPathGrants(grantPool, clientId, jobId);
+  const jobHasPathGrants = await portalOrCompanyJobHasPathGrants(grantPool, req.user, clientId, jobId);
   const permEditorTree = readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
   if (!jobHasPathGrants || permEditorTree) {
     const ur = isDas ? normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user)) : '';
@@ -1226,7 +1262,7 @@ async function createPortalPathVisibilityChecker(grantPool, req, clientId, jobId
       }
     };
   }
-  const treeUserGrants = await loadUserPathGrants(grantPool, clientId, jobId, req.user);
+  const treeUserGrants = await loadCombinedUserPathGrants(grantPool, clientId, jobId, req.user);
   if (bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) {
     return { check: () => true };
   }
@@ -1759,12 +1795,12 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
-      const jobHasPathGrants = await portalJobHasPathGrants(aclPool, clientId, jobId);
+      const jobHasPathGrants = await portalOrCompanyJobHasPathGrants(aclPool, req.user, clientId, jobId);
       const permEditorList =
         readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
       let userGrants = null;
       if (jobHasPathGrants && !permEditorList) {
-        const loaded = await loadUserPathGrants(aclPool, clientId, jobId, req.user);
+        const loaded = await loadCombinedUserPathGrants(aclPool, clientId, jobId, req.user);
         if (!bypassPathGrantsForLenientPortalClient(req.user, loaded)) {
           if (loaded.length) {
             userGrants = loaded;
@@ -1853,12 +1889,12 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       let tree = buildTreeFromKeys(prefix, keys);
       const treePortalMode = readPortalMode(req, req.query);
       const isDataAutoSyncTreeList = treePortalMode === DATA_AUTO_SYNC_MODE;
-      const jobHasPathGrantsTree = await portalJobHasPathGrants(aclPool, clientId, jobId);
+      const jobHasPathGrantsTree = await portalOrCompanyJobHasPathGrants(aclPool, req.user, clientId, jobId);
       /** @type {Array<{ path_prefix: string, recursive: boolean, access_mode: string }>} */
       let treeUserGrants = [];
       let appliedPathGrantFilter = false;
       if (jobHasPathGrantsTree && !permEditorTree) {
-        treeUserGrants = await loadUserPathGrants(aclPool, clientId, jobId, req.user);
+        treeUserGrants = await loadCombinedUserPathGrants(aclPool, clientId, jobId, req.user);
         if (!bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) {
           if (treeUserGrants.length) {
             tree = filterTreeByPathGrants(tree, treeUserGrants, true);
@@ -2954,6 +2990,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, folderRel, 'full'))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
+      await recordPortalTrashDelete(aclPool, req.user, clientId, jobId, 'folder', folderRel, null, {
+        name: path.basename(folderRel) || folderRel
+      });
       const pref = jobPrefix(String(clientId), String(jobId));
       const prefix = `${pref}${folderRel}/`;
       const keys = await listAllKeys(s3, bucket, prefix);
@@ -4546,6 +4585,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!(await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDel, 'full'))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
+      await recordPortalTrashDelete(aclPool, req.user, parsed.clientId, parsed.jobId, 'file', relPathDel, req.params.id, {
+        name: path.basename(Key)
+      });
       await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key }));
       invalidatePortalDlCachesForFile(req.params.id, Key);
       return res.status(204).send();
