@@ -5596,7 +5596,9 @@ function sanitizePortalWorkspaceBundle(bundle) {
   });
   let activeTabId = cleanString(bundle.activeTabId) || tabs[0].id;
   if (!tabs.some((t) => t.id === activeTabId)) activeTabId = tabs[0].id;
-  return { version: 3, activeTabId, tabs };
+  const savedAt =
+    typeof bundle.savedAt === 'number' && Number.isFinite(bundle.savedAt) ? bundle.savedAt : Date.now();
+  return { version: 3, savedAt, activeTabId, tabs };
 }
 
 app.get('/me/portal-workspace-layout', requireAuth, async (req, res) => {
