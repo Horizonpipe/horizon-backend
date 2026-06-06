@@ -208,36 +208,42 @@ function registerCompanyPermissionsRoutes(app, { pool, requireAuth, requireAdmin
     }
   });
 
+  function serializeFolderGrantRow(row) {
+    return {
+      id: row.id,
+      roleKey: row.role_key,
+      clientId: row.client_id,
+      jobId: row.job_id,
+      pathPrefix: row.path_prefix || '',
+      enabled: row.enabled === true,
+      canView: row.can_view === true,
+      canEdit: row.can_edit === true,
+      canDelete: row.can_delete === true,
+      canUpload: row.can_upload === true,
+      canDownload: row.can_download === true
+    };
+  }
+
   app.get('/companies/:id/folder-grants', requireAuth, requireAdminPanelAccess, async (req, res) => {
     try {
       const roleKey = normalizeRoleKey(req.query?.roleKey || req.query?.role);
       const clientId = cleanString(req.query?.clientId);
       const jobId = cleanString(req.query?.jobId);
       if (!roleKey) return jsonError(res, 400, 'roleKey query param is required');
-      if (!clientId || !jobId) return jsonError(res, 400, 'clientId and jobId query params are required');
-      const r = await pool.query(
-        `SELECT id, company_id, role_key, client_id, job_id, path_prefix, enabled,
-                can_view, can_edit, can_delete, can_upload, can_download, created_at, updated_at
-         FROM company_folder_grants
-         WHERE company_id = $1 AND role_key = $2 AND client_id = $3 AND job_id = $4
-         ORDER BY path_prefix ASC`,
-        [String(req.params.id), roleKey, clientId, jobId]
-      );
+      const params = [String(req.params.id), roleKey];
+      let sql = `SELECT id, company_id, role_key, client_id, job_id, path_prefix, enabled,
+                        can_view, can_edit, can_delete, can_upload, can_download, created_at, updated_at
+                 FROM company_folder_grants
+                 WHERE company_id = $1 AND role_key = $2`;
+      if (clientId && jobId) {
+        params.push(clientId, jobId);
+        sql += ` AND client_id = $3 AND job_id = $4`;
+      }
+      sql += ` ORDER BY client_id ASC, job_id ASC, path_prefix ASC`;
+      const r = await pool.query(sql, params);
       return res.json({
         success: true,
-        grants: r.rows.map((row) => ({
-          id: row.id,
-          roleKey: row.role_key,
-          clientId: row.client_id,
-          jobId: row.job_id,
-          pathPrefix: row.path_prefix || '',
-          enabled: row.enabled === true,
-          canView: row.can_view === true,
-          canEdit: row.can_edit === true,
-          canDelete: row.can_delete === true,
-          canUpload: row.can_upload === true,
-          canDownload: row.can_download === true
-        }))
+        grants: r.rows.map(serializeFolderGrantRow)
       });
     } catch (error) {
       console.error('[companies] folder-grants get error:', error);
@@ -250,20 +256,40 @@ function registerCompanyPermissionsRoutes(app, { pool, requireAuth, requireAdmin
       const company = await loadCompanyRow(req.params.id);
       if (!company) return jsonError(res, 404, 'Company not found');
       const roleKey = normalizeRoleKey(req.body?.roleKey || req.body?.role);
-      const clientId = cleanString(req.body?.clientId);
-      const jobId = cleanString(req.body?.jobId);
+      const scopeClientId = cleanString(req.body?.clientId);
+      const scopeJobId = cleanString(req.body?.jobId);
       const grants = Array.isArray(req.body?.grants) ? req.body.grants : [];
       if (!roleKey) return jsonError(res, 400, 'roleKey is required');
-      if (!clientId || !jobId) return jsonError(res, 400, 'clientId and jobId are required');
+      const batchMode = !(scopeClientId && scopeJobId);
+      if (batchMode && !grants.length) {
+        await pool.query(
+          `DELETE FROM company_folder_grants WHERE company_id = $1 AND role_key = $2`,
+          [String(req.params.id), roleKey]
+        );
+      } else if (batchMode) {
+        await pool.query(
+          `DELETE FROM company_folder_grants WHERE company_id = $1 AND role_key = $2`,
+          [String(req.params.id), roleKey]
+        );
+      } else {
+        await pool.query(
+          `DELETE FROM company_folder_grants
+           WHERE company_id = $1 AND role_key = $2 AND client_id = $3 AND job_id = $4`,
+          [String(req.params.id), roleKey, scopeClientId, scopeJobId]
+        );
+      }
 
-      await pool.query(
-        `DELETE FROM company_folder_grants
-         WHERE company_id = $1 AND role_key = $2 AND client_id = $3 AND job_id = $4`,
-        [String(req.params.id), roleKey, clientId, jobId]
-      );
-
+      const seen = new Set();
       for (const grant of grants) {
+        const clientId = cleanString(grant?.clientId ?? grant?.client_id) || scopeClientId;
+        const jobId = cleanString(grant?.jobId ?? grant?.job_id) || scopeJobId;
+        if (!clientId || !jobId) {
+          return jsonError(res, 400, 'Each grant requires clientId and jobId (or provide scope clientId/jobId on the body).');
+        }
         const pathPrefix = normalizeRelPath(grant?.pathPrefix ?? grant?.path ?? '');
+        const dedupeKey = `${clientId}\0${jobId}\0${pathPrefix}`;
+        if (seen.has(dedupeKey)) continue;
+        seen.add(dedupeKey);
         await pool.query(
           `INSERT INTO company_folder_grants
             (company_id, role_key, client_id, job_id, path_prefix, enabled, can_view, can_edit, can_delete, can_upload, can_download)
@@ -284,25 +310,20 @@ function registerCompanyPermissionsRoutes(app, { pool, requireAuth, requireAdmin
         );
       }
 
-      const r = await pool.query(
-        `SELECT id, path_prefix, enabled, can_view, can_edit, can_delete, can_upload, can_download
-         FROM company_folder_grants
-         WHERE company_id = $1 AND role_key = $2 AND client_id = $3 AND job_id = $4
-         ORDER BY path_prefix ASC`,
-        [String(req.params.id), roleKey, clientId, jobId]
-      );
+      const params = [String(req.params.id), roleKey];
+      let selectSql = `SELECT id, company_id, role_key, client_id, job_id, path_prefix, enabled,
+                              can_view, can_edit, can_delete, can_upload, can_download, created_at, updated_at
+                       FROM company_folder_grants
+                       WHERE company_id = $1 AND role_key = $2`;
+      if (!batchMode) {
+        params.push(scopeClientId, scopeJobId);
+        selectSql += ` AND client_id = $3 AND job_id = $4`;
+      }
+      selectSql += ` ORDER BY client_id ASC, job_id ASC, path_prefix ASC`;
+      const r = await pool.query(selectSql, params);
       return res.json({
         success: true,
-        grants: r.rows.map((row) => ({
-          id: row.id,
-          pathPrefix: row.path_prefix || '',
-          enabled: row.enabled === true,
-          canView: row.can_view === true,
-          canEdit: row.can_edit === true,
-          canDelete: row.can_delete === true,
-          canUpload: row.can_upload === true,
-          canDownload: row.can_download === true
-        }))
+        grants: r.rows.map(serializeFolderGrantRow)
       });
     } catch (error) {
       console.error('[companies] folder-grants put error:', error);
