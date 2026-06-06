@@ -1911,6 +1911,24 @@ function parseProductTutorialsSeen(row) {
   };
 }
 
+function parsePortalWorkspaceLayouts(row) {
+  const raw = row?.portal_workspace_layouts ?? row?.portalWorkspaceLayouts;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {};
+  }
+  const out = {};
+  for (const key of ['desktop', 'mobile']) {
+    const bundle = raw[key];
+    if (!bundle || typeof bundle !== 'object' || !Array.isArray(bundle.tabs) || !bundle.tabs.length) continue;
+    out[key] = {
+      version: Number(bundle.version) || 3,
+      activeTabId: typeof bundle.activeTabId === 'string' ? bundle.activeTabId : String(bundle.tabs[0]?.id || 't0'),
+      tabs: bundle.tabs.slice(0, 12)
+    };
+  }
+  return out;
+}
+
 function normalizeUser(row) {
   const id = row.id;
   const selfSignup = row?.self_signup === true;
@@ -1981,7 +1999,8 @@ function normalizeUser(row) {
     psrScopes: [],
     portalPermissionsAccessRaw,
     portalPermissionsAccess,
-    productTutorialsSeen: parseProductTutorialsSeen(row)
+    productTutorialsSeen: parseProductTutorialsSeen(row),
+    portalWorkspaceLayouts: parsePortalWorkspaceLayouts(row)
   };
 }
 
@@ -3589,7 +3608,7 @@ async function readFreshUserFromPostgresById(userId) {
   const result = await pool.query(
     `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
             portal_permissions_access, portal_files_access_granted, autosync_master_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
-            product_tutorials_seen
+            product_tutorials_seen, portal_workspace_layouts
      FROM users
      WHERE CAST(id AS text) = $1
      LIMIT 1`,
@@ -3640,7 +3659,7 @@ async function readSessionFromPostgres(token) {
     `SELECT s.token, s.user_id, s.keep_session, s.expires_at, u.id, u.username, u.display_name, u.password,
             u.is_admin, u.roles, u.must_change_password, u.portal_files_client_id, u.portal_files_job_id,
             u.portal_permissions_access, u.portal_files_access_granted, u.autosync_master_granted, u.self_signup, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified,
-            u.product_tutorials_seen
+            u.product_tutorials_seen, u.portal_workspace_layouts
      FROM auth_sessions s
      JOIN users u ON CAST(u.id AS text) = s.user_id
      WHERE s.token = $1
@@ -4547,7 +4566,8 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_access_granted BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS autosync_master_granted BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS self_signup BOOLEAN NOT NULL DEFAULT false`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS product_tutorials_seen JSONB NOT NULL DEFAULT '{}'::jsonb`
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS product_tutorials_seen JSONB NOT NULL DEFAULT '{}'::jsonb`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_workspace_layouts JSONB NOT NULL DEFAULT '{}'::jsonb`
   ];
   for (const query of userAlters) await pool.query(query);
   await pool.query(`
@@ -5557,6 +5577,70 @@ app.get('/session', requireAuth, async (req, res) => {
  * Mark guided product tutorial completion per account (PipeShare / PipeSync).
  * Body: `{ product: 'pipeshare' | 'pipesync', completed?: boolean }` — `completed` defaults to true; false removes the flag so the tour can auto-run again.
  */
+function normalizePortalWorkspaceViewport(raw) {
+  const v = cleanString(raw).toLowerCase();
+  return v === 'mobile' ? 'mobile' : v === 'desktop' ? 'desktop' : '';
+}
+
+function sanitizePortalWorkspaceBundle(bundle) {
+  if (!bundle || typeof bundle !== 'object' || !Array.isArray(bundle.tabs) || !bundle.tabs.length) {
+    return null;
+  }
+  const tabs = bundle.tabs.slice(0, 12).map((row, i) => {
+    const id = cleanString(row?.id) || `t${i}`;
+    const title = cleanString(row?.title).slice(0, 40) || `Layout ${i + 1}`;
+    const locked = row?.locked === true;
+    const visible = row?.visible && typeof row.visible === 'object' && !Array.isArray(row.visible) ? row.visible : {};
+    const rects = row?.rects && typeof row.rects === 'object' && !Array.isArray(row.rects) ? row.rects : {};
+    return { id, title, locked, visible, rects };
+  });
+  let activeTabId = cleanString(bundle.activeTabId) || tabs[0].id;
+  if (!tabs.some((t) => t.id === activeTabId)) activeTabId = tabs[0].id;
+  return { version: 3, activeTabId, tabs };
+}
+
+app.get('/me/portal-workspace-layout', requireAuth, async (req, res) => {
+  const viewport = normalizePortalWorkspaceViewport(req.query?.viewport);
+  if (!viewport) {
+    return res.status(400).json({ success: false, error: 'viewport must be desktop or mobile' });
+  }
+  const layouts = req.user?.portalWorkspaceLayouts || {};
+  const bundle = layouts[viewport] || null;
+  res.json({ success: true, viewport, bundle });
+});
+
+app.put('/me/portal-workspace-layout', requireAuth, async (req, res) => {
+  const viewport = normalizePortalWorkspaceViewport(req.body?.viewport);
+  if (!viewport) {
+    return res.status(400).json({ success: false, error: 'viewport must be desktop or mobile' });
+  }
+  const bundle = sanitizePortalWorkspaceBundle(req.body?.bundle);
+  if (!bundle) {
+    return res.status(400).json({ success: false, error: 'Invalid workspace bundle' });
+  }
+  const userId = String(req.user?.id || '').trim();
+  if (!userId) {
+    return res.status(400).json({ success: false, error: 'Missing user id' });
+  }
+  try {
+    await pool.query(
+      `UPDATE users
+       SET portal_workspace_layouts = COALESCE(portal_workspace_layouts, '{}'::jsonb) || $2::jsonb,
+           updated_at = NOW()
+       WHERE CAST(id AS text) = $1`,
+      [userId, JSON.stringify({ [viewport]: bundle })]
+    );
+    const fresh = await readFreshUserFromPostgresById(userId);
+    if (!fresh) {
+      return res.status(404).json({ success: false, error: 'User not found after update' });
+    }
+    res.json({ success: true, user: fresh, viewport, bundle });
+  } catch (error) {
+    console.error('[me/portal-workspace-layout]', error);
+    res.status(500).json({ success: false, error: error.message || 'Server error' });
+  }
+});
+
 app.post('/me/product-tutorials-seen', requireAuth, async (req, res) => {
   const product = cleanString(req.body?.product).toLowerCase();
   if (product !== 'pipeshare' && product !== 'pipesync') {
