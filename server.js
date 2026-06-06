@@ -5115,13 +5115,30 @@ async function ensureSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_company_membership (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL UNIQUE,
       company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
       role_key TEXT NOT NULL DEFAULT 'employee',
       override_folder_grants JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
+  `);
+  await pool.query(
+    `ALTER TABLE user_company_membership DROP CONSTRAINT IF EXISTS user_company_membership_user_id_fkey`
+  );
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = 'user_company_membership'
+          AND column_name = 'user_id'
+          AND data_type <> 'text'
+      ) THEN
+        EXECUTE 'ALTER TABLE user_company_membership ALTER COLUMN user_id TYPE TEXT USING user_id::text';
+      END IF;
+    END $$;
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_company_membership_company ON user_company_membership (company_id)`);
 
