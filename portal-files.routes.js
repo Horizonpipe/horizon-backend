@@ -2431,6 +2431,60 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     }
   });
 
+  /**
+   * Upsert one path grant row for a specific user/path target.
+   * Uses the same `portal_path_grants` schema and access_mode semantics as PUT /permissions.
+   * Horizon admins only.
+   */
+  r.post('/permissions/grant', express.json({ limit: '64kb' }), async (req, res) => {
+    try {
+      if (!req.user?.isAdmin) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      if (scope.error) {
+        return res.status(400).json({ error: 'clientId and jobId are required' });
+      }
+      const username = String(body.username || '').trim();
+      if (!username) {
+        return res.status(400).json({ error: 'username is required' });
+      }
+      if (!(await assertPortalJobAccessForRequest(pool, req, String(scope.clientId), String(scope.jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      let pathPrefix = '';
+      try {
+        pathPrefix = normalizeRelPath(body.pathPrefix != null ? String(body.pathPrefix) : '');
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        return res.status(400).json({ error: `Invalid pathPrefix: ${m}` });
+      }
+      const recursive = body.recursive !== false;
+      if (body.accessMode != null && !isValidGrantAccessMode(body.accessMode)) {
+        return res.status(400).json({ error: 'Invalid accessMode. Allowed: full, view, view_download, off' });
+      }
+      const accessMode = normalizeGrantAccessMode(body.accessMode || body.access_mode || 'view');
+      await aclPool.query(
+        `DELETE FROM portal_path_grants
+         WHERE client_id = $1 AND job_id = $2
+           AND LOWER(TRIM(username)) = LOWER(TRIM($3))
+           AND path_prefix = $4
+           AND COALESCE(recursive, true) = $5`,
+        [String(scope.clientId), String(scope.jobId), username, pathPrefix, recursive]
+      );
+      await aclPool.query(
+        `INSERT INTO portal_path_grants (client_id, job_id, username, path_prefix, recursive, access_mode)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [String(scope.clientId), String(scope.jobId), username, pathPrefix, recursive, accessMode]
+      );
+      return res.json({ success: true });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
   async function loadShareLinkRowForToken(tkn) {
     const q = await aclPool.query(`SELECT * FROM portal_share_links WHERE token = $1`, [String(tkn)]);
     return q.rows[0] || null;

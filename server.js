@@ -4105,11 +4105,22 @@ function denyOutOfScope(res) {
 }
 
 function requireMike(req, res, next) {
-  const name = String(req.user?.displayName || req.user?.username || '').trim().toLowerCase();
-  if (name !== 'mike strickland' && name !== 'mik') {
+  if (!isMikeStricklandUser(req.user)) {
     return res.status(403).json({ success: false, error: 'Mike-only importer access' });
   }
   return next();
+}
+
+function isMikeStricklandUser(user) {
+  const username = String(user?.username || '').trim().toLowerCase();
+  const displayName = String(user?.displayName || '').trim().toLowerCase();
+  const email = String(user?.email || '').trim().toLowerCase();
+  return (
+    username === 'mik' ||
+    username === 'mike strickland' ||
+    displayName === 'mike strickland' ||
+    email === 'mike@horizonpipe.com'
+  );
 }
 
 function fileToStoredJson(file) {
@@ -6210,7 +6221,7 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
   const displayName = cleanString(req.body?.displayName || username);
   const password = cleanString(req.body?.password || '1234');
   let isAdmin = !!req.body?.isAdmin;
-  if (!req.user?.isAdmin) {
+  if (!req.user?.isAdmin || !isMikeStricklandUser(req.user)) {
     isAdmin = false;
   }
   /** Planner-created accounts now default to no permissions until explicitly assigned by admin edit. */
@@ -6397,6 +6408,7 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
     const nextDisplayName = displayName || current.display_name || current.username;
     let nextIsAdmin = isAdmin === null ? !!current.is_admin : !!isAdmin;
     const actorIsGlobalAdmin = req.user?.isAdmin === true;
+    const actorIsMike = isMikeStricklandUser(req.user);
     if (!actorIsGlobalAdmin && current.is_admin && String(req.user?.id || '') !== String(id)) {
       return res.status(403).json({
         success: false,
@@ -6405,6 +6417,12 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
     }
     if (!actorIsGlobalAdmin) {
       nextIsAdmin = !!current.is_admin;
+    }
+    if (!current.is_admin && nextIsAdmin && !actorIsMike) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only Mike Strickland can elevate a user to Horizon Pipe Admin.'
+      });
     }
     const nextRoles = roles === null ? normalizeRoles(current.roles) : roles;
     let nextPortalFilesClientId = current.portal_files_client_id || null;
@@ -6643,6 +6661,35 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
   } catch (error) {
     console.error('UPDATE USER ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/users/:id/elevate-horizon-admin', requireAuth, requireAdminPanelAccess, requireMike, async (req, res) => {
+  const id = cleanString(req.params.id);
+  if (!id) {
+    return res.status(400).json({ success: false, error: 'User id is required' });
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE users
+       SET is_admin = true,
+           self_signup = false,
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup`,
+      [id]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+    await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [id]);
+    return res.json({
+      success: true,
+      user: normalizeUser(result.rows[0])
+    });
+  } catch (error) {
+    console.error('ELEVATE HORIZON ADMIN ERROR:', error);
+    return res.status(500).json({ success: false, error: error.message || 'Elevation failed' });
   }
 });
 
