@@ -2418,25 +2418,44 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         const accessMode = normalizeGrantAccessMode(g.accessMode || g.access_mode || 'full');
         normalizedGrants.push([String(clientId), String(jobId), u, pp, rec, accessMode]);
       }
-      const client = await aclPool.connect();
-      try {
-        await client.query('BEGIN');
-        await client.query(`DELETE FROM portal_path_grants WHERE client_id = $1 AND job_id = $2`, [
+      const connectFn = poolOption && typeof poolOption.connect === 'function' ? poolOption.connect.bind(poolOption) : null;
+      if (connectFn) {
+        const client = await connectFn();
+        try {
+          await client.query('BEGIN');
+          await client.query(`DELETE FROM portal_path_grants WHERE client_id = $1 AND job_id = $2`, [
+            String(clientId),
+            String(jobId)
+          ]);
+          for (const params of normalizedGrants) {
+            await client.query(
+              `INSERT INTO portal_path_grants (client_id, job_id, username, path_prefix, recursive, access_mode) VALUES ($1,$2,$3,$4,$5,$6)`,
+              params
+            );
+          }
+          await client.query('COMMIT');
+        } catch (txErr) {
+          try {
+            await client.query('ROLLBACK');
+          } catch (_) {
+            // Preserve original transaction error when rollback also fails.
+          }
+          throw txErr;
+        } finally {
+          if (typeof client.release === 'function') client.release();
+        }
+      } else {
+        // Compatibility path for query-only pool adapters that do not expose `.connect()`.
+        await aclPool.query(`DELETE FROM portal_path_grants WHERE client_id = $1 AND job_id = $2`, [
           String(clientId),
           String(jobId)
         ]);
         for (const params of normalizedGrants) {
-          await client.query(
+          await aclPool.query(
             `INSERT INTO portal_path_grants (client_id, job_id, username, path_prefix, recursive, access_mode) VALUES ($1,$2,$3,$4,$5,$6)`,
             params
           );
         }
-        await client.query('COMMIT');
-      } catch (txErr) {
-        await client.query('ROLLBACK');
-        throw txErr;
-      } finally {
-        client.release();
       }
       return res.json({ success: true });
     } catch (e) {
