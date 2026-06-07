@@ -6501,83 +6501,103 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
      * is updated separately — without mirroring here, the next refresh would show stale toggles.
      */
     async function persistUserUpdateToPostgres() {
-      const updatedCoreResult = await pool.query(
-        `UPDATE users
-         SET display_name = $1,
-             is_admin = $2,
-             roles = $3::jsonb,
-             portal_files_client_id = $4,
-             portal_files_job_id = $5,
-             portal_files_access_granted = $6,
-             self_signup = $7,
-             portal_permissions_access = $8,
-             autosync_master_granted = $9,
-             updated_at = NOW()
-         WHERE id = $10
-         RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup`,
-        [
-          nextDisplayName,
-          nextIsAdmin,
-          JSON.stringify(nextRoles),
-          nextPortalFilesClientId,
-          nextPortalFilesJobId,
-          nextPortalFilesAccessGranted,
-          nextSelfSignup,
-          nextPortalPermissionsAccess,
-          nextAutosyncMasterGranted,
-          id
-        ]
-      );
-
-      if (!updatedCoreResult.rowCount) {
-        console.error('[update-user] Postgres UPDATE matched 0 rows — permissions UI reads pool; check user id / replica.', {
-          id
-        });
-        throw new Error(
-          'Could not update user in database (no matching row). Permissions list may not reflect this account until the database is in sync.'
-        );
-      }
-
-      if (hasPortalScopesPayload || hasPortalScopeInPayload) {
-        await pool.query('DELETE FROM user_portal_scopes WHERE user_id = $1', [String(id)]);
-        for (const scope of nextPortalScopes) {
-          await pool.query(
-            `INSERT INTO user_portal_scopes (user_id, client_id, job_id)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (user_id, client_id, job_id) DO NOTHING`,
-            [String(id), scope.clientId, scope.jobId]
-          );
-        }
-      }
-
-      if (hasPsrScopesPayload && !PLANNER_STORE_WASABI_ONLY) {
-        await pool.query('DELETE FROM user_psr_scopes WHERE user_id = $1', [String(id)]);
-        for (const scope of nextPsrScopes) {
-          await pool.query(
-            `INSERT INTO user_psr_scopes (user_id, client, city, jobsite, psr_record_id)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (user_id, client, city, jobsite) DO NOTHING`,
-            [String(id), scope.client, scope.city, scope.jobsite, cleanString(scope.recordId || '') || null]
-          );
-        }
-      }
-
-      let updatedRow = updatedCoreResult.rows[0];
-      if (passwordHash) {
-        const pwResult = await pool.query(
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const updatedCoreResult = await client.query(
           `UPDATE users
-           SET password = $1,
-               must_change_password = false,
+           SET display_name = $1,
+               is_admin = $2,
+               roles = $3::jsonb,
+               portal_files_client_id = $4,
+               portal_files_job_id = $5,
+               portal_files_access_granted = $6,
+               self_signup = $7,
+               portal_permissions_access = $8,
+               autosync_master_granted = $9,
                updated_at = NOW()
-           WHERE id = $2
+           WHERE id = $10
            RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup`,
-          [passwordHash, id]
+          [
+            nextDisplayName,
+            nextIsAdmin,
+            JSON.stringify(nextRoles),
+            nextPortalFilesClientId,
+            nextPortalFilesJobId,
+            nextPortalFilesAccessGranted,
+            nextSelfSignup,
+            nextPortalPermissionsAccess,
+            nextAutosyncMasterGranted,
+            id
+          ]
         );
-        updatedRow = pwResult.rows[0];
-      }
 
-      await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [String(id)]);
-      return updatedRow;
+        if (!updatedCoreResult.rowCount) {
+          console.error('[update-user] Postgres UPDATE matched 0 rows — permissions UI reads pool; check user id / replica.', {
+            id
+          });
+          throw new Error(
+            'Could not update user in database (no matching row). Permissions list may not reflect this account until the database is in sync.'
+          );
+        }
+
+        if (hasPortalScopesPayload || hasPortalScopeInPayload) {
+          await client.query('DELETE FROM user_portal_scopes WHERE user_id = $1', [String(id)]);
+          for (const scope of nextPortalScopes) {
+            await client.query(
+              `INSERT INTO user_portal_scopes (user_id, client_id, job_id)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (user_id, client_id, job_id) DO NOTHING`,
+              [String(id), scope.clientId, scope.jobId]
+            );
+          }
+        }
+
+        if (hasPsrScopesPayload && !PLANNER_STORE_WASABI_ONLY) {
+          await client.query('DELETE FROM user_psr_scopes WHERE user_id = $1', [String(id)]);
+          for (const scope of nextPsrScopes) {
+            await client.query(
+              `INSERT INTO user_psr_scopes (user_id, client, city, jobsite, psr_record_id)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (user_id, client, city, jobsite) DO NOTHING`,
+              [String(id), scope.client, scope.city, scope.jobsite, cleanString(scope.recordId || '') || null]
+            );
+          }
+        }
+
+        let updatedRow = updatedCoreResult.rows[0];
+        if (passwordHash) {
+          const pwResult = await client.query(
+            `UPDATE users
+             SET password = $1,
+                 must_change_password = false,
+                 updated_at = NOW()
+             WHERE id = $2
+             RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup`,
+            [passwordHash, id]
+          );
+          updatedRow = pwResult.rows[0];
+        }
+
+        /**
+         * Keep the currently signed-in admin session alive while they edit their own permissions.
+         * Revoking immediately here causes follow-up save/hydration calls to 401 and bounce to login.
+         * For password changes (or editing another account), revoke sessions so new auth state applies.
+         */
+        const editingSelf = String(req.user?.id || '') === String(id || '');
+        const shouldRevokeSessions = passwordHash != null || !editingSelf;
+        if (shouldRevokeSessions) {
+          await client.query('DELETE FROM auth_sessions WHERE user_id = $1', [String(id)]);
+        }
+
+        await client.query('COMMIT');
+        return updatedRow;
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
     }
 
     if (WASABI_WRITES_PRIMARY_ENABLED) {

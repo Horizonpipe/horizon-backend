@@ -2400,10 +2400,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
-      await aclPool.query(`DELETE FROM portal_path_grants WHERE client_id = $1 AND job_id = $2`, [
-        String(clientId),
-        String(jobId)
-      ]);
+      const normalizedGrants = [];
       for (const g of grants) {
         const u = String(g.username || '').trim();
         if (!u) continue;
@@ -2419,10 +2416,27 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           return res.status(400).json({ error: 'Invalid accessMode. Allowed: full, view, view_download, off' });
         }
         const accessMode = normalizeGrantAccessMode(g.accessMode || g.access_mode || 'full');
-        await aclPool.query(
-          `INSERT INTO portal_path_grants (client_id, job_id, username, path_prefix, recursive, access_mode) VALUES ($1,$2,$3,$4,$5,$6)`,
-          [String(clientId), String(jobId), u, pp, rec, accessMode]
-        );
+        normalizedGrants.push([String(clientId), String(jobId), u, pp, rec, accessMode]);
+      }
+      const client = await aclPool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(`DELETE FROM portal_path_grants WHERE client_id = $1 AND job_id = $2`, [
+          String(clientId),
+          String(jobId)
+        ]);
+        for (const params of normalizedGrants) {
+          await client.query(
+            `INSERT INTO portal_path_grants (client_id, job_id, username, path_prefix, recursive, access_mode) VALUES ($1,$2,$3,$4,$5,$6)`,
+            params
+          );
+        }
+        await client.query('COMMIT');
+      } catch (txErr) {
+        await client.query('ROLLBACK');
+        throw txErr;
+      } finally {
+        client.release();
       }
       return res.json({ success: true });
     } catch (e) {
