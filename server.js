@@ -2366,6 +2366,31 @@ function isUnifiedPortalScopeAllowed(clientIdValue, jobIdValue) {
   return UNIFIED_PORTAL_SCOPE_ALLOWED_JOB_IDS.has(jobId);
 }
 
+function ensureUnifiedPortalScopeRoots(portalRows) {
+  const rows = Array.isArray(portalRows) ? portalRows : [];
+  const existing = new Set(
+    rows
+      .map((row) => ({
+        clientId: String(row?.client_id || '').trim().toLowerCase(),
+        jobId: String(row?.job_id || '').trim()
+      }))
+      .filter((row) => row.clientId && row.jobId)
+      .map((row) => `${row.clientId}|||${row.jobId}`)
+  );
+  for (const jobId of UNIFIED_PORTAL_SCOPE_ALLOWED_JOB_IDS) {
+    const key = `portal-users|||${jobId}`;
+    if (existing.has(key)) continue;
+    rows.push({
+      client_id: 'portal-users',
+      job_id: jobId,
+      label_client: 'portal-users',
+      label_city: 'NOT SET',
+      label_jobsite: jobId
+    });
+  }
+  return rows;
+}
+
 function buildPermissionsTreesFromRows({ portalRows = [], portalPathRows = [], psrRows = [] }) {
   const pathMap = new Map();
   for (const row of portalPathRows) {
@@ -2383,7 +2408,7 @@ function buildPermissionsTreesFromRows({ portalRows = [], portalPathRows = [], p
   }
 
   const portalMap = new Map();
-  for (const row of portalRows) {
+  for (const row of ensureUnifiedPortalScopeRoots(portalRows)) {
     const clientId = String(row.client_id || '').trim();
     const jobId = String(row.job_id || '').trim();
     if (!clientId || !jobId) continue;
