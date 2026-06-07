@@ -1880,6 +1880,8 @@ const PORTAL_FORCE_JOB_SCOPE = PORTAL_FORCE_CLIENT_ID && PORTAL_FORCE_JOB_ID;
 const PORTAL_SHARED_DEFAULT_CLIENT_ID = (process.env.PORTAL_SHARED_DEFAULT_CLIENT_ID || 'portal-users').trim();
 const PORTAL_SHARED_DEFAULT_JOB_ID = (process.env.PORTAL_SHARED_DEFAULT_JOB_ID || '8').trim();
 const PORTAL_SHARED_DEFAULT_SCOPE = PORTAL_SHARED_DEFAULT_CLIENT_ID && PORTAL_SHARED_DEFAULT_JOB_ID;
+/** Unified Permissions scope picker roots for portal-users (Folder 2 + Folder 8 only). */
+const UNIFIED_PORTAL_SCOPE_ALLOWED_JOB_IDS = new Set(['2', '8']);
 /** Backward-compat toggle: set `PORTAL_USER_SCOPED_DEFAULTS=1` to restore `portal-users/{userId}` defaults. */
 const PORTAL_USER_SCOPED_DEFAULTS =
   String(process.env.PORTAL_USER_SCOPED_DEFAULTS || '1').trim().toLowerCase() === '1' ||
@@ -2356,12 +2358,21 @@ function snapshotLooksFresh(snapshot, maxAgeMs = WASABI_AUTH_PRIMARY_MAX_SNAPSHO
   return Date.now() - generatedAt <= Math.max(1000, Number(maxAgeMs || 0));
 }
 
+function isUnifiedPortalScopeAllowed(clientIdValue, jobIdValue) {
+  const clientId = String(clientIdValue || '').trim().toLowerCase();
+  const jobId = String(jobIdValue || '').trim();
+  if (!clientId || !jobId) return false;
+  if (clientId !== 'portal-users') return true;
+  return UNIFIED_PORTAL_SCOPE_ALLOWED_JOB_IDS.has(jobId);
+}
+
 function buildPermissionsTreesFromRows({ portalRows = [], portalPathRows = [], psrRows = [] }) {
   const pathMap = new Map();
   for (const row of portalPathRows) {
     const clientId = String(row.client_id || '').trim();
     const jobId = String(row.job_id || '').trim();
     if (!clientId || !jobId) continue;
+    if (!isUnifiedPortalScopeAllowed(clientId, jobId)) continue;
     const key = `${clientId}|||${jobId}`;
     if (!pathMap.has(key)) pathMap.set(key, new Set());
     const p = String(row.path_prefix || '')
@@ -2376,6 +2387,7 @@ function buildPermissionsTreesFromRows({ portalRows = [], portalPathRows = [], p
     const clientId = String(row.client_id || '').trim();
     const jobId = String(row.job_id || '').trim();
     if (!clientId || !jobId) continue;
+    if (!isUnifiedPortalScopeAllowed(clientId, jobId)) continue;
     const displayClient = upperCleanString(row.label_client || clientId);
     const displayCity = upperCleanString(row.label_city || 'NOT SET');
     const displayJobsite = normalizeJobsiteName(row.label_jobsite || jobId);
