@@ -1850,8 +1850,8 @@ function normalizeRoles(value) {
 }
 
 /**
- * Self-signup accounts must be explicitly enabled by admin before they can sign in.
- * We treat "any one permission enabled" as active access.
+ * Access assignment signal used for UI/admin reporting.
+ * Login itself is gated by credentials + email verification, not by this flag.
  */
 function userHasAnyAssignedAccess(row) {
   if (row?.is_admin) return true;
@@ -5819,13 +5819,6 @@ app.post('/login', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Invalid email or password' });
     }
 
-    if (!userHasAnyAssignedAccess(row)) {
-      return res.status(403).json({
-        success: false,
-        error: 'Account created. Your access is pending admin approval.'
-      });
-    }
-
     if (needsRehash && !userRowFromWasabi) {
       const hash = await bcrypt.hash(submittedPassword, 10);
       const wasabiWrote = await tryWasabiStateWrite('login-rehash-password', async (data) => {
@@ -6318,10 +6311,20 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
     }
 
     const user = await attachScopesToUser(normalizeUser(result.rows[0]));
+    const assignedAtCreate = userHasAnyAssignedAccess({
+      is_admin: user?.isAdmin === true,
+      roles: user?.roles || {},
+      portal_files_access_granted: user?.portalFilesAccessGranted === true,
+      autosync_master_granted: user?.autosyncMasterGranted === true,
+      portal_permissions_access: user?.portalPermissionsAccessRaw === true,
+      username: user?.username || ''
+    });
     res.status(201).json({
       success: true,
       user,
-      message: 'User created with no access. Assign roles/portal scope to enable.'
+      message: assignedAtCreate
+        ? 'User created. They can sign in immediately with the assigned roles/permissions.'
+        : 'User created. They can sign in now, but no work access is assigned yet.'
     });
   } catch (error) {
     if (insertedPgId) {
