@@ -51,8 +51,8 @@ const {
 const CATEGORIES = new Set(['videos', 'db3', 'pdf', 'photos']);
 const FOLDER_MARKER = '.hp-folder';
 const DATA_AUTO_SYNC_MODE = 'dataautosync';
-/** Client / non-employee AUTOSYNC accounts are pinned to this job folder (default 2; override with DATA_AUTO_SYNC_CLIENT_JOB_ID). */
-const DATA_AUTO_SYNC_JOB_ID = String(process.env.DATA_AUTO_SYNC_CLIENT_JOB_ID || '2').trim() || '2';
+/** Client / non-employee AUTOSYNC accounts default to this job folder (default 8; override with DATA_AUTO_SYNC_CLIENT_JOB_ID). */
+const DATA_AUTO_SYNC_JOB_ID = String(process.env.DATA_AUTO_SYNC_CLIENT_JOB_ID || '8').trim() || '8';
 /** `roles.dataAutoSyncEmployee` users who are not portal admins are pinned to this folder (default 2). */
 const DATA_AUTO_SYNC_EMPLOYEE_JOB_ID = String(process.env.DATA_AUTO_SYNC_EMPLOYEE_JOB_ID || '2').trim() || '2';
 /** When no explicit jobId is provided, portal admins start on this folder. */
@@ -178,6 +178,31 @@ function pickUserDefaultClientId(user) {
   return String(user.portalFilesClientId || '').trim();
 }
 
+/**
+ * Explicit DataAutoSync job assignment from user/session fields.
+ * Uses legacy `(portalFilesClientId, portalFilesJobId)` when compatible with active client,
+ * otherwise falls back to the first scoped portal job for that client.
+ * @param {import('express').Request['user']} user
+ * @param {string} clientId
+ */
+function pickExplicitDataAutoSyncJobId(user, clientId) {
+  if (!user) return '';
+  const activeClient = String(clientId || '').trim();
+  const legacyClient = String(user.portalFilesClientId || '').trim();
+  const legacyJob = String(user.portalFilesJobId || '').trim();
+  if (legacyJob && (!activeClient || !legacyClient || legacyClient === activeClient)) return legacyJob;
+  const scopes = Array.isArray(user.portalScopes) ? user.portalScopes : [];
+  let firstAny = '';
+  for (const scope of scopes) {
+    const scopeClient = String(scope?.clientId || '').trim();
+    const scopeJob = String(scope?.jobId || '').trim();
+    if (!scopeClient || !scopeJob) continue;
+    if (!firstAny) firstAny = scopeJob;
+    if (activeClient && scopeClient === activeClient) return scopeJob;
+  }
+  return firstAny;
+}
+
 function readPortalMode(req, source) {
   const bodyMode =
     source && typeof source === 'object'
@@ -212,14 +237,13 @@ function resolvePortalScope(req, source, options = {}) {
   const clientId = rawClient || (isDataAutoSync ? pickUserDefaultClientId(req?.user) : '');
   const requireJob = options.requireJob !== false;
   const adminCanOverrideDataAutoSyncJob = isDataAutoSync && userIsPortalAdmin(req?.user);
+  const explicitDataAutoSyncJobId = isDataAutoSync ? pickExplicitDataAutoSyncJobId(req?.user, clientId) : '';
   const jobId = isDataAutoSync
     ? adminCanOverrideDataAutoSyncJob && rawJob
       ? rawJob
       : adminCanOverrideDataAutoSyncJob
         ? DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID
-        : isDataAutoSyncLineEmployee(req?.user)
-          ? DATA_AUTO_SYNC_EMPLOYEE_JOB_ID
-          : DATA_AUTO_SYNC_JOB_ID
+        : explicitDataAutoSyncJobId || (isDataAutoSyncLineEmployee(req?.user) ? DATA_AUTO_SYNC_EMPLOYEE_JOB_ID : DATA_AUTO_SYNC_JOB_ID)
     : rawJob;
   if (!clientId || (requireJob && !jobId)) {
     return { error: 'clientId and jobId are required' };
