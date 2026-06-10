@@ -27,6 +27,7 @@ const {
   presignAdminAttachmentPut,
   presignAdminAttachmentGet,
   deleteAdminAttachmentKeys,
+  deletePipesyncPlanPageKeys,
   collectAdminAttachmentStorageKeysFromFiles,
   storageKeysRemovedBetweenFileLists,
   normalizeAdminFilesForPersist,
@@ -611,6 +612,14 @@ const wasabiStateClient = createWasabiStateClient();
 const ADMIN_ATTACHMENT_MAX_BYTES = Math.max(
   1024,
   Math.min(50 * 1024 * 1024, Number(process.env.ADMIN_ATTACHMENT_MAX_BYTES || 25 * 1024 * 1024))
+);
+/**
+ * Plan Viewer uploads go directly browser -> Wasabi via presigned PUT (single-part).
+ * Keep app-level limits aligned to storage capabilities, not tiny admin attachment defaults.
+ */
+const PIPESYNC_PLAN_VIEW_UPLOAD_MAX_BYTES = Math.max(
+  1024 * 1024,
+  Math.min(5 * 1024 * 1024 * 1024, Number(process.env.PIPESYNC_PLAN_VIEW_UPLOAD_MAX_BYTES || 5 * 1024 * 1024 * 1024))
 );
 const ADMIN_ATTACHMENT_UPLOAD_TTL_SECONDS = Math.max(
   60,
@@ -7012,10 +7021,10 @@ app.post(
       const contentType = cleanString(req.body?.contentType || 'application/octet-stream');
       const fileSize = Number(req.body?.fileSize);
       if (!fileName) return res.status(400).json({ success: false, error: 'fileName is required' });
-      if (!Number.isFinite(fileSize) || fileSize < 1 || fileSize > ADMIN_ATTACHMENT_MAX_BYTES) {
+      if (!Number.isFinite(fileSize) || fileSize < 1 || fileSize > PIPESYNC_PLAN_VIEW_UPLOAD_MAX_BYTES) {
         return res.status(400).json({
           success: false,
-          error: `fileSize must be between 1 and ${ADMIN_ATTACHMENT_MAX_BYTES} bytes`
+          error: `fileSize must be between 1 and ${PIPESYNC_PLAN_VIEW_UPLOAD_MAX_BYTES} bytes`
         });
       }
       if (!isAllowedAdminAttachmentContentType(contentType, 'pipesync-plan-view')) {
@@ -7044,6 +7053,30 @@ app.post(
       return res.json({ success: true, ...signed, viewUrl });
     } catch (error) {
       console.error('PIPESYNC PLAN VIEW UPLOAD PRESIGN:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+app.post(
+  '/pipesync/plan-view/delete-files',
+  requireAuth,
+  requirePsrViewerAccess,
+  express.json({ limit: '256kb' }),
+  async (req, res) => {
+    try {
+      if (!adminAttachmentsWasabiConfigured()) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
+      }
+      const rawKeys = Array.isArray(req.body?.storageKeys) ? req.body.storageKeys : [];
+      const storageKeys = [...new Set(rawKeys.map((k) => cleanString(k)).filter((k) => isValidPipesyncPlanPageStorageKey(k)))];
+      if (!storageKeys.length) {
+        return res.status(400).json({ success: false, error: 'storageKeys must include at least one valid plan page key.' });
+      }
+      await deletePipesyncPlanPageKeys(wasabiStateClient, WASABI_STATE_BUCKET, storageKeys);
+      return res.json({ success: true, deleted: storageKeys.length });
+    } catch (error) {
+      console.error('PIPESYNC PLAN VIEW DELETE FILES:', error);
       return res.status(500).json({ success: false, error: error.message });
     }
   }

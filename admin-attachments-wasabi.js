@@ -97,6 +97,22 @@ async function deleteAdminAttachmentKeys(client, bucket, keys) {
   }
 }
 
+async function deletePipesyncPlanPageKeys(client, bucket, keys) {
+  if (!client || !bucket || !Array.isArray(keys)) return;
+  const seen = new Set();
+  for (const raw of keys) {
+    const key = String(raw || '').trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    if (!isValidPipesyncPlanPageStorageKey(key)) continue;
+    try {
+      await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
 function collectAdminAttachmentStorageKeysFromFiles(files) {
   const out = [];
   const list = Array.isArray(files) ? files : [];
@@ -190,6 +206,7 @@ module.exports = {
   presignAdminAttachmentPut,
   presignAdminAttachmentGet,
   deleteAdminAttachmentKeys,
+  deletePipesyncPlanPageKeys,
   collectAdminAttachmentStorageKeysFromFiles,
   storageKeysRemovedBetweenFileLists,
   normalizeAdminFilesForPersist,
