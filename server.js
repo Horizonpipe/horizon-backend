@@ -5074,10 +5074,20 @@ async function ensureSchema() {
       kind TEXT NOT NULL CHECK (kind IN ('public', 'interactive', 'signin')),
       created_by_username TEXT,
       payload JSONB NOT NULL DEFAULT '{"folderPaths":[],"fileIds":[]}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '7 days'),
+      revoked_at TIMESTAMPTZ,
+      revoked_by_username TEXT
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_portal_share_links_cj ON portal_share_links (client_id, job_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_portal_share_links_expires ON portal_share_links (expires_at)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_portal_share_links_revoked ON portal_share_links (revoked_at)`);
+  await pool.query(
+    `ALTER TABLE portal_share_links ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '7 days')`
+  );
+  await pool.query(`ALTER TABLE portal_share_links ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE portal_share_links ADD COLUMN IF NOT EXISTS revoked_by_username TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS portal_share_guest_sessions (
@@ -8880,7 +8890,7 @@ function portalShareDataLivePostgresSql(text) {
   const sql = normalizeSqlForPortalData(text);
   if (!sql) return false;
   if (sql === 'begin' || sql === 'commit' || sql === 'rollback') return true;
-  if (sql.startsWith('select * from portal_share_links where token = $1')) return true;
+  if (sql.includes('from portal_share_links where token = $1')) return true;
   if (sql.startsWith('select 1 from portal_share_guest_sessions where guest_token = $1 and share_link_id = $2'))
     return true;
   if (
@@ -8890,10 +8900,10 @@ function portalShareDataLivePostgresSql(text) {
   )
     return true;
   if (
-    sql.startsWith(
-      'insert into portal_share_links (id, token, client_id, job_id, kind, created_by_username, payload) values'
-    )
+    sql.startsWith('insert into portal_share_links (id, token, client_id, job_id, kind, created_by_username, payload')
   )
+    return true;
+  if (sql.startsWith('update portal_share_links set revoked_at = now(), revoked_by_username = $2 where token = $1 returning revoked_at'))
     return true;
   if (sql.startsWith('insert into portal_share_access_log')) return true;
   if (sql.startsWith('insert into portal_share_guest_sessions')) return true;
@@ -9241,7 +9251,7 @@ async function runPortalDataWasabiQuery(text, params = []) {
     }
     if (
       sql.startsWith(
-        'insert into portal_share_links (id, token, client_id, job_id, kind, created_by_username, payload) values ($1,$2,$3,$4,$5,$6,$7::jsonb)'
+        'insert into portal_share_links (id, token, client_id, job_id, kind, created_by_username, payload'
       )
     ) {
       shareLinks.push({
@@ -9252,9 +9262,23 @@ async function runPortalDataWasabiQuery(text, params = []) {
         kind: String(params[4] || ''),
         created_by_username: String(params[5] || ''),
         payload: safeJsonParse(params[6], {}),
-        created_at: now
+        created_at: now,
+        expires_at: params[7] ? new Date(String(params[7])).toISOString() : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        revoked_at: null,
+        revoked_by_username: null
       });
       outRows = [];
+      return;
+    }
+    if (sql.startsWith('update portal_share_links set revoked_at = now(), revoked_by_username = $2 where token = $1 returning revoked_at')) {
+      const token = String(params[0] || '');
+      const by = params[1] == null ? null : String(params[1]);
+      const row = shareLinks.find((r) => String(r.token || '') === token);
+      if (row) {
+        row.revoked_at = now;
+        row.revoked_by_username = by;
+      }
+      outRows = [{ revoked_at: row ? row.revoked_at : null }];
       return;
     }
     if (

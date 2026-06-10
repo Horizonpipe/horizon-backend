@@ -1398,6 +1398,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
     throw new Error('registerPortalShareLinkRoutes requires either pool.query or options.query.');
   }
   const pool = { query: dbQuery };
+  const PORTAL_SHARE_LINK_TTL_DAYS = clampIntEnv('PORTAL_SHARE_LINK_TTL_DAYS', 7, 1, 90);
   const r = express.Router();
   r.use(requireAuth);
   r.use((req, res, next) => {
@@ -1435,12 +1436,15 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
       const createdBy = String(req.user?.username || '');
       const payload = { folderPaths: fp.map(String), fileIds: fi.map(String) };
       const id = crypto.randomUUID();
+      const expiresAt = new Date(Date.now() + PORTAL_SHARE_LINK_TTL_DAYS * 24 * 60 * 60 * 1000).toISOString();
       await pool.query(
-        `INSERT INTO portal_share_links (id, token, client_id, job_id, kind, created_by_username, payload)
-         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
-        [id, token, String(clientId), String(jobId), kind, createdBy, JSON.stringify(payload)]
+        `INSERT INTO portal_share_links (id, token, client_id, job_id, kind, created_by_username, payload, expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::timestamptz)`,
+        [id, token, String(clientId), String(jobId), kind, createdBy, JSON.stringify(payload), expiresAt]
       );
-      return res.status(201).json({ token, id, kind, clientId: String(clientId), jobId: String(jobId) });
+      return res
+        .status(201)
+        .json({ token, id, kind, clientId: String(clientId), jobId: String(jobId), expiresAt, ttlDays: PORTAL_SHARE_LINK_TTL_DAYS });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(400).json({ error: msg });
@@ -1470,6 +1474,34 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
         [String(clientId), String(jobId)]
       );
       return res.json({ rows: r2.rows });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  r.delete('/shares/:token', async (req, res) => {
+    try {
+      const token = String(req.params?.token || '').trim();
+      if (!token) return res.status(400).json({ error: 'token is required' });
+      const found = await pool.query(`SELECT * FROM portal_share_links WHERE token = $1`, [token]);
+      const row = found.rows[0] || null;
+      if (!row) return res.status(404).json({ error: 'Link not found (expired, revoked, or invalid)' });
+      if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (row.revoked_at) {
+        return res.json({ ok: true, revokedAt: row.revoked_at, alreadyRevoked: true });
+      }
+      const by = String(req.user?.username || '').trim() || null;
+      const out = await pool.query(
+        `UPDATE portal_share_links
+            SET revoked_at = NOW(), revoked_by_username = $2
+          WHERE token = $1
+        RETURNING revoked_at`,
+        [token, by]
+      );
+      return res.json({ ok: true, revokedAt: out.rows?.[0]?.revoked_at || null });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
@@ -2519,7 +2551,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   });
 
   async function loadShareLinkRowForToken(tkn) {
-    const q = await aclPool.query(`SELECT * FROM portal_share_links WHERE token = $1`, [String(tkn)]);
+    const q = await aclPool.query(
+      `SELECT * FROM portal_share_links
+       WHERE token = $1
+         AND revoked_at IS NULL
+         AND expires_at > NOW()`,
+      [String(tkn)]
+    );
     return q.rows[0] || null;
   }
 
@@ -2537,7 +2575,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
    */
   async function shareViewAuthObjectKey(req, token, idParam) {
     const row = await loadShareLinkRowForToken(token);
-    if (!row || portalShareLinkKind(row) !== 'signin') return { ok: false, status: 404, body: { error: 'Not found' } };
+    if (!row) return { ok: false, status: 404, body: { error: 'Not found' } };
     if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
       return { ok: false, status: 403, body: { error: 'Forbidden' } };
     }
@@ -2558,11 +2596,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     return { ok: true, Key };
   }
 
-  /** Sign-in share: tree for authenticated users with job access. */
+  /** Authenticated share tree for users with explicit job access. */
   r.get('/share-view/:token/tree', async (req, res) => {
     try {
       const row = await loadShareLinkRowForToken(req.params.token);
-      if (!row || portalShareLinkKind(row) !== 'signin') return res.status(404).json({ error: 'Not found' });
+      if (!row) return res.status(404).json({ error: 'Not found' });
       if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
@@ -4713,7 +4751,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   const guest = express.Router();
 
   async function loadGuestShareRow(tkn) {
-    const q = await aclPool.query(`SELECT * FROM portal_share_links WHERE token = $1`, [String(tkn)]);
+    const q = await aclPool.query(
+      `SELECT * FROM portal_share_links
+       WHERE token = $1
+         AND revoked_at IS NULL
+         AND expires_at > NOW()`,
+      [String(tkn)]
+    );
     return q.rows[0] || null;
   }
 
@@ -4733,14 +4777,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   guest.get('/share/:token/meta', async (req, res) => {
     try {
       const row = await loadGuestShareRow(req.params.token);
-      if (!row) return res.status(404).json({ error: 'Link not found' });
+      if (!row) return res.status(404).json({ error: 'Link not found (expired, revoked, or invalid)' });
       const linkKind = portalShareLinkKind(row);
       if (linkKind === 'signin') {
         return res.json({
           kind: 'signin',
           requiresSignIn: true,
           clientId: row.client_id,
-          jobId: row.job_id
+          jobId: row.job_id,
+          expiresAt: row.expires_at || null
         });
       }
       const interactive = linkKind === 'interactive';
@@ -4750,7 +4795,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         kind: linkKind || 'public',
         needsRegistration: interactive && !unlocked,
         clientId: row.client_id,
-        jobId: row.job_id
+        jobId: row.job_id,
+        expiresAt: row.expires_at || null
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -4761,7 +4807,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   guest.post('/share/:token/register', express.json({ limit: '64kb' }), async (req, res) => {
     try {
       const row = await loadGuestShareRow(req.params.token);
-      if (!row) return res.status(404).json({ error: 'Link not found' });
+      if (!row) return res.status(404).json({ error: 'Link not found (expired, revoked, or invalid)' });
       if (portalShareLinkKind(row) !== 'interactive') {
         return res.status(400).json({ error: 'This link does not require registration' });
       }
@@ -4823,7 +4869,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
    */
   async function guestShareAuthObjectKey(req, token, idParam) {
     const row = await loadGuestShareRow(token);
-    if (!row) return { ok: false, status: 404, body: { error: 'Link not found' } };
+    if (!row) return { ok: false, status: 404, body: { error: 'Link not found (expired, revoked, or invalid)' } };
     if (portalShareLinkKind(row) === 'signin') {
       return { ok: false, status: 401, body: { error: 'Sign in required', requiresSignIn: true, kind: 'signin' } };
     }
@@ -4881,7 +4927,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   guest.get('/share/:token/tree', async (req, res) => {
     try {
       const row = await loadGuestShareRow(req.params.token);
-      if (!row) return res.status(404).json({ error: 'Link not found' });
+      if (!row) return res.status(404).json({ error: 'Link not found (expired, revoked, or invalid)' });
       if (portalShareLinkKind(row) === 'signin') {
         return res.status(401).json({ error: 'Sign in required', requiresSignIn: true, kind: 'signin' });
       }
