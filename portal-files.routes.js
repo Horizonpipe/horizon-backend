@@ -1366,6 +1366,28 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
   }
   const pool = { query: dbQuery };
   const PORTAL_SHARE_LINK_TTL_DAYS = clampIntEnv('PORTAL_SHARE_LINK_TTL_DAYS', 7, 1, 90);
+  const PORTAL_SHARE_META_MAX_BYTES = clampIntEnv('PORTAL_SHARE_META_MAX_BYTES', 512 * 1024, 8 * 1024, 2 * 1024 * 1024);
+  /**
+   * Optional metadata snapshot carried by a share token.
+   * Supports Plan View share overlays/edits while preserving existing payload shape.
+   */
+  function sanitizeShareMeta(rawMeta) {
+    if (rawMeta == null) return null;
+    if (typeof rawMeta !== 'object' || Array.isArray(rawMeta)) {
+      throw new Error('shareMeta must be an object');
+    }
+    let json = '';
+    try {
+      json = JSON.stringify(rawMeta);
+    } catch {
+      throw new Error('shareMeta must be JSON-serializable');
+    }
+    if (!json || json === '{}') return null;
+    if (Buffer.byteLength(json, 'utf8') > PORTAL_SHARE_META_MAX_BYTES) {
+      throw new Error(`shareMeta exceeds ${PORTAL_SHARE_META_MAX_BYTES} bytes`);
+    }
+    return JSON.parse(json);
+  }
   const r = express.Router();
   r.use(requireAuth);
   r.use((req, res, next) => {
@@ -1381,7 +1403,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
 
   r.post('/shares', express.json({ limit: '512kb' }), async (req, res) => {
     try {
-      const { clientId, jobId, kind: kindRaw, folderPaths, fileIds } = req.body || {};
+      const { clientId, jobId, kind: kindRaw, folderPaths, fileIds, shareMeta: shareMetaRaw } = req.body || {};
       if (!clientId || !jobId) {
         return res.status(400).json({ error: 'clientId and jobId are required' });
       }
@@ -1401,7 +1423,12 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
       }
       const token = crypto.randomBytes(24).toString('base64url');
       const createdBy = String(req.user?.username || '');
-      const payload = { folderPaths: fp.map(String), fileIds: fi.map(String) };
+      const shareMeta = sanitizeShareMeta(shareMetaRaw);
+      const payload = {
+        folderPaths: fp.map(String),
+        fileIds: fi.map(String),
+        ...(shareMeta ? { shareMeta } : {})
+      };
       const id = crypto.randomUUID();
       const expiresAt = new Date(Date.now() + PORTAL_SHARE_LINK_TTL_DAYS * 24 * 60 * 60 * 1000).toISOString();
       await pool.query(
@@ -2469,7 +2496,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const full = buildTreeFromKeys(prefix, keys);
       const filtered = filterTreeForSharePayload(full, payload);
       await mergeCompletedUploadSha256IntoTree(String(row.client_id), String(row.job_id), filtered);
-      return res.json(filtered);
+      return res.json({
+        ...filtered,
+        shareMeta: payload && typeof payload === 'object' ? payload.shareMeta || null : null
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
@@ -4799,7 +4829,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const full = buildTreeFromKeys(prefix, keys);
       const filtered = filterTreeForSharePayload(full, payload);
       await mergeCompletedUploadSha256IntoTree(String(row.client_id), String(row.job_id), filtered);
-      return res.json(filtered);
+      return res.json({
+        ...filtered,
+        shareMeta: payload && typeof payload === 'object' ? payload.shareMeta || null : null
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });

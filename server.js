@@ -1886,9 +1886,10 @@ function userHasAnyAssignedAccess(row) {
     email: row?.email
   });
   if (accountModel.accountType === ACCOUNT_TYPES.EMPLOYEE && accountModel.employeeRole) return true;
-  if (row?.is_admin) return true;
+  const isCustomerModel = accountModel.accountType === ACCOUNT_TYPES.CUSTOMER;
+  if (!isCustomerModel && row?.is_admin) return true;
   const roles = normalizeRoles(row?.roles);
-  const hasRoleAccess = Object.values(roles).some((v) => v === true);
+  const hasRoleAccess = !isCustomerModel && Object.values(roles).some((v) => v === true);
   const hasPortalFiles = row?.portal_files_access_granted === true;
   const hasAutosyncMaster = row?.autosync_master_granted === true;
   const hasPortalPermissionUi = !!row?.portal_permissions_access || canManagePortalExtras(row);
@@ -6588,12 +6589,27 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
   const username = cleanString(req.body?.username);
   const displayName = cleanString(req.body?.displayName || username);
   const password = cleanString(req.body?.password || '1234');
+  const hasAdminAccessPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'adminAccess');
+  const hasSuperAdminAccessPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'superAdminAccess');
   const accountType = normalizeAccountType(req.body?.accountType || ACCOUNT_TYPES.EMPLOYEE);
-  let employeeRole =
-    accountType === ACCOUNT_TYPES.EMPLOYEE
-      ? normalizeEmployeeRole(req.body?.employeeRole || EMPLOYEE_ROLES.CAMERA_OPERATOR)
-      : null;
-  if (accountType === ACCOUNT_TYPES.EMPLOYEE && !employeeRole) employeeRole = EMPLOYEE_ROLES.CAMERA_OPERATOR;
+  const requestedEmployeeRoleRaw = normalizeEmployeeRole(req.body?.employeeRole || '');
+  const requestedRoleIsLegacyAdmin =
+    requestedEmployeeRoleRaw === EMPLOYEE_ROLES.ADMIN || requestedEmployeeRoleRaw === EMPLOYEE_ROLES.SUPERADMIN;
+  let adminAccess = hasAdminAccessPayload ? !!req.body?.adminAccess : requestedRoleIsLegacyAdmin;
+  let superAdminAccess = hasSuperAdminAccessPayload
+    ? !!req.body?.superAdminAccess
+    : requestedEmployeeRoleRaw === EMPLOYEE_ROLES.SUPERADMIN;
+  if (!adminAccess) superAdminAccess = false;
+  let employeeRole = null;
+  if (accountType === ACCOUNT_TYPES.EMPLOYEE) {
+    const requestedWorkerRole =
+      requestedEmployeeRoleRaw === EMPLOYEE_ROLES.CAMERA_OPERATOR ||
+      requestedEmployeeRoleRaw === EMPLOYEE_ROLES.VAC_OPERATOR ||
+      requestedEmployeeRoleRaw === EMPLOYEE_ROLES.SIMPLE_VAC
+        ? requestedEmployeeRoleRaw
+        : EMPLOYEE_ROLES.CAMERA_OPERATOR;
+    employeeRole = superAdminAccess ? EMPLOYEE_ROLES.SUPERADMIN : adminAccess ? EMPLOYEE_ROLES.ADMIN : requestedWorkerRole;
+  }
   const actorIsMike = isMikeStricklandUser(req.user);
   const targetLooksMike =
     looksLikeMike({ username, displayName, email: req.body?.email }) || username.toLowerCase() === 'mik';
@@ -6731,6 +6747,8 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
   const displayName = cleanString(req.body?.displayName || req.body?.name);
   const hasAccountTypePayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'accountType');
   const hasEmployeeRolePayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'employeeRole');
+  const hasAdminAccessPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'adminAccess');
+  const hasSuperAdminAccessPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'superAdminAccess');
   const legacyIsAdmin = req.body?.isAdmin === undefined ? null : !!req.body.isAdmin;
   const legacyRolesInput = req.body?.roles === undefined ? null : normalizeRoles(req.body.roles);
   const password = cleanString(req.body?.password || '');
@@ -6756,6 +6774,9 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
   const hasPsrScopesPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'psrScopes');
   const hasLegacyScopeMutationPayload = hasPortalScopesPayload || hasPsrScopesPayload;
   const hasCompanyPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'companyId');
+  const hasCompanyRolePayload =
+    Object.prototype.hasOwnProperty.call(req.body || {}, 'companyRoleKey') ||
+    Object.prototype.hasOwnProperty.call(req.body || {}, 'roleKey');
 
   try {
     let current = null;
@@ -6820,16 +6841,43 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
     let nextAccountType = hasAccountTypePayload
       ? normalizeAccountType(req.body?.accountType)
       : currentModel.accountType;
-    let nextEmployeeRole;
+    const currentIsAdminRole =
+      currentModel.employeeRole === EMPLOYEE_ROLES.ADMIN || currentModel.employeeRole === EMPLOYEE_ROLES.SUPERADMIN;
+    const currentIsSuperAdminRole = currentModel.employeeRole === EMPLOYEE_ROLES.SUPERADMIN;
+    const requestedEmployeeRoleRaw = hasEmployeeRolePayload ? normalizeEmployeeRole(req.body?.employeeRole || '') : '';
+    const requestedRoleIsLegacyAdmin =
+      requestedEmployeeRoleRaw === EMPLOYEE_ROLES.ADMIN || requestedEmployeeRoleRaw === EMPLOYEE_ROLES.SUPERADMIN;
+    let adminAccess = hasAdminAccessPayload ? !!req.body?.adminAccess : currentIsAdminRole;
+    let superAdminAccess = hasSuperAdminAccessPayload ? !!req.body?.superAdminAccess : currentIsSuperAdminRole;
+    if (!hasAdminAccessPayload && !hasSuperAdminAccessPayload && hasEmployeeRolePayload && requestedRoleIsLegacyAdmin) {
+      adminAccess = true;
+      superAdminAccess = requestedEmployeeRoleRaw === EMPLOYEE_ROLES.SUPERADMIN;
+    }
+    if (!adminAccess) superAdminAccess = false;
+    const currentWorkerRole =
+      currentModel.employeeRole === EMPLOYEE_ROLES.CAMERA_OPERATOR ||
+      currentModel.employeeRole === EMPLOYEE_ROLES.VAC_OPERATOR ||
+      currentModel.employeeRole === EMPLOYEE_ROLES.SIMPLE_VAC
+        ? currentModel.employeeRole
+        : EMPLOYEE_ROLES.CAMERA_OPERATOR;
+    const requestedWorkerRole =
+      requestedEmployeeRoleRaw === EMPLOYEE_ROLES.CAMERA_OPERATOR ||
+      requestedEmployeeRoleRaw === EMPLOYEE_ROLES.VAC_OPERATOR ||
+      requestedEmployeeRoleRaw === EMPLOYEE_ROLES.SIMPLE_VAC
+        ? requestedEmployeeRoleRaw
+        : currentWorkerRole;
+    let nextEmployeeRole = null;
     if (nextAccountType === ACCOUNT_TYPES.EMPLOYEE) {
-      if (hasEmployeeRolePayload) {
-        nextEmployeeRole = normalizeEmployeeRole(req.body?.employeeRole || EMPLOYEE_ROLES.CAMERA_OPERATOR);
-      } else {
-        nextEmployeeRole = currentModel.employeeRole || EMPLOYEE_ROLES.CAMERA_OPERATOR;
-      }
+      nextEmployeeRole = superAdminAccess
+        ? EMPLOYEE_ROLES.SUPERADMIN
+        : adminAccess
+          ? EMPLOYEE_ROLES.ADMIN
+          : (hasEmployeeRolePayload ? requestedWorkerRole : currentWorkerRole);
       if (!nextEmployeeRole) nextEmployeeRole = EMPLOYEE_ROLES.CAMERA_OPERATOR;
     } else {
       nextEmployeeRole = null;
+      adminAccess = false;
+      superAdminAccess = false;
     }
     if (!hasAccountTypePayload && !hasEmployeeRolePayload && (legacyIsAdmin !== null || legacyRolesInput !== null)) {
       if (legacyIsAdmin === true) {
@@ -7034,7 +7082,19 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
 
     if (hasCompanyPayload) {
       const companyId = cleanString(req.body?.companyId);
-      const companyRoleKey = cleanString(req.body?.companyRoleKey || req.body?.roleKey || 'employee').toLowerCase();
+      let companyRoleKey = '';
+      if (hasCompanyRolePayload) {
+        companyRoleKey = cleanString(req.body?.companyRoleKey || req.body?.roleKey || 'employee').toLowerCase();
+      } else {
+        const membershipResult = await pool.query(
+          `SELECT role_key
+           FROM user_company_membership
+           WHERE user_id = $1
+           LIMIT 1`,
+          [String(id)]
+        );
+        companyRoleKey = cleanString(membershipResult.rows[0]?.role_key || 'employee').toLowerCase();
+      }
       if (!companyId) {
         await pool.query('DELETE FROM user_company_membership WHERE user_id = $1', [String(id)]);
       } else {
