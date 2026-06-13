@@ -3587,6 +3587,7 @@ function normalizeJobsiteName(jobsite, street = '') {
 const PSR_IMPORT_QUEUE_CLIENT = '__HP_IMPORT_QUEUE__';
 
 function resolveWincanImportScope(body, rows) {
+  const targetRecordId = cleanString(body?.targetRecordId || body?.recordId || '');
   let targetClient = cleanString(body?.targetClient);
   let targetCity = cleanString(body?.targetCity);
   if (!targetClient) targetClient = PSR_IMPORT_QUEUE_CLIENT;
@@ -3598,7 +3599,7 @@ function resolveWincanImportScope(body, rows) {
     targetJobsite = normalizeJobsiteName(projectName);
   }
   const targetSystem = cleanString(body?.targetSystem || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
-  return { targetClient, targetCity, targetJobsite, targetSystem };
+  return { targetClient, targetCity, targetJobsite, targetSystem, targetRecordId };
 }
 
 function db3NormalizedValue(value) {
@@ -3673,6 +3674,19 @@ function collectRecordDb3IdentitySets(record, targetSystem) {
     if (hash) dedupeHashes.add(hash);
   }
   return { dedupeKeys, dedupeHashes, references };
+}
+
+function ensureImportTargetSystemBranch(record, targetSystem) {
+  if (!record || typeof record !== 'object') return;
+  const system = targetSystem === 'sanitary' ? 'sanitary' : 'storm';
+  if (!record.systems || typeof record.systems !== 'object') record.systems = { storm: [], sanitary: [] };
+  if (!Array.isArray(record.systems.storm)) record.systems.storm = [];
+  if (!Array.isArray(record.systems.sanitary)) record.systems.sanitary = [];
+  const nextBranches = {
+    ...(record.systemBranches && typeof record.systemBranches === 'object' ? record.systemBranches : {}),
+    [system]: true
+  };
+  record.systemBranches = coerceSystemBranchesForStorage(nextBranches, record.systems);
 }
 
 /** Persisted under planner record `data.systemBranches` — which top-level folders show under a jobsite. */
@@ -8479,9 +8493,21 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
     }
 
     const rows = await parseDb3(req.file.buffer);
-    const { targetClient, targetCity, targetJobsite, targetSystem } = resolveWincanImportScope(req.body, rows);
-
-    const existingRecords = await findPlannerRecordsByScope(targetClient, targetCity, targetJobsite, { latestOnly: false });
+    const scope = resolveWincanImportScope(req.body, rows);
+    let { targetClient, targetCity, targetJobsite, targetSystem } = scope;
+    let existingRecords = [];
+    if (scope.targetRecordId) {
+      const selectedRecord = await fetchRecordById(scope.targetRecordId);
+      if (!selectedRecord) {
+        return res.status(400).json({ success: false, error: 'Selected PSR job no longer exists. Re-pick a green job and preview again.' });
+      }
+      targetClient = selectedRecord.client;
+      targetCity = selectedRecord.city;
+      targetJobsite = normalizeJobsiteName(selectedRecord.jobsite, selectedRecord.street);
+      existingRecords = [selectedRecord];
+    } else {
+      existingRecords = await findPlannerRecordsByScope(targetClient, targetCity, targetJobsite, { latestOnly: false });
+    }
     const existingDedupeKeys = new Set();
     const existingDedupeHashes = new Set();
     const existingRefs = new Set();
@@ -8523,7 +8549,18 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
 app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) => {
   try {
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
-    const { targetClient, targetCity, targetJobsite, targetSystem } = resolveWincanImportScope(req.body, rows);
+    const scope = resolveWincanImportScope(req.body, rows);
+    let { targetClient, targetCity, targetJobsite, targetSystem } = scope;
+    let selectedRecord = null;
+    if (scope.targetRecordId) {
+      selectedRecord = await fetchRecordById(scope.targetRecordId);
+      if (!selectedRecord) {
+        return res.status(400).json({ success: false, error: 'Selected PSR job no longer exists. Re-pick a green job and commit again.' });
+      }
+      targetClient = selectedRecord.client;
+      targetCity = selectedRecord.city;
+      targetJobsite = normalizeJobsiteName(selectedRecord.jobsite, selectedRecord.street);
+    }
     if (!targetJobsite || targetJobsite === 'NOT SET') {
       return res.status(400).json({
         success: false,
@@ -8532,22 +8569,27 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
     }
 
     let record;
-    const existingMatches = await findPlannerRecordsByScope(targetClient, targetCity, targetJobsite, { latestOnly: true });
-    if (existingMatches.length) {
-      record = existingMatches[0];
+    if (selectedRecord) {
+      record = selectedRecord;
     } else {
-      record = {
-        record_date: new Date().toISOString().slice(0, 10),
-        client: targetClient,
-        city: targetCity,
-        street: '',
-        jobsite: targetJobsite,
-        status: '',
-        saved_by: req.user.displayName || req.user.username,
-        systems: { storm: [], sanitary: [] }
-      };
-      record = await createPlannerRecord(record);
+      const existingMatches = await findPlannerRecordsByScope(targetClient, targetCity, targetJobsite, { latestOnly: true });
+      if (existingMatches.length) {
+        record = existingMatches[0];
+      } else {
+        record = {
+          record_date: new Date().toISOString().slice(0, 10),
+          client: targetClient,
+          city: targetCity,
+          street: '',
+          jobsite: targetJobsite,
+          status: '',
+          saved_by: req.user.displayName || req.user.username,
+          systems: { storm: [], sanitary: [] }
+        };
+        record = await createPlannerRecord(record);
+      }
     }
+    ensureImportTargetSystemBranch(record, targetSystem);
 
     const existingIdentity = collectRecordDb3IdentitySets(record, targetSystem);
     const refSet = existingIdentity.references;
@@ -8592,6 +8634,7 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
           })
         ]
       }, req.user.displayName || req.user.username);
+      if (!Array.isArray(record.systems[targetSystem])) record.systems[targetSystem] = [];
       record.systems[targetSystem].push(segment);
       refSet.add(String(segment.reference || '').toLowerCase());
       if (dedupeKey) dedupeKeySet.add(dedupeKey);
