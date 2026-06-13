@@ -865,7 +865,7 @@ function sanitizePlanBoardBranch(branch) {
         const o = { ...d };
         delete o.viewUrl;
         const sk = String(o.storageKey || '').trim();
-        if (!isValidPipesyncPlanPageStorageKey(sk)) return null;
+        if (sk && !isValidPipesyncPlanPageStorageKey(sk)) return null;
         if (Array.isArray(o.pieces)) {
           o.pieces = o.pieces
             .map((p) => {
@@ -879,6 +879,12 @@ function sanitizePlanBoardBranch(branch) {
             .filter(Boolean);
         } else {
           o.pieces = [];
+        }
+        if (!o.pieces.length) return null;
+        if (!isValidPipesyncPlanPageStorageKey(sk)) {
+          // Keep split-page metadata for docs whose original archive sync is still pending.
+          // Without this, PDF doc identity disappears across saves and breaks unassigned parity.
+          delete o.storageKey;
         }
         return o;
       })

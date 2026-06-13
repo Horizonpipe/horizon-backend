@@ -40,6 +40,7 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { Upload } = require('@aws-sdk/lib-storage');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
 const { canManagePortalExtras } = require('./capabilities');
+const { isValidPipesyncPlanPageStorageKey } = require('./admin-attachments-wasabi');
 const {
   loadEffectivePathGrantsForUser,
   jobHasAnyEffectivePathGrants,
@@ -1388,6 +1389,86 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
     }
     return JSON.parse(json);
   }
+  const PLAN_SHARE_SENTINEL_CLIENT = '__pipesync_plan__';
+  const PLAN_SHARE_SENTINEL_JOB = '__plan_view__';
+  const PLAN_SHARE_VIRTUAL_ID_PREFIX = 'planmeta_';
+  function isPlanPdfShareMeta(meta) {
+    return !!(meta && typeof meta === 'object' && !Array.isArray(meta) && String(meta.kind || '').toLowerCase() === 'plan-pdf-share-v1');
+  }
+  function isPlanPdfSharePayload(payload) {
+    return !!(
+      payload &&
+      typeof payload === 'object' &&
+      !Array.isArray(payload) &&
+      isPlanPdfShareMeta(payload.shareMeta)
+    );
+  }
+  function shareRowIsPlanPdfVirtual(row) {
+    return (
+      String(row?.client_id || '') === PLAN_SHARE_SENTINEL_CLIENT &&
+      String(row?.job_id || '') === PLAN_SHARE_SENTINEL_JOB &&
+      isPlanPdfSharePayload(row?.payload || {})
+    );
+  }
+  function planShareVirtualIdFromStorageKey(key) {
+    return `${PLAN_SHARE_VIRTUAL_ID_PREFIX}${Buffer.from(String(key || ''), 'utf8').toString('base64url')}`;
+  }
+  function planShareStorageKeyFromVirtualId(id) {
+    const raw = String(id || '').trim();
+    if (!raw.startsWith(PLAN_SHARE_VIRTUAL_ID_PREFIX)) return '';
+    const enc = raw.slice(PLAN_SHARE_VIRTUAL_ID_PREFIX.length);
+    if (!enc) return '';
+    try {
+      return Buffer.from(enc, 'base64url').toString('utf8');
+    } catch {
+      return '';
+    }
+  }
+  function collectPlanShareVirtualFiles(payload) {
+    const shareMeta = payload?.shareMeta;
+    if (!isPlanPdfShareMeta(shareMeta)) return [];
+    const selectedName = String(shareMeta?.selectedPdf?.name || '').trim();
+    const pages = Array.isArray(shareMeta?.snapshot?.pages) ? shareMeta.snapshot.pages : [];
+    const out = [];
+    const seen = new Set();
+    let i = 0;
+    const addKey = (rawKey, rawPageName = '') => {
+      const key = String(rawKey || '').trim();
+      if (!isValidPipesyncPlanPageStorageKey(key) || seen.has(key)) return false;
+      seen.add(key);
+      const pageName = String(rawPageName || '').trim();
+      const fallback = selectedName || 'Plan.pdf';
+      const name = (pageName || fallback || `Sheet-${i + 1}.pdf`).slice(0, 260);
+      out.push({
+        id: planShareVirtualIdFromStorageKey(key),
+        key,
+        name: /\.pdf$/i.test(name) ? name : `${name}.pdf`,
+        path: `plans/${/\.pdf$/i.test(name) ? name : `${name}.pdf`}`
+      });
+      i += 1;
+      return true;
+    };
+    for (const page of pages) {
+      if (!page || typeof page !== 'object') continue;
+      addKey(page.storageKey || page.storage_key, page.name);
+    }
+    // Some assigned/foldered docs can carry only selectedPdf storage metadata.
+    addKey(shareMeta?.selectedPdf?.storageKey || shareMeta?.selectedPdf?.storage_key, shareMeta?.selectedPdf?.name);
+    return out;
+  }
+  function planShareVirtualTree(payload) {
+    const files = collectPlanShareVirtualFiles(payload).map((f) => ({
+      id: f.id,
+      name: f.name,
+      path: f.path
+    }));
+    return { folders: [], files };
+  }
+  function planShareAllowsVirtualKey(payload, storageKey) {
+    const key = String(storageKey || '').trim();
+    if (!isValidPipesyncPlanPageStorageKey(key)) return false;
+    return collectPlanShareVirtualFiles(payload).some((f) => f.key === key);
+  }
   const r = express.Router();
   r.use(requireAuth);
   r.use((req, res, next) => {
@@ -1404,26 +1485,33 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
   r.post('/shares', express.json({ limit: '512kb' }), async (req, res) => {
     try {
       const { clientId, jobId, kind: kindRaw, folderPaths, fileIds, shareMeta: shareMetaRaw } = req.body || {};
-      if (!clientId || !jobId) {
-        return res.status(400).json({ error: 'clientId and jobId are required' });
-      }
       const kind = String(kindRaw ?? '')
         .trim()
         .toLowerCase();
       if (kind !== 'public' && kind !== 'interactive' && kind !== 'signin') {
         return res.status(400).json({ error: 'kind must be public, interactive, or signin' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      const shareMeta = sanitizeShareMeta(shareMetaRaw);
+      const planShare = isPlanPdfShareMeta(shareMeta);
+      const resolvedClientId = planShare ? String(clientId || PLAN_SHARE_SENTINEL_CLIENT) : String(clientId || '');
+      const resolvedJobId = planShare ? String(jobId || PLAN_SHARE_SENTINEL_JOB) : String(jobId || '');
+      if (!resolvedClientId || !resolvedJobId) {
+        return res.status(400).json({ error: 'clientId and jobId are required' });
+      }
+      if (planShare) {
+        if (!collectPlanShareVirtualFiles({ shareMeta }).length) {
+          return res.status(400).json({ error: 'Plan share requires at least one synced PDF page.' });
+        }
+      } else if (!(await assertPortalJobAccess(pool, req.user, resolvedClientId, resolvedJobId))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const fp = Array.isArray(folderPaths) ? folderPaths : [];
       const fi = Array.isArray(fileIds) ? fileIds : [];
-      if (fp.length === 0 && fi.length === 0) {
+      if (!planShare && fp.length === 0 && fi.length === 0) {
         return res.status(400).json({ error: 'Select at least one folder or file' });
       }
       const token = crypto.randomBytes(24).toString('base64url');
       const createdBy = String(req.user?.username || '');
-      const shareMeta = sanitizeShareMeta(shareMetaRaw);
       const payload = {
         folderPaths: fp.map(String),
         fileIds: fi.map(String),
@@ -1434,11 +1522,11 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
       await pool.query(
         `INSERT INTO portal_share_links (id, token, client_id, job_id, kind, created_by_username, payload, expires_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::timestamptz)`,
-        [id, token, String(clientId), String(jobId), kind, createdBy, JSON.stringify(payload), expiresAt]
+        [id, token, resolvedClientId, resolvedJobId, kind, createdBy, JSON.stringify(payload), expiresAt]
       );
       return res
         .status(201)
-        .json({ token, id, kind, clientId: String(clientId), jobId: String(jobId), expiresAt, ttlDays: PORTAL_SHARE_LINK_TTL_DAYS });
+        .json({ token, id, kind, clientId: resolvedClientId, jobId: resolvedJobId, expiresAt, ttlDays: PORTAL_SHARE_LINK_TTL_DAYS });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(400).json({ error: msg });
@@ -2454,9 +2542,18 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
    * @returns {Promise<{ ok: true, Key: string } | { ok: false, status: number, body: Record<string, unknown> }>}
    */
   async function shareViewAuthObjectKey(req, token, idParam) {
+    void req;
     const row = await loadShareLinkRowForToken(token);
     if (!row) return { ok: false, status: 404, body: { error: 'Not found' } };
     const payload = row.payload || {};
+    if (shareRowIsPlanPdfVirtual(row)) {
+      const storageKey = planShareStorageKeyFromVirtualId(idParam);
+      if (!storageKey) return { ok: false, status: 400, body: { error: 'Invalid id' } };
+      if (!planShareAllowsVirtualKey(payload, storageKey)) {
+        return { ok: false, status: 403, body: { error: 'Not included in this share' } };
+      }
+      return { ok: true, Key: storageKey };
+    }
     const Key = idToKey(idParam);
     if (!Key.startsWith('clients/')) {
       return { ok: false, status: 400, body: { error: 'Invalid id' } };
@@ -2479,6 +2576,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const row = await loadShareLinkRowForToken(req.params.token);
       if (!row) return res.status(404).json({ error: 'Not found' });
       const payload = row.payload || {};
+      if (shareRowIsPlanPdfVirtual(row)) {
+        const virtualTree = planShareVirtualTree(payload);
+        return res.json({
+          ...virtualTree,
+          shareMeta: payload && typeof payload === 'object' ? payload.shareMeta || null : null
+        });
+      }
       const prefix = jobPrefix(String(row.client_id), String(row.job_id));
       let listPrefix = prefix;
       const subtreeRaw = String(req.query.pathPrefix ?? req.query.prefix ?? '').trim();
@@ -4754,6 +4858,14 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       return { ok: false, status: 401, body: { error: 'Registration required', needsRegistration: true } };
     }
     const payload = row.payload || {};
+    if (shareRowIsPlanPdfVirtual(row)) {
+      const storageKey = planShareStorageKeyFromVirtualId(idParam);
+      if (!storageKey) return { ok: false, status: 400, body: { error: 'Invalid id' } };
+      if (!planShareAllowsVirtualKey(payload, storageKey)) {
+        return { ok: false, status: 403, body: { error: 'Not included in this share' } };
+      }
+      return { ok: true, Key: storageKey };
+    }
     const Key = idToKey(idParam);
     if (!Key.startsWith('clients/')) {
       return { ok: false, status: 400, body: { error: 'Invalid id' } };
@@ -4812,6 +4924,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(401).json({ error: 'Registration required', needsRegistration: true });
       }
       const payload = row.payload || {};
+      if (shareRowIsPlanPdfVirtual(row)) {
+        const virtualTree = planShareVirtualTree(payload);
+        return res.json({
+          ...virtualTree,
+          shareMeta: payload && typeof payload === 'object' ? payload.shareMeta || null : null
+        });
+      }
       const prefix = jobPrefix(String(row.client_id), String(row.job_id));
       let listPrefix = prefix;
       const subtreeRaw = String(req.query.pathPrefix ?? req.query.prefix ?? '').trim();
