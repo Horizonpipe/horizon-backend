@@ -3558,6 +3558,8 @@ function normalizeSegment(raw = {}, userName = 'System') {
     selectedVersionId: raw.selectedVersionId || versions[versions.length - 1].id,
     db3Imported: sanitizeDb3ImportedObject(raw.db3Imported),
     db3DuplicateOf: sanitizeDb3DuplicateOf(raw.db3DuplicateOf),
+    db3DedupeKey: cleanString(raw.db3DedupeKey).slice(0, 240),
+    db3RowHash: cleanString(raw.db3RowHash).slice(0, 120).toLowerCase(),
     linkedPortalDb3FileId: cleanString(raw.linkedPortalDb3FileId).slice(0, 128),
     linkedPortalDb3FolderPath: cleanString(raw.linkedPortalDb3FolderPath).slice(0, 800),
     linkedPortalDb3ClientId: cleanString(raw.linkedPortalDb3ClientId).slice(0, 128),
@@ -3597,6 +3599,80 @@ function resolveWincanImportScope(body, rows) {
   }
   const targetSystem = cleanString(body?.targetSystem || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
   return { targetClient, targetCity, targetJobsite, targetSystem };
+}
+
+function db3NormalizedValue(value) {
+  return String(value == null ? '' : value)
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toUpperCase();
+}
+
+function db3StableKeyFromImported(imported) {
+  if (!imported || typeof imported !== 'object' || Array.isArray(imported)) return '';
+  const pick = (...keys) => {
+    for (const key of keys) {
+      const raw = imported[key];
+      const v = db3NormalizedValue(raw);
+      if (v) return v;
+    }
+    return '';
+  };
+  const guid = pick('OBJ_GUID', 'SECTION_GUID', 'GUID');
+  if (guid) return `GUID:${guid}`;
+  const objPk = pick('OBJ_PK', 'OBJ_ID', 'SECTION_ID');
+  if (objPk) return `OBJ:${objPk}`;
+  return '';
+}
+
+function db3RowFingerprintHash(row) {
+  const importedObj =
+    row && row.db3Imported && typeof row.db3Imported === 'object' && !Array.isArray(row.db3Imported) ? row.db3Imported : {};
+  const importedPairs = Object.entries(importedObj)
+    .map(([k, v]) => `${db3NormalizedValue(k)}=${db3NormalizedValue(v)}`)
+    .filter((line) => line && !line.endsWith('='))
+    .sort();
+  const materialized = [
+    db3NormalizedValue(row?.project),
+    db3NormalizedValue(row?.reference),
+    db3NormalizedValue(row?.city),
+    db3NormalizedValue(row?.street),
+    db3NormalizedValue(row?.upstream),
+    db3NormalizedValue(row?.downstream),
+    db3NormalizedValue(row?.material),
+    db3NormalizedValue(row?.shape),
+    db3NormalizedValue(row?.dia),
+    db3NormalizedValue(row?.length),
+    ...importedPairs
+  ].join('|');
+  return crypto.createHash('sha256').update(materialized).digest('hex');
+}
+
+function buildDb3DeterministicIdentity(row) {
+  const ref = db3NormalizedValue(row?.reference);
+  if (ref) return { dedupeKey: `REF:${ref}`, dedupeHash: db3RowFingerprintHash(row) };
+  const importedStable = db3StableKeyFromImported(row?.db3Imported);
+  if (importedStable) return { dedupeKey: importedStable, dedupeHash: db3RowFingerprintHash(row) };
+  return { dedupeKey: '', dedupeHash: db3RowFingerprintHash(row) };
+}
+
+function collectRecordDb3IdentitySets(record, targetSystem) {
+  const systemRows = record && record.systems && Array.isArray(record.systems[targetSystem]) ? record.systems[targetSystem] : [];
+  const dedupeKeys = new Set();
+  const dedupeHashes = new Set();
+  const references = new Set();
+  for (const seg of systemRows) {
+    const ref = db3NormalizedValue(seg?.reference);
+    if (ref) {
+      references.add(ref.toLowerCase());
+      dedupeKeys.add(`REF:${ref}`);
+    }
+    const key = db3NormalizedValue(seg?.db3DedupeKey);
+    if (key) dedupeKeys.add(key);
+    const hash = String(seg?.db3RowHash || '').trim().toLowerCase();
+    if (hash) dedupeHashes.add(hash);
+  }
+  return { dedupeKeys, dedupeHashes, references };
 }
 
 /** Persisted under planner record `data.systemBranches` — which top-level folders show under a jobsite. */
@@ -4240,6 +4316,99 @@ const DB3_SECTION_CORE_PHYSICAL_COLS = new Set(
   ].map((s) => s.toUpperCase())
 );
 
+const DB3_INSPECTOR_HINT_KEYS = new Set(
+  [
+    'OBJ_SURVEYEDBY',
+    'OBJ_SURVEYOR',
+    'OBJ_SURVEYORNAME',
+    'OBJ_INSPECTOR',
+    'OBJ_INSPECTORNAME',
+    'OBJ_INSPECTIONBY',
+    'OBJ_INSPECTEDBY',
+    'INS_INSPECTOR',
+    'INS_INSPECTORNAME',
+    'INS_INSPECTOR_NAME',
+    'INS_INSPECTIONBY',
+    'INS_INSPECTEDBY',
+    'INS_SURVEYOR',
+    'INS_SURVEYORNAME',
+    'INS_OPERATOR',
+    'INS_OPERATORNAME',
+    'INS_TECHNICIAN',
+    'INS_TECHNICIANNAME',
+    'INS_CREWLEADER',
+    'INS_CREW_LEADER',
+    'INS_FIELDLEAD',
+    'INS_FIELD_LEAD',
+    'INS_COMPLETEDBY'
+  ].map((k) => String(k).toUpperCase())
+);
+
+const DB3_INSPECTOR_ALIAS_MAP = new Map([
+  ['thomas', 'Mike Thomas'],
+  ['m thomas', 'Mike Thomas'],
+  ['mike thomas', 'Mike Thomas'],
+  ['mike s', 'Mike Strickland'],
+  ['m strickland', 'Mike Strickland'],
+  ['strickland', 'Mike Strickland'],
+  ['mike strickland', 'Mike Strickland'],
+  ['alec beck', 'Alec Beck']
+]);
+
+function db3InspectorAliasKey(value) {
+  return String(value == null ? '' : value)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function db3InspectorDisplay(value) {
+  return String(value == null ? '' : value)
+    .trim()
+    .replace(/\s+/g, ' ')
+    .replace(/\b\w/g, (m) => m.toUpperCase());
+}
+
+function db3InspectorIdentityFromImported(imported) {
+  const imp = imported && typeof imported === 'object' && !Array.isArray(imported) ? imported : {};
+  const read = (k) => {
+    const v = imp[k];
+    return typeof v === 'number' && Number.isFinite(v) ? String(v) : cleanString(v);
+  };
+  let raw = read('HP_INSPECTOR_RAW') || read('HP_EDIT_INSPECTED_BY') || read('HP_INSPECTOR_DISPLAY');
+  if (!raw) {
+    for (const [k, v] of Object.entries(imp)) {
+      const ku = String(k || '').toUpperCase();
+      const vv = typeof v === 'number' && Number.isFinite(v) ? String(v) : cleanString(v);
+      if (!vv) continue;
+      if (DB3_INSPECTOR_HINT_KEYS.has(ku)) {
+        raw = vv;
+        break;
+      }
+    }
+  }
+  if (!raw) {
+    for (const [k, v] of Object.entries(imp)) {
+      const ku = String(k || '').toUpperCase();
+      const vv = typeof v === 'number' && Number.isFinite(v) ? String(v) : cleanString(v);
+      if (!vv) continue;
+      if (/^INS_(PK|ID)$/.test(ku)) continue;
+      if (/INSPECT|SURVEY|OPERATOR|TECHNICIAN|CREW|FIELD.?LEAD|COMPLETEDBY/.test(ku)) {
+        raw = vv;
+        break;
+      }
+    }
+  }
+  raw = db3InspectorDisplay(raw);
+  if (!raw) return null;
+  const alias = db3InspectorAliasKey(raw);
+  const canonical = db3InspectorDisplay(DB3_INSPECTOR_ALIAS_MAP.get(alias) || raw);
+  const key = db3InspectorAliasKey(canonical) || alias;
+  return { raw, canonical, key };
+}
+
 /**
  * @param {any} db sql.js Database
  * @param {string} tableName
@@ -4663,6 +4832,15 @@ async function parseDb3(buffer) {
         let imported = extractDb3ImportedFromRow(raw, extraFrag.aliasNames);
         imported = mergeSecinspRowIntoDb3Imported(db, sectionT, secinspT || '', mapped.reference, imported);
         imported = mergeSecinspBySectionObjKeyColumn(db, secinspT || '', mapped.reference, imported);
+        const inspector = db3InspectorIdentityFromImported(imported);
+        if (inspector) {
+          imported.HP_INSPECTOR_RAW = inspector.raw;
+          imported.HP_INSPECTOR_DISPLAY = inspector.canonical;
+          imported.HP_INSPECTOR_KEY = inspector.key;
+          mapped.inspectorRaw = inspector.raw;
+          mapped.inspector = inspector.canonical;
+          mapped.inspectorKey = inspector.key;
+        }
         if (Object.keys(imported).length) {
           mapped.db3Imported = imported;
         }
@@ -8304,9 +8482,14 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
     const { targetClient, targetCity, targetJobsite, targetSystem } = resolveWincanImportScope(req.body, rows);
 
     const existingRecords = await findPlannerRecordsByScope(targetClient, targetCity, targetJobsite, { latestOnly: false });
+    const existingDedupeKeys = new Set();
+    const existingDedupeHashes = new Set();
     const existingRefs = new Set();
     existingRecords.forEach((record) => {
-      (record.systems[targetSystem] || []).forEach((segment) => existingRefs.add(String(segment.reference || '').toLowerCase()));
+      const scoped = collectRecordDb3IdentitySets(record, targetSystem);
+      scoped.dedupeKeys.forEach((key) => existingDedupeKeys.add(key));
+      scoped.dedupeHashes.forEach((hash) => existingDedupeHashes.add(hash));
+      scoped.references.forEach((ref) => existingRefs.add(ref));
     });
 
     const refKeys = rows.map((row) => String(row?.reference || '').trim().toLowerCase()).filter(Boolean);
@@ -8314,10 +8497,17 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
 
     const previewRows = rows.map((row) => {
       const refKey = String(row?.reference || '').trim().toLowerCase();
+      const identity = buildDb3DeterministicIdentity(row);
       const placedDup = refKey ? placedDupMap.get(refKey) : null;
+      const duplicate =
+        (identity.dedupeKey && existingDedupeKeys.has(identity.dedupeKey)) ||
+        (identity.dedupeHash && existingDedupeHashes.has(identity.dedupeHash.toLowerCase())) ||
+        existingRefs.has(refKey);
       return {
         ...row,
-        duplicate: existingRefs.has(refKey),
+        db3DedupeKey: identity.dedupeKey,
+        db3RowHash: identity.dedupeHash,
+        duplicate,
         placedDuplicate: !!placedDup,
         placedDuplicateOf: placedDup || null
       };
@@ -8359,14 +8549,23 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
       record = await createPlannerRecord(record);
     }
 
-    const refSet = new Set((record.systems[targetSystem] || []).map((segment) => String(segment.reference || '').toLowerCase()));
+    const existingIdentity = collectRecordDb3IdentitySets(record, targetSystem);
+    const refSet = existingIdentity.references;
+    const dedupeKeySet = existingIdentity.dedupeKeys;
+    const dedupeHashSet = existingIdentity.dedupeHashes;
     const queueImport = String(targetClient || '').trim().toLowerCase() === String(PSR_IMPORT_QUEUE_CLIENT).trim().toLowerCase();
     const commitRefKeys = rows.map((r) => String(r?.reference || '').trim().toLowerCase()).filter(Boolean);
     const placedAtCommit = queueImport ? await findPlacedDuplicatePayloadsByReferences(commitRefKeys) : new Map();
 
     rows.forEach((row) => {
       if (!row || row.duplicate) return;
-      if (refSet.has(String(row.reference || '').toLowerCase())) return;
+      const refLower = String(row.reference || '').trim().toLowerCase();
+      const identity = buildDb3DeterministicIdentity(row);
+      const dedupeKey = String(row.db3DedupeKey || identity.dedupeKey || '').trim();
+      const dedupeHash = String(row.db3RowHash || identity.dedupeHash || '').trim().toLowerCase();
+      if (refSet.has(refLower)) return;
+      if (dedupeKey && dedupeKeySet.has(dedupeKey)) return;
+      if (dedupeHash && dedupeHashSet.has(dedupeHash)) return;
       const refKey = String(row.reference || '').trim().toLowerCase();
       const placedDup = queueImport ? placedAtCommit.get(refKey) || null : null;
       const segment = normalizeSegment({
@@ -8383,6 +8582,8 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
         system: targetSystem,
         db3Imported: row.db3Imported,
         db3DuplicateOf: placedDup || undefined,
+        db3DedupeKey: dedupeKey,
+        db3RowHash: dedupeHash,
         versions: [
           defaultVersion(req.user.displayName || req.user.username, {
             status: 'neutral',
@@ -8393,6 +8594,8 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
       }, req.user.displayName || req.user.username);
       record.systems[targetSystem].push(segment);
       refSet.add(String(segment.reference || '').toLowerCase());
+      if (dedupeKey) dedupeKeySet.add(dedupeKey);
+      if (dedupeHash) dedupeHashSet.add(dedupeHash);
     });
 
     record.saved_by = req.user.displayName || req.user.username;
