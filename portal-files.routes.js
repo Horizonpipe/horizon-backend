@@ -1395,6 +1395,52 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
   function isPlanPdfShareMeta(meta) {
     return !!(meta && typeof meta === 'object' && !Array.isArray(meta) && String(meta.kind || '').toLowerCase() === 'plan-pdf-share-v1');
   }
+  function planShareFallbackFromRequestBody(body) {
+    const src = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+    const selectedDocStorageKey = String(
+      src.selectedDocStorageKey || src.selectedPdfStorageKey || src.selectedPdfKey || src.storageKey || ''
+    ).trim();
+    const selectedDocId = String(src.selectedDocId || src.selectedPdfDocId || src.docId || '').trim();
+    const selectedDocName = String(src.selectedDocName || src.fileName || src.name || '').trim();
+    return {
+      selectedDocStorageKey: isValidPipesyncPlanPageStorageKey(selectedDocStorageKey) ? selectedDocStorageKey : '',
+      selectedDocId: selectedDocId.slice(0, 80),
+      selectedDocName: selectedDocName.slice(0, 260)
+    };
+  }
+  function normalizePlanShareMetaForCreate(rawShareMeta, requestBody) {
+    const baseMeta = rawShareMeta && typeof rawShareMeta === 'object' && !Array.isArray(rawShareMeta) ? rawShareMeta : null;
+    const fallback = planShareFallbackFromRequestBody(requestBody);
+    const baseKind = String(baseMeta?.kind || '')
+      .trim()
+      .toLowerCase();
+    const baseStorageKey = String(baseMeta?.selectedPdf?.storageKey || baseMeta?.selectedPdf?.storage_key || '').trim();
+    const selectedDocStorageKey = isValidPipesyncPlanPageStorageKey(baseStorageKey)
+      ? baseStorageKey
+      : fallback.selectedDocStorageKey;
+    const planShareRequested = baseKind === 'plan-pdf-share-v1' || (!baseKind && !!fallback.selectedDocStorageKey);
+    if (!planShareRequested) {
+      return { planShare: false, shareMeta: baseMeta, selectedDocStorageKey: '' };
+    }
+    if (!selectedDocStorageKey) {
+      return { planShare: true, shareMeta: baseMeta, selectedDocStorageKey: '' };
+    }
+    const selectedPdfBase =
+      baseMeta && baseMeta.selectedPdf && typeof baseMeta.selectedPdf === 'object' && !Array.isArray(baseMeta.selectedPdf)
+        ? baseMeta.selectedPdf
+        : {};
+    const normalizedMeta = {
+      ...(baseMeta || {}),
+      kind: 'plan-pdf-share-v1',
+      selectedPdf: {
+        ...selectedPdfBase,
+        docId: String(selectedPdfBase.docId || fallback.selectedDocId || '').slice(0, 80),
+        name: String(selectedPdfBase.name || fallback.selectedDocName || 'Plan.pdf').slice(0, 260),
+        storageKey: selectedDocStorageKey
+      }
+    };
+    return { planShare: true, shareMeta: normalizedMeta, selectedDocStorageKey };
+  }
   function isPlanPdfSharePayload(payload) {
     return !!(
       payload &&
@@ -1491,16 +1537,29 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
       if (kind !== 'public' && kind !== 'interactive' && kind !== 'signin') {
         return res.status(400).json({ error: 'kind must be public, interactive, or signin' });
       }
-      const shareMeta = sanitizeShareMeta(shareMetaRaw);
-      const planShare = isPlanPdfShareMeta(shareMeta);
-      const resolvedClientId = planShare ? String(clientId || PLAN_SHARE_SENTINEL_CLIENT) : String(clientId || '');
-      const resolvedJobId = planShare ? String(jobId || PLAN_SHARE_SENTINEL_JOB) : String(jobId || '');
+      const sanitizedShareMeta = sanitizeShareMeta(shareMetaRaw);
+      const normalizedPlan = normalizePlanShareMetaForCreate(sanitizedShareMeta, req.body || {});
+      const shareMeta = normalizedPlan.shareMeta;
+      const planShare = normalizedPlan.planShare;
+      const resolvedClientId = planShare ? PLAN_SHARE_SENTINEL_CLIENT : String(clientId || '');
+      const resolvedJobId = planShare ? PLAN_SHARE_SENTINEL_JOB : String(jobId || '');
       if (!resolvedClientId || !resolvedJobId) {
-        return res.status(400).json({ error: 'clientId and jobId are required' });
+        return res.status(400).json({
+          error: 'clientId and jobId are required unless plan-pdf-share-v1 metadata includes a valid selected PDF storage key'
+        });
       }
       if (planShare) {
+        if (!normalizedPlan.selectedDocStorageKey) {
+          return res.status(400).json({
+            error:
+              'Plan share validation failed: include shareMeta.kind="plan-pdf-share-v1" plus selectedPdf.storageKey (or selectedDocStorageKey) with a valid synced plan key'
+          });
+        }
         if (!collectPlanShareVirtualFiles({ shareMeta }).length) {
-          return res.status(400).json({ error: 'Plan share requires at least one synced PDF page.' });
+          return res.status(400).json({
+            error:
+              'Plan share validation failed: selected plan key was not accepted. Ensure selectedPdf.storageKey points to a synced plan page key.'
+          });
         }
       } else if (!(await assertPortalJobAccess(pool, req.user, resolvedClientId, resolvedJobId))) {
         return res.status(403).json({ error: 'Forbidden' });
