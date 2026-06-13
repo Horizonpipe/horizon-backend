@@ -4270,6 +4270,29 @@ function sqliteTableList(db) {
   }
 }
 
+function sqliteObjectType(db, objectName) {
+  const target = cleanString(objectName);
+  if (!target) return '';
+  let stmt;
+  try {
+    stmt = db.prepare("SELECT type FROM sqlite_master WHERE lower(name) = lower(?) LIMIT 1");
+    stmt.bind([target]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      return cleanString(row.type).toLowerCase();
+    }
+  } catch {
+    return '';
+  } finally {
+    try {
+      stmt?.free();
+    } catch {
+      /* ignore */
+    }
+  }
+  return '';
+}
+
 function pickSqliteTable(actualNames, ...wanted) {
   const set = new Set(actualNames);
   const byLower = new Map(actualNames.map((n) => [n.toLowerCase(), n]));
@@ -4368,6 +4391,10 @@ const DB3_INSPECTOR_ALIAS_MAP = new Map([
   ['mike strickland', 'Mike Strickland'],
   ['alec beck', 'Alec Beck']
 ]);
+
+/** Guard against extremely wide SECINSP schemas generating huge OR predicates in sql.js. */
+const DB3_SECINSP_MAX_FK_COLUMNS = 32;
+const DB3_SECINSP_MAX_KEY_COLUMNS = 24;
 
 function db3InspectorAliasKey(value) {
   return String(value == null ? '' : value)
@@ -4576,6 +4603,9 @@ function mergeSecinspRowIntoDb3Imported(db, sectionTable, secinspTable, referenc
     }
   }
   if (!fkCols.length) return out;
+  if (fkCols.length > DB3_SECINSP_MAX_FK_COLUMNS) {
+    fkCols.splice(DB3_SECINSP_MAX_FK_COLUMNS);
+  }
   const SI = sqlIdentQuoted(secinspTable);
   const where = fkCols.map((c) => `${sqlIdentQuoted(c)} = ?`).join(' OR ');
   const ref = cleanString(reference);
@@ -4647,6 +4677,9 @@ function mergeSecinspBySectionObjKeyColumn(db, secinspTable, reference, imported
       return false;
     });
   if (!keyCols.length) return out;
+  if (keyCols.length > DB3_SECINSP_MAX_KEY_COLUMNS) {
+    keyCols.splice(DB3_SECINSP_MAX_KEY_COLUMNS);
+  }
   const SI = sqlIdentQuoted(secinspTable);
   for (const kcol of keyCols) {
     let stmt;
@@ -4720,6 +4753,9 @@ async function parseDb3(buffer) {
   const extraFrag = buildDb3SectionExtraSelect(db, sectionT);
   const nodeT = pickSqliteTable(tables, 'NODE');
   const secinspT = pickSqliteTable(tables, 'SECINSP');
+  const secinspType = secinspT ? sqliteObjectType(db, secinspT) : '';
+  const secinspSafeForJoin = !!secinspT && secinspType !== 'view';
+  const secinspRuntimeTable = secinspSafeForJoin ? secinspT : '';
   const projectT = pickSqliteTable(tables, 'PROJECT');
 
   let projectName = '';
@@ -4779,7 +4815,7 @@ async function parseDb3(buffer) {
 
   /** @type {string[]} */
   const sqlVariants = [];
-  if (secinspT && nodeT) {
+  if (secinspSafeForJoin && nodeT) {
     const SI = sqlIdentQuoted(secinspT);
     sqlVariants.push(`
     SELECT ${coreCols}
@@ -4844,8 +4880,10 @@ async function parseDb3(buffer) {
         const raw = stmt.getAsObject();
         const mapped = mapDb3SectionRow(raw, projectName);
         let imported = extractDb3ImportedFromRow(raw, extraFrag.aliasNames);
-        imported = mergeSecinspRowIntoDb3Imported(db, sectionT, secinspT || '', mapped.reference, imported);
-        imported = mergeSecinspBySectionObjKeyColumn(db, secinspT || '', mapped.reference, imported);
+        if (secinspRuntimeTable) {
+          imported = mergeSecinspRowIntoDb3Imported(db, sectionT, secinspRuntimeTable, mapped.reference, imported);
+          imported = mergeSecinspBySectionObjKeyColumn(db, secinspRuntimeTable, mapped.reference, imported);
+        }
         const inspector = db3InspectorIdentityFromImported(imported);
         if (inspector) {
           imported.HP_INSPECTOR_RAW = inspector.raw;
