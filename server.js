@@ -6036,23 +6036,17 @@ app.get('/permissions/tree', requireAuth, requireAdminPanelAccess, async (req, r
      * When planner canonical data is Wasabi-only, job labels and PSR tree come from the snapshot — not `planner_records` in Postgres.
      */
     const portalPathGrantsSql = `SELECT client_id, job_id, path_prefix
-         FROM portal_path_grants
-         WHERE client_id IS NOT NULL AND BTRIM(client_id) <> ''
+         FROM company_folder_grants
+         WHERE enabled = true
+           AND client_id IS NOT NULL AND BTRIM(client_id) <> ''
            AND job_id IS NOT NULL AND BTRIM(job_id) <> ''
          ORDER BY client_id, job_id, path_prefix`;
 
     if (PLANNER_STORE_WASABI_ONLY) {
       const scopePairsSql = `WITH scope_pairs AS (
-           SELECT client_id, job_id FROM user_portal_scopes
-           UNION
-           SELECT portal_files_client_id AS client_id, portal_files_job_id AS job_id
-           FROM users
-           WHERE portal_files_client_id IS NOT NULL
-             AND BTRIM(portal_files_client_id) <> ''
-             AND portal_files_job_id IS NOT NULL
-             AND BTRIM(portal_files_job_id) <> ''
-           UNION
-           SELECT client_id, job_id FROM portal_path_grants
+           SELECT client_id, job_id
+           FROM company_folder_grants
+           WHERE enabled = true
          ),
          scope_pairs_clean AS (
            SELECT DISTINCT BTRIM(client_id) AS client_id, BTRIM(job_id) AS job_id
@@ -6094,16 +6088,9 @@ app.get('/permissions/tree', requireAuth, requireAdminPanelAccess, async (req, r
     const [portalRows, portalPathRows, psrRows] = await Promise.all([
       pool.query(
         `WITH scope_pairs AS (
-           SELECT client_id, job_id FROM user_portal_scopes
-           UNION
-           SELECT portal_files_client_id AS client_id, portal_files_job_id AS job_id
-           FROM users
-           WHERE portal_files_client_id IS NOT NULL
-             AND BTRIM(portal_files_client_id) <> ''
-             AND portal_files_job_id IS NOT NULL
-             AND BTRIM(portal_files_job_id) <> ''
-           UNION
-           SELECT client_id, job_id FROM portal_path_grants
+           SELECT client_id, job_id
+           FROM company_folder_grants
+           WHERE enabled = true
          ),
          scope_pairs_clean AS (
            SELECT DISTINCT BTRIM(client_id) AS client_id, BTRIM(job_id) AS job_id
@@ -6767,6 +6754,7 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
   );
   const hasPortalScopesPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'portalScopes');
   const hasPsrScopesPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'psrScopes');
+  const hasLegacyScopeMutationPayload = hasPortalScopesPayload || hasPsrScopesPayload;
   const hasCompanyPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'companyId');
 
   try {
@@ -6807,8 +6795,16 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
     if (!current) {
       return res.status(404).json({ success: false, error: 'User not found' });
     }
-    const scopeMap = await readScopesForUserIds([id]);
-    const currentScopes = scopeMap.get(String(id)) || { portalScopes: [], psrScopes: [] };
+    const legacyScopeWarnings = [];
+    if (hasLegacyScopeMutationPayload) {
+      console.warn('[update-user] legacy scope payload ignored', {
+        userId: id,
+        hasPortalScopesPayload,
+        hasPsrScopesPayload
+      });
+      if (hasPortalScopesPayload) legacyScopeWarnings.push('portalScopes payload ignored (legacy scopes disabled)');
+      if (hasPsrScopesPayload) legacyScopeWarnings.push('psrScopes payload ignored (legacy scopes disabled)');
+    }
 
     const nextDisplayName = displayName || current.display_name || current.username;
     const actorIsGlobalAdmin = isAdminUser(req.user);
@@ -6885,27 +6881,9 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
       nextPortalFilesClientId = portalFilesClientId || null;
       nextPortalFilesJobId = portalFilesJobId || null;
     }
-    let nextPortalScopes = dedupePortalScopes(currentScopes.portalScopes);
-    if (hasPortalScopesPayload) {
-      nextPortalScopes = normalizePortalScopesPayload(req.body.portalScopes);
-      nextPortalFilesClientId = nextPortalScopes[0]?.clientId || null;
-      nextPortalFilesJobId = nextPortalScopes[0]?.jobId || null;
-    } else if (hasPortalScopeInPayload) {
-      nextPortalScopes =
-        portalFilesClientId && portalFilesJobId
-          ? [{ clientId: portalFilesClientId, jobId: portalFilesJobId }]
-          : [];
-    }
-    let nextPsrScopes = dedupePsrScopes(currentScopes.psrScopes);
-    if (hasPsrScopesPayload) {
-      nextPsrScopes = normalizePsrScopesPayload(req.body.psrScopes);
-    }
-
     let nextPortalFilesAccessGranted = current.portal_files_access_granted === true;
     if (hasAccessPayload) {
       nextPortalFilesAccessGranted = !!req.body.portalFilesAccessGranted;
-    } else if (hasPortalScopesPayload) {
-      nextPortalFilesAccessGranted = nextPortalScopes.length > 0;
     } else if (hasPortalScopeInPayload && portalFilesClientId && portalFilesJobId) {
       nextPortalFilesAccessGranted = true;
     }
@@ -6925,17 +6903,8 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
     const nextPortalPermissionsAccess =
       nextIsAdmin && (hasPortalPermissionsPayload ? !!req.body.portalPermissionsAccess : true);
     if (nextPortalFilesAccessGranted !== true && !nextAutosyncMasterGranted) {
-      nextPortalScopes = [];
       nextPortalFilesClientId = null;
       nextPortalFilesJobId = null;
-    }
-
-    if (hasPsrScopesPayload && PLANNER_STORE_WASABI_ONLY && !WASABI_WRITES_PRIMARY_ENABLED) {
-      return res.status(503).json({
-        success: false,
-        error:
-          'PSR scopes are stored only in Wasabi when WASABI_PLANNER_STORE_WASABI_ONLY or WASABI_APP_DATA_STORE_WASABI_ONLY is set. Enable WASABI_WRITES_PRIMARY_ENABLED=1 to save them.'
-      });
     }
 
     const passwordHash = password ? await bcrypt.hash(password, 10) : null;
@@ -6987,30 +6956,6 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
           throw new Error(
             'Could not update user in database (no matching row). Permissions list may not reflect this account until the database is in sync.'
           );
-        }
-
-        if (hasPortalScopesPayload || hasPortalScopeInPayload) {
-          await client.query('DELETE FROM user_portal_scopes WHERE user_id = $1', [String(id)]);
-          for (const scope of nextPortalScopes) {
-            await client.query(
-              `INSERT INTO user_portal_scopes (user_id, client_id, job_id)
-               VALUES ($1, $2, $3)
-               ON CONFLICT (user_id, client_id, job_id) DO NOTHING`,
-              [String(id), scope.clientId, scope.jobId]
-            );
-          }
-        }
-
-        if (hasPsrScopesPayload && !PLANNER_STORE_WASABI_ONLY) {
-          await client.query('DELETE FROM user_psr_scopes WHERE user_id = $1', [String(id)]);
-          for (const scope of nextPsrScopes) {
-            await client.query(
-              `INSERT INTO user_psr_scopes (user_id, client, city, jobsite, psr_record_id)
-               VALUES ($1, $2, $3, $4, $5)
-               ON CONFLICT (user_id, client, city, jobsite) DO NOTHING`,
-              [String(id), scope.client, scope.city, scope.jobsite, cleanString(scope.recordId || '') || null]
-            );
-          }
         }
 
         let updatedRow = updatedCoreResult.rows[0];
@@ -7079,32 +7024,6 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
           };
         }
 
-        if (hasPortalScopesPayload || hasPortalScopeInPayload) {
-          const portalScopes = ensureSnapshotTable(data, 'user_portal_scopes');
-          data.user_portal_scopes = portalScopes.filter((row) => String(row.user_id || '') !== String(id || ''));
-          for (const scope of nextPortalScopes) {
-            data.user_portal_scopes.push({
-              user_id: String(id),
-              client_id: scope.clientId,
-              job_id: scope.jobId
-            });
-          }
-        }
-
-        if (hasPsrScopesPayload) {
-          const psrScopes = ensureSnapshotTable(data, 'user_psr_scopes');
-          data.user_psr_scopes = psrScopes.filter((row) => String(row.user_id || '') !== String(id || ''));
-          for (const scope of nextPsrScopes) {
-            data.user_psr_scopes.push({
-              user_id: String(id),
-              client: scope.client,
-              city: scope.city,
-              jobsite: scope.jobsite,
-              psr_record_id: cleanString(scope.recordId || '') || null
-            });
-          }
-        }
-
         const sessions = ensureSnapshotTable(data, 'auth_sessions');
         data.auth_sessions = sessions.filter((row) => String(row.user_id || '') !== String(id || ''));
       });
@@ -7130,7 +7049,11 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
     }
 
     const user = await attachScopesToUser(normalizeUser(updatedResult.rows[0]));
-    res.json({ success: true, user });
+    res.json({
+      success: true,
+      user,
+      ...(legacyScopeWarnings.length ? { deprecated: legacyScopeWarnings } : {})
+    });
   } catch (error) {
     console.error('UPDATE USER ERROR:', error);
     res.status(500).json({ success: false, error: error.message });

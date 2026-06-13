@@ -43,6 +43,7 @@ const { canManagePortalExtras } = require('./capabilities');
 const {
   loadEffectivePathGrantsForUser,
   jobHasAnyEffectivePathGrants,
+  migrateLegacyScopeAuthorityForUserJob,
   recordTrashBinEntry,
   loadUserCompanyMembership,
   buildSkeletonPath
@@ -998,61 +999,18 @@ async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) 
   const j = String(jobId || '').trim();
   if (!c || !j) return false;
 
-  if (portalJobAllowedByPsrScopes(user, c, j)) return true;
+  void options;
 
-  const optWide = options.allowClientWideDataAutoSync;
-  let allowClientWideDataAutoSync = false;
-  if (optWide === true) {
-    if (isDataAutoSyncLineEmployee(user)) {
-      allowClientWideDataAutoSync = j === DATA_AUTO_SYNC_EMPLOYEE_JOB_ID;
-    } else if (userCanDataAutoSync(user)) {
-      allowClientWideDataAutoSync = false;
-    } else {
-      allowClientWideDataAutoSync = j === DATA_AUTO_SYNC_JOB_ID;
-    }
-  } else if (optWide !== false) {
-    allowClientWideDataAutoSync =
-      userCanDataAutoSync(user) && j === DATA_AUTO_SYNC_JOB_ID && !isDataAutoSyncLineEmployee(user);
+  const canonicalGrants = await loadEffectivePathGrantsForUser(pool, user, c, j);
+  if (canonicalGrants.length) return true;
+
+  // One-way compatibility bridge: lift legacy scope/path rows into canonical overrides.
+  const migrated = await migrateLegacyScopeAuthorityForUserJob(pool, user, c, j);
+  if (migrated) {
+    const migratedGrants = await loadEffectivePathGrantsForUser(pool, user, c, j);
+    if (migratedGrants.length) return true;
   }
 
-  const scopeList = Array.isArray(user.portalScopes) ? user.portalScopes : [];
-  if (scopeList.length) {
-    if (
-      scopeList.some((scope) => {
-        const uc = String(scope?.clientId || '').trim();
-        const uj = String(scope?.jobId || '').trim();
-        return uc === c && uj === j;
-      })
-    ) {
-      return true;
-    }
-    if (allowClientWideDataAutoSync) {
-      if (scopeList.some((scope) => String(scope?.clientId || '').trim() === c)) return true;
-    }
-  }
-  const username = String(user?.username || '').trim();
-  const email = String(user?.email || '').trim();
-  if (username || email) {
-    const directGrant = await pool.query(
-      `SELECT 1
-       FROM portal_path_grants
-       WHERE client_id = $1
-         AND job_id = $2
-         AND (
-           LOWER(TRIM(username)) = LOWER(TRIM($3))
-           OR ($4 <> '' AND LOWER(TRIM(username)) = LOWER(TRIM($4)))
-         )
-       LIMIT 1`,
-      [c, j, username, email]
-    );
-    if (directGrant.rows.length) return true;
-  }
-  // Backward-compatible fallback while legacy fields are still present.
-  const legacyClient = String(user.portalFilesClientId || '').trim();
-  const legacyJob = String(user.portalFilesJobId || '').trim();
-  if (!legacyClient || !legacyJob) return false;
-  if (c === legacyClient && j === legacyJob) return true;
-  if (allowClientWideDataAutoSync && c === legacyClient) return true;
   return false;
 }
 
@@ -1233,9 +1191,6 @@ async function assertPortalPathRel(grantPool, user, clientId, jobId, relPath, re
   if (!anyGrants) return true;
   const grants = await loadCombinedUserPathGrants(grantPool, clientId, jobId, user);
   if (!grants.length) {
-    if (portalJobAllowedByPsrScopes(user, String(clientId), String(jobId))) {
-      return true;
-    }
     return bypassPathGrantsForLenientPortalClient(user, grants);
   }
   const rp = normalizeRelPath(relPath);
@@ -1268,7 +1223,6 @@ async function assertRelPathMatchesPortalTreeVisibility(grantPool, req, clientId
     const best = bestPathGrantForRelPath(treeUserGrants, rp);
     return Boolean(best && normalizeGrantAccessMode(best.access_mode) !== 'off');
   }
-  if (portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) return true;
   if (isDas) {
     const ur = normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user));
     if (ur) return rp === ur || rp.startsWith(`${ur}/`);
@@ -1315,9 +1269,6 @@ async function createPortalPathVisibilityChecker(grantPool, req, clientId, jobId
         return Boolean(best && normalizeGrantAccessMode(best.access_mode) !== 'off');
       }
     };
-  }
-  if (portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) {
-    return { check: () => true };
   }
   if (isDas) {
     const ur = normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user));
@@ -1876,7 +1827,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         if (!bypassPathGrantsForLenientPortalClient(req.user, loaded)) {
           if (loaded.length) {
             userGrants = loaded;
-          } else if (!portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) {
+          } else {
             userGrants = loaded;
           }
         }
@@ -1971,20 +1922,18 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           if (treeUserGrants.length) {
             tree = filterTreeByPathGrants(tree, treeUserGrants, true);
             appliedPathGrantFilter = true;
-          } else if (!portalJobAllowedByPsrScopes(req.user, String(clientId), String(jobId))) {
-            if (isDataAutoSyncTreeList) {
-              const userRoot = dataAutosyncPortalUserFolderPrefix(req.user);
-              if (userRoot) {
-                tree = filterTreeToDescendantPrefix(tree, userRoot);
-                appliedPathGrantFilter = true;
-              } else {
-                tree = filterTreeByPathGrants(tree, treeUserGrants, true);
-                appliedPathGrantFilter = true;
-              }
+          } else if (isDataAutoSyncTreeList) {
+            const userRoot = dataAutosyncPortalUserFolderPrefix(req.user);
+            if (userRoot) {
+              tree = filterTreeToDescendantPrefix(tree, userRoot);
+              appliedPathGrantFilter = true;
             } else {
               tree = filterTreeByPathGrants(tree, treeUserGrants, true);
               appliedPathGrantFilter = true;
             }
+          } else {
+            tree = filterTreeByPathGrants(tree, treeUserGrants, true);
+            appliedPathGrantFilter = true;
           }
         }
       }
@@ -2434,82 +2383,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   });
 
   r.put('/permissions', express.json({ limit: '512kb' }), async (req, res) => {
-    try {
-      if (!userCanManagePortalExtras(req.user)) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-      const body = req.body || {};
-      const scope = resolvePortalScope(req, body);
-      const grants = body.grants;
-      if (scope.error || !Array.isArray(grants)) {
-        return res.status(400).json({ error: 'clientId, jobId, and grants array are required' });
-      }
-      const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-      const normalizedGrants = [];
-      for (const g of grants) {
-        const u = String(g.username || '').trim();
-        if (!u) continue;
-        let pp = '';
-        try {
-          pp = normalizeRelPath(g.pathPrefix != null ? String(g.pathPrefix) : '');
-        } catch (err) {
-          const m = err instanceof Error ? err.message : String(err);
-          return res.status(400).json({ error: `Invalid pathPrefix: ${m}` });
-        }
-        const rec = g.recursive !== false;
-        if (g.accessMode != null && !isValidGrantAccessMode(g.accessMode)) {
-          return res.status(400).json({ error: 'Invalid accessMode. Allowed: full, view, view_download, off' });
-        }
-        const accessMode = normalizeGrantAccessMode(g.accessMode || g.access_mode || 'full');
-        normalizedGrants.push([String(clientId), String(jobId), u, pp, rec, accessMode]);
-      }
-      const connectFn = poolOption && typeof poolOption.connect === 'function' ? poolOption.connect.bind(poolOption) : null;
-      if (connectFn) {
-        const client = await connectFn();
-        try {
-          await client.query('BEGIN');
-          await client.query(`DELETE FROM portal_path_grants WHERE client_id = $1 AND job_id = $2`, [
-            String(clientId),
-            String(jobId)
-          ]);
-          for (const params of normalizedGrants) {
-            await client.query(
-              `INSERT INTO portal_path_grants (client_id, job_id, username, path_prefix, recursive, access_mode) VALUES ($1,$2,$3,$4,$5,$6)`,
-              params
-            );
-          }
-          await client.query('COMMIT');
-        } catch (txErr) {
-          try {
-            await client.query('ROLLBACK');
-          } catch (_) {
-            // Preserve original transaction error when rollback also fails.
-          }
-          throw txErr;
-        } finally {
-          if (typeof client.release === 'function') client.release();
-        }
-      } else {
-        // Compatibility path for query-only pool adapters that do not expose `.connect()`.
-        await aclPool.query(`DELETE FROM portal_path_grants WHERE client_id = $1 AND job_id = $2`, [
-          String(clientId),
-          String(jobId)
-        ]);
-        for (const params of normalizedGrants) {
-          await aclPool.query(
-            `INSERT INTO portal_path_grants (client_id, job_id, username, path_prefix, recursive, access_mode) VALUES ($1,$2,$3,$4,$5,$6)`,
-            params
-          );
-        }
-      }
-      return res.json({ success: true });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return res.status(500).json({ error: msg });
-    }
+    return res.status(410).json({
+      success: false,
+      code: 'LEGACY_SCOPE_PATHS_DISABLED',
+      error: 'Legacy scope path grant mutation is disabled. Use company role/folder grants in Unified Permissions.'
+    });
   });
 
   /**
@@ -2518,52 +2396,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
    * Horizon admins only.
    */
   r.post('/permissions/grant', express.json({ limit: '64kb' }), async (req, res) => {
-    try {
-      if (!req.user?.isAdmin) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-      const body = req.body || {};
-      const scope = resolvePortalScope(req, body);
-      if (scope.error) {
-        return res.status(400).json({ error: 'clientId and jobId are required' });
-      }
-      const username = String(body.username || '').trim();
-      if (!username) {
-        return res.status(400).json({ error: 'username is required' });
-      }
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(scope.clientId), String(scope.jobId)))) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-      let pathPrefix = '';
-      try {
-        pathPrefix = normalizeRelPath(body.pathPrefix != null ? String(body.pathPrefix) : '');
-      } catch (err) {
-        const m = err instanceof Error ? err.message : String(err);
-        return res.status(400).json({ error: `Invalid pathPrefix: ${m}` });
-      }
-      const recursive = body.recursive !== false;
-      if (body.accessMode != null && !isValidGrantAccessMode(body.accessMode)) {
-        return res.status(400).json({ error: 'Invalid accessMode. Allowed: full, view, view_download, off' });
-      }
-      const accessMode = normalizeGrantAccessMode(body.accessMode || body.access_mode || 'view');
-      await aclPool.query(
-        `DELETE FROM portal_path_grants
-         WHERE client_id = $1 AND job_id = $2
-           AND LOWER(TRIM(username)) = LOWER(TRIM($3))
-           AND path_prefix = $4
-           AND COALESCE(recursive, true) = $5`,
-        [String(scope.clientId), String(scope.jobId), username, pathPrefix, recursive]
-      );
-      await aclPool.query(
-        `INSERT INTO portal_path_grants (client_id, job_id, username, path_prefix, recursive, access_mode)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [String(scope.clientId), String(scope.jobId), username, pathPrefix, recursive, accessMode]
-      );
-      return res.json({ success: true });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return res.status(500).json({ error: msg });
-    }
+    return res.status(410).json({
+      success: false,
+      code: 'LEGACY_SCOPE_PATHS_DISABLED',
+      error: 'Legacy scope path grant mutation is disabled. Use company role/folder grants in Unified Permissions.'
+    });
   });
 
   async function loadShareLinkRowForToken(tkn) {

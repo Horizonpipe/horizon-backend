@@ -78,6 +78,22 @@ function mergePortalGrantRows(rows) {
   return [...byPath.values()];
 }
 
+function accessModeToCompanyFlags(rawMode) {
+  const mode = String(rawMode || 'full')
+    .trim()
+    .toLowerCase();
+  if (mode === 'off' || mode === 'none') {
+    return { canView: false, canEdit: false, canDelete: false, canUpload: false, canDownload: false };
+  }
+  if (mode === 'view') {
+    return { canView: true, canEdit: false, canDelete: false, canUpload: false, canDownload: false };
+  }
+  if (mode === 'view_download') {
+    return { canView: true, canEdit: false, canDelete: false, canUpload: false, canDownload: true };
+  }
+  return { canView: true, canEdit: true, canDelete: true, canUpload: true, canDownload: true };
+}
+
 async function loadUserCompanyMembership(pool, userId) {
   const r = await pool.query(
     `SELECT m.id, m.user_id, m.company_id, m.role_key, m.override_folder_grants, m.created_at, m.updated_at,
@@ -126,19 +142,15 @@ async function loadCompanyFolderGrants(pool, companyId, roleKey, clientId, jobId
 }
 
 /**
- * Wrap existing portal_path_grants with company role grants and optional user overrides.
- * Existing per-user portal grants are preserved and merged (union, strongest mode wins).
+ * Canonical-only effective grants:
+ * company role grants + user override grants.
  */
 async function loadEffectivePathGrantsForUser(pool, user, clientId, jobId, loadUserPathGrantsFn) {
-  const portalGrants =
-    typeof loadUserPathGrantsFn === 'function'
-      ? await loadUserPathGrantsFn(pool, clientId, jobId, user)
-      : [];
-
-  if (!user?.id) return portalGrants;
+  void loadUserPathGrantsFn;
+  if (!user?.id) return [];
 
   const membership = await loadUserCompanyMembership(pool, user.id);
-  if (!membership) return portalGrants;
+  if (!membership) return [];
 
   const companyGrants = await loadCompanyFolderGrants(
     pool,
@@ -158,20 +170,150 @@ async function loadEffectivePathGrantsForUser(pool, user, clientId, jobId, loadU
     .filter(Boolean)
     .filter((g) => g.access_mode !== 'off');
 
-  if (!companyGrants.length && !overrideGrants.length) return portalGrants;
-  return mergePortalGrantRows([...portalGrants, ...companyGrants, ...overrideGrants]);
+  if (!companyGrants.length && !overrideGrants.length) return [];
+  return mergePortalGrantRows([...companyGrants, ...overrideGrants]);
 }
 
 async function jobHasAnyEffectivePathGrants(pool, user, clientId, jobId, portalJobHasPathGrantsFn) {
-  const portalHas =
-    typeof portalJobHasPathGrantsFn === 'function'
-      ? await portalJobHasPathGrantsFn(pool, clientId, jobId)
-      : false;
-  if (portalHas) return true;
+  void portalJobHasPathGrantsFn;
   if (!user?.id) return false;
   const membership = await loadUserCompanyMembership(pool, user.id);
   if (!membership) return false;
-  return companyJobHasFolderGrants(pool, membership.companyId, clientId, jobId, membership.roleKey);
+  if (await companyJobHasFolderGrants(pool, membership.companyId, clientId, jobId, membership.roleKey)) return true;
+  const wantClient = String(clientId || '').trim().toLowerCase();
+  const wantJob = String(jobId || '').trim().toLowerCase();
+  return (membership.overrideFolderGrants || []).some((entry) => {
+    const entryClient = String(entry?.clientId || entry?.client_id || '').trim().toLowerCase();
+    const entryJob = String(entry?.jobId || entry?.job_id || '').trim().toLowerCase();
+    return entryClient === wantClient && entryJob === wantJob;
+  });
+}
+
+async function migrateLegacyScopeAuthorityForUserJob(pool, user, clientId, jobId) {
+  const userId = String(user?.id || '').trim();
+  const username = String(user?.username || '').trim();
+  const email = String(user?.email || '').trim();
+  const c = String(clientId || '').trim();
+  const j = String(jobId || '').trim();
+  if (!userId || !c || !j) return false;
+
+  const membership = await loadUserCompanyMembership(pool, userId);
+  if (!membership) return false;
+
+  const existing = Array.isArray(membership.overrideFolderGrants) ? membership.overrideFolderGrants : [];
+  const merged = [...existing];
+  const existingKeys = new Set(
+    merged.map((entry) =>
+      `${String(entry?.clientId || entry?.client_id || '')
+        .trim()
+        .toLowerCase()}\0${String(entry?.jobId || entry?.job_id || '')
+        .trim()
+        .toLowerCase()}\0${normalizeRelPath(entry?.pathPrefix || entry?.path_prefix || '')}`
+    )
+  );
+  const nowIso = new Date().toISOString();
+  const pushIfMissing = (entry) => {
+    const key = `${String(entry.clientId || '')
+      .trim()
+      .toLowerCase()}\0${String(entry.jobId || '')
+      .trim()
+      .toLowerCase()}\0${normalizeRelPath(entry.pathPrefix || '')}`;
+    if (existingKeys.has(key)) return;
+    existingKeys.add(key);
+    merged.push(entry);
+  };
+
+  const portalScopeRes = await pool.query(
+    `SELECT 1
+     FROM user_portal_scopes
+     WHERE user_id = $1 AND client_id = $2 AND job_id = $3
+     LIMIT 1`,
+    [userId, c, j]
+  );
+  if (portalScopeRes.rows.length) {
+    pushIfMissing({
+      clientId: c,
+      jobId: j,
+      pathPrefix: '',
+      enabled: true,
+      canView: true,
+      canEdit: true,
+      canDelete: true,
+      canUpload: true,
+      canDownload: true,
+      source: 'legacy-user-portal-scopes',
+      migratedAt: nowIso
+    });
+  }
+
+  const psrScopeRes = await pool.query(
+    `SELECT 1
+     FROM user_psr_scopes
+     WHERE user_id = $1
+       AND UPPER(TRIM(client)) = UPPER(TRIM($2))
+       AND (
+         (psr_record_id IS NOT NULL AND BTRIM(psr_record_id) <> '' AND UPPER(TRIM(psr_record_id)) = UPPER(TRIM($3)))
+         OR UPPER(TRIM(jobsite)) = UPPER(TRIM($3))
+       )
+     LIMIT 1`,
+    [userId, c, j]
+  );
+  if (psrScopeRes.rows.length) {
+    pushIfMissing({
+      clientId: c,
+      jobId: j,
+      pathPrefix: '',
+      enabled: true,
+      canView: true,
+      canEdit: true,
+      canDelete: true,
+      canUpload: true,
+      canDownload: true,
+      source: 'legacy-user-psr-scopes',
+      migratedAt: nowIso
+    });
+  }
+
+  if (username || email) {
+    const pathGrantRes = await pool.query(
+      `SELECT path_prefix, COALESCE(recursive, true) AS recursive, COALESCE(access_mode, 'full') AS access_mode
+       FROM portal_path_grants
+       WHERE client_id = $1
+         AND job_id = $2
+         AND (
+           LOWER(TRIM(username)) = LOWER(TRIM($3))
+           OR ($4 <> '' AND LOWER(TRIM(username)) = LOWER(TRIM($4)))
+         )`,
+      [c, j, username, email]
+    );
+    for (const row of pathGrantRes.rows) {
+      const flags = accessModeToCompanyFlags(row.access_mode);
+      pushIfMissing({
+        clientId: c,
+        jobId: j,
+        pathPrefix: normalizeRelPath(row.path_prefix || ''),
+        enabled: row.access_mode !== 'off' && row.access_mode !== 'none',
+        canView: flags.canView,
+        canEdit: flags.canEdit,
+        canDelete: flags.canDelete,
+        canUpload: flags.canUpload,
+        canDownload: flags.canDownload,
+        recursive: row.recursive !== false,
+        source: 'legacy-portal-path-grants',
+        migratedAt: nowIso
+      });
+    }
+  }
+
+  if (merged.length === existing.length) return false;
+  await pool.query(
+    `UPDATE user_company_membership
+     SET override_folder_grants = $1::jsonb,
+         updated_at = NOW()
+     WHERE user_id = $2`,
+    [JSON.stringify(merged), userId]
+  );
+  return true;
 }
 
 function buildSkeletonPath(clientId, jobId, relPath) {
@@ -216,6 +358,7 @@ module.exports = {
   companyJobHasFolderGrants,
   loadEffectivePathGrantsForUser,
   jobHasAnyEffectivePathGrants,
+  migrateLegacyScopeAuthorityForUserJob,
   buildSkeletonPath,
   recordTrashBinEntry,
   mergePortalGrantRows
