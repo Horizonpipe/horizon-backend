@@ -694,7 +694,6 @@ async function hydratePlanBoardPageRow(p) {
 async function hydratePlanBoardLegacyPieceRow(p) {
   if (!p || typeof p !== 'object') return p;
   const copy = { ...p };
-  delete copy.viewUrl;
   const sk = String(copy.storageKey || '').trim();
   if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
     try {
@@ -715,7 +714,6 @@ async function hydratePlanBoardLegacyPieceRow(p) {
 async function hydratePlanBoardLegacyPlanRow(d) {
   if (!d || typeof d !== 'object') return d;
   const copy = { ...d };
-  delete copy.viewUrl;
   const sk = String(copy.storageKey || '').trim();
   if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
     try {
@@ -797,6 +795,21 @@ async function hydratePlanViewPayloadForResponse(payload) {
   return hydratePlanBoardBranch(payload);
 }
 
+function isLegacyPlanPdfStorageKey(key) {
+  const norm = String(key || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .toLowerCase();
+  return norm.startsWith('clients/');
+}
+
+function isPersistablePlanPdfStorageKey(key) {
+  const sk = String(key || '').trim();
+  if (!sk) return false;
+  return isValidPipesyncPlanPageStorageKey(sk) || isLegacyPlanPdfStorageKey(sk);
+}
+
 function sanitizePlanBoardBranch(branch) {
   if (!branch || typeof branch !== 'object') return branch;
   let clone;
@@ -813,9 +826,12 @@ function sanitizePlanBoardBranch(branch) {
         delete o.viewUrl;
         const sk = String(o.storageKey || '').trim();
         if (String(o.kind) === 'pdf') {
-          if (!isValidPipesyncPlanPageStorageKey(sk)) return null;
-          delete o.src;
-          return o;
+          if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+            delete o.src;
+            return o;
+          }
+          if (sk && isLegacyPlanPdfStorageKey(sk)) return o;
+          return null;
         }
         if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
           delete o.src;
@@ -841,9 +857,12 @@ function sanitizePlanBoardBranch(branch) {
               delete o.viewUrl;
               const sk = String(o.storageKey || '').trim();
               if (String(o.kind) === 'pdf') {
-                if (!isValidPipesyncPlanPageStorageKey(sk)) return null;
-                delete o.src;
-                return o;
+                if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+                  delete o.src;
+                  return o;
+                }
+                if (sk && isLegacyPlanPdfStorageKey(sk)) return o;
+                return null;
               }
               if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
                 delete o.src;
@@ -863,17 +882,17 @@ function sanitizePlanBoardBranch(branch) {
       .map((d) => {
         if (!d || typeof d !== 'object') return null;
         const o = { ...d };
-        delete o.viewUrl;
         const sk = String(o.storageKey || '').trim();
-        if (sk && !isValidPipesyncPlanPageStorageKey(sk)) return null;
+        if (sk && !isPersistablePlanPdfStorageKey(sk)) return null;
+        if (sk && isValidPipesyncPlanPageStorageKey(sk)) delete o.viewUrl;
         if (Array.isArray(o.pieces)) {
           o.pieces = o.pieces
             .map((p) => {
               if (!p || typeof p !== 'object') return null;
               const piece = { ...p };
-              delete piece.viewUrl;
               const psk = String(piece.storageKey || '').trim();
-              if (!isValidPipesyncPlanPageStorageKey(psk)) return null;
+              if (!isPersistablePlanPdfStorageKey(psk)) return null;
+              if (isValidPipesyncPlanPageStorageKey(psk)) delete piece.viewUrl;
               return piece;
             })
             .filter(Boolean);
@@ -881,7 +900,7 @@ function sanitizePlanBoardBranch(branch) {
           o.pieces = [];
         }
         if (!o.pieces.length) return null;
-        if (!isValidPipesyncPlanPageStorageKey(sk)) {
+        if (!isPersistablePlanPdfStorageKey(sk)) {
           // Keep split-page metadata for docs whose original archive sync is still pending.
           // Without this, PDF doc identity disappears across saves and breaks unassigned parity.
           delete o.storageKey;
