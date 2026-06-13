@@ -16,7 +16,19 @@ const { registerCompanyPermissionsRoutes } = require('./company-permissions.rout
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
 const { registerSignupRoutes } = require('./signup.routes');
 const { loadUserCompanyMembership, normalizeAppFeatures } = require('./company-permissions.service');
-const { resolveCapabilities, canAccessAdminPanel, canManagePortalExtras } = require('./capabilities');
+const {
+  ACCOUNT_TYPES,
+  EMPLOYEE_ROLES,
+  normalizeAccountType,
+  normalizeEmployeeRole,
+  deriveAccountModel,
+  legacyRolesForAccountModel,
+  resolveCapabilities,
+  canAccessAdminPanel,
+  canManagePortalExtras,
+  isAdminUser,
+  looksLikeMike
+} = require('./capabilities');
 const {
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,
@@ -1863,13 +1875,23 @@ function normalizeRoles(value) {
  * Login itself is gated by credentials + email verification, not by this flag.
  */
 function userHasAnyAssignedAccess(row) {
+  const accountModel = deriveAccountModel({
+    accountType: row?.account_type ?? row?.accountType,
+    employeeRole: row?.employee_role ?? row?.employeeRole,
+    isAdmin: row?.is_admin ?? row?.isAdmin,
+    roles: row?.roles,
+    username: row?.username,
+    display_name: row?.display_name,
+    displayName: row?.displayName,
+    email: row?.email
+  });
+  if (accountModel.accountType === ACCOUNT_TYPES.EMPLOYEE && accountModel.employeeRole) return true;
   if (row?.is_admin) return true;
   const roles = normalizeRoles(row?.roles);
   const hasRoleAccess = Object.values(roles).some((v) => v === true);
   const hasPortalFiles = row?.portal_files_access_granted === true;
   const hasAutosyncMaster = row?.autosync_master_granted === true;
-  const hasPortalPermissionUi =
-    !!row?.portal_permissions_access || portalPermissionsWhitelistHas(row?.username);
+  const hasPortalPermissionUi = !!row?.portal_permissions_access || canManagePortalExtras(row);
   return hasRoleAccess || hasPortalFiles || hasAutosyncMaster || hasPortalPermissionUi;
 }
 
@@ -2014,6 +2036,21 @@ function mergeUserPrefsPatch(current, patch) {
 }
 
 function normalizeUser(row) {
+  const accountModel = deriveAccountModel({
+    accountType: row?.account_type,
+    employeeRole: row?.employee_role,
+    isAdmin: row?.is_admin,
+    roles: row?.roles,
+    username: row?.username,
+    display_name: row?.display_name,
+    email: row?.email
+  });
+  const legacyRoles = normalizeRoles(row?.roles);
+  const canonicalRoles = legacyRolesForAccountModel(accountModel, legacyRoles);
+  const canonicalIsAdmin =
+    accountModel.accountType === ACCOUNT_TYPES.EMPLOYEE &&
+    (accountModel.employeeRole === EMPLOYEE_ROLES.ADMIN || accountModel.employeeRole === EMPLOYEE_ROLES.SUPERADMIN);
+
   const id = row.id;
   const selfSignup = row?.self_signup === true;
   const legacyUserScoped = id != null && String(id).trim() && PORTAL_USER_SCOPED_DEFAULTS;
@@ -2059,7 +2096,12 @@ function normalizeUser(row) {
   }
 
   const portalPermissionsAccessRaw = !!row.portal_permissions_access;
-  const portalPermissionsAccess = portalPermissionsAccessRaw || portalPermissionsWhitelistHas(row.username);
+  const portalPermissionsAccess = portalPermissionsAccessRaw || canManagePortalExtras({
+    ...row,
+    accountType: accountModel.accountType,
+    employeeRole: accountModel.employeeRole,
+    isAdmin: canonicalIsAdmin
+  });
   return {
     id,
     username: row.username,
@@ -2071,8 +2113,12 @@ function normalizeUser(row) {
     title: row.title || undefined,
     phone: row.phone || undefined,
     emailVerified: row.email_verified !== false,
-    isAdmin: !!row.is_admin,
-    roles: normalizeRoles(row.roles),
+    isAdmin: canonicalIsAdmin,
+    isSuperAdmin:
+      accountModel.accountType === ACCOUNT_TYPES.EMPLOYEE && accountModel.employeeRole === EMPLOYEE_ROLES.SUPERADMIN,
+    accountType: accountModel.accountType,
+    employeeRole: accountModel.employeeRole,
+    roles: canonicalRoles,
     mustChangePassword: !!row.must_change_password,
     selfSignup,
     portalFilesAccessGranted,
@@ -3844,7 +3890,7 @@ async function readFreshUserFromPostgresById(userId) {
   const id = String(userId || '').trim();
   if (!id) return null;
   const result = await pool.query(
-    `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
+    `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id,
             portal_permissions_access, portal_files_access_granted, autosync_master_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
             product_tutorials_seen, portal_workspace_layouts, user_prefs
      FROM users
@@ -4058,7 +4104,7 @@ async function requireAuth(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  if (!req.user?.isAdmin) {
+  if (!isAdminUser(req.user)) {
     return res.status(403).json({ success: false, error: 'Admin access required' });
   }
   return next();
@@ -4076,7 +4122,7 @@ function requireAdminPanelAccess(req, res, next) {
 
 function userRoleEnabled(user, roleKey) {
   if (!user || !roleKey) return false;
-  if (user.isAdmin) return true;
+  if (isAdminUser(user)) return true;
   const roles = normalizeRoles(user.roles);
   return roles[roleKey] === true;
 }
@@ -4087,7 +4133,7 @@ function requireAnyRole(roleKeys, message = 'Access denied for this feature') {
     if (!req.user) {
       return res.status(401).json({ success: false, error: 'Authentication required' });
     }
-    if (req.user.isAdmin) return next();
+    if (isAdminUser(req.user)) return next();
     const allowed = keys.some((k) => userRoleEnabled(req.user, k));
     if (!allowed) {
       return res.status(403).json({ success: false, error: message });
@@ -4096,18 +4142,37 @@ function requireAnyRole(roleKeys, message = 'Access denied for this feature') {
   };
 }
 
-const requirePlannerAccess = requireAnyRole(
-  ['psrPlanner', 'psrViewer', 'psrDataEntry', 'camera', 'vac', 'simpleVac', 'pricingView', 'footageView'],
-  'Planner access is not enabled for this account'
-);
-const requirePsrViewerAccess = requireAnyRole(
-  ['psrViewer', 'psrDataEntry', 'psrPlanner', 'camera', 'vac', 'simpleVac', 'pricingView', 'footageView'],
-  'PSR viewer access is not enabled for this account'
-);
-const requirePsrDataEntryAccess = requireAnyRole(
-  ['psrDataEntry', 'psrPlanner', 'camera', 'vac', 'simpleVac'],
-  'PSR data entry access is not enabled for this account'
-);
+function customerHasAssignedPsrScopes(user) {
+  return normalizeAccountType(user?.accountType) === ACCOUNT_TYPES.CUSTOMER && Array.isArray(user?.psrScopes) && user.psrScopes.length > 0;
+}
+const requirePlannerAccess = (req, res, next) => {
+  if (!req.user) return res.status(401).json({ success: false, error: 'Authentication required' });
+  if (isAdminUser(req.user)) return next();
+  if (customerHasAssignedPsrScopes(req.user)) return next();
+  const allowed = ['psrPlanner', 'psrViewer', 'psrDataEntry', 'camera', 'vac', 'simpleVac', 'pricingView', 'footageView'].some((k) =>
+    userRoleEnabled(req.user, k)
+  );
+  if (allowed) return next();
+  return res.status(403).json({ success: false, error: 'Planner access is not enabled for this account' });
+};
+const requirePsrViewerAccess = (req, res, next) => {
+  if (!req.user) return res.status(401).json({ success: false, error: 'Authentication required' });
+  if (isAdminUser(req.user)) return next();
+  if (customerHasAssignedPsrScopes(req.user)) return next();
+  const allowed = ['psrViewer', 'psrDataEntry', 'psrPlanner', 'camera', 'vac', 'simpleVac', 'pricingView', 'footageView'].some((k) =>
+    userRoleEnabled(req.user, k)
+  );
+  if (allowed) return next();
+  return res.status(403).json({ success: false, error: 'PSR viewer access is not enabled for this account' });
+};
+const requirePsrDataEntryAccess = (req, res, next) => {
+  if (!req.user) return res.status(401).json({ success: false, error: 'Authentication required' });
+  if (isAdminUser(req.user)) return next();
+  if (customerHasAssignedPsrScopes(req.user)) return next();
+  const allowed = ['psrDataEntry', 'psrPlanner', 'camera', 'vac', 'simpleVac'].some((k) => userRoleEnabled(req.user, k));
+  if (allowed) return next();
+  return res.status(403).json({ success: false, error: 'PSR data entry access is not enabled for this account' });
+};
 const requireDataAutoSyncEmployeeAccess = requireAnyRole(
   ['dataAutoSyncEmployee'],
   'DataAutoSync employee access is not enabled for this account'
@@ -4211,15 +4276,13 @@ function requireMike(req, res, next) {
 }
 
 function isMikeStricklandUser(user) {
-  const username = String(user?.username || '').trim().toLowerCase();
-  const displayName = String(user?.displayName || '').trim().toLowerCase();
-  const email = String(user?.email || '').trim().toLowerCase();
-  return (
-    username === 'mik' ||
-    username === 'mike strickland' ||
-    displayName === 'mike strickland' ||
-    email === 'mike@horizonpipe.com'
-  );
+  return looksLikeMike(user);
+}
+
+function isVacLineOperator(user) {
+  const model = deriveAccountModel(user || {});
+  if (model.accountType !== ACCOUNT_TYPES.EMPLOYEE) return false;
+  return model.employeeRole === EMPLOYEE_ROLES.VAC_OPERATOR || model.employeeRole === EMPLOYEE_ROLES.SIMPLE_VAC;
 }
 
 function fileToStoredJson(file) {
@@ -4741,7 +4804,36 @@ async function parseDb3(buffer) {
   const SQL = await sqlJsPromise;
   const db = new SQL.Database(new Uint8Array(buffer));
   const tables = sqliteTableList(db);
-  const sectionT = pickSqliteTable(tables, 'SECTION');
+  const preferredSection = pickSqliteTable(tables, 'SECTION');
+  let sectionT = preferredSection;
+  const preferredSectionType = sectionT ? sqliteObjectType(db, sectionT) : '';
+  if (!sectionT || preferredSectionType === 'view') {
+    /** @type {{ name: string, score: number }[]} */
+    const candidates = [];
+    for (const tableName of tables) {
+      if (!tableName) continue;
+      if (tableName === preferredSection) continue;
+      if (sqliteObjectType(db, tableName) !== 'table') continue;
+      const cols = sqlitePragmaColumns(db, tableName).map((c) => String(c.name || '').toUpperCase());
+      const set = new Set(cols);
+      if (!set.has('OBJ_KEY')) continue;
+      let score = 0;
+      if (String(tableName).toUpperCase().includes('SECTION')) score += 6;
+      if (set.has('OBJ_LENGTH')) score += 3;
+      if (set.has('OBJ_FROMNODE_REF')) score += 2;
+      if (set.has('OBJ_TONODE_REF')) score += 2;
+      if (set.has('OBJ_MATERIAL')) score += 1;
+      if (set.has('OBJ_SHAPE')) score += 1;
+      if (set.has('OBJ_SIZE1')) score += 1;
+      if (set.has('OBJ_SIZE2')) score += 1;
+      candidates.push({ name: tableName, score });
+    }
+    candidates.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
+    });
+    if (candidates.length) sectionT = candidates[0].name;
+  }
   if (!sectionT) {
     db.close();
     const preview = tables.slice(0, 40).join(', ') || '(none)';
@@ -4752,6 +4844,8 @@ async function parseDb3(buffer) {
   }
   const extraFrag = buildDb3SectionExtraSelect(db, sectionT);
   const nodeT = pickSqliteTable(tables, 'NODE');
+  const nodeType = nodeT ? sqliteObjectType(db, nodeT) : '';
+  const nodeRuntimeTable = nodeT && nodeType !== 'view' ? nodeT : '';
   const secinspT = pickSqliteTable(tables, 'SECINSP');
   const secinspType = secinspT ? sqliteObjectType(db, secinspT) : '';
   const secinspSafeForJoin = !!secinspT && secinspType !== 'view';
@@ -4775,7 +4869,7 @@ async function parseDb3(buffer) {
   }
 
   const S = sqlIdentQuoted(sectionT);
-  const N = nodeT ? sqlIdentQuoted(nodeT) : '';
+  const N = nodeRuntimeTable ? sqlIdentQuoted(nodeRuntimeTable) : '';
 
   const coreCols = `
       s.OBJ_Key AS reference,
@@ -4815,7 +4909,7 @@ async function parseDb3(buffer) {
 
   /** @type {string[]} */
   const sqlVariants = [];
-  if (secinspSafeForJoin && nodeT) {
+  if (secinspSafeForJoin && nodeRuntimeTable) {
     const SI = sqlIdentQuoted(secinspT);
     sqlVariants.push(`
     SELECT ${coreCols}
@@ -4851,7 +4945,7 @@ async function parseDb3(buffer) {
     LEFT JOIN ${N} n2 ON n2.OBJ_PK = s.OBJ_ToNode_REF
     ORDER BY s.OBJ_Key`);
   }
-  if (nodeT) {
+  if (nodeRuntimeTable) {
     sqlVariants.push(`
     SELECT ${coreColsNoInsp}
     FROM ${S} s
@@ -4938,6 +5032,8 @@ async function ensureSchema() {
 
   const userAlters = [
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type TEXT NOT NULL DEFAULT 'employee'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS employee_role TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "dataAutoSyncEmployee": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_client_id TEXT`,
@@ -4984,6 +5080,7 @@ async function ensureSchema() {
   await pool.query(
     `ALTER TABLE users ALTER COLUMN roles SET DEFAULT '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "dataAutoSyncEmployee": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb`
   );
+  await pool.query(`ALTER TABLE users ALTER COLUMN account_type SET DEFAULT 'employee'`);
   await pool.query(`ALTER TABLE users ALTER COLUMN portal_files_access_granted SET DEFAULT false`);
   await pool.query(
     `UPDATE users
@@ -4994,6 +5091,42 @@ async function ensureSchema() {
     `UPDATE users
      SET roles = '{"camera": false, "vac": false, "simpleVac": false, "email": false, "psrPlanner": false, "psrViewer": false, "psrDataEntry": false, "dataAutoSyncEmployee": false, "pricingView": false, "footageView": false, "portalUpload": false, "portalDownload": false, "portalEdit": false, "portalDelete": false}'::jsonb
                  || COALESCE(roles, '{}'::jsonb)`
+  );
+  await pool.query(
+    `UPDATE users
+     SET account_type = CASE
+       WHEN LOWER(TRIM(COALESCE(username, ''))) IN ('mik', 'mike strickland')
+         OR LOWER(TRIM(COALESCE(display_name, ''))) = 'mike strickland'
+         OR LOWER(TRIM(COALESCE(email, ''))) = 'mike@horizonpipe.com'
+         OR is_admin = true
+         OR LOWER(COALESCE(roles ->> 'camera', 'false')) = 'true'
+         OR LOWER(COALESCE(roles ->> 'vac', 'false')) = 'true'
+         OR LOWER(COALESCE(roles ->> 'simpleVac', 'false')) = 'true'
+         OR LOWER(COALESCE(roles ->> 'psrPlanner', 'false')) = 'true'
+         OR LOWER(COALESCE(roles ->> 'psrDataEntry', 'false')) = 'true'
+         OR LOWER(COALESCE(roles ->> 'psrViewer', 'false')) = 'true'
+         OR LOWER(COALESCE(roles ->> 'dataAutoSyncEmployee', 'false')) = 'true'
+         THEN 'employee'
+       ELSE 'customer'
+     END
+     WHERE account_type IS NULL
+        OR BTRIM(account_type) = ''
+        OR LOWER(BTRIM(account_type)) NOT IN ('employee', 'customer')`
+  );
+  await pool.query(
+    `UPDATE users
+     SET employee_role = CASE
+       WHEN LOWER(TRIM(COALESCE(username, ''))) IN ('mik', 'mike strickland')
+         OR LOWER(TRIM(COALESCE(display_name, ''))) = 'mike strickland'
+         OR LOWER(TRIM(COALESCE(email, ''))) = 'mike@horizonpipe.com'
+         THEN 'superadmin'
+       WHEN is_admin = true THEN 'admin'
+       WHEN LOWER(COALESCE(roles ->> 'simpleVac', 'false')) = 'true' THEN 'simple_vac'
+       WHEN LOWER(COALESCE(roles ->> 'vac', 'false')) = 'true' THEN 'vac_operator'
+       WHEN LOWER(COALESCE(roles ->> 'camera', 'false')) = 'true' THEN 'camera_operator'
+       WHEN LOWER(COALESCE(account_type, 'employee')) = 'employee' THEN COALESCE(NULLIF(BTRIM(employee_role), ''), 'camera_operator')
+       ELSE NULL
+     END`
   );
   await pool.query(
     `UPDATE users
@@ -5503,6 +5636,8 @@ async function ensureSchema() {
         username: 'mik',
         displayName: 'Mike Strickland',
         isAdmin: true,
+        accountType: 'employee',
+        employeeRole: 'superadmin',
         roles: {
           camera: true,
           vac: true,
@@ -5517,6 +5652,8 @@ async function ensureSchema() {
         username: 'nick',
         displayName: 'Nick Krull',
         isAdmin: true,
+        accountType: 'employee',
+        employeeRole: 'admin',
         roles: {
           camera: true,
           vac: true,
@@ -5531,6 +5668,8 @@ async function ensureSchema() {
         username: 'tyler',
         displayName: 'Tyler Clark',
         isAdmin: true,
+        accountType: 'employee',
+        employeeRole: 'admin',
         roles: {
           camera: true,
           vac: true,
@@ -5545,9 +5684,9 @@ async function ensureSchema() {
     for (const user of defaults) {
       const hash = await bcrypt.hash('1234', 10);
       await pool.query(
-        `INSERT INTO users (username, display_name, password, is_admin, roles, must_change_password)
-         VALUES ($1, $2, $3, $4, $5::jsonb, true)`,
-        [user.username, user.displayName, hash, user.isAdmin, JSON.stringify(user.roles)]
+        `INSERT INTO users (username, display_name, password, is_admin, account_type, employee_role, roles, must_change_password)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, true)`,
+        [user.username, user.displayName, hash, user.isAdmin, user.accountType, user.employeeRole, JSON.stringify(user.roles)]
       );
     }
   }
@@ -5868,7 +6007,7 @@ app.get('/users', requireAuth, async (req, res) => {
     const currentUser = req.user;
     /** Permissions UI must reflect Postgres immediately after saves — do not prefer stale Wasabi snapshots here. */
     const result = await pool.query(
-      `SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup
+      `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup
        FROM users
        ORDER BY LOWER(COALESCE(display_name, username)), LOWER(username)`
     );
@@ -6025,7 +6164,7 @@ app.post('/login', async (req, res) => {
     let userRowFromWasabi = false;
     try {
       const result = await pool.query(
-        `SELECT id, username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id,
+        `SELECT id, username, display_name, password, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id,
                 email, email_verified, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup, product_tutorials_seen, user_prefs
          FROM users u
          WHERE LOWER(TRIM(u.username)) = LOWER(TRIM($1))
@@ -6462,20 +6601,26 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
   const username = cleanString(req.body?.username);
   const displayName = cleanString(req.body?.displayName || username);
   const password = cleanString(req.body?.password || '1234');
-  let isAdmin = !!req.body?.isAdmin;
-  if (!req.user?.isAdmin || !isMikeStricklandUser(req.user)) {
-    isAdmin = false;
+  const accountType = normalizeAccountType(req.body?.accountType || ACCOUNT_TYPES.EMPLOYEE);
+  let employeeRole =
+    accountType === ACCOUNT_TYPES.EMPLOYEE
+      ? normalizeEmployeeRole(req.body?.employeeRole || EMPLOYEE_ROLES.CAMERA_OPERATOR)
+      : null;
+  if (accountType === ACCOUNT_TYPES.EMPLOYEE && !employeeRole) employeeRole = EMPLOYEE_ROLES.CAMERA_OPERATOR;
+  const actorIsMike = isMikeStricklandUser(req.user);
+  const targetLooksMike =
+    looksLikeMike({ username, displayName, email: req.body?.email }) || username.toLowerCase() === 'mik';
+  if (employeeRole === EMPLOYEE_ROLES.SUPERADMIN) {
+    if (!actorIsMike || !targetLooksMike) {
+      return res.status(403).json({
+        success: false,
+        error: 'SuperAdmin can only be assigned by Mike Strickland to Mike Strickland.'
+      });
+    }
   }
-  /** Planner-created accounts now default to no permissions until explicitly assigned by admin edit. */
-  const roles = normalizeRoles({
-    camera: false,
-    vac: false,
-    simpleVac: false,
-    email: false,
-    psrPlanner: false,
-    pricingView: false,
-    footageView: false
-  });
+  if (accountType === ACCOUNT_TYPES.CUSTOMER) employeeRole = null;
+  const isAdmin = employeeRole === EMPLOYEE_ROLES.ADMIN || employeeRole === EMPLOYEE_ROLES.SUPERADMIN;
+  const roles = legacyRolesForAccountModel({ accountType, employeeRole }, normalizeRoles(req.body?.roles));
 
   if (!username) {
     return res.status(400).json({ success: false, error: 'Username is required' });
@@ -6511,11 +6656,11 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
 
     const result = await pool.query(
       `INSERT INTO users (
-         username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup
+         username, display_name, password, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup
        )
-       VALUES ($1, $2, $3, $4, $5::jsonb, true, NULL, NULL, false, false)
-       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, self_signup`,
-      [username, displayName, hash, isAdmin, JSON.stringify(roles)]
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, true, NULL, NULL, false, false)
+       RETURNING id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, self_signup`,
+      [username, displayName, hash, isAdmin, accountType, employeeRole, JSON.stringify(roles)]
     );
     insertedPgId = result.rows[0].id;
 
@@ -6539,6 +6684,8 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
           display_name: displayName,
           password: hash,
           is_admin: isAdmin === true,
+          account_type: accountType,
+          employee_role: employeeRole,
           roles: normalizeRoles(roles),
           must_change_password: true,
           portal_files_client_id: null,
@@ -6561,6 +6708,8 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
 
     const user = await attachScopesToUser(normalizeUser(result.rows[0]));
     const assignedAtCreate = userHasAnyAssignedAccess({
+      account_type: user?.accountType,
+      employee_role: user?.employeeRole,
       is_admin: user?.isAdmin === true,
       roles: user?.roles || {},
       portal_files_access_granted: user?.portalFilesAccessGranted === true,
@@ -6593,8 +6742,10 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
     return res.status(400).json({ success: false, error: 'User id is required' });
   }
   const displayName = cleanString(req.body?.displayName || req.body?.name);
-  const isAdmin = req.body?.isAdmin === undefined ? null : !!req.body.isAdmin;
-  const roles = req.body?.roles === undefined ? null : normalizeRoles(req.body.roles);
+  const hasAccountTypePayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'accountType');
+  const hasEmployeeRolePayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'employeeRole');
+  const legacyIsAdmin = req.body?.isAdmin === undefined ? null : !!req.body.isAdmin;
+  const legacyRolesInput = req.body?.roles === undefined ? null : normalizeRoles(req.body.roles);
   const password = cleanString(req.body?.password || '');
   const hasPortalScopeInPayload =
     Object.prototype.hasOwnProperty.call(req.body || {}, 'portalFilesClientId') ||
@@ -6621,7 +6772,7 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
   try {
     let current = null;
     const currentResult = await pool.query(
-      'SELECT id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup FROM users WHERE id = $1 LIMIT 1',
+      'SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup FROM users WHERE id = $1 LIMIT 1',
       [id]
     );
     if (currentResult.rows.length) {
@@ -6635,6 +6786,8 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
             username: snapshotUser.username,
             display_name: snapshotUser.displayName,
             is_admin: snapshotUser.isAdmin,
+            account_type: snapshotUser.accountType,
+            employee_role: snapshotUser.employeeRole,
             roles: snapshotUser.roles,
             must_change_password: snapshotUser.mustChangePassword,
             portal_files_client_id: snapshotUser.portalFilesClientId,
@@ -6658,25 +6811,68 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
     const currentScopes = scopeMap.get(String(id)) || { portalScopes: [], psrScopes: [] };
 
     const nextDisplayName = displayName || current.display_name || current.username;
-    let nextIsAdmin = isAdmin === null ? !!current.is_admin : !!isAdmin;
-    const actorIsGlobalAdmin = req.user?.isAdmin === true;
+    const actorIsGlobalAdmin = isAdminUser(req.user);
     const actorIsMike = isMikeStricklandUser(req.user);
+    const currentModel = deriveAccountModel({
+      accountType: current.account_type,
+      employeeRole: current.employee_role,
+      isAdmin: current.is_admin,
+      roles: current.roles,
+      username: current.username,
+      display_name: current.display_name
+    });
+    let nextAccountType = hasAccountTypePayload
+      ? normalizeAccountType(req.body?.accountType)
+      : currentModel.accountType;
+    let nextEmployeeRole;
+    if (nextAccountType === ACCOUNT_TYPES.EMPLOYEE) {
+      if (hasEmployeeRolePayload) {
+        nextEmployeeRole = normalizeEmployeeRole(req.body?.employeeRole || EMPLOYEE_ROLES.CAMERA_OPERATOR);
+      } else {
+        nextEmployeeRole = currentModel.employeeRole || EMPLOYEE_ROLES.CAMERA_OPERATOR;
+      }
+      if (!nextEmployeeRole) nextEmployeeRole = EMPLOYEE_ROLES.CAMERA_OPERATOR;
+    } else {
+      nextEmployeeRole = null;
+    }
+    if (!hasAccountTypePayload && !hasEmployeeRolePayload && (legacyIsAdmin !== null || legacyRolesInput !== null)) {
+      if (legacyIsAdmin === true) {
+        nextAccountType = ACCOUNT_TYPES.EMPLOYEE;
+        nextEmployeeRole = EMPLOYEE_ROLES.ADMIN;
+      } else if (legacyRolesInput?.simpleVac) {
+        nextAccountType = ACCOUNT_TYPES.EMPLOYEE;
+        nextEmployeeRole = EMPLOYEE_ROLES.SIMPLE_VAC;
+      } else if (legacyRolesInput?.vac) {
+        nextAccountType = ACCOUNT_TYPES.EMPLOYEE;
+        nextEmployeeRole = EMPLOYEE_ROLES.VAC_OPERATOR;
+      } else if (legacyRolesInput?.camera) {
+        nextAccountType = ACCOUNT_TYPES.EMPLOYEE;
+        nextEmployeeRole = EMPLOYEE_ROLES.CAMERA_OPERATOR;
+      } else {
+        nextAccountType = ACCOUNT_TYPES.CUSTOMER;
+        nextEmployeeRole = null;
+      }
+    }
+    if (nextEmployeeRole === EMPLOYEE_ROLES.SUPERADMIN) {
+      const targetLooksMike = looksLikeMike({ username: current.username, display_name: nextDisplayName, email: current.email });
+      if (!actorIsMike || !targetLooksMike) {
+        return res.status(403).json({
+          success: false,
+          error: 'SuperAdmin can only be assigned by Mike Strickland to Mike Strickland.'
+        });
+      }
+    }
+    const nextIsAdmin = nextEmployeeRole === EMPLOYEE_ROLES.ADMIN || nextEmployeeRole === EMPLOYEE_ROLES.SUPERADMIN;
     if (!actorIsGlobalAdmin && current.is_admin && String(req.user?.id || '') !== String(id)) {
       return res.status(403).json({
         success: false,
         error: 'Only global admins can edit Horizon admin accounts.'
       });
     }
-    if (!actorIsGlobalAdmin) {
-      nextIsAdmin = !!current.is_admin;
-    }
-    if (!current.is_admin && nextIsAdmin && !actorIsMike) {
-      return res.status(403).json({
-        success: false,
-        error: 'Only Mike Strickland can elevate a user to Horizon Pipe Admin.'
-      });
-    }
-    const nextRoles = roles === null ? normalizeRoles(current.roles) : roles;
+    const nextRoles = legacyRolesForAccountModel(
+      { accountType: nextAccountType, employeeRole: nextEmployeeRole },
+      legacyRolesInput === null ? normalizeRoles(current.roles) : legacyRolesInput
+    );
     let nextPortalFilesClientId = current.portal_files_client_id || null;
     let nextPortalFilesJobId = current.portal_files_job_id || null;
     if (hasPortalScopeInPayload) {
@@ -6726,9 +6922,8 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
       nextSelfSignup = false;
     }
 
-    const nextPortalPermissionsAccess = hasPortalPermissionsPayload
-      ? !!req.body.portalPermissionsAccess
-      : current.portal_permissions_access === true;
+    const nextPortalPermissionsAccess =
+      nextIsAdmin && (hasPortalPermissionsPayload ? !!req.body.portalPermissionsAccess : true);
     if (nextPortalFilesAccessGranted !== true && !nextAutosyncMasterGranted) {
       nextPortalScopes = [];
       nextPortalFilesClientId = null;
@@ -6757,19 +6952,23 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
           `UPDATE users
            SET display_name = $1,
                is_admin = $2,
-               roles = $3::jsonb,
-               portal_files_client_id = $4,
-               portal_files_job_id = $5,
-               portal_files_access_granted = $6,
-               self_signup = $7,
-               portal_permissions_access = $8,
-               autosync_master_granted = $9,
+               account_type = $3,
+               employee_role = $4,
+               roles = $5::jsonb,
+               portal_files_client_id = $6,
+               portal_files_job_id = $7,
+               portal_files_access_granted = $8,
+               self_signup = $9,
+               portal_permissions_access = $10,
+               autosync_master_granted = $11,
                updated_at = NOW()
-           WHERE id = $10
-           RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup`,
+           WHERE id = $12
+           RETURNING id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup`,
           [
             nextDisplayName,
             nextIsAdmin,
+            nextAccountType,
+            nextEmployeeRole,
             JSON.stringify(nextRoles),
             nextPortalFilesClientId,
             nextPortalFilesJobId,
@@ -6822,7 +7021,7 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
                  must_change_password = false,
                  updated_at = NOW()
              WHERE id = $2
-             RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup`,
+             RETURNING id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup`,
             [passwordHash, id]
           );
           updatedRow = pwResult.rows[0];
@@ -6859,6 +7058,8 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
           ...currentUserRow,
           display_name: nextDisplayName,
           is_admin: nextIsAdmin === true,
+          account_type: nextAccountType,
+          employee_role: nextEmployeeRole,
           roles: normalizeRoles(nextRoles),
           portal_files_client_id: nextPortalFilesClientId || null,
           portal_files_job_id: nextPortalFilesJobId || null,
@@ -6945,10 +7146,12 @@ app.post('/users/:id/elevate-horizon-admin', requireAuth, requireAdminPanelAcces
     const result = await pool.query(
       `UPDATE users
        SET is_admin = true,
+           account_type = 'employee',
+           employee_role = 'admin',
            self_signup = false,
            updated_at = NOW()
        WHERE id = $1
-       RETURNING id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup`,
+       RETURNING id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup`,
       [id]
     );
     if (!result.rowCount) {
@@ -8087,6 +8290,15 @@ app.put('/records/:id/segments/:segmentId', requireAuth, requirePsrDataEntryAcce
     }
 
     if (Object.keys(versionPatch).length) {
+      if (isVacLineOperator(req.user) && versionPatch.status !== undefined) {
+        const nextStatus = normalizeStatus(versionPatch.status);
+        if (nextStatus !== 'jetted') {
+          return res.status(403).json({
+            success: false,
+            error: 'Vac Operator and Simple Vac accounts can only mark status as Jetted.'
+          });
+        }
+      }
       const nextVersion = defaultVersion(req.body?.saveBy || req.user.displayName || req.user.username, {
         status: versionPatch.status || found.versions[found.versions.length - 1]?.status || 'neutral',
         notes: versionPatch.notes !== undefined ? versionPatch.notes : found.versions[found.versions.length - 1]?.notes,
@@ -10002,7 +10214,7 @@ async function runSignupDataWasabiQuery(text, params = []) {
     }
     if (
       sql.startsWith(
-        'insert into users ( username, display_name, password, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified ) values ($1, $2, $3, false, $4::jsonb, false, null, null, false, true, $5, $6, $7, $8, $9, $10, true) returning id, username, display_name, is_admin, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified'
+        'insert into users ( username, display_name, password, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified ) values ($1, $2, $3, false, \'customer\', null, $4::jsonb, false, null, null, false, true, $5, $6, $7, $8, $9, $10, true) returning id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified'
       )
     ) {
       const username = String(params[0] || '').trim().toLowerCase();
@@ -10025,6 +10237,8 @@ async function runSignupDataWasabiQuery(text, params = []) {
         display_name: String(params[1] || ''),
         password: String(params[2] || ''),
         is_admin: false,
+        account_type: 'customer',
+        employee_role: null,
         roles: parseJsonObject(params[3], {}),
         must_change_password: false,
         portal_files_client_id: null,

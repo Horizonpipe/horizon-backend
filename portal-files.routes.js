@@ -1027,9 +1027,25 @@ async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) 
       return true;
     }
     if (allowClientWideDataAutoSync) {
-      return scopeList.some((scope) => String(scope?.clientId || '').trim() === c);
+      if (scopeList.some((scope) => String(scope?.clientId || '').trim() === c)) return true;
     }
-    return false;
+  }
+  const username = String(user?.username || '').trim();
+  const email = String(user?.email || '').trim();
+  if (username || email) {
+    const directGrant = await pool.query(
+      `SELECT 1
+       FROM portal_path_grants
+       WHERE client_id = $1
+         AND job_id = $2
+         AND (
+           LOWER(TRIM(username)) = LOWER(TRIM($3))
+           OR ($4 <> '' AND LOWER(TRIM(username)) = LOWER(TRIM($4)))
+         )
+       LIMIT 1`,
+      [c, j, username, email]
+    );
+    if (directGrant.rows.length) return true;
   }
   // Backward-compatible fallback while legacy fields are still present.
   const legacyClient = String(user.portalFilesClientId || '').trim();
@@ -2576,9 +2592,6 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   async function shareViewAuthObjectKey(req, token, idParam) {
     const row = await loadShareLinkRowForToken(token);
     if (!row) return { ok: false, status: 404, body: { error: 'Not found' } };
-    if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
-      return { ok: false, status: 403, body: { error: 'Forbidden' } };
-    }
     const payload = row.payload || {};
     const Key = idToKey(idParam);
     if (!Key.startsWith('clients/')) {
@@ -2596,14 +2609,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     return { ok: true, Key };
   }
 
-  /** Authenticated share tree for users with explicit job access. */
+  /** Authenticated share tree; token payload remains the explicit access boundary. */
   r.get('/share-view/:token/tree', async (req, res) => {
     try {
       const row = await loadShareLinkRowForToken(req.params.token);
       if (!row) return res.status(404).json({ error: 'Not found' });
-      if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
       const payload = row.payload || {};
       const prefix = jobPrefix(String(row.client_id), String(row.job_id));
       let listPrefix = prefix;
