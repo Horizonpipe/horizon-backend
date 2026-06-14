@@ -5469,14 +5469,14 @@ async function ensureSchema() {
       revoked_by_username TEXT
     )
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_portal_share_links_cj ON portal_share_links (client_id, job_id)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_portal_share_links_expires ON portal_share_links (expires_at)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_portal_share_links_revoked ON portal_share_links (revoked_at)`);
   await pool.query(
     `ALTER TABLE portal_share_links ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '7 days')`
   );
   await pool.query(`ALTER TABLE portal_share_links ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE portal_share_links ADD COLUMN IF NOT EXISTS revoked_by_username TEXT`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_portal_share_links_cj ON portal_share_links (client_id, job_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_portal_share_links_expires ON portal_share_links (expires_at)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_portal_share_links_revoked ON portal_share_links (revoked_at)`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS portal_share_guest_sessions (
