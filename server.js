@@ -4484,6 +4484,9 @@ const DB3_INSPECTOR_ALIAS_MAP = new Map([
 /** Guard against extremely wide SECINSP schemas generating huge OR predicates in sql.js. */
 const DB3_SECINSP_MAX_FK_COLUMNS = 32;
 const DB3_SECINSP_MAX_KEY_COLUMNS = 24;
+const DB3_SECINSP_OR_SAFE_FK_COLUMNS = 6;
+const DB3_SECINSP_SPLIT_QUERY_LIMIT = 6;
+const DB3_SECINSP_DIAG_ONCE = new Set();
 
 function db3InspectorAliasKey(value) {
   return String(value == null ? '' : value)
@@ -4713,25 +4716,73 @@ function mergeSecinspRowIntoDb3Imported(db, sectionTable, secinspTable, referenc
     }
   };
 
+  function logSecinspStrategyOnce(strategy, detail = {}) {
+    const key = `${String(secinspTable || '').toLowerCase()}|${strategy}|${fkCols.length}`;
+    if (DB3_SECINSP_DIAG_ONCE.has(key)) return;
+    DB3_SECINSP_DIAG_ONCE.add(key);
+    console.warn('[db3-preview][secinsp-probe]', {
+      table: secinspTable,
+      strategy,
+      fkColumns: fkCols.length,
+      ...detail
+    });
+  }
+
+  /**
+   * @param {string|number|null|undefined} bindVal
+   */
+  const mergeForBindSplit = (bindVal) => {
+    if (bindVal == null || bindVal === '') return;
+    for (const fkCol of fkCols) {
+      let stmt;
+      try {
+        stmt = db.prepare(`SELECT * FROM ${SI} WHERE ${sqlIdentQuoted(fkCol)} = ? LIMIT ${DB3_SECINSP_SPLIT_QUERY_LIMIT}`);
+        stmt.bind([bindVal]);
+        while (stmt.step()) {
+          applyRow(stmt.getAsObject());
+        }
+        stmt.free();
+      } catch {
+        try {
+          stmt?.free();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  };
+
   /**
    * @param {string|number|null|undefined} bindVal
    */
   const mergeForBind = (bindVal) => {
     if (bindVal == null || bindVal === '') return;
+    if (fkCols.length > DB3_SECINSP_OR_SAFE_FK_COLUMNS) {
+      logSecinspStrategyOnce('split-only', { reason: 'wide-fk-list' });
+      mergeForBindSplit(bindVal);
+      return;
+    }
     let stmt;
     try {
-      stmt = db.prepare(`SELECT * FROM ${SI} WHERE ${where}`);
+      stmt = db.prepare(`SELECT * FROM ${SI} WHERE ${where} LIMIT ${DB3_SECINSP_SPLIT_QUERY_LIMIT}`);
       stmt.bind(fkCols.map(() => bindVal));
       while (stmt.step()) {
         applyRow(stmt.getAsObject());
       }
       stmt.free();
-    } catch {
+    } catch (error) {
       try {
         stmt?.free();
       } catch {
         /* ignore */
       }
+      const msg = String(error?.message || error || '');
+      if (/too many from clause terms/i.test(msg)) {
+        logSecinspStrategyOnce('split-fallback', { reason: 'sqlite-from-clause-limit' });
+      } else {
+        logSecinspStrategyOnce('split-fallback', { reason: 'or-query-error', message: msg.slice(0, 220) });
+      }
+      mergeForBindSplit(bindVal);
     }
   };
 
