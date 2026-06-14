@@ -1392,6 +1392,24 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
   const PLAN_SHARE_SENTINEL_CLIENT = '__pipesync_plan__';
   const PLAN_SHARE_SENTINEL_JOB = '__plan_view__';
   const PLAN_SHARE_VIRTUAL_ID_PREFIX = 'planmeta_';
+  function emitDebugLog(payload) {
+    try {
+      const post =
+        typeof globalThis === 'object' &&
+        globalThis &&
+        typeof globalThis.fetch === 'function'
+          ? globalThis.fetch.bind(globalThis)
+          : null;
+      if (!post) return;
+      post('http://127.0.0.1:7642/ingest/6f95c29d-5bab-4b09-8206-ff9dd9c19317', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'bf0e49' },
+        body: JSON.stringify(payload)
+      }).catch(() => {});
+    } catch {
+      /* no-op */
+    }
+  }
   function isPlanPdfShareMeta(meta) {
     return !!(meta && typeof meta === 'object' && !Array.isArray(meta) && String(meta.kind || '').toLowerCase() === 'plan-pdf-share-v1');
   }
@@ -2632,6 +2650,20 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   /** Authenticated share tree; token payload remains the explicit access boundary. */
   r.get('/share-view/:token/tree', async (req, res) => {
     try {
+      // #region agent log
+      emitDebugLog({
+        sessionId: 'bf0e49',
+        runId: 'share-tree-runtime',
+        hypothesisId: 'H1',
+        location: 'portal-files.routes.js:/share-view/:token/tree:entry',
+        message: 'Entered authenticated share tree route',
+        data: {
+          tokenLen: String(req.params?.token || '').length,
+          fnType: typeof shareRowIsPlanPdfVirtual
+        },
+        timestamp: Date.now()
+      });
+      // #endregion
       const row = await loadShareLinkRowForToken(req.params.token);
       if (!row) return res.status(404).json({ error: 'Not found' });
       const payload = row.payload || {};
@@ -2664,6 +2696,20 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         shareMeta: payload && typeof payload === 'object' ? payload.shareMeta || null : null
       });
     } catch (e) {
+      // #region agent log
+      emitDebugLog({
+        sessionId: 'bf0e49',
+        runId: 'share-tree-runtime',
+        hypothesisId: 'H2',
+        location: 'portal-files.routes.js:/share-view/:token/tree:catch',
+        message: 'Authenticated share tree failed',
+        data: {
+          name: e && typeof e === 'object' && 'name' in e ? e.name : '',
+          message: e instanceof Error ? e.message : String(e)
+        },
+        timestamp: Date.now()
+      });
+      // #endregion
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
     }
@@ -4974,6 +5020,20 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   guest.get('/share/:token/tree', async (req, res) => {
     try {
+      // #region agent log
+      emitDebugLog({
+        sessionId: 'bf0e49',
+        runId: 'share-tree-runtime',
+        hypothesisId: 'H3',
+        location: 'portal-files.routes.js:/guest/share/:token/tree:entry',
+        message: 'Entered guest share tree route',
+        data: {
+          tokenLen: String(req.params?.token || '').length,
+          fnType: typeof shareRowIsPlanPdfVirtual
+        },
+        timestamp: Date.now()
+      });
+      // #endregion
       const row = await loadGuestShareRow(req.params.token);
       if (!row) return res.status(404).json({ error: 'Link not found (expired, revoked, or invalid)' });
       if (portalShareLinkKind(row) === 'signin') {
@@ -5012,6 +5072,20 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         shareMeta: payload && typeof payload === 'object' ? payload.shareMeta || null : null
       });
     } catch (e) {
+      // #region agent log
+      emitDebugLog({
+        sessionId: 'bf0e49',
+        runId: 'share-tree-runtime',
+        hypothesisId: 'H4',
+        location: 'portal-files.routes.js:/guest/share/:token/tree:catch',
+        message: 'Guest share tree failed',
+        data: {
+          name: e && typeof e === 'object' && 'name' in e ? e.name : '',
+          message: e instanceof Error ? e.message : String(e)
+        },
+        timestamp: Date.now()
+      });
+      // #endregion
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
     }
