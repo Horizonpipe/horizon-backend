@@ -4850,6 +4850,51 @@ function mapDb3SectionRow(row, projectName) {
   };
 }
 
+function isDb3FromClauseOverflowError(error) {
+  const msg = String(error?.message || error || '');
+  return /too many from clause terms/i.test(msg) || /from clause terms,\s*max:\s*200/i.test(msg);
+}
+
+function resolveDb3NodeKeyByRef(db, nodeTable, rawRef) {
+  const ref = rawRef == null ? '' : String(rawRef).trim();
+  if (!ref || !nodeTable) return '';
+  const cols = sqlitePragmaColumns(db, nodeTable).map((c) => String(c.name || '').toUpperCase());
+  const hasPk = cols.includes('OBJ_PK');
+  const hasId = cols.includes('OBJ_ID');
+  if (!hasPk && !hasId) return '';
+  const N = sqlIdentQuoted(nodeTable);
+  const readObjKey = (colName) => {
+    let stmt;
+    try {
+      stmt = db.prepare(`SELECT COALESCE(OBJ_Key, '') AS obj_key FROM ${N} WHERE ${sqlIdentQuoted(colName)} = ? LIMIT 1`);
+      stmt.bind([ref]);
+      if (stmt.step()) {
+        const row = stmt.getAsObject();
+        const key = cleanString(row.obj_key);
+        stmt.free();
+        return key;
+      }
+      stmt.free();
+    } catch {
+      try {
+        stmt?.free();
+      } catch {
+        /* ignore */
+      }
+    }
+    return '';
+  };
+  if (hasPk) {
+    const key = readObjKey('OBJ_PK');
+    if (key) return key;
+  }
+  if (hasId) {
+    const key = readObjKey('OBJ_ID');
+    if (key) return key;
+  }
+  return '';
+}
+
 async function parseDb3(buffer) {
   const SQL = await sqlJsPromise;
   const db = new SQL.Database(new Uint8Array(buffer));
@@ -5009,6 +5054,7 @@ async function parseDb3(buffer) {
     ORDER BY s.OBJ_Key`);
 
   let lastErr = 'no query variant succeeded';
+  let sawFromClauseOverflow = false;
   for (const sql of sqlVariants) {
     const sqlWithExtras = injectDb3ExtrasBeforeOrderBy(sql, extraFrag.sql);
     let stmt;
@@ -5016,6 +5062,16 @@ async function parseDb3(buffer) {
       stmt = db.prepare(sqlWithExtras);
     } catch (e) {
       lastErr = e instanceof Error ? e.message : String(e);
+      if (isDb3FromClauseOverflowError(e)) {
+        sawFromClauseOverflow = true;
+        console.warn('[db3-preview][variant-overflow]', {
+          strategyVersion: DB3_PREVIEW_STRATEGY_VERSION,
+          branch: 'variant-prepare',
+          hasNodeTable: !!nodeRuntimeTable,
+          hasSecinspTable: !!secinspRuntimeTable,
+          message: String(lastErr || '').slice(0, 220)
+        });
+      }
       continue;
     }
     try {
@@ -5047,8 +5103,90 @@ async function parseDb3(buffer) {
       return rows;
     } catch (e) {
       lastErr = e instanceof Error ? e.message : String(e);
+      if (isDb3FromClauseOverflowError(e)) {
+        sawFromClauseOverflow = true;
+        console.warn('[db3-preview][variant-overflow]', {
+          strategyVersion: DB3_PREVIEW_STRATEGY_VERSION,
+          branch: 'variant-step',
+          hasNodeTable: !!nodeRuntimeTable,
+          hasSecinspTable: !!secinspRuntimeTable,
+          message: String(lastErr || '').slice(0, 220)
+        });
+      }
       try {
         stmt.free();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  if (sawFromClauseOverflow) {
+    let splitStmt;
+    try {
+      const splitCoreCols = `
+      s.OBJ_Key AS reference,
+      COALESCE(s.OBJ_Length, 0) AS length,
+      COALESCE(s.OBJ_City, '') AS city,
+      COALESCE(s.OBJ_Street, '') AS street,
+      COALESCE(s.OBJ_FromNode_REF, '') AS from_node_ref,
+      COALESCE(s.OBJ_ToNode_REF, '') AS to_node_ref,
+      COALESCE(s.OBJ_Material, '') AS material_code,
+      COALESCE(s.OBJ_Shape, '') AS shape_code,
+      COALESCE(s.OBJ_Size1, '') AS size1,
+      COALESCE(s.OBJ_Size2, '') AS size2`;
+      const splitSql = injectDb3ExtrasBeforeOrderBy(
+        `
+        SELECT ${splitCoreCols}
+        FROM ${S} s
+        ORDER BY s.OBJ_Key`,
+        extraFrag.sql
+      );
+      console.warn('[db3-preview][variant-fallback]', {
+        strategyVersion: DB3_PREVIEW_STRATEGY_VERSION,
+        strategy: 'section-split-probe-v1',
+        hasNodeTable: !!nodeRuntimeTable,
+        hasSecinspTable: !!secinspRuntimeTable
+      });
+      splitStmt = db.prepare(splitSql);
+      const rows = [];
+      const nodeCache = new Map();
+      const lookupNode = (rawRef) => {
+        const key = rawRef == null ? '' : String(rawRef).trim();
+        if (!key || !nodeRuntimeTable) return '';
+        if (nodeCache.has(key)) return nodeCache.get(key) || '';
+        const hit = resolveDb3NodeKeyByRef(db, nodeRuntimeTable, key);
+        nodeCache.set(key, hit || '');
+        return hit || '';
+      };
+      while (splitStmt.step()) {
+        const raw = splitStmt.getAsObject();
+        const mapped = mapDb3SectionRow(raw, projectName);
+        mapped.upstream = lookupNode(raw.from_node_ref);
+        mapped.downstream = lookupNode(raw.to_node_ref);
+        let imported = extractDb3ImportedFromRow(raw, extraFrag.aliasNames);
+        if (secinspRuntimeTable) {
+          imported = mergeSecinspRowIntoDb3Imported(db, sectionT, secinspRuntimeTable, mapped.reference, imported);
+          imported = mergeSecinspBySectionObjKeyColumn(db, secinspRuntimeTable, mapped.reference, imported);
+        }
+        const inspector = db3InspectorIdentityFromImported(imported);
+        if (inspector) {
+          imported.HP_INSPECTOR_RAW = inspector.raw;
+          imported.HP_INSPECTOR_DISPLAY = inspector.canonical;
+          imported.HP_INSPECTOR_KEY = inspector.key;
+          mapped.inspectorRaw = inspector.raw;
+          mapped.inspector = inspector.canonical;
+          mapped.inspectorKey = inspector.key;
+        }
+        if (Object.keys(imported).length) mapped.db3Imported = imported;
+        rows.push(mapped);
+      }
+      splitStmt.free();
+      db.close();
+      return rows;
+    } catch (fallbackErr) {
+      lastErr = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+      try {
+        splitStmt?.free();
       } catch {
         /* ignore */
       }
