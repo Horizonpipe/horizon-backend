@@ -1679,6 +1679,104 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     throw new Error('registerPortalFilesRoutes requires either pool.query or options.query.');
   }
   const pool = { query: dbQuery };
+  const PLAN_SHARE_SENTINEL_CLIENT = '__pipesync_plan__';
+  const PLAN_SHARE_SENTINEL_JOB = '__plan_view__';
+  const PLAN_SHARE_VIRTUAL_ID_PREFIX = 'planmeta_';
+  function emitDebugLog(payload) {
+    try {
+      const post =
+        typeof globalThis === 'object' &&
+        globalThis &&
+        typeof globalThis.fetch === 'function'
+          ? globalThis.fetch.bind(globalThis)
+          : null;
+      if (!post) return;
+      post('http://127.0.0.1:7642/ingest/6f95c29d-5bab-4b09-8206-ff9dd9c19317', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'bf0e49' },
+        body: JSON.stringify(payload)
+      }).catch(() => {});
+    } catch {
+      /* no-op */
+    }
+  }
+  function isPlanPdfShareMeta(meta) {
+    return !!(meta && typeof meta === 'object' && !Array.isArray(meta) && String(meta.kind || '').toLowerCase() === 'plan-pdf-share-v1');
+  }
+  function isPlanPdfSharePayload(payload) {
+    return !!(
+      payload &&
+      typeof payload === 'object' &&
+      !Array.isArray(payload) &&
+      isPlanPdfShareMeta(payload.shareMeta)
+    );
+  }
+  function shareRowIsPlanPdfVirtual(row) {
+    return (
+      String(row?.client_id || '') === PLAN_SHARE_SENTINEL_CLIENT &&
+      String(row?.job_id || '') === PLAN_SHARE_SENTINEL_JOB &&
+      isPlanPdfSharePayload(row?.payload || {})
+    );
+  }
+  function planShareStorageKeyFromVirtualId(id) {
+    const raw = String(id || '').trim();
+    if (!raw.startsWith(PLAN_SHARE_VIRTUAL_ID_PREFIX)) return '';
+    const enc = raw.slice(PLAN_SHARE_VIRTUAL_ID_PREFIX.length);
+    if (!enc) return '';
+    try {
+      return Buffer.from(enc, 'base64url').toString('utf8');
+    } catch {
+      return '';
+    }
+  }
+  function collectPlanShareVirtualFiles(payload) {
+    const shareMeta = payload?.shareMeta;
+    if (!isPlanPdfShareMeta(shareMeta)) return [];
+    const selectedName = String(shareMeta?.selectedPdf?.name || '').trim();
+    const pages = Array.isArray(shareMeta?.snapshot?.pages) ? shareMeta.snapshot.pages : [];
+    const out = [];
+    const seen = new Set();
+    let i = 0;
+    const addKey = (rawKey, rawPageName = '') => {
+      const key = String(rawKey || '').trim();
+      if (!isValidPipesyncPlanPageStorageKey(key) || seen.has(key)) return false;
+      seen.add(key);
+      const pageName = String(rawPageName || '').trim();
+      const fallback = selectedName || 'Plan.pdf';
+      const name = (pageName || fallback || `Sheet-${i + 1}.pdf`).slice(0, 260);
+      out.push({
+        id: `${PLAN_SHARE_VIRTUAL_ID_PREFIX}${Buffer.from(key, 'utf8').toString('base64url')}`,
+        key,
+        name: /\.pdf$/i.test(name) ? name : `${name}.pdf`,
+        size: null,
+        modifiedAt: null
+      });
+      i += 1;
+      return true;
+    };
+    addKey(shareMeta?.selectedPdf?.storageKey, shareMeta?.selectedPdf?.name);
+    for (const p of pages) {
+      if (!p || typeof p !== 'object') continue;
+      addKey(p.storageKey || p.storage_key, p.name || p.pageName || p.fileName);
+    }
+    return out;
+  }
+  function planShareVirtualTree(payload) {
+    const files = collectPlanShareVirtualFiles(payload).map((f) => ({
+      id: f.id,
+      name: f.name,
+      path: f.name,
+      parentPath: '',
+      size: f.size,
+      modifiedAt: f.modifiedAt
+    }));
+    return { folders: [], files };
+  }
+  function planShareAllowsVirtualKey(payload, storageKey) {
+    const target = String(storageKey || '').trim();
+    if (!target) return false;
+    return collectPlanShareVirtualFiles(payload).some((f) => f.key === target);
+  }
   /** Path grants must match `GET /permissions/tree` portal path rows (live Postgres in all modes). Wasabi portal-data-primary must not shadow them. */
   const aclPool =
     poolOption && typeof poolOption.query === 'function'
