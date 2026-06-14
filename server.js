@@ -4484,9 +4484,9 @@ const DB3_INSPECTOR_ALIAS_MAP = new Map([
 /** Guard against extremely wide SECINSP schemas generating huge OR predicates in sql.js. */
 const DB3_SECINSP_MAX_FK_COLUMNS = 32;
 const DB3_SECINSP_MAX_KEY_COLUMNS = 24;
-const DB3_SECINSP_OR_SAFE_FK_COLUMNS = 6;
 const DB3_SECINSP_SPLIT_QUERY_LIMIT = 6;
 const DB3_SECINSP_DIAG_ONCE = new Set();
+const DB3_PREVIEW_STRATEGY_VERSION = 'secinsp-split-only-v2';
 
 function db3InspectorAliasKey(value) {
   return String(value == null ? '' : value)
@@ -4699,7 +4699,6 @@ function mergeSecinspRowIntoDb3Imported(db, sectionTable, secinspTable, referenc
     fkCols.splice(DB3_SECINSP_MAX_FK_COLUMNS);
   }
   const SI = sqlIdentQuoted(secinspTable);
-  const where = fkCols.map((c) => `${sqlIdentQuoted(c)} = ?`).join(' OR ');
   const ref = cleanString(reference);
 
   /**
@@ -4733,6 +4732,7 @@ function mergeSecinspRowIntoDb3Imported(db, sectionTable, secinspTable, referenc
    */
   const mergeForBindSplit = (bindVal) => {
     if (bindVal == null || bindVal === '') return;
+    logSecinspStrategyOnce('split-only', { reason: 'or-disabled-hardening', strategyVersion: DB3_PREVIEW_STRATEGY_VERSION });
     for (const fkCol of fkCols) {
       let stmt;
       try {
@@ -4742,7 +4742,14 @@ function mergeSecinspRowIntoDb3Imported(db, sectionTable, secinspTable, referenc
           applyRow(stmt.getAsObject());
         }
         stmt.free();
-      } catch {
+      } catch (error) {
+        const msg = String(error?.message || error || '');
+        logSecinspStrategyOnce('split-column-error', {
+          reason: 'column-query-error',
+          fkColumn: String(fkCol || ''),
+          message: msg.slice(0, 220),
+          strategyVersion: DB3_PREVIEW_STRATEGY_VERSION
+        });
         try {
           stmt?.free();
         } catch {
@@ -4752,44 +4759,10 @@ function mergeSecinspRowIntoDb3Imported(db, sectionTable, secinspTable, referenc
     }
   };
 
-  /**
-   * @param {string|number|null|undefined} bindVal
-   */
-  const mergeForBind = (bindVal) => {
-    if (bindVal == null || bindVal === '') return;
-    if (fkCols.length > DB3_SECINSP_OR_SAFE_FK_COLUMNS) {
-      logSecinspStrategyOnce('split-only', { reason: 'wide-fk-list' });
-      mergeForBindSplit(bindVal);
-      return;
-    }
-    let stmt;
-    try {
-      stmt = db.prepare(`SELECT * FROM ${SI} WHERE ${where} LIMIT ${DB3_SECINSP_SPLIT_QUERY_LIMIT}`);
-      stmt.bind(fkCols.map(() => bindVal));
-      while (stmt.step()) {
-        applyRow(stmt.getAsObject());
-      }
-      stmt.free();
-    } catch (error) {
-      try {
-        stmt?.free();
-      } catch {
-        /* ignore */
-      }
-      const msg = String(error?.message || error || '');
-      if (/too many from clause terms/i.test(msg)) {
-        logSecinspStrategyOnce('split-fallback', { reason: 'sqlite-from-clause-limit' });
-      } else {
-        logSecinspStrategyOnce('split-fallback', { reason: 'or-query-error', message: msg.slice(0, 220) });
-      }
-      mergeForBindSplit(bindVal);
-    }
-  };
-
   try {
-    mergeForBind(spk);
+    mergeForBindSplit(spk);
     /* Some WinCan builds store the section OBJ_Key string in SECINSP FK columns instead of OBJ_PK. */
-    if (ref && String(spk) !== String(ref)) mergeForBind(ref);
+    if (ref && String(spk) !== String(ref)) mergeForBindSplit(ref);
   } catch {
     /* ignore */
   }
