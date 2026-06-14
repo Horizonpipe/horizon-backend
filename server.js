@@ -9072,12 +9072,28 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
         db3DedupeKey: identity.dedupeKey,
         db3RowHash: identity.dedupeHash,
         duplicate,
+        existingInDatabase: duplicate,
         placedDuplicate: !!placedDup,
         placedDuplicateOf: placedDup || null
       };
     });
 
-    res.json({ success: true, sourceKind: 'DB3', defaultJobsite: cleanString(previewRows[0]?.project || 'NOT SET'), rows: previewRows });
+    const updateMode = String(req.body?.updateMode || '').trim() === '1' || String(req.body?.updateMode || '').toLowerCase() === 'true';
+    if (updateMode) {
+      console.warn('[db3-preview][plan-sync-update]', {
+        strategyVersion: DB3_PREVIEW_STRATEGY_VERSION,
+        targetRecordId: scope.targetRecordId || '',
+        targetClient,
+        targetCity,
+        targetJobsite,
+        targetSystem,
+        rowCount: previewRows.length,
+        existingCount: previewRows.filter((row) => row.duplicate).length,
+        newCount: previewRows.filter((row) => !row.duplicate).length
+      });
+    }
+
+    res.json({ success: true, sourceKind: 'DB3', defaultJobsite: cleanString(previewRows[0]?.project || 'NOT SET'), rows: previewRows, updateMode });
   } catch (error) {
     console.error('IMPORT PREVIEW ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
