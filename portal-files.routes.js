@@ -1394,8 +1394,14 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
   const PLAN_SHARE_VIRTUAL_ID_PREFIX = 'planmeta_';
   function emitDebugLog(payload) {
     try {
-      if (typeof fetch !== 'function') return;
-      fetch('http://127.0.0.1:7642/ingest/6f95c29d-5bab-4b09-8206-ff9dd9c19317', {
+      const post =
+        typeof globalThis === 'object' &&
+        globalThis &&
+        typeof globalThis.fetch === 'function'
+          ? globalThis.fetch.bind(globalThis)
+          : null;
+      if (!post) return;
+      post('http://127.0.0.1:7642/ingest/6f95c29d-5bab-4b09-8206-ff9dd9c19317', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'bf0e49' },
         body: JSON.stringify(payload)
