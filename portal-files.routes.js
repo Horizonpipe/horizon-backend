@@ -1392,6 +1392,18 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
   const PLAN_SHARE_SENTINEL_CLIENT = '__pipesync_plan__';
   const PLAN_SHARE_SENTINEL_JOB = '__plan_view__';
   const PLAN_SHARE_VIRTUAL_ID_PREFIX = 'planmeta_';
+  function emitDebugLog(payload) {
+    try {
+      if (typeof fetch !== 'function') return;
+      fetch('http://127.0.0.1:7642/ingest/6f95c29d-5bab-4b09-8206-ff9dd9c19317', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'bf0e49' },
+        body: JSON.stringify(payload)
+      }).catch(() => {});
+    } catch {
+      /* no-op */
+    }
+  }
   function isPlanPdfShareMeta(meta) {
     return !!(meta && typeof meta === 'object' && !Array.isArray(meta) && String(meta.kind || '').toLowerCase() === 'plan-pdf-share-v1');
   }
@@ -1542,13 +1554,13 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
       const shareMeta = normalizedPlan.shareMeta;
       const planShare = normalizedPlan.planShare;
       // #region agent log
-      fetch('http://127.0.0.1:7642/ingest/6f95c29d-5bab-4b09-8206-ff9dd9c19317',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'bf0e49'},body:JSON.stringify({sessionId:'bf0e49',runId:'pdf-share-create',hypothesisId:'H2',location:'portal-files.routes.js:/shares:normalizedPlan',message:'Normalized share-create payload on backend',data:{kind,planShare,baseShareMetaKind:String(sanitizedShareMeta?.kind||''),normalizedShareMetaKind:String(shareMeta?.kind||''),selectedDocStorageKey:String(normalizedPlan.selectedDocStorageKey||''),bodySelectedDocStorageKey:String((req.body||{}).selectedDocStorageKey||'')},timestamp:Date.now()})}).catch(()=>{});
+      emitDebugLog({sessionId:'bf0e49',runId:'pdf-share-create',hypothesisId:'H2',location:'portal-files.routes.js:/shares:normalizedPlan',message:'Normalized share-create payload on backend',data:{kind,planShare,baseShareMetaKind:String(sanitizedShareMeta?.kind||''),normalizedShareMetaKind:String(shareMeta?.kind||''),selectedDocStorageKey:String(normalizedPlan.selectedDocStorageKey||''),bodySelectedDocStorageKey:String((req.body||{}).selectedDocStorageKey||'')},timestamp:Date.now()});
       // #endregion
       const resolvedClientId = planShare ? PLAN_SHARE_SENTINEL_CLIENT : String(clientId || '');
       const resolvedJobId = planShare ? PLAN_SHARE_SENTINEL_JOB : String(jobId || '');
       if (!resolvedClientId || !resolvedJobId) {
         // #region agent log
-        fetch('http://127.0.0.1:7642/ingest/6f95c29d-5bab-4b09-8206-ff9dd9c19317',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'bf0e49'},body:JSON.stringify({sessionId:'bf0e49',runId:'pdf-share-create',hypothesisId:'H3',location:'portal-files.routes.js:/shares:missingScope',message:'Rejected share because resolved scope is empty',data:{planShare,resolvedClientId,resolvedJobId,hasClientId:!!String(clientId||''),hasJobId:!!String(jobId||'')},timestamp:Date.now()})}).catch(()=>{});
+        emitDebugLog({sessionId:'bf0e49',runId:'pdf-share-create',hypothesisId:'H3',location:'portal-files.routes.js:/shares:missingScope',message:'Rejected share because resolved scope is empty',data:{planShare,resolvedClientId,resolvedJobId,hasClientId:!!String(clientId||''),hasJobId:!!String(jobId||'')},timestamp:Date.now()});
         // #endregion
         return res.status(400).json({
           error: 'clientId and jobId are required unless plan-pdf-share-v1 metadata includes a valid selected PDF storage key'
@@ -1557,7 +1569,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
       if (planShare) {
         if (!normalizedPlan.selectedDocStorageKey) {
           // #region agent log
-          fetch('http://127.0.0.1:7642/ingest/6f95c29d-5bab-4b09-8206-ff9dd9c19317',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'bf0e49'},body:JSON.stringify({sessionId:'bf0e49',runId:'pdf-share-create',hypothesisId:'H2',location:'portal-files.routes.js:/shares:missingSelectedDocStorageKey',message:'Plan share rejected due missing validated selectedDocStorageKey',data:{normalizedShareMetaKind:String(shareMeta?.kind||''),bodySelectedDocStorageKey:String((req.body||{}).selectedDocStorageKey||''),bodySelectedPdfStorageKey:String((req.body||{}).selectedPdfStorageKey||'')},timestamp:Date.now()})}).catch(()=>{});
+          emitDebugLog({sessionId:'bf0e49',runId:'pdf-share-create',hypothesisId:'H2',location:'portal-files.routes.js:/shares:missingSelectedDocStorageKey',message:'Plan share rejected due missing validated selectedDocStorageKey',data:{normalizedShareMetaKind:String(shareMeta?.kind||''),bodySelectedDocStorageKey:String((req.body||{}).selectedDocStorageKey||''),bodySelectedPdfStorageKey:String((req.body||{}).selectedPdfStorageKey||'')},timestamp:Date.now()});
           // #endregion
           return res.status(400).json({
             error:
@@ -1566,7 +1578,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
         }
         if (!collectPlanShareVirtualFiles({ shareMeta }).length) {
           // #region agent log
-          fetch('http://127.0.0.1:7642/ingest/6f95c29d-5bab-4b09-8206-ff9dd9c19317',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'bf0e49'},body:JSON.stringify({sessionId:'bf0e49',runId:'pdf-share-create',hypothesisId:'H5',location:'portal-files.routes.js:/shares:noVirtualFiles',message:'Plan share rejected because no virtual files could be collected',data:{normalizedShareMetaKind:String(shareMeta?.kind||''),selectedDocStorageKey:String(normalizedPlan.selectedDocStorageKey||''),snapshotPageCount:Array.isArray(shareMeta?.snapshot?.pages)?shareMeta.snapshot.pages.length:0},timestamp:Date.now()})}).catch(()=>{});
+          emitDebugLog({sessionId:'bf0e49',runId:'pdf-share-create',hypothesisId:'H5',location:'portal-files.routes.js:/shares:noVirtualFiles',message:'Plan share rejected because no virtual files could be collected',data:{normalizedShareMetaKind:String(shareMeta?.kind||''),selectedDocStorageKey:String(normalizedPlan.selectedDocStorageKey||''),snapshotPageCount:Array.isArray(shareMeta?.snapshot?.pages)?shareMeta.snapshot.pages.length:0},timestamp:Date.now()});
           // #endregion
           return res.status(400).json({
             error:
