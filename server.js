@@ -4902,7 +4902,16 @@ async function parseDb3(buffer) {
   const preferredSection = pickSqliteTable(tables, 'SECTION');
   let sectionT = preferredSection;
   const preferredSectionType = sectionT ? sqliteObjectType(db, sectionT) : '';
-  if (!sectionT || preferredSectionType === 'view') {
+  if (sectionT && preferredSectionType === 'view') {
+    console.warn('[db3-preview][section-source]', {
+      strategyVersion: DB3_PREVIEW_STRATEGY_VERSION,
+      branch: 'reject-preferred-view',
+      preferredSection,
+      preferredSectionType
+    });
+    sectionT = '';
+  }
+  if (!sectionT) {
     /** @type {{ name: string, score: number }[]} */
     const candidates = [];
     for (const tableName of tables) {
@@ -4938,6 +4947,13 @@ async function parseDb3(buffer) {
     );
   }
   const extraFrag = buildDb3SectionExtraSelect(db, sectionT);
+  console.warn('[db3-preview][section-source]', {
+    strategyVersion: DB3_PREVIEW_STRATEGY_VERSION,
+    branch: 'selected-section-source',
+    selectedSection: sectionT,
+    preferredSection: preferredSection || '',
+    preferredSectionType: preferredSectionType || ''
+  });
   const nodeT = pickSqliteTable(tables, 'NODE');
   const nodeType = nodeT ? sqliteObjectType(db, nodeT) : '';
   const nodeRuntimeTable = nodeT && nodeType !== 'view' ? nodeT : '';
@@ -5099,6 +5115,13 @@ async function parseDb3(buffer) {
         rows.push(mapped);
       }
       stmt.free();
+      console.warn('[db3-preview][strategy-select]', {
+        strategyVersion: DB3_PREVIEW_STRATEGY_VERSION,
+        strategy: 'sql-variant-v1',
+        hasNodeTable: !!nodeRuntimeTable,
+        hasSecinspTable: !!secinspRuntimeTable,
+        usesSectionExtras: !!extraFrag.sql
+      });
       db.close();
       return rows;
     } catch (e) {
@@ -5181,10 +5204,105 @@ async function parseDb3(buffer) {
         rows.push(mapped);
       }
       splitStmt.free();
+      console.warn('[db3-preview][strategy-select]', {
+        strategyVersion: DB3_PREVIEW_STRATEGY_VERSION,
+        strategy: 'section-split-probe-v1',
+        hasNodeTable: !!nodeRuntimeTable,
+        hasSecinspTable: !!secinspRuntimeTable,
+        usesSectionExtras: !!extraFrag.sql
+      });
       db.close();
       return rows;
     } catch (fallbackErr) {
       lastErr = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+      if (isDb3FromClauseOverflowError(fallbackErr)) {
+        console.warn('[db3-preview][variant-overflow]', {
+          strategyVersion: DB3_PREVIEW_STRATEGY_VERSION,
+          branch: 'split-fallback',
+          hasNodeTable: !!nodeRuntimeTable,
+          hasSecinspTable: !!secinspRuntimeTable,
+          message: String(lastErr || '').slice(0, 220)
+        });
+        let bareStmt;
+        try {
+          const bareSplitCoreCols = `
+      s.OBJ_Key AS reference,
+      COALESCE(s.OBJ_Length, 0) AS length,
+      COALESCE(s.OBJ_City, '') AS city,
+      COALESCE(s.OBJ_Street, '') AS street,
+      COALESCE(s.OBJ_FromNode_REF, '') AS from_node_ref,
+      COALESCE(s.OBJ_ToNode_REF, '') AS to_node_ref,
+      COALESCE(s.OBJ_Material, '') AS material_code,
+      COALESCE(s.OBJ_Shape, '') AS shape_code,
+      COALESCE(s.OBJ_Size1, '') AS size1,
+      COALESCE(s.OBJ_Size2, '') AS size2`;
+          const bareSplitSql = `
+        SELECT ${bareSplitCoreCols}
+        FROM ${S} s
+        ORDER BY s.OBJ_Key`;
+          console.warn('[db3-preview][variant-fallback]', {
+            strategyVersion: DB3_PREVIEW_STRATEGY_VERSION,
+            strategy: 'section-split-no-extras-v1',
+            hasNodeTable: !!nodeRuntimeTable,
+            hasSecinspTable: !!secinspRuntimeTable
+          });
+          bareStmt = db.prepare(bareSplitSql);
+          const rows = [];
+          const nodeCache = new Map();
+          const lookupNode = (rawRef) => {
+            const key = rawRef == null ? '' : String(rawRef).trim();
+            if (!key || !nodeRuntimeTable) return '';
+            if (nodeCache.has(key)) return nodeCache.get(key) || '';
+            const hit = resolveDb3NodeKeyByRef(db, nodeRuntimeTable, key);
+            nodeCache.set(key, hit || '');
+            return hit || '';
+          };
+          while (bareStmt.step()) {
+            const raw = bareStmt.getAsObject();
+            const mapped = mapDb3SectionRow(raw, projectName);
+            mapped.upstream = lookupNode(raw.from_node_ref);
+            mapped.downstream = lookupNode(raw.to_node_ref);
+            let imported = {};
+            if (secinspRuntimeTable) {
+              imported = mergeSecinspRowIntoDb3Imported(db, sectionT, secinspRuntimeTable, mapped.reference, imported);
+              imported = mergeSecinspBySectionObjKeyColumn(db, secinspRuntimeTable, mapped.reference, imported);
+            }
+            const inspector = db3InspectorIdentityFromImported(imported);
+            if (inspector) {
+              imported.HP_INSPECTOR_RAW = inspector.raw;
+              imported.HP_INSPECTOR_DISPLAY = inspector.canonical;
+              imported.HP_INSPECTOR_KEY = inspector.key;
+              mapped.inspectorRaw = inspector.raw;
+              mapped.inspector = inspector.canonical;
+              mapped.inspectorKey = inspector.key;
+            }
+            if (Object.keys(imported).length) mapped.db3Imported = imported;
+            rows.push(mapped);
+          }
+          bareStmt.free();
+          console.warn('[db3-preview][strategy-select]', {
+            strategyVersion: DB3_PREVIEW_STRATEGY_VERSION,
+            strategy: 'section-split-no-extras-v1',
+            hasNodeTable: !!nodeRuntimeTable,
+            hasSecinspTable: !!secinspRuntimeTable,
+            usesSectionExtras: false
+          });
+          db.close();
+          return rows;
+        } catch (bareErr) {
+          lastErr = bareErr instanceof Error ? bareErr.message : String(bareErr);
+          console.warn('[db3-preview][variant-fallback-error]', {
+            strategyVersion: DB3_PREVIEW_STRATEGY_VERSION,
+            strategy: 'section-split-no-extras-v1',
+            message: String(lastErr || '').slice(0, 220)
+          });
+          try {
+            bareStmt?.free();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
       try {
         splitStmt?.free();
       } catch {
