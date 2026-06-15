@@ -40,7 +40,7 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { Upload } = require('@aws-sdk/lib-storage');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
 const { canManagePortalExtras } = require('./capabilities');
-const { isValidPipesyncPlanPageStorageKey } = require('./admin-attachments-wasabi');
+const { isValidPipesyncPlanPageStorageKey, isValidPlanShareDownloadStorageKey } = require('./admin-attachments-wasabi');
 const {
   loadEffectivePathGrantsForUser,
   jobHasAnyEffectivePathGrants,
@@ -1498,7 +1498,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
     let i = 0;
     const addKey = (rawKey, rawPageName = '') => {
       const key = String(rawKey || '').trim();
-      if (!isValidPipesyncPlanPageStorageKey(key) || seen.has(key)) return false;
+      if (!isValidPlanShareDownloadStorageKey(key) || seen.has(key)) return false;
       seen.add(key);
       const pageName = String(rawPageName || '').trim();
       const fallback = selectedName || 'Plan.pdf';
@@ -1514,7 +1514,12 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
     };
     for (const page of pages) {
       if (!page || typeof page !== 'object') continue;
-      addKey(page.storageKey || page.storage_key, page.name);
+      const bakedKey = page.bakedStorageKey || page.baked_storage_key || '';
+      if (bakedKey) {
+        addKey(bakedKey, page.name);
+      } else {
+        addKey(page.storageKey || page.storage_key, page.name);
+      }
     }
     // Some assigned/foldered docs can carry only selectedPdf storage metadata.
     addKey(shareMeta?.selectedPdf?.storageKey || shareMeta?.selectedPdf?.storage_key, shareMeta?.selectedPdf?.name);
@@ -1530,7 +1535,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
   }
   function planShareAllowsVirtualKey(payload, storageKey) {
     const key = String(storageKey || '').trim();
-    if (!isValidPipesyncPlanPageStorageKey(key)) return false;
+    if (!isValidPlanShareDownloadStorageKey(key)) return false;
     return collectPlanShareVirtualFiles(payload).some((f) => f.key === key);
   }
   const r = express.Router();
@@ -1739,7 +1744,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     let i = 0;
     const addKey = (rawKey, rawPageName = '') => {
       const key = String(rawKey || '').trim();
-      if (!isValidPipesyncPlanPageStorageKey(key) || seen.has(key)) return false;
+      if (!isValidPlanShareDownloadStorageKey(key) || seen.has(key)) return false;
       seen.add(key);
       const pageName = String(rawPageName || '').trim();
       const fallback = selectedName || 'Plan.pdf';
@@ -1757,7 +1762,12 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     addKey(shareMeta?.selectedPdf?.storageKey, shareMeta?.selectedPdf?.name);
     for (const p of pages) {
       if (!p || typeof p !== 'object') continue;
-      addKey(p.storageKey || p.storage_key, p.name || p.pageName || p.fileName);
+      const bakedKey = p.bakedStorageKey || p.baked_storage_key || '';
+      if (bakedKey) {
+        addKey(bakedKey, p.name || p.pageName || p.fileName);
+      } else {
+        addKey(p.storageKey || p.storage_key, p.name || p.pageName || p.fileName);
+      }
     }
     return out;
   }

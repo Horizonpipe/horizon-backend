@@ -33,12 +33,16 @@ const {
 const {
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,
+  buildPipesyncPlanShareBakeStorageKey,
   buildPipesyncPlanWorkspaceSaveStorageKey,
   isAllowedAdminAttachmentContentType,
   isValidPipesyncPlanPageStorageKey,
+  isValidPipesyncPlanShareBakeStorageKey,
   isValidPipesyncPlanWorkspaceSaveStorageKey,
   presignAdminAttachmentPut,
+  presignPipesyncPlanShareBakePut,
   presignAdminAttachmentGet,
+  headPipesyncPlanShareBake,
   deleteAdminAttachmentKeys,
   deletePipesyncPlanPageKeys,
   collectAdminAttachmentStorageKeysFromFiles,
@@ -7817,6 +7821,90 @@ app.post(
       return res.json({ success: true, ...signed, viewUrl });
     } catch (error) {
       console.error('PIPESYNC PLAN VIEW UPLOAD PRESIGN:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+app.post(
+  '/pipesync/plan-view/share-bake-head',
+  requireAuth,
+  requirePsrViewerAccess,
+  express.json({ limit: '32kb' }),
+  async (req, res) => {
+    try {
+      if (!adminAttachmentsWasabiConfigured()) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
+      }
+      const docId = cleanString(req.body?.docId);
+      const pageId = cleanString(req.body?.pageId);
+      if (!docId || !pageId) {
+        return res.status(400).json({ success: false, error: 'docId and pageId are required' });
+      }
+      const storageKey = buildPipesyncPlanShareBakeStorageKey(docId, pageId);
+      const head = await headPipesyncPlanShareBake(wasabiStateClient, WASABI_STATE_BUCKET, storageKey);
+      return res.json({ success: true, storageKey, ...head });
+    } catch (error) {
+      console.error('PIPESYNC PLAN SHARE BAKE HEAD:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+app.post(
+  '/pipesync/plan-view/share-bake-presign',
+  requireAuth,
+  requirePsrViewerAccess,
+  express.json({ limit: '64kb' }),
+  async (req, res) => {
+    try {
+      if (!adminAttachmentsWasabiConfigured()) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
+      }
+      const docId = cleanString(req.body?.docId);
+      const pageId = cleanString(req.body?.pageId);
+      const bakeFingerprint = cleanString(req.body?.bakeFingerprint);
+      const contentType = cleanString(req.body?.contentType || 'application/pdf');
+      const fileSize = Number(req.body?.fileSize);
+      if (!docId || !pageId) {
+        return res.status(400).json({ success: false, error: 'docId and pageId are required' });
+      }
+      if (!bakeFingerprint) {
+        return res.status(400).json({ success: false, error: 'bakeFingerprint is required' });
+      }
+      if (!Number.isFinite(fileSize) || fileSize < 1 || fileSize > PIPESYNC_PLAN_VIEW_UPLOAD_MAX_BYTES) {
+        return res.status(400).json({
+          success: false,
+          error: `fileSize must be between 1 and ${PIPESYNC_PLAN_VIEW_UPLOAD_MAX_BYTES} bytes`
+        });
+      }
+      if (!isAllowedAdminAttachmentContentType(contentType, 'pipesync-plan-view')) {
+        return res.status(400).json({ success: false, error: 'Only PDF files are allowed for share bakes.' });
+      }
+      const storageKey = buildPipesyncPlanShareBakeStorageKey(docId, pageId);
+      const signed = await presignPipesyncPlanShareBakePut(
+        wasabiStateClient,
+        WASABI_STATE_BUCKET,
+        storageKey,
+        contentType,
+        bakeFingerprint,
+        ADMIN_ATTACHMENT_UPLOAD_TTL_SECONDS
+      );
+      let viewUrl = null;
+      try {
+        const getSigned = await presignAdminAttachmentGet(
+          wasabiStateClient,
+          WASABI_STATE_BUCKET,
+          storageKey,
+          ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+        );
+        viewUrl = getSigned.url;
+      } catch {
+        /* optional */
+      }
+      return res.json({ success: true, ...signed, viewUrl, overwritten: true });
+    } catch (error) {
+      console.error('PIPESYNC PLAN SHARE BAKE PRESIGN:', error);
       return res.status(500).json({ success: false, error: error.message });
     }
   }
