@@ -1,8 +1,7 @@
 'use strict';
 
+const { normalizeRelPath } = require('./company-permissions.service');
 const {
-  normalizeRelPath,
-  mapCompanyGrantToPortalGrant,
   serializeUserFolderGrantRow,
   loadUserFolderGrantsForScope,
   saveUserFolderGrantsForScope,
