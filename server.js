@@ -33,6 +33,7 @@ const {
 const {
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,
+  buildPipesyncPlanPageBaseStorageKey,
   buildPipesyncPlanShareBakeStorageKey,
   buildPipesyncPlanShareBakeStorageKeyLegacy,
   buildPipesyncPlanWorkspaceSaveStorageKey,
@@ -41,8 +42,10 @@ const {
   isValidPipesyncPlanShareBakeStorageKey,
   isValidPipesyncPlanWorkspaceSaveStorageKey,
   presignAdminAttachmentPut,
+  presignPipesyncPlanPagePut,
   presignPipesyncPlanShareBakePut,
   presignAdminAttachmentGet,
+  headPipesyncPlanPage,
   headPipesyncPlanShareBake,
   deleteAdminAttachmentKeys,
   deletePipesyncPlanPageKeys,
@@ -7990,6 +7993,82 @@ app.post(
       return res.json({ success: true, url: typeof url === 'string' ? url : '' });
     } catch (error) {
       console.error('PIPESYNC PLAN VIEW READ URL:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+app.post(
+  '/pipesync/plan-view/page-head',
+  requireAuth,
+  requirePsrViewerAccess,
+  express.json({ limit: '32kb' }),
+  async (req, res) => {
+    try {
+      if (!adminAttachmentsWasabiConfigured()) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
+      }
+      const storageKey = cleanString(req.body?.storageKey);
+      if (!storageKey || !isValidPipesyncPlanPageStorageKey(storageKey)) {
+        return res.status(400).json({ success: false, error: 'A valid plan page storageKey is required.' });
+      }
+      const head = await headPipesyncPlanPage(wasabiStateClient, WASABI_STATE_BUCKET, storageKey);
+      return res.json({ success: true, storageKey, ...head });
+    } catch (error) {
+      console.error('PIPESYNC PLAN VIEW PAGE HEAD:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+/** Overwrite an existing plan-page PDF (highlight ink sync writes back to the same Wasabi key). */
+app.post(
+  '/pipesync/plan-view/page-put-presign',
+  requireAuth,
+  requirePsrViewerAccess,
+  express.json({ limit: '64kb' }),
+  async (req, res) => {
+    try {
+      if (!adminAttachmentsWasabiConfigured()) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
+      }
+      const storageKey = cleanString(req.body?.storageKey);
+      const contentType = cleanString(req.body?.contentType || 'application/pdf');
+      const fileSize = Number(req.body?.fileSize);
+      if (!storageKey || !isValidPipesyncPlanPageStorageKey(storageKey)) {
+        return res.status(400).json({ success: false, error: 'A valid plan page storageKey is required.' });
+      }
+      if (!Number.isFinite(fileSize) || fileSize < 1 || fileSize > PIPESYNC_PLAN_VIEW_UPLOAD_MAX_BYTES) {
+        return res.status(400).json({
+          success: false,
+          error: `fileSize must be between 1 and ${PIPESYNC_PLAN_VIEW_UPLOAD_MAX_BYTES} bytes`
+        });
+      }
+      if (!isAllowedAdminAttachmentContentType(contentType, 'pipesync-plan-view')) {
+        return res.status(400).json({ success: false, error: 'Only PDF files are allowed for plan page overwrite.' });
+      }
+      const signed = await presignPipesyncPlanPagePut(
+        wasabiStateClient,
+        WASABI_STATE_BUCKET,
+        storageKey,
+        contentType,
+        ADMIN_ATTACHMENT_UPLOAD_TTL_SECONDS
+      );
+      let viewUrl = null;
+      try {
+        const getSigned = await presignAdminAttachmentGet(
+          wasabiStateClient,
+          WASABI_STATE_BUCKET,
+          storageKey,
+          ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+        );
+        viewUrl = getSigned.url;
+      } catch {
+        /* client can refresh read-url */
+      }
+      return res.json({ success: true, storageKey, viewUrl, ...signed });
+    } catch (error) {
+      console.error('PIPESYNC PLAN VIEW PAGE PUT PRESIGN:', error);
       return res.status(500).json({ success: false, error: error.message });
     }
   }

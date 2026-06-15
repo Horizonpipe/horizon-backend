@@ -28,6 +28,16 @@ function buildPipesyncPlanPageStorageKey(fileName) {
   return `${PIPESYNC_PLAN_PAGE_STORAGE_PREFIX}${id}/${sanitizeAdminAttachmentFilename(fileName)}`;
 }
 
+/** Immutable pristine split page PDF (highlights rebuild from this object). */
+function buildPipesyncPlanPageBaseStorageKey(sourceStorageKey) {
+  const sk = String(sourceStorageKey || '').trim();
+  if (!isValidPipesyncPlanPageStorageKey(sk)) {
+    throw new Error('sourceStorageKey must be a valid plan page storage key');
+  }
+  if (/\.base\.pdf$/i.test(sk)) return sk;
+  return sk.replace(/\.pdf$/i, '.base.pdf');
+}
+
 function isValidPipesyncPlanPageStorageKey(key) {
   if (typeof key !== 'string') return false;
   if (!key.startsWith(PIPESYNC_PLAN_PAGE_STORAGE_PREFIX)) return false;
@@ -123,6 +133,35 @@ async function presignAdminAttachmentPut(client, bucket, key, contentType, expir
   });
   const url = await getSignedUrl(client, cmd, { expiresIn });
   return { url, method: 'PUT', headers: { 'Content-Type': ct }, storageKey: key, expiresIn };
+}
+
+async function headPipesyncPlanPage(client, bucket, key) {
+  const k = String(key || '').trim();
+  if (!k || !isValidPipesyncPlanPageStorageKey(k)) {
+    throw new Error('Invalid plan page storage key');
+  }
+  try {
+    const out = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: k }));
+    return {
+      exists: true,
+      contentLength: Math.max(0, Number(out?.ContentLength) || 0),
+      etag: String(out?.ETag || '').replace(/"/g, '')
+    };
+  } catch (err) {
+    const code = err?.name || err?.Code || '';
+    if (code === 'NotFound' || code === 'NoSuchKey' || err?.$metadata?.httpStatusCode === 404) {
+      return { exists: false, contentLength: 0, etag: '' };
+    }
+    throw err;
+  }
+}
+
+async function presignPipesyncPlanPagePut(client, bucket, storageKey, contentType, ttlSeconds) {
+  const key = String(storageKey || '').trim();
+  if (!isValidPipesyncPlanPageStorageKey(key)) {
+    throw new Error('Invalid plan page storage key');
+  }
+  return presignAdminAttachmentPut(client, bucket, key, contentType, ttlSeconds);
 }
 
 async function headPipesyncPlanShareBake(client, bucket, key) {
@@ -278,6 +317,7 @@ module.exports = {
   sanitizeAdminAttachmentFilename,
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,
+  buildPipesyncPlanPageBaseStorageKey,
   buildPipesyncPlanShareBakeStorageKey,
   buildPipesyncPlanShareBakeStorageKeyLegacy,
   planShareBakeSegmentFromSourceStorageKey,
@@ -289,8 +329,10 @@ module.exports = {
   isValidAdminAttachmentStorageKey,
   isAllowedAdminAttachmentContentType,
   presignAdminAttachmentPut,
+  presignPipesyncPlanPagePut,
   presignPipesyncPlanShareBakePut,
   presignAdminAttachmentGet,
+  headPipesyncPlanPage,
   headPipesyncPlanShareBake,
   deleteAdminAttachmentKeys,
   deletePipesyncPlanPageKeys,
