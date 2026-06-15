@@ -34,6 +34,7 @@ const {
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,
   buildPipesyncPlanShareBakeStorageKey,
+  buildPipesyncPlanShareBakeStorageKeyLegacy,
   buildPipesyncPlanWorkspaceSaveStorageKey,
   isAllowedAdminAttachmentContentType,
   isValidPipesyncPlanPageStorageKey,
@@ -7838,11 +7839,35 @@ app.post(
       }
       const docId = cleanString(req.body?.docId);
       const pageId = cleanString(req.body?.pageId);
-      if (!docId || !pageId) {
-        return res.status(400).json({ success: false, error: 'docId and pageId are required' });
+      const sourceStorageKey = cleanString(req.body?.sourceStorageKey);
+      if (!docId) {
+        return res.status(400).json({ success: false, error: 'docId is required' });
       }
-      const storageKey = buildPipesyncPlanShareBakeStorageKey(docId, pageId);
-      const head = await headPipesyncPlanShareBake(wasabiStateClient, WASABI_STATE_BUCKET, storageKey);
+      if (!sourceStorageKey && !pageId) {
+        return res.status(400).json({ success: false, error: 'sourceStorageKey or pageId is required' });
+      }
+      let storageKey = '';
+      if (sourceStorageKey && isValidPipesyncPlanPageStorageKey(sourceStorageKey)) {
+        storageKey = buildPipesyncPlanShareBakeStorageKey(docId, sourceStorageKey);
+      } else if (pageId) {
+        storageKey = buildPipesyncPlanShareBakeStorageKeyLegacy(docId, pageId);
+      }
+      let head = await headPipesyncPlanShareBake(wasabiStateClient, WASABI_STATE_BUCKET, storageKey);
+      if (
+        !head.exists &&
+        sourceStorageKey &&
+        pageId &&
+        isValidPipesyncPlanPageStorageKey(sourceStorageKey)
+      ) {
+        const legacyKey = buildPipesyncPlanShareBakeStorageKeyLegacy(docId, pageId);
+        if (legacyKey !== storageKey) {
+          const legacyHead = await headPipesyncPlanShareBake(wasabiStateClient, WASABI_STATE_BUCKET, legacyKey);
+          if (legacyHead.exists) {
+            storageKey = legacyKey;
+            head = legacyHead;
+          }
+        }
+      }
       return res.json({ success: true, storageKey, ...head });
     } catch (error) {
       console.error('PIPESYNC PLAN SHARE BAKE HEAD:', error);
@@ -7863,11 +7888,15 @@ app.post(
       }
       const docId = cleanString(req.body?.docId);
       const pageId = cleanString(req.body?.pageId);
+      const sourceStorageKey = cleanString(req.body?.sourceStorageKey);
       const bakeFingerprint = cleanString(req.body?.bakeFingerprint);
       const contentType = cleanString(req.body?.contentType || 'application/pdf');
       const fileSize = Number(req.body?.fileSize);
-      if (!docId || !pageId) {
-        return res.status(400).json({ success: false, error: 'docId and pageId are required' });
+      if (!docId) {
+        return res.status(400).json({ success: false, error: 'docId is required' });
+      }
+      if (!sourceStorageKey && !pageId) {
+        return res.status(400).json({ success: false, error: 'sourceStorageKey or pageId is required' });
       }
       if (!bakeFingerprint) {
         return res.status(400).json({ success: false, error: 'bakeFingerprint is required' });
@@ -7881,7 +7910,10 @@ app.post(
       if (!isAllowedAdminAttachmentContentType(contentType, 'pipesync-plan-view')) {
         return res.status(400).json({ success: false, error: 'Only PDF files are allowed for share bakes.' });
       }
-      const storageKey = buildPipesyncPlanShareBakeStorageKey(docId, pageId);
+      const storageKey =
+        sourceStorageKey && isValidPipesyncPlanPageStorageKey(sourceStorageKey)
+          ? buildPipesyncPlanShareBakeStorageKey(docId, sourceStorageKey)
+          : buildPipesyncPlanShareBakeStorageKeyLegacy(docId, pageId);
       const signed = await presignPipesyncPlanShareBakePut(
         wasabiStateClient,
         WASABI_STATE_BUCKET,

@@ -41,7 +41,22 @@ function sanitizePlanShareBakeIdSegment(value) {
   return id;
 }
 
-function buildPipesyncPlanShareBakeStorageKey(docId, pageId) {
+function planShareBakeSegmentFromSourceStorageKey(sourceStorageKey) {
+  const sk = String(sourceStorageKey || '').trim();
+  if (!sk) throw new Error('sourceStorageKey is required');
+  return crypto.createHash('sha256').update(sk, 'utf8').digest('hex').slice(0, 32);
+}
+
+/** Stable bake object per doc + source PDF piece (survives page moves / folder reorganize in Plan View). */
+function buildPipesyncPlanShareBakeStorageKey(docId, sourceStorageKey) {
+  const doc = sanitizePlanShareBakeIdSegment(docId);
+  if (!doc) throw new Error('docId must be a valid UUID');
+  const seg = planShareBakeSegmentFromSourceStorageKey(sourceStorageKey);
+  return `${PIPESYNC_PLAN_SHARE_BAKE_PREFIX}${doc}/${seg}.pdf`;
+}
+
+/** @deprecated Legacy page-id bakes — kept for HEAD fallback only. */
+function buildPipesyncPlanShareBakeStorageKeyLegacy(docId, pageId) {
   const doc = sanitizePlanShareBakeIdSegment(docId);
   const page = sanitizePlanShareBakeIdSegment(pageId);
   if (!doc || !page) throw new Error('docId and pageId must be valid UUIDs');
@@ -58,8 +73,9 @@ function isValidPipesyncPlanShareBakeStorageKey(key) {
   if (parts.length !== 2) return false;
   const pagePart = parts[1];
   if (!pagePart.endsWith('.pdf')) return false;
-  const pageId = pagePart.slice(0, -4);
-  return sanitizePlanShareBakeIdSegment(parts[0]) === parts[0] && sanitizePlanShareBakeIdSegment(pageId) === pageId;
+  const seg = pagePart.slice(0, -4);
+  if (sanitizePlanShareBakeIdSegment(parts[0]) !== parts[0]) return false;
+  return /^[0-9a-f]{32}$/.test(seg) || sanitizePlanShareBakeIdSegment(seg) === seg;
 }
 
 function isValidPlanShareDownloadStorageKey(key) {
@@ -263,6 +279,8 @@ module.exports = {
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,
   buildPipesyncPlanShareBakeStorageKey,
+  buildPipesyncPlanShareBakeStorageKeyLegacy,
+  planShareBakeSegmentFromSourceStorageKey,
   buildPipesyncPlanWorkspaceSaveStorageKey,
   isValidPipesyncPlanPageStorageKey,
   isValidPipesyncPlanShareBakeStorageKey,
