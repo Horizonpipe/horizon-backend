@@ -1514,12 +1514,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
     };
     for (const page of pages) {
       if (!page || typeof page !== 'object') continue;
-      const bakedKey = page.bakedStorageKey || page.baked_storage_key || '';
-      if (bakedKey) {
-        addKey(bakedKey, page.name);
-      } else {
-        addKey(page.storageKey || page.storage_key, page.name);
-      }
+      addKey(page.storageKey || page.storage_key, page.name);
     }
     // Some assigned/foldered docs can carry only selectedPdf storage metadata.
     addKey(shareMeta?.selectedPdf?.storageKey || shareMeta?.selectedPdf?.storage_key, shareMeta?.selectedPdf?.name);
@@ -1762,12 +1757,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     addKey(shareMeta?.selectedPdf?.storageKey, shareMeta?.selectedPdf?.name);
     for (const p of pages) {
       if (!p || typeof p !== 'object') continue;
-      const bakedKey = p.bakedStorageKey || p.baked_storage_key || '';
-      if (bakedKey) {
-        addKey(bakedKey, p.name || p.pageName || p.fileName);
-      } else {
-        addKey(p.storageKey || p.storage_key, p.name || p.pageName || p.fileName);
-      }
+      addKey(p.storageKey || p.storage_key, p.name || p.pageName || p.fileName);
     }
     return out;
   }
