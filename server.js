@@ -1856,6 +1856,7 @@ function emptyRoles() {
     dataAutoSyncEmployee: false,
     pricingView: false,
     footageView: false,
+    jobsiteContactsView: false,
     portalUpload: false,
     portalDownload: false,
     portalEdit: false,
@@ -1880,6 +1881,8 @@ function normalizeRoles(value) {
         value.employee === true,
       pricingView: value.pricingView === true || value.pricing === true,
       footageView: value.footageView === true || value.footage === true,
+      jobsiteContactsView:
+        value.jobsiteContactsView === true || value.jobsite_contacts_view === true,
       portalUpload: value.portalUpload === true || value.portal_upload === true,
       portalDownload: value.portalDownload === true || value.portal_download === true,
       portalEdit: value.portalEdit === true || value.portal_edit === true,

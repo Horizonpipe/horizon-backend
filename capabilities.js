@@ -53,6 +53,7 @@ function normalizeLegacyRoles(value) {
     dataAutoSyncEmployee: false,
     pricingView: false,
     footageView: false,
+    jobsiteContactsView: false,
     portalUpload: false,
     portalDownload: false,
     portalEdit: false,
@@ -119,6 +120,7 @@ function legacyRolesForAccountModel(model, legacyRolesInput = null) {
     dataAutoSyncEmployee: false,
     pricingView: false,
     footageView: false,
+    jobsiteContactsView: false,
     portalUpload: false,
     portalDownload: false,
     portalEdit: false,
@@ -140,14 +142,14 @@ function legacyRolesForAccountModel(model, legacyRolesInput = null) {
     out.portalDownload = true;
     out.portalEdit = true;
     out.portalDelete = true;
-    return out;
+    return { ...out, ...legacy };
   }
   if (role === EMPLOYEE_ROLES.VAC_OPERATOR || role === EMPLOYEE_ROLES.SIMPLE_VAC) {
     out.vac = true;
     out.psrViewer = true;
     out.psrDataEntry = true;
     if (role === EMPLOYEE_ROLES.SIMPLE_VAC) out.simpleVac = true;
-    return out;
+    return { ...out, ...legacy };
   }
   return { ...out, ...legacy };
 }
@@ -197,6 +199,7 @@ function resolveCapabilities(user) {
     simpleVac: !!roles.simpleVac,
     pricingView: !!roles.pricingView,
     footageView: !!roles.footageView,
+    jobsiteContactsView: !!roles.jobsiteContactsView,
     dataAutoSyncEmployee: !!roles.dataAutoSyncEmployee,
     email: !!roles.email,
     portalUpload: !!roles.portalUpload,
