@@ -26,18 +26,19 @@ function normalizeAppFeatures(raw) {
 }
 
 function mapCompanyGrantToPortalGrant(row) {
+  const recursive = row?.recursive !== false;
   if (!row || row.enabled === false) {
-    return { path_prefix: normalizeRelPath(row?.path_prefix), recursive: true, access_mode: 'off' };
+    return { path_prefix: normalizeRelPath(row?.path_prefix), recursive, access_mode: 'off' };
   }
   if (!row.can_view) {
-    return { path_prefix: normalizeRelPath(row.path_prefix), recursive: true, access_mode: 'off' };
+    return { path_prefix: normalizeRelPath(row.path_prefix), recursive, access_mode: 'off' };
   }
   let access_mode = 'view';
   if (row.can_download) access_mode = 'view_download';
   if (row.can_edit || row.can_delete || row.can_upload) access_mode = 'full';
   return {
     path_prefix: normalizeRelPath(row.path_prefix),
-    recursive: true,
+    recursive,
     access_mode,
     _companyGrant: {
       canView: !!row.can_view,
@@ -142,12 +143,17 @@ async function loadCompanyFolderGrants(pool, companyId, roleKey, clientId, jobId
 }
 
 /**
- * Canonical-only effective grants:
- * company role grants + user override grants.
+ * Effective PipeShare path grants for a user: direct user_folder_grants first,
+ * then legacy company role grants + membership overrides when no direct rows exist for the job.
  */
 async function loadEffectivePathGrantsForUser(pool, user, clientId, jobId, loadUserPathGrantsFn) {
   void loadUserPathGrantsFn;
   if (!user?.id) return [];
+
+  const { loadDirectUserFolderGrantsForUser, jobHasDirectUserFolderGrants } = require('./user-grants.service');
+  const directGrants = await loadDirectUserFolderGrantsForUser(pool, user.id, clientId, jobId);
+  if (directGrants.length) return directGrants;
+  if (await jobHasDirectUserFolderGrants(pool, clientId, jobId)) return [];
 
   const membership = await loadUserCompanyMembership(pool, user.id);
   if (!membership) return [];
@@ -176,6 +182,8 @@ async function loadEffectivePathGrantsForUser(pool, user, clientId, jobId, loadU
 
 async function jobHasAnyEffectivePathGrants(pool, user, clientId, jobId, portalJobHasPathGrantsFn) {
   void portalJobHasPathGrantsFn;
+  const { jobHasDirectUserFolderGrants } = require('./user-grants.service');
+  if (await jobHasDirectUserFolderGrants(pool, clientId, jobId)) return true;
   if (!user?.id) return false;
   const membership = await loadUserCompanyMembership(pool, user.id);
   if (!membership) return false;

@@ -13,6 +13,7 @@ const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/clien
 const { ensureOutlookSchema, registerOutlookRoutes } = require('./outlook');
 const { registerPortalFilesRoutes } = require('./portal-files.routes');
 const { registerCompanyPermissionsRoutes } = require('./company-permissions.routes');
+const { registerUserGrantsRoutes } = require('./user-grants.routes');
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
 const { registerSignupRoutes } = require('./signup.routes');
 const { loadUserCompanyMembership, normalizeAppFeatures } = require('./company-permissions.service');
@@ -5849,6 +5850,35 @@ async function ensureSchema() {
   );
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_folder_grants (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id TEXT NOT NULL,
+      app TEXT NOT NULL DEFAULT 'pipeshare',
+      client_id TEXT NOT NULL,
+      job_id TEXT NOT NULL DEFAULT '',
+      path_prefix TEXT NOT NULL DEFAULT '',
+      psr_scope_level TEXT NOT NULL DEFAULT '',
+      psr_city TEXT NOT NULL DEFAULT '',
+      recursive BOOLEAN NOT NULL DEFAULT true,
+      enabled BOOLEAN NOT NULL DEFAULT true,
+      can_view BOOLEAN NOT NULL DEFAULT true,
+      can_edit BOOLEAN NOT NULL DEFAULT false,
+      can_delete BOOLEAN NOT NULL DEFAULT false,
+      can_upload BOOLEAN NOT NULL DEFAULT false,
+      can_download BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (user_id, app, client_id, job_id, path_prefix, psr_scope_level, psr_city)
+    )
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_user_folder_grants_user_job ON user_folder_grants (user_id, app, client_id, job_id)`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_user_folder_grants_scope ON user_folder_grants (app, client_id, job_id, path_prefix, psr_scope_level, psr_city)`
+  );
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS user_company_membership (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id TEXT NOT NULL UNIQUE,
@@ -10726,6 +10756,7 @@ registerOutlookRoutes(app, {
 });
 registerPortalFilesRoutes(app, { pool, query: queryPortalDataWithWasabiFallback, requireAuth, requireAdmin });
 registerCompanyPermissionsRoutes(app, { pool, requireAuth, requireAdminPanelAccess });
+registerUserGrantsRoutes(app, { pool, requireAuth, requireAdminPanelAccess });
 registerSignupRoutes(app, {
   pool,
   query: querySignupDataWithWasabiFallback,
