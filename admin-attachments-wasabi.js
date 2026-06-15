@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
-const { PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
+const { PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const ADMIN_ATTACHMENT_STORAGE_PREFIX = 'app-data/horizon-admin/attachments/';
@@ -9,8 +9,6 @@ const ADMIN_ATTACHMENT_STORAGE_PREFIX = 'app-data/horizon-admin/attachments/';
 const PIPESYNC_PLAN_PAGE_STORAGE_PREFIX = 'app-data/horizon-pipesync/plan-pages/';
 /** Versioned workspace checkpoints (board layout, masks, crops) — JSON blobs keyed by save id. */
 const PIPESYNC_PLAN_WORKSPACE_SAVE_PREFIX = 'app-data/horizon-pipesync/plan-workspace-saves/';
-/** Pre-baked plan PDFs for PipeShare (highlights embedded at share time). One object per doc page; overwritten when content changes. */
-const PIPESYNC_PLAN_SHARE_BAKE_PREFIX = 'app-data/horizon-pipesync/plan-share-bakes/';
 
 function sanitizeAdminAttachmentFilename(name) {
   const base = String(name || '').split(/[/\\]/).pop() || 'upload.bin';
@@ -28,68 +26,11 @@ function buildPipesyncPlanPageStorageKey(fileName) {
   return `${PIPESYNC_PLAN_PAGE_STORAGE_PREFIX}${id}/${sanitizeAdminAttachmentFilename(fileName)}`;
 }
 
-/** Immutable pristine split page PDF (highlights rebuild from this object). */
-function buildPipesyncPlanPageBaseStorageKey(sourceStorageKey) {
-  const sk = String(sourceStorageKey || '').trim();
-  if (!isValidPipesyncPlanPageStorageKey(sk)) {
-    throw new Error('sourceStorageKey must be a valid plan page storage key');
-  }
-  if (/\.base\.pdf$/i.test(sk)) return sk;
-  return sk.replace(/\.pdf$/i, '.base.pdf');
-}
-
 function isValidPipesyncPlanPageStorageKey(key) {
   if (typeof key !== 'string') return false;
   if (!key.startsWith(PIPESYNC_PLAN_PAGE_STORAGE_PREFIX)) return false;
   if (key.length >= 4096 || key.includes('..')) return false;
   return true;
-}
-
-function sanitizePlanShareBakeIdSegment(value) {
-  const id = String(value || '').trim().toLowerCase();
-  if (!id || !/^[0-9a-f-]{36}$/.test(id)) return '';
-  return id;
-}
-
-function planShareBakeSegmentFromSourceStorageKey(sourceStorageKey) {
-  const sk = String(sourceStorageKey || '').trim();
-  if (!sk) throw new Error('sourceStorageKey is required');
-  return crypto.createHash('sha256').update(sk, 'utf8').digest('hex').slice(0, 32);
-}
-
-/** Stable bake object per doc + source PDF piece (survives page moves / folder reorganize in Plan View). */
-function buildPipesyncPlanShareBakeStorageKey(docId, sourceStorageKey) {
-  const doc = sanitizePlanShareBakeIdSegment(docId);
-  if (!doc) throw new Error('docId must be a valid UUID');
-  const seg = planShareBakeSegmentFromSourceStorageKey(sourceStorageKey);
-  return `${PIPESYNC_PLAN_SHARE_BAKE_PREFIX}${doc}/${seg}.pdf`;
-}
-
-/** @deprecated Legacy page-id bakes — kept for HEAD fallback only. */
-function buildPipesyncPlanShareBakeStorageKeyLegacy(docId, pageId) {
-  const doc = sanitizePlanShareBakeIdSegment(docId);
-  const page = sanitizePlanShareBakeIdSegment(pageId);
-  if (!doc || !page) throw new Error('docId and pageId must be valid UUIDs');
-  return `${PIPESYNC_PLAN_SHARE_BAKE_PREFIX}${doc}/${page}.pdf`;
-}
-
-function isValidPipesyncPlanShareBakeStorageKey(key) {
-  if (typeof key !== 'string') return false;
-  if (!key.startsWith(PIPESYNC_PLAN_SHARE_BAKE_PREFIX)) return false;
-  if (!key.endsWith('.pdf')) return false;
-  if (key.length >= 4096 || key.includes('..')) return false;
-  const rest = key.slice(PIPESYNC_PLAN_SHARE_BAKE_PREFIX.length);
-  const parts = rest.split('/');
-  if (parts.length !== 2) return false;
-  const pagePart = parts[1];
-  if (!pagePart.endsWith('.pdf')) return false;
-  const seg = pagePart.slice(0, -4);
-  if (sanitizePlanShareBakeIdSegment(parts[0]) !== parts[0]) return false;
-  return /^[0-9a-f]{32}$/.test(seg) || sanitizePlanShareBakeIdSegment(seg) === seg;
-}
-
-function isValidPlanShareDownloadStorageKey(key) {
-  return isValidPipesyncPlanPageStorageKey(key) || isValidPipesyncPlanShareBakeStorageKey(key);
 }
 
 function buildPipesyncPlanWorkspaceSaveStorageKey(saveId) {
@@ -123,74 +64,15 @@ function isAllowedAdminAttachmentContentType(mime, fileKind) {
   return m.startsWith('image/') || m === 'application/pdf';
 }
 
-async function presignAdminAttachmentPut(client, bucket, key, contentType, expiresIn, metadata = null) {
+async function presignAdminAttachmentPut(client, bucket, key, contentType, expiresIn) {
   const ct = String(contentType || 'application/octet-stream').trim() || 'application/octet-stream';
   const cmd = new PutObjectCommand({
     Bucket: bucket,
     Key: key,
-    ContentType: ct,
-    ...(metadata && typeof metadata === 'object' ? { Metadata: metadata } : {})
+    ContentType: ct
   });
   const url = await getSignedUrl(client, cmd, { expiresIn });
   return { url, method: 'PUT', headers: { 'Content-Type': ct }, storageKey: key, expiresIn };
-}
-
-async function headPipesyncPlanPage(client, bucket, key) {
-  const k = String(key || '').trim();
-  if (!k || !isValidPipesyncPlanPageStorageKey(k)) {
-    throw new Error('Invalid plan page storage key');
-  }
-  try {
-    const out = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: k }));
-    return {
-      exists: true,
-      contentLength: Math.max(0, Number(out?.ContentLength) || 0),
-      etag: String(out?.ETag || '').replace(/"/g, '')
-    };
-  } catch (err) {
-    const code = err?.name || err?.Code || '';
-    if (code === 'NotFound' || code === 'NoSuchKey' || err?.$metadata?.httpStatusCode === 404) {
-      return { exists: false, contentLength: 0, etag: '' };
-    }
-    throw err;
-  }
-}
-
-async function presignPipesyncPlanPagePut(client, bucket, storageKey, contentType, ttlSeconds) {
-  const key = String(storageKey || '').trim();
-  if (!isValidPipesyncPlanPageStorageKey(key)) {
-    throw new Error('Invalid plan page storage key');
-  }
-  return presignAdminAttachmentPut(client, bucket, key, contentType, ttlSeconds);
-}
-
-async function headPipesyncPlanShareBake(client, bucket, key) {
-  if (!isValidPipesyncPlanShareBakeStorageKey(key)) {
-    return { exists: false, bakeFingerprint: '' };
-  }
-  try {
-    const out = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
-    const meta = out.Metadata && typeof out.Metadata === 'object' ? out.Metadata : {};
-    const bakeFingerprint =
-      String(meta['bake-fingerprint'] || meta.bakefingerprint || meta['bakeFingerprint'] || '').trim();
-    return {
-      exists: true,
-      bakeFingerprint,
-      contentLength: Math.max(0, Number(out.ContentLength) || 0)
-    };
-  } catch (error) {
-    const status = Number(error?.$metadata?.httpStatusCode) || 0;
-    if (status === 404 || String(error?.name || '') === 'NotFound') {
-      return { exists: false, bakeFingerprint: '' };
-    }
-    throw error;
-  }
-}
-
-async function presignPipesyncPlanShareBakePut(client, bucket, key, contentType, bakeFingerprint, expiresIn) {
-  if (!isValidPipesyncPlanShareBakeStorageKey(key)) throw new Error('Invalid plan share bake storage key');
-  const fp = String(bakeFingerprint || '').trim().slice(0, 128);
-  return presignAdminAttachmentPut(client, bucket, key, contentType, expiresIn, fp ? { 'bake-fingerprint': fp } : null);
 }
 
 async function presignAdminAttachmentGet(client, bucket, key, expiresIn) {
@@ -312,28 +194,17 @@ async function hydrateAdminReportOrAssetRows(client, bucket, rows, filesField, v
 module.exports = {
   ADMIN_ATTACHMENT_STORAGE_PREFIX,
   PIPESYNC_PLAN_PAGE_STORAGE_PREFIX,
-  PIPESYNC_PLAN_SHARE_BAKE_PREFIX,
   PIPESYNC_PLAN_WORKSPACE_SAVE_PREFIX,
   sanitizeAdminAttachmentFilename,
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,
-  buildPipesyncPlanPageBaseStorageKey,
-  buildPipesyncPlanShareBakeStorageKey,
-  buildPipesyncPlanShareBakeStorageKeyLegacy,
-  planShareBakeSegmentFromSourceStorageKey,
   buildPipesyncPlanWorkspaceSaveStorageKey,
   isValidPipesyncPlanPageStorageKey,
-  isValidPipesyncPlanShareBakeStorageKey,
-  isValidPlanShareDownloadStorageKey,
   isValidPipesyncPlanWorkspaceSaveStorageKey,
   isValidAdminAttachmentStorageKey,
   isAllowedAdminAttachmentContentType,
   presignAdminAttachmentPut,
-  presignPipesyncPlanPagePut,
-  presignPipesyncPlanShareBakePut,
   presignAdminAttachmentGet,
-  headPipesyncPlanPage,
-  headPipesyncPlanShareBake,
   deleteAdminAttachmentKeys,
   deletePipesyncPlanPageKeys,
   collectAdminAttachmentStorageKeysFromFiles,

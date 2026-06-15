@@ -40,7 +40,7 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { Upload } = require('@aws-sdk/lib-storage');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
 const { canManagePortalExtras } = require('./capabilities');
-const { isValidPipesyncPlanPageStorageKey, isValidPlanShareDownloadStorageKey } = require('./admin-attachments-wasabi');
+const { isValidPipesyncPlanPageStorageKey } = require('./admin-attachments-wasabi');
 const {
   loadEffectivePathGrantsForUser,
   jobHasAnyEffectivePathGrants,
@@ -1498,7 +1498,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
     let i = 0;
     const addKey = (rawKey, rawPageName = '') => {
       const key = String(rawKey || '').trim();
-      if (!isValidPlanShareDownloadStorageKey(key) || seen.has(key)) return false;
+      if (!isValidPipesyncPlanPageStorageKey(key) || seen.has(key)) return false;
       seen.add(key);
       const pageName = String(rawPageName || '').trim();
       const fallback = selectedName || 'Plan.pdf';
@@ -1530,7 +1530,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
   }
   function planShareAllowsVirtualKey(payload, storageKey) {
     const key = String(storageKey || '').trim();
-    if (!isValidPlanShareDownloadStorageKey(key)) return false;
+    if (!isValidPipesyncPlanPageStorageKey(key)) return false;
     return collectPlanShareVirtualFiles(payload).some((f) => f.key === key);
   }
   const r = express.Router();
@@ -1739,7 +1739,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     let i = 0;
     const addKey = (rawKey, rawPageName = '') => {
       const key = String(rawKey || '').trim();
-      if (!isValidPlanShareDownloadStorageKey(key) || seen.has(key)) return false;
+      if (!isValidPipesyncPlanPageStorageKey(key) || seen.has(key)) return false;
       seen.add(key);
       const pageName = String(rawPageName || '').trim();
       const fallback = selectedName || 'Plan.pdf';
@@ -1919,157 +1919,6 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   const r = express.Router();
   r.use(requireAuth);
-
-  const PORTAL_PLAN_SHARE_BACKUP_CLIENT_ID = (
-    process.env.PORTAL_PLAN_SHARE_BACKUP_CLIENT_ID ||
-    process.env.PORTAL_SHARED_DEFAULT_CLIENT_ID ||
-    'portal-users'
-  ).trim();
-  const PORTAL_PLAN_SHARE_BACKUP_JOB_ID = (
-    process.env.PORTAL_PLAN_SHARE_BACKUP_JOB_ID || process.env.PORTAL_FORCE_JOB_ID || '3'
-  ).trim();
-  const PORTAL_PLAN_SHARE_BACKUP_FOLDER = (
-    process.env.PORTAL_PLAN_SHARE_BACKUP_FOLDER || 'Plan View Share Backups'
-  ).trim();
-
-  function isPlanPdfShareMetaForArchive(meta) {
-    return !!(
-      meta &&
-      typeof meta === 'object' &&
-      !Array.isArray(meta) &&
-      String(meta.kind || '').toLowerCase() === 'plan-pdf-share-v1'
-    );
-  }
-
-  async function copyWasabiObjectIfExists(s3Client, bucketName, sourceKey, destKey) {
-    const src = String(sourceKey || '').trim();
-    const dst = String(destKey || '').trim();
-    if (!src || !dst) return false;
-    try {
-      await s3Client.send(new HeadObjectCommand({ Bucket: bucketName, Key: src }));
-    } catch {
-      return false;
-    }
-    await s3Client.send(
-      new CopyObjectCommand({
-        Bucket: bucketName,
-        Key: dst,
-        CopySource: copySourceHeader(bucketName, src),
-        MetadataDirective: 'COPY'
-      })
-    );
-    return true;
-  }
-
-  r.post('/plan-shares/archive-doc', express.json({ limit: '64kb' }), async (req, res) => {
-    try {
-      const docId = String(req.body?.docId || '').trim();
-      const docName = String(req.body?.docName || 'Plan.pdf').trim().slice(0, 260);
-      if (!docId) return res.status(400).json({ error: 'docId is required' });
-      const found = await pool.query(
-        `SELECT id, token, kind, payload, created_at
-           FROM portal_share_links
-          WHERE revoked_at IS NULL
-            AND payload->'shareMeta'->'selectedPdf'->>'docId' = $1`,
-        [docId]
-      );
-      const rows = Array.isArray(found.rows) ? found.rows : [];
-      if (!rows.length) {
-        return res.json({ ok: true, archivedShareCount: 0, copiedFileCount: 0 });
-      }
-      const archivedBy = String(req.user?.username || '').trim() || null;
-      const archivedAt = new Date().toISOString();
-      const safeDocFolder = sanitizeFilename(docName.replace(/\.pdf$/i, '') || 'Plan') || 'Plan';
-      let copiedFileCount = 0;
-      let archivedShareCount = 0;
-      for (const row of rows) {
-        const payload = row.payload && typeof row.payload === 'object' ? row.payload : {};
-        const shareMeta = payload.shareMeta && typeof payload.shareMeta === 'object' ? payload.shareMeta : null;
-        if (!isPlanPdfShareMetaForArchive(shareMeta)) continue;
-        const token = String(row.token || '').trim();
-        const tokenFolder = token ? token.slice(0, 12) : crypto.randomBytes(6).toString('hex');
-        const relFolder = `${PORTAL_PLAN_SHARE_BACKUP_FOLDER}/${safeDocFolder}/${tokenFolder}`;
-        const keyPrefix = `${jobPrefix(PORTAL_PLAN_SHARE_BACKUP_CLIENT_ID, PORTAL_PLAN_SHARE_BACKUP_JOB_ID)}${relFolder}`;
-        const pages = Array.isArray(shareMeta?.snapshot?.pages) ? shareMeta.snapshot.pages : [];
-        const archivedPages = [];
-        for (const page of pages) {
-          if (!page || typeof page !== 'object') continue;
-          const srcKey = String(page.bakedStorageKey || page.baked_storage_key || page.storageKey || page.storage_key || '').trim();
-          if (!srcKey) continue;
-          const pageName = sanitizeFilename(String(page.name || 'sheet.pdf').trim()) || 'sheet.pdf';
-          const destKey = `${keyPrefix}/${pageName.endsWith('.pdf') ? pageName : `${pageName}.pdf`}`;
-          const copied = await copyWasabiObjectIfExists(s3, bucket, srcKey, destKey);
-          if (copied) {
-            copiedFileCount += 1;
-            archivedPages.push({
-              name: String(page.name || pageName).slice(0, 260),
-              sourceKey: srcKey.slice(0, 800),
-              backupKey: destKey.slice(0, 800)
-            });
-          }
-        }
-        const manifest = {
-          kind: 'plan-pdf-share-archive-v1',
-          docId,
-          docName,
-          shareToken: token,
-          shareKind: String(row.kind || ''),
-          shareCreatedAt: row.created_at || null,
-          archivedAt,
-          archivedBy,
-          backupClientId: PORTAL_PLAN_SHARE_BACKUP_CLIENT_ID,
-          backupJobId: PORTAL_PLAN_SHARE_BACKUP_JOB_ID,
-          backupFolderRel: relFolder,
-          pages: archivedPages
-        };
-        const manifestKey = `${keyPrefix}/share-manifest.json`;
-        await s3.send(
-          new PutObjectCommand({
-            Bucket: bucket,
-            Key: manifestKey,
-            Body: JSON.stringify(manifest),
-            ContentType: 'application/json'
-          })
-        );
-        copiedFileCount += 1;
-        const linkKey = `${keyPrefix}/share-link.txt`;
-        await s3.send(
-          new PutObjectCommand({
-            Bucket: bucket,
-            Key: linkKey,
-            Body: `Share token: ${token}\nDoc: ${docName}\nArchived: ${archivedAt}\n`,
-            ContentType: 'text/plain; charset=utf-8'
-          })
-        );
-        copiedFileCount += 1;
-        const nextPayload = {
-          ...payload,
-          shareMeta: {
-            ...shareMeta,
-            archived: {
-              at: archivedAt,
-              by: archivedBy,
-              reason: 'plan-deleted',
-              backupClientId: PORTAL_PLAN_SHARE_BACKUP_CLIENT_ID,
-              backupJobId: PORTAL_PLAN_SHARE_BACKUP_JOB_ID,
-              backupFolderRel: relFolder,
-              docName
-            }
-          }
-        };
-        await pool.query(`UPDATE portal_share_links SET payload = $2::jsonb WHERE id = $1`, [
-          row.id,
-          JSON.stringify(nextPayload)
-        ]);
-        archivedShareCount += 1;
-      }
-      return res.json({ ok: true, archivedShareCount, copiedFileCount, backupFolder: PORTAL_PLAN_SHARE_BACKUP_FOLDER });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error('[portal-files] plan-shares/archive-doc:', msg);
-      return res.status(500).json({ error: msg });
-    }
-  });
 
   /**
    * Persist client-reported full-object SHA-256 (presigned uploads; trusted like resumable flow).
