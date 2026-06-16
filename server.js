@@ -13,6 +13,12 @@ const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/clien
 const { ensureOutlookSchema, registerOutlookRoutes } = require('./outlook');
 const { registerPortalFilesRoutes } = require('./portal-files.routes');
 const { registerCompanyPermissionsRoutes } = require('./company-permissions.routes');
+const {
+  nextDb3DuplicateReference,
+  isDb3DuplicateExcludeDecision,
+  isDb3DuplicateIncludeDecision,
+  rowHasJobsiteDuplicateFlag
+} = require('./lib/db3-jobsite-duplicate');
 const { registerUserGrantsRoutes } = require('./user-grants.routes');
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
 const { registerSignupRoutes } = require('./signup.routes');
@@ -3567,15 +3573,20 @@ function buildDb3DuplicatePayloadFromPlacedRow(row) {
 }
 
 /**
- * For each WinCan OBJ_Key (segment.reference), find a matching segment on a **non–import-queue** planner record
- * (latest `updated_at` wins). Used for DB3 import queue staging.
+ * For each WinCan OBJ_Key (segment.reference), find a matching segment on planner records in the **same jobsite**
+ * (client + city + jobsite; latest `updated_at` wins). Never matches across jobsites.
  * @param {string[]} referenceLowers lowercased trimmed references
+ * @param {{ client?: string, city?: string, jobsite?: string }} scope import target jobsite identity
  * @returns {Promise<Map<string, ReturnType<typeof sanitizeDb3DuplicateOf>>>}
  */
-async function findPlacedDuplicatePayloadsByReferences(referenceLowers) {
+async function findPlacedDuplicatePayloadsByReferences(referenceLowers, scope = {}) {
   const map = new Map();
   const uniq = [...new Set((referenceLowers || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean))];
   if (!uniq.length) return map;
+  const scopeClient = cleanString(scope.client);
+  const scopeCity = cleanString(scope.city);
+  const scopeJobsite = normalizeJobsiteName(scope.jobsite || 'NOT SET');
+  if (!scopeClient || !scopeJobsite || scopeJobsite === 'NOT SET') return map;
   if (typeof pool?.query !== 'function') return map;
   try {
     const { rows: hits } = await pool.query(
@@ -3584,17 +3595,21 @@ async function findPlacedDuplicatePayloadsByReferences(referenceLowers) {
                 'storm'::text AS sys, seg
          FROM planner_records pr,
          LATERAL jsonb_array_elements(COALESCE(pr.data->'systems'->'storm', '[]'::jsonb)) seg
-         WHERE LOWER(BTRIM(pr.client)) <> LOWER(BTRIM($1))
-           AND LOWER(BTRIM(COALESCE(seg->>'reference',''))) = ANY($2::text[])
+         WHERE LOWER(BTRIM(pr.client)) = LOWER(BTRIM($1))
+           AND LOWER(BTRIM(COALESCE(pr.city, ''))) = LOWER(BTRIM($2))
+           AND LOWER(BTRIM(COALESCE(pr.jobsite, ''))) = LOWER(BTRIM($3))
+           AND LOWER(BTRIM(COALESCE(seg->>'reference',''))) = ANY($4::text[])
        UNION ALL
          SELECT pr.id, pr.client, pr.city, pr.jobsite, pr.street, pr.updated_at,
                 'sanitary'::text, seg
          FROM planner_records pr,
          LATERAL jsonb_array_elements(COALESCE(pr.data->'systems'->'sanitary', '[]'::jsonb)) seg
-         WHERE LOWER(BTRIM(pr.client)) <> LOWER(BTRIM($1))
-           AND LOWER(BTRIM(COALESCE(seg->>'reference',''))) = ANY($2::text[])
+         WHERE LOWER(BTRIM(pr.client)) = LOWER(BTRIM($1))
+           AND LOWER(BTRIM(COALESCE(pr.city, ''))) = LOWER(BTRIM($2))
+           AND LOWER(BTRIM(COALESCE(pr.jobsite, ''))) = LOWER(BTRIM($3))
+           AND LOWER(BTRIM(COALESCE(seg->>'reference',''))) = ANY($4::text[])
        ) q`,
-      [PSR_IMPORT_QUEUE_CLIENT, uniq]
+      [scopeClient, scopeCity, scopeJobsite, uniq]
     );
     for (const row of hits) {
       const seg = row.seg && typeof row.seg === 'object' ? row.seg : parseJsonObject(row.seg, {});
@@ -9090,7 +9105,11 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
     });
 
     const refKeys = rows.map((row) => String(row?.reference || '').trim().toLowerCase()).filter(Boolean);
-    const placedDupMap = await findPlacedDuplicatePayloadsByReferences(refKeys);
+    const placedDupMap = await findPlacedDuplicatePayloadsByReferences(refKeys, {
+      client: targetClient,
+      city: targetCity,
+      jobsite: targetJobsite
+    });
 
     const previewRows = rows.map((row) => {
       const refKey = String(row?.reference || '').trim().toLowerCase();
@@ -9182,24 +9201,42 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
     const refSet = existingIdentity.references;
     const dedupeKeySet = existingIdentity.dedupeKeys;
     const dedupeHashSet = existingIdentity.dedupeHashes;
-    const queueImport = String(targetClient || '').trim().toLowerCase() === String(PSR_IMPORT_QUEUE_CLIENT).trim().toLowerCase();
     const commitRefKeys = rows.map((r) => String(r?.reference || '').trim().toLowerCase()).filter(Boolean);
-    const placedAtCommit = queueImport ? await findPlacedDuplicatePayloadsByReferences(commitRefKeys) : new Map();
+    const placedAtCommit = await findPlacedDuplicatePayloadsByReferences(commitRefKeys, {
+      client: targetClient,
+      city: targetCity,
+      jobsite: targetJobsite
+    });
 
     rows.forEach((row) => {
-      if (!row || row.duplicate) return;
+      if (!row) return;
+      const jobsiteDup = rowHasJobsiteDuplicateFlag(row);
+      if (jobsiteDup && isDb3DuplicateExcludeDecision(row)) return;
       const refLower = String(row.reference || '').trim().toLowerCase();
       const identity = buildDb3DeterministicIdentity(row);
       const dedupeKey = String(row.db3DedupeKey || identity.dedupeKey || '').trim();
       const dedupeHash = String(row.db3RowHash || identity.dedupeHash || '').trim().toLowerCase();
-      if (refSet.has(refLower)) return;
-      if (dedupeKey && dedupeKeySet.has(dedupeKey)) return;
-      if (dedupeHash && dedupeHashSet.has(dedupeHash)) return;
+      if (!jobsiteDup || !isDb3DuplicateIncludeDecision(row)) {
+        if (refSet.has(refLower)) return;
+        if (dedupeKey && dedupeKeySet.has(dedupeKey)) return;
+        if (dedupeHash && dedupeHashSet.has(dedupeHash)) return;
+      }
       const refKey = String(row.reference || '').trim().toLowerCase();
-      const placedDup = queueImport ? placedAtCommit.get(refKey) || null : null;
+      const placedDup = placedAtCommit.get(refKey) || row.placedDuplicateOf || null;
+      let importReference = row.reference;
+      if (jobsiteDup && isDb3DuplicateIncludeDecision(row)) {
+        importReference = nextDb3DuplicateReference(row.reference, refSet);
+      }
+      const dupNotes = placedDup
+        ? 'Imported from WinCan DB3. Flagged: possible double entry (same OBJ_Key in this jobsite).'
+        : 'Imported from WinCan DB3.';
+      const renamedNote =
+        importReference && String(importReference) !== String(row.reference || '')
+          ? ` Imported as ${importReference}.`
+          : '';
       const segment = normalizeSegment({
         id: crypto.randomUUID(),
-        reference: row.reference,
+        reference: importReference,
         upstream: row.upstream,
         downstream: row.downstream,
         dia: row.dia,
@@ -9217,7 +9254,7 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
           defaultVersion(req.user.displayName || req.user.username, {
             status: 'neutral',
             recordedDate: record.record_date,
-            notes: placedDup ? 'Imported from WinCan DB3. Flagged: possible double entry (OBJ_Key exists on a placed jobsite).' : 'Imported from WinCan DB3.'
+            notes: `${dupNotes}${renamedNote}`
           })
         ]
       }, req.user.displayName || req.user.username);
