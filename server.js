@@ -7799,7 +7799,12 @@ app.post(
       const fileName = cleanString(req.body?.fileName);
       const contentType = cleanString(req.body?.contentType || 'application/octet-stream');
       const fileSize = Number(req.body?.fileSize);
-      if (!fileName) return res.status(400).json({ success: false, error: 'fileName is required' });
+      const reuseKey = cleanString(req.body?.storageKey);
+      if (reuseKey && isValidPipesyncPlanPageStorageKey(reuseKey)) {
+        // Overwrite/update existing piece (e.g. bake PDF annotation into the file). fileName optional for naming.
+      } else if (!fileName) {
+        return res.status(400).json({ success: false, error: 'fileName is required (or provide storageKey to update existing)' });
+      }
       if (!Number.isFinite(fileSize) || fileSize < 1 || fileSize > PIPESYNC_PLAN_VIEW_UPLOAD_MAX_BYTES) {
         return res.status(400).json({
           success: false,
@@ -7809,7 +7814,9 @@ app.post(
       if (!isAllowedAdminAttachmentContentType(contentType, 'pipesync-plan-view')) {
         return res.status(400).json({ success: false, error: 'Only images and PDF files are allowed for plan view.' });
       }
-      const storageKey = buildPipesyncPlanPageStorageKey(fileName);
+      const storageKey = (reuseKey && isValidPipesyncPlanPageStorageKey(reuseKey))
+        ? reuseKey
+        : buildPipesyncPlanPageStorageKey(fileName);
       const signed = await presignAdminAttachmentPut(
         wasabiStateClient,
         WASABI_STATE_BUCKET,
