@@ -682,7 +682,7 @@ async function hydratePlanBoardPageRow(p) {
   const copy = { ...p };
   delete copy.viewUrl;
   const sk = String(copy.storageKey || '').trim();
-  if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+  if (sk && isPersistablePlanPdfStorageKey(sk)) {
     try {
       const { url } = await presignAdminAttachmentGet(
         wasabiStateClient,
@@ -702,7 +702,7 @@ async function hydratePlanBoardLegacyPieceRow(p) {
   if (!p || typeof p !== 'object') return p;
   const copy = { ...p };
   const sk = String(copy.storageKey || '').trim();
-  if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+  if (sk && isPersistablePlanPdfStorageKey(sk)) {
     try {
       const { url } = await presignAdminAttachmentGet(
         wasabiStateClient,
@@ -722,7 +722,7 @@ async function hydratePlanBoardLegacyPlanRow(d) {
   if (!d || typeof d !== 'object') return d;
   const copy = { ...d };
   const sk = String(copy.storageKey || '').trim();
-  if (sk && isValidPipesyncPlanPageStorageKey(sk)) {
+  if (sk && isPersistablePlanPdfStorageKey(sk)) {
     try {
       const { url } = await presignAdminAttachmentGet(
         wasabiStateClient,
@@ -7880,7 +7880,7 @@ app.post(
         return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
       }
       const storageKey = cleanString(req.body?.storageKey);
-      if (!storageKey || !isValidPipesyncPlanPageStorageKey(storageKey)) {
+      if (!storageKey || !isPersistablePlanPdfStorageKey(storageKey)) {
         return res.status(400).json({ success: false, error: 'A valid plan page storageKey is required.' });
       }
       const { url } = await presignAdminAttachmentGet(
