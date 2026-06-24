@@ -22,6 +22,7 @@ const {
 const { registerUserGrantsRoutes } = require('./user-grants.routes');
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
 const { registerSignupRoutes } = require('./signup.routes');
+const { registerAccountRoutes } = require('./account.routes');
 const { loadUserCompanyMembership, normalizeAppFeatures } = require('./company-permissions.service');
 const {
   ACCOUNT_TYPES,
@@ -10812,6 +10813,15 @@ registerSignupRoutes(app, {
   normalizeRoles,
   issueSession,
   normalizeUser
+});
+registerAccountRoutes(app, {
+  pool,
+  requireAuth,
+  cleanString,
+  readFreshUserFromPostgresById,
+  tryWasabiStateWrite,
+  ensureSnapshotTable,
+  nowIso
 });
 
 const autoImportPlugin = createAutoImportPlugin({
