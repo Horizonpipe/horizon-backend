@@ -160,7 +160,7 @@ async function loadEffectivePathGrantsForUser(pool, user, clientId, jobId, loadU
       const path = require('path');
       const logPath =
         process.env.HP_DEBUG_LOG_PATH ||
-        path.join('C:', 'HorizonDev', 'wincan_auto_import_exe_project', 'debug-2099e1.log');
+        path.join('C:', 'HorizonDev', 'wincan_auto_import_exe_project', '.cursor', 'debug-2099e1.log');
       fs.appendFileSync(
         logPath,
         `${JSON.stringify({

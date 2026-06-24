@@ -101,7 +101,7 @@ function bypassPathGrantsForLenientPortalClient(user, userGrants) {
 // #region agent log
 const HP_DEBUG_LOG_PATH =
   process.env.HP_DEBUG_LOG_PATH ||
-  path.join('C:', 'HorizonDev', 'wincan_auto_import_exe_project', 'debug-2099e1.log');
+  path.join('C:', 'HorizonDev', 'wincan_auto_import_exe_project', '.cursor', 'debug-2099e1.log');
 function hpAgentDebugLog(location, message, data, hypothesisId) {
   try {
     fs.appendFileSync(
@@ -1372,7 +1372,19 @@ function filterTreeByPathGrants(tree, grants, jobHasAnyGrant) {
       cur = parentRelPath(cur);
     }
   }
-  const folders = (tree.folders || []).filter((fol) => keepFolders.has(fol.path));
+  for (const fol of tree.folders || []) {
+    const fp = normalizeRelPath(fol.path || '');
+    if (!fp) continue;
+    if (keepFolders.has(fp)) continue;
+    for (const g of grants) {
+      if (normalizeGrantAccessMode(g.access_mode) === 'off') continue;
+      if (relPathMatchesGrant(fp, g.path_prefix, g.recursive)) {
+        keepFolders.add(fp);
+        break;
+      }
+    }
+  }
+  const folders = (tree.folders || []).filter((fol) => keepFolders.has(normalizeRelPath(fol.path || '')));
   return { folders, files };
 }
 
@@ -2135,7 +2147,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const permEditorList =
         readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
       let userGrants = null;
-      if (jobHasPathGrants && !permEditorList) {
+      if (jobHasPathGrants && !permEditorList && !userIsPortalAdmin(req.user)) {
         const loaded = await loadCombinedUserPathGrants(aclPool, clientId, jobId, req.user);
         if (!bypassPathGrantsForLenientPortalClient(req.user, loaded)) {
           if (loaded.length) {
@@ -2240,7 +2252,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       } catch {
         /* ignore */
       }
-      if (jobHasPathGrantsTree && !permEditorTree) {
+      if (jobHasPathGrantsTree && !permEditorTree && !userIsPortalAdmin(req.user)) {
         treeUserGrants = await loadCombinedUserPathGrants(aclPool, clientId, jobId, req.user);
         if (!bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) {
           if (treeUserGrants.length) {
