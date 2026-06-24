@@ -153,7 +153,35 @@ async function loadEffectivePathGrantsForUser(pool, user, clientId, jobId, loadU
   const { loadDirectUserFolderGrantsForUser, jobHasDirectUserFolderGrants } = require('./user-grants.service');
   const directGrants = await loadDirectUserFolderGrantsForUser(pool, user.id, clientId, jobId);
   if (directGrants.length) return directGrants;
-  if (await jobHasDirectUserFolderGrants(pool, clientId, jobId)) return [];
+  if (await jobHasDirectUserFolderGrants(pool, clientId, jobId)) {
+    // #region agent log
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const logPath =
+        process.env.HP_DEBUG_LOG_PATH ||
+        path.join('C:', 'HorizonDev', 'wincan_auto_import_exe_project', 'debug-2099e1.log');
+      fs.appendFileSync(
+        logPath,
+        `${JSON.stringify({
+          sessionId: '2099e1',
+          location: 'company-permissions.service.js:loadEffectivePathGrantsForUser',
+          message: 'direct user_folder_grants exist for job but user has none — returning empty grants',
+          hypothesisId: 'A',
+          data: {
+            clientId: String(clientId || ''),
+            jobId: String(jobId || ''),
+            userIdSuffix: String(user.id || '').slice(-6)
+          },
+          timestamp: Date.now()
+        })}\n`
+      );
+    } catch {
+      /* ignore debug log failures */
+    }
+    // #endregion
+    return [];
+  }
 
   const membership = await loadUserCompanyMembership(pool, user.id);
   if (!membership) return [];

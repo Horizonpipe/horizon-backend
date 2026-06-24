@@ -98,6 +98,29 @@ function bypassPathGrantsForLenientPortalClient(user, userGrants) {
   return !userGrants.length;
 }
 
+// #region agent log
+const HP_DEBUG_LOG_PATH =
+  process.env.HP_DEBUG_LOG_PATH ||
+  path.join('C:', 'HorizonDev', 'wincan_auto_import_exe_project', 'debug-2099e1.log');
+function hpAgentDebugLog(location, message, data, hypothesisId) {
+  try {
+    fs.appendFileSync(
+      HP_DEBUG_LOG_PATH,
+      `${JSON.stringify({
+        sessionId: '2099e1',
+        location,
+        message,
+        data,
+        hypothesisId,
+        timestamp: Date.now()
+      })}\n`
+    );
+  } catch {
+    /* ignore debug log failures */
+  }
+}
+// #endregion
+
 function clampIntEnv(name, fallback, min, max) {
   const raw = Number(process.env[name]);
   if (!Number.isFinite(raw)) return fallback;
@@ -2200,12 +2223,23 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         });
       }
       let tree = buildTreeFromKeys(prefix, keys);
+      const treeBeforeFilter = {
+        folders: Array.isArray(tree?.folders) ? tree.folders.length : 0,
+        files: Array.isArray(tree?.files) ? tree.files.length : 0
+      };
       const treePortalMode = readPortalMode(req, req.query);
       const isDataAutoSyncTreeList = treePortalMode === DATA_AUTO_SYNC_MODE;
       const jobHasPathGrantsTree = await portalOrCompanyJobHasPathGrants(aclPool, req.user, clientId, jobId);
       /** @type {Array<{ path_prefix: string, recursive: boolean, access_mode: string }>} */
       let treeUserGrants = [];
       let appliedPathGrantFilter = false;
+      let jobHasDirectUserFolderGrantsFlag = false;
+      try {
+        const { jobHasDirectUserFolderGrants } = require('./user-grants.service');
+        jobHasDirectUserFolderGrantsFlag = await jobHasDirectUserFolderGrants(aclPool, clientId, jobId);
+      } catch {
+        /* ignore */
+      }
       if (jobHasPathGrantsTree && !permEditorTree) {
         treeUserGrants = await loadCombinedUserPathGrants(aclPool, clientId, jobId, req.user);
         if (!bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) {
@@ -2227,6 +2261,37 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           }
         }
       }
+      // #region agent log
+      hpAgentDebugLog(
+        'portal-files.routes.js:GET/tree',
+        'portal tree grant filter',
+        {
+          clientId: String(clientId || ''),
+          jobId: String(jobId || ''),
+          pathPrefix: String(subtreeRaw || ''),
+          s3KeyCount: keys.length,
+          treeBeforeFilter,
+          treeAfterFilter: {
+            folders: Array.isArray(tree?.folders) ? tree.folders.length : 0,
+            files: Array.isArray(tree?.files) ? tree.files.length : 0
+          },
+          sampleFolderPaths: (tree?.folders || []).slice(0, 8).map((f) => String(f.path || '')),
+          jobHasPathGrantsTree,
+          jobHasDirectUserFolderGrants: jobHasDirectUserFolderGrantsFlag,
+          userGrantCount: treeUserGrants.length,
+          grantPrefixes: treeUserGrants.slice(0, 8).map((g) => ({
+            path: String(g.path_prefix || ''),
+            recursive: g.recursive !== false,
+            accessMode: normalizeGrantAccessMode(g.access_mode)
+          })),
+          appliedPathGrantFilter,
+          permEditorTree,
+          isPortalAdmin: userIsPortalAdmin(req.user),
+          userIdSuffix: String(req.user?.id || '').slice(-6)
+        },
+        'A'
+      );
+      // #endregion
       const forceHashes = String(req.query.includeHashes ?? '').trim() === '1';
       const skipHashMerge =
         !forceHashes && PORTAL_TREE_MERGE_HASH_MAX_FILES > 0 && keys.length > PORTAL_TREE_MERGE_HASH_MAX_FILES;
