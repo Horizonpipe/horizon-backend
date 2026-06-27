@@ -32,8 +32,26 @@ git_fetch_reset() {
   run_as_deploy_user git -C "$dir" reset --hard "origin/$BRANCH"
 }
 
-git_fetch_reset backend "$BACKEND" "$BACKEND_KEY"
-run_as_deploy_user bash -lc "cd '$BACKEND' && npm install --omit=dev"
+# Production .env must never come from git (even if accidentally tracked). Preserve across reset.
+preserve_backend_env() {
+  local env_file="$BACKEND/.env"
+  local stash="/tmp/horizon-backend-env.stash.$$"
+  if [[ -s "$env_file" ]] && grep -q '^DATABASE_URL=' "$env_file" 2>/dev/null; then
+    cp "$env_file" "$stash"
+    echo "[github-deploy] stashed valid .env ($(grep -cE '^[A-Z]' "$env_file") keys)"
+  fi
+  git_fetch_reset backend "$BACKEND" "$BACKEND_KEY"
+  if [[ -f "$stash" ]]; then
+    cp "$stash" "$env_file"
+    chmod 600 "$env_file"
+    chown "${PM2_USER}:${PM2_USER}" "$env_file" 2>/dev/null || true
+    rm -f "$stash"
+    echo "[github-deploy] restored stashed .env after git reset"
+  fi
+  run_as_deploy_user bash -lc "cd '$BACKEND' && npm install --omit=dev"
+}
+
+preserve_backend_env
 
 git_fetch_reset frontend "$FRONTEND" "$FRONTEND_KEY"
 
