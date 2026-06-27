@@ -1,10 +1,11 @@
 {
-  "title": "Fix double highlight lines on PDF download",
-  "description": "PipeSync flat PDF download (Baked in Highlights) was drawing two strokes per highlight line.\n\nRoot cause: the flat export path attached a custom appearance stream (/AP) for round caps. Acrobat, Edge, and Okular render both /AP and the InkList ink path, even when InkList is collapsed to a point — so every line appeared doubled. dbg33 reintroduced this after dbg32 had moved to a single InkList+BS layer.\n\nFix: flat export now uses one InkList + BS stroke with /LE Round line endings (matching SVG round caps) and no /AP. Editable download unchanged. Download still clears baked annots before reburn.\n\nHard-refresh PipeSync after deploy (Ctrl+Shift+R).\n\nWho is affected: Private OVH server. SaaS unchanged until you publish a platform release.",
+  "title": "Fix Download plans modal — options now trigger export",
+  "description": "PipeSync \"Download plans\" modal (right-click a plan in the PDF explorer) showed three export options but clicking any of them did nothing.\n\nRoot cause: the modal buttons used data-action=\"plan-download-plans-run\" but no click handler was registered in app.js (or the modular plan-view-data-actions handler). The modal opened correctly with fileId in state, but clicks were ignored.\n\nFix: wire plan-download-plans-run to planBoardDownloadLegacyPlanWholePdf(docId, mode) for original, highlights-flat, and highlights-editable. Modal closes immediately on click (same pattern as Build map and other plan modals).\n\nHard-refresh PipeSync after deploy (Ctrl+Shift+R).\n\nWho is affected: Private OVH server. SaaS unchanged until you publish a platform release.",
   "changeLog": [
-    "Fix double highlight lines on flat PDF download (/LE Round, no /AP).",
-    "Harden Annots lookup before download reburn clear.",
-    "Cache bust dbg36 for app.js and pipesync-boot.js."
+    "Fix Download plans modal — all three export options now start download.",
+    "Modal auto-closes on option click (matches other plan modals).",
+    "Add plan-download-plans-run handler in app.js and plan-view-data-actions.js.",
+    "Cache bust dbg37 for app.js, pipesync-boot.js, and pdf-highlight-shape."
   ],
-  "updatedAt": "2026-06-27T23:55:00.000Z"
+  "updatedAt": "2026-06-27T24:30:00.000Z"
 }
