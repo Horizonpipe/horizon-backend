@@ -17,6 +17,9 @@ const HEARTBEAT_MIN_WRITE_MS = Math.max(
 const sseByTenant = new Map();
 /** @type {Map<string, number>} */
 const lastPresenceWriteMs = new Map();
+/** @type {Map<string, { id: number, at: number, fromUserId: string, type: string, payload: unknown }[]>} */
+const remoteSignalsBySession = new Map();
+const REMOTE_SIGNAL_BUFFER_MAX = 120;
 
 function cleanString(v) {
   return String(v ?? '').trim();
@@ -38,6 +41,30 @@ function requireSupportAdmin(req, res, next) {
     return jsonError(res, 403, 'Admin access required');
   }
   return next();
+}
+
+function pushRemoteSignal(sessionId, fromUserId, type, payload) {
+  const key = String(sessionId || '');
+  if (!key) return null;
+  let list = remoteSignalsBySession.get(key);
+  if (!list) {
+    list = [];
+    remoteSignalsBySession.set(key, list);
+  }
+  const entry = {
+    id: (list[list.length - 1]?.id || 0) + 1,
+    at: Date.now(),
+    fromUserId: String(fromUserId || ''),
+    type: String(type || ''),
+    payload
+  };
+  list.push(entry);
+  while (list.length > REMOTE_SIGNAL_BUFFER_MAX) list.shift();
+  return entry;
+}
+
+function clearRemoteSignals(sessionId) {
+  remoteSignalsBySession.delete(String(sessionId || ''));
 }
 
 function broadcastTenant(tenantId, eventName, payload) {
@@ -629,11 +656,45 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
+  async function loadRemoteSessionForUser(pool, tenantId, sessionId, user) {
+    const r = await pool.query(
+      `SELECT * FROM cp_support_remote_sessions WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
+      [sessionId, tenantId]
+    );
+    const row = r.rows[0];
+    if (!row) return { ok: false, status: 404, message: 'Remote session not found' };
+    const uid = String(user.id);
+    if (
+      uid !== String(row.customer_user_id) &&
+      uid !== String(row.admin_user_id) &&
+      !canAccessAdminPanel(user)
+    ) {
+      return { ok: false, status: 403, message: 'Not a participant in this remote session' };
+    }
+    return { ok: true, row };
+  }
+
   app.post('/saas/support/remote/request', requireSaas, requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
     try {
       const customerUserId = cleanString(req.body?.customerUserId);
       const customerTabId = cleanString(req.body?.customerTabId) || 'default';
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
+
+      const existing = await pool.query(
+        `SELECT id, status FROM cp_support_remote_sessions
+         WHERE tenant_id = $1 AND customer_user_id = $2 AND admin_user_id = $3 AND status IN ('pending','active')
+         ORDER BY updated_at DESC LIMIT 1`,
+        [req.supportTenant.tenantId, customerUserId, req.user.id]
+      );
+      if (existing.rows[0]) {
+        const row = existing.rows[0];
+        return res.json({
+          success: true,
+          sessionId: row.id,
+          status: row.status,
+          existing: true
+        });
+      }
 
       const persistToken = crypto.randomBytes(24).toString('base64url');
       const r = await pool.query(
@@ -728,6 +789,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         `UPDATE cp_support_remote_sessions SET status = 'ended', updated_at = NOW(), ended_at = NOW() WHERE id = $1`,
         [sessionId]
       );
+      clearRemoteSignals(sessionId);
       broadcastTenant(req.supportTenant.tenantId, 'remote-ended', {
         sessionId,
         customerUserId: row.customer_user_id
@@ -735,6 +797,104 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       return res.json({ success: true, sessionId, status: 'ended' });
     } catch (error) {
       console.error('[saas/support/remote/end]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.post('/saas/support/remote/cancel-pending', requireSaas, requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
+    try {
+      const customerUserId = cleanString(req.body?.customerUserId);
+      if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
+      const r = await pool.query(
+        `UPDATE cp_support_remote_sessions
+         SET status = 'ended', updated_at = NOW(), ended_at = NOW()
+         WHERE tenant_id = $1 AND customer_user_id = $2 AND admin_user_id = $3 AND status = 'pending'
+         RETURNING id`,
+        [req.supportTenant.tenantId, customerUserId, req.user.id]
+      );
+      for (const row of r.rows) {
+        clearRemoteSignals(row.id);
+        broadcastTenant(req.supportTenant.tenantId, 'remote-ended', {
+          sessionId: row.id,
+          customerUserId,
+          reason: 'cancelled'
+        });
+      }
+      return res.json({ success: true, cancelled: r.rows.length });
+    } catch (error) {
+      console.error('[saas/support/remote/cancel-pending]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.post('/saas/support/remote/:sessionId/signal', requireSaas, requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const sessionId = cleanString(req.params.sessionId);
+      const type = cleanString(req.body?.type).toLowerCase();
+      const payload = req.body?.payload;
+      if (!sessionId) return jsonError(res, 400, 'sessionId is required');
+      if (!type || !['offer', 'answer', 'ice'].includes(type)) {
+        return jsonError(res, 400, 'type must be offer, answer, or ice');
+      }
+
+      const loaded = await loadRemoteSessionForUser(pool, req.supportTenant.tenantId, sessionId, req.user);
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (row.status !== 'active') return jsonError(res, 400, 'Remote session is not active');
+
+      const entry = pushRemoteSignal(sessionId, req.user.id, type, payload);
+      broadcastTenant(req.supportTenant.tenantId, 'remote-signal', {
+        sessionId,
+        signalId: entry?.id,
+        fromUserId: req.user.id,
+        type,
+        payload
+      });
+      return res.json({ success: true, signalId: entry?.id });
+    } catch (error) {
+      console.error('[saas/support/remote/signal POST]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.get('/saas/support/remote/:sessionId/signals', requireSaas, requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const sessionId = cleanString(req.params.sessionId);
+      const afterId = Math.max(0, Number(req.query?.after || 0));
+      if (!sessionId) return jsonError(res, 400, 'sessionId is required');
+
+      const loaded = await loadRemoteSessionForUser(pool, req.supportTenant.tenantId, sessionId, req.user);
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (row.status !== 'active') return jsonError(res, 400, 'Remote session is not active');
+
+      const list = remoteSignalsBySession.get(sessionId) || [];
+      const signals = list.filter((s) => s.id > afterId);
+      return res.json({ success: true, signals });
+    } catch (error) {
+      console.error('[saas/support/remote/signals GET]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.post('/saas/support/remote/:sessionId/virtual-call', requireSaas, requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
+    try {
+      const sessionId = cleanString(req.params.sessionId);
+      if (!sessionId) return jsonError(res, 400, 'sessionId is required');
+
+      const loaded = await loadRemoteSessionForUser(pool, req.supportTenant.tenantId, sessionId, req.user);
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (row.status !== 'active') return jsonError(res, 400, 'Remote session must be active');
+
+      broadcastTenant(req.supportTenant.tenantId, 'virtual-call-invite', {
+        sessionId,
+        customerUserId: row.customer_user_id,
+        adminUserId: req.user.id
+      });
+      return res.json({ success: true });
+    } catch (error) {
+      console.error('[saas/support/remote/virtual-call]', error);
       return jsonError(res, 500, error.message || 'Server error');
     }
   });
