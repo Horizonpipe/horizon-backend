@@ -72,15 +72,6 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .map((value) => value.trim())
   .filter(Boolean);
 
-function isOnRenderOrigin(origin) {
-  try {
-    const h = new URL(origin).hostname;
-    return h === 'onrender.com' || h.endsWith('.onrender.com');
-  } catch {
-    return false;
-  }
-}
-
 const corsOptions = {
   origin(origin, callback) {
     const allowAny = CORS_ORIGINS.length === 0 || (CORS_ORIGINS.length === 1 && CORS_ORIGINS[0] === '*');
@@ -91,9 +82,6 @@ const corsOptions = {
       return callback(null, true);
     }
     if (CORS_ORIGINS.includes(origin)) {
-      return callback(null, origin);
-    }
-    if (isOnRenderOrigin(origin)) {
       return callback(null, origin);
     }
     return callback(new Error(`CORS blocked for origin: ${origin}`));

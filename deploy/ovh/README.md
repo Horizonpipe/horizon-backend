@@ -207,8 +207,7 @@ git checkout <commit-hash> -- path/to/file
 - [ ] Login, PipeShare, PipeSync, cPanel setup/billing
 - [ ] Stripe webhook → `https://app.yourdomain.com/saas/billing/webhook`
 - [ ] Wasabi bucket CORS includes new origin
-- [ ] Remove hardcoded `onrender.com` fallbacks in frontend when convenient (same-origin works when frontend is served from OVH)
-- [ ] Stop Render web services (keep Postgres until migration verified, then delete)
+- [ ] Stop Render web services and Postgres after OVH cutover is verified
 - [ ] Rotate any secrets that were ever pasted in chat/logs
 
 ---
@@ -241,7 +240,14 @@ Optional: UptimeRobot (free) HTTP check on `https://app.yourdomain.com/horizonpi
 
 **Web console (Render-style):** Admins open `https://YOUR_DOMAIN/horizonpipe-cpanel/ops.html` — CPU, RAM, bandwidth, logs, events, manual deploy, rollback.
 
-**GitHub auto-deploy:** On each repo, add a webhook to `https://YOUR_DOMAIN/ops/webhook/github` (JSON, Push events, secret = `GITHUB_WEBHOOK_SECRET` in `.env`).
+**GitHub auto-deploy:** On each repo, add a webhook to `https://YOUR_DOMAIN/ops/webhook/github` (JSON, Push events, secret = `GITHUB_WEBHOOK_SECRET` in `.env`). Deploy keys (one per repo):
+
+```bash
+sudo bash deploy/ovh/setup-github-deploy-keys.sh   # on OVH — tests SSH pull
+# From your PC (GITHUB_TOKEN set):
+pwsh deploy/ovh/setup-github-deploy-keys.ps1 -OvhHost YOUR_OVH_IP
+bash deploy/ovh/github-deploy.sh                   # manual pull + pm2 reload
+```
 
 **Desktop monitor:** Java app in `ovh-ops-monitor/` — see `ovh-ops-monitor/README.md`.
 

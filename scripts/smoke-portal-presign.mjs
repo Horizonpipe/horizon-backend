@@ -3,7 +3,7 @@
  * Smoke test: portal presign + optional meta + optional proxy-download check.
  *
  * Usage:
- *   HP_API_BASE=https://your-api.onrender.com HP_TOKEN=eyJ... HP_FILE_ID=<portal_file_uuid> node scripts/smoke-portal-presign.mjs
+ *   HP_API_BASE=https://your-api.example.com HP_TOKEN=eyJ... HP_FILE_ID=<portal_file_uuid> node scripts/smoke-portal-presign.mjs
  *
  * Optional:
  *   HP_CHECK_META=1            — GET /api/files/meta/:id (small JSON; mirrors Explorer parallel meta+presign).
