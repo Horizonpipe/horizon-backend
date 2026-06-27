@@ -27,6 +27,8 @@ const { registerAccountRoutes } = require('./account.routes');
 const { registerSaasTenantRoutes } = require('./saas-tenant.routes');
 const { registerSaasBillingWebhook, registerSaasBillingRoutes } = require('./saas-billing.routes');
 const { registerPlatformReleaseRoutes } = require('./platform-release.routes');
+const { registerOvhOpsWebhook, registerOvhOpsRoutes } = require('./ovh-ops.routes');
+const { startMetricsCollector, isOvhOpsEnabled } = require('./ovh-ops.service');
 const { loadUserCompanyMembership, normalizeAppFeatures } = require('./company-permissions.service');
 const {
   ACCOUNT_TYPES,
@@ -238,6 +240,7 @@ console.log(
 );
 
 registerSaasBillingWebhook(app, { pool });
+registerOvhOpsWebhook(app);
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -10911,6 +10914,11 @@ registerPlatformReleaseRoutes(app, {
   wasabiClient: wasabiStateClient,
   wasabiBucket: WASABI_STATE_BUCKET
 });
+registerOvhOpsRoutes(app, { requireAuth, requireAdmin });
+if (isOvhOpsEnabled()) {
+  startMetricsCollector();
+  console.log('[ovh-ops] metrics collector started');
+}
 
 const SAAS_CPANEL_STATIC_DIR = process.env.SAAS_CPANEL_STATIC_DIR
   ? path.resolve(process.env.SAAS_CPANEL_STATIC_DIR)

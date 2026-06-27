@@ -239,6 +239,12 @@ tail -f /var/log/horizon/backup.log
 
 Optional: UptimeRobot (free) HTTP check on `https://app.yourdomain.com/horizonpipe-cpanel/`
 
+**Web console (Render-style):** Admins open `https://YOUR_DOMAIN/horizonpipe-cpanel/ops.html` — CPU, RAM, bandwidth, logs, events, manual deploy, rollback.
+
+**GitHub auto-deploy:** On each repo, add a webhook to `https://YOUR_DOMAIN/ops/webhook/github` (JSON, Push events, secret = `GITHUB_WEBHOOK_SECRET` in `.env`).
+
+**Desktop monitor:** Java app in `ovh-ops-monitor/` — see `ovh-ops-monitor/README.md`.
+
 ---
 
 ## When to scale beyond one box
@@ -261,4 +267,6 @@ Next step: second OVH app server + Hetzner/OVH load balancer, **keep Postgres on
 | `ecosystem.config.cjs` | PM2 cluster (4 workers) |
 | `nginx-horizon.conf` | Reverse proxy + SSL |
 | `backup-postgres.sh` | Daily dump + optional Wasabi |
-| `install-backups.sh` | Cron installation |
+| `github-deploy.sh` | Pull main + npm install + pm2 reload (webhook / manual) |
+| `rollback-main.sh` | Roll back backend/frontend/both on main |
+| `../ovh-ops-monitor/` | Portable Java desktop monitor |
