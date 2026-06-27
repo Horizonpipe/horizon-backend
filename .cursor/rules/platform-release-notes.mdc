@@ -1,0 +1,39 @@
+---
+description: Agent must maintain platform-release-draft.json with plain-English release notes for every deployable change batch
+alwaysApply: true
+---
+
+# Platform release notes (agent-maintained)
+
+When you change **horizon-backend** or **horizon-frontend** and deploy to the non-SaaS OVH server, you **must** update `horizon-backend/platform-release-draft.json` before or as part of that deploy.
+
+## What to write
+
+Use plain English Mike can understand months later:
+
+- **title** — one short line (what the update is about)
+- **description** — 2–4 paragraphs or bullet list: what changed, why it matters, who is affected (private server vs SaaS)
+- **changeLog** — 3–8 short bullets, one fix/feature each
+
+## Example
+
+```json
+{
+  "title": "Auto-save before refresh",
+  "description": "PipeSync now saves...\n\nWho is affected: ...",
+  "changeLog": ["PipeSync auto-saves plan highlights before refresh.", "..."]
+}
+```
+
+## Workflow
+
+1. Make code changes
+2. **Update `platform-release-draft.json`** with this batch's notes (overwrite prior draft — it is the *next* release only)
+3. Deploy to OVH (include the draft file in scp)
+4. Optionally run `deploy/ovh/publish-platform-release.sh` to upload artifacts + register version
+
+SaaS is **never** updated by direct deploy. Only when Mike applies a version in `/horizonpipe-cpanel/releases.html`.
+
+After a successful publish, the draft file is cleared on the server; write a fresh draft for the next change batch.
+
+Do **not** leave generic placeholders like "Platform update 0.0.1".

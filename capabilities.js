@@ -209,6 +209,13 @@ function resolveCapabilities(user) {
   };
 }
 
+function deploymentMode() {
+  const mode = String(process.env.HP_DEPLOYMENT_MODE || 'non-saas')
+    .trim()
+    .toLowerCase();
+  return mode === 'saas' ? 'saas' : 'non-saas';
+}
+
 module.exports = {
   ACCOUNT_TYPES,
   EMPLOYEE_ROLES,
@@ -221,5 +228,6 @@ module.exports = {
   canAccessAdminPanel,
   canManagePortalExtras,
   isAdminUser,
-  looksLikeMike
+  looksLikeMike,
+  deploymentMode
 };

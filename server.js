@@ -1,3 +1,4 @@
+require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
@@ -23,6 +24,9 @@ const { registerUserGrantsRoutes } = require('./user-grants.routes');
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
 const { registerSignupRoutes } = require('./signup.routes');
 const { registerAccountRoutes } = require('./account.routes');
+const { registerSaasTenantRoutes } = require('./saas-tenant.routes');
+const { registerSaasBillingWebhook, registerSaasBillingRoutes } = require('./saas-billing.routes');
+const { registerPlatformReleaseRoutes } = require('./platform-release.routes');
 const { loadUserCompanyMembership, normalizeAppFeatures } = require('./company-permissions.service');
 const {
   ACCOUNT_TYPES,
@@ -35,7 +39,8 @@ const {
   canAccessAdminPanel,
   canManagePortalExtras,
   isAdminUser,
-  looksLikeMike
+  looksLikeMike,
+  deploymentMode
 } = require('./capabilities');
 const {
   buildAdminAttachmentStorageKey,
@@ -175,8 +180,6 @@ try {
 } catch {
   console.warn('[http] Install optional `compression` (npm i) to gzip JSON/text API responses and cut HTTP egress.');
 }
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
   res.on('finish', () => {
     const method = String(req.method || '').toUpperCase();
@@ -233,6 +236,10 @@ pool.on('error', (err) => {
 console.log(
   `[pg] Pool ready: max=${PG_POOL_MAX}, idleTimeout=${PG_IDLE_TIMEOUT_MS}ms, connectTimeout=${PG_CONNECT_TIMEOUT_MS}ms, ssl=${sslDisabledByEnv || databaseUrlLooksLocal ? 'off' : 'on'}`
 );
+
+registerSaasBillingWebhook(app, { pool });
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true }));
 
 function createWasabiStateClient() {
   const accessKeyId = String(process.env.WASABI_ACCESS_KEY_ID || process.env.WASABI_ACCESS_KEY || '').trim();
@@ -452,10 +459,21 @@ const WASABI_AUTH_FALLBACK_CACHE_MS = Math.max(
   1000,
   Math.min(60000, Number(process.env.WASABI_AUTH_FALLBACK_CACHE_MS || 5000))
 );
-const WASABI_AUTH_PRIMARY_ENABLED =
-  WASABI_ALL_READS_PRIMARY_ENABLED || String(process.env.WASABI_AUTH_PRIMARY_ENABLED || '0').trim().toLowerCase() === '1';
+function readEnvTriState(key) {
+  const raw = String(process.env[key] ?? '').trim().toLowerCase();
+  if (raw === '0' || raw === 'false' || raw === 'no') return false;
+  if (raw === '1' || raw === 'true' || raw === 'yes') return true;
+  return null;
+}
+const WASABI_AUTH_PRIMARY_ENABLED = (() => {
+  const explicit = readEnvTriState('WASABI_AUTH_PRIMARY_ENABLED');
+  if (explicit === false) return false;
+  if (explicit === true) return true;
+  return WASABI_ALL_READS_PRIMARY_ENABLED;
+})();
 const WASABI_AUTH_PRIMARY_STRICT =
-  WASABI_ALL_READS_PRIMARY_STRICT || String(process.env.WASABI_AUTH_PRIMARY_STRICT || '0').trim().toLowerCase() === '1';
+  WASABI_AUTH_PRIMARY_ENABLED &&
+  (readEnvTriState('WASABI_AUTH_PRIMARY_STRICT') ?? WASABI_ALL_READS_PRIMARY_STRICT);
 const WASABI_AUTH_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
   5000,
   Math.min(15 * 60 * 1000, Number(process.env.WASABI_AUTH_PRIMARY_MAX_SNAPSHOT_AGE_MS || 120000))
@@ -5962,6 +5980,51 @@ async function ensureSchema() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_company_plan_share_links_company ON company_plan_share_links (company_id)`);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS saas_tenant_instances (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      owner_user_id TEXT NOT NULL UNIQUE,
+      website_url TEXT NOT NULL DEFAULT '',
+      wasabi_root_prefix TEXT NOT NULL DEFAULT '',
+      portal_client_id TEXT NOT NULL DEFAULT '',
+      portal_job_id TEXT NOT NULL DEFAULT '1',
+      branding JSONB NOT NULL DEFAULT '{}'::jsonb,
+      subscription_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (subscription_status IN ('pending', 'trialing', 'active', 'past_due', 'canceled')),
+      stripe_customer_id TEXT,
+      stripe_subscription_id TEXT,
+      setup_status TEXT NOT NULL DEFAULT 'draft'
+        CHECK (setup_status IN ('draft', 'provisioning', 'ready', 'failed')),
+      setup_completed_at TIMESTAMPTZ,
+      provisioning_error TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (company_id)
+    )
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_saas_tenant_instances_owner ON saas_tenant_instances (owner_user_id)`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_saas_tenant_instances_subscription ON saas_tenant_instances (subscription_status)`
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS platform_release_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      version TEXT NOT NULL,
+      event_type TEXT NOT NULL CHECK (event_type IN ('published', 'applied', 'heartbeat')),
+      actor_user_id TEXT NOT NULL DEFAULT '',
+      deployment_mode TEXT NOT NULL DEFAULT '',
+      notes TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_platform_release_events_version ON platform_release_events (version)`
+  );
+
   const companyCountResult = await pool.query('SELECT COUNT(*)::int AS count FROM companies');
   if (companyCountResult.rows[0].count === 0) {
     const seedCompanies = ['Horizon Pipe', 'AJJ', 'JUM', 'Dirt Works'];
@@ -6570,7 +6633,13 @@ app.post('/login', async (req, res) => {
     const keepRaw = req.body?.keepSession;
     const keepSession = keepRaw === true || keepRaw === 1 || String(keepRaw || '').trim().toLowerCase() === 'true';
     const token = await issueSession(row.id, { keepSession });
-    res.json({ success: true, user, token, capabilities: resolveCapabilities(user) });
+    res.json({
+      success: true,
+      user,
+      token,
+      capabilities: resolveCapabilities(user),
+      deploymentMode: deploymentMode()
+    });
   } catch (error) {
     console.error('LOGIN ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -6578,7 +6647,12 @@ app.post('/login', async (req, res) => {
 });
 
 app.get('/session', requireAuth, async (req, res) => {
-  res.json({ success: true, user: req.user, capabilities: resolveCapabilities(req.user) });
+  res.json({
+    success: true,
+    user: req.user,
+    capabilities: resolveCapabilities(req.user),
+    deploymentMode: deploymentMode()
+  });
 });
 
 app.get('/me/user-prefs', requireAuth, async (req, res) => {
@@ -10823,6 +10897,39 @@ registerAccountRoutes(app, {
   ensureSnapshotTable,
   nowIso
 });
+registerSaasTenantRoutes(app, {
+  pool,
+  requireAuth,
+  wasabiClient: wasabiStateClient,
+  wasabiBucket: WASABI_STATE_BUCKET
+});
+registerSaasBillingRoutes(app, { pool, requireAuth });
+registerPlatformReleaseRoutes(app, {
+  pool,
+  requireAuth,
+  requireAdmin,
+  wasabiClient: wasabiStateClient,
+  wasabiBucket: WASABI_STATE_BUCKET
+});
+
+const SAAS_CPANEL_STATIC_DIR = process.env.SAAS_CPANEL_STATIC_DIR
+  ? path.resolve(process.env.SAAS_CPANEL_STATIC_DIR)
+  : path.resolve(__dirname, '../horizon-frontend/horizonpipe-cpanel');
+
+if (fs.existsSync(SAAS_CPANEL_STATIC_DIR)) {
+  app.use(
+    '/horizonpipe-cpanel',
+    express.static(SAAS_CPANEL_STATIC_DIR, { index: ['index.html'], fallthrough: true })
+  );
+  app.get('/horizonpipe-cpanel', (_req, res) => {
+    res.sendFile(path.join(SAAS_CPANEL_STATIC_DIR, 'index.html'));
+  });
+  console.log(`[saas-cpanel] GET /horizonpipe-cpanel/* from ${SAAS_CPANEL_STATIC_DIR}`);
+} else {
+  console.warn(
+    `[saas-cpanel] static dir not found (${SAAS_CPANEL_STATIC_DIR}); set SAAS_CPANEL_STATIC_DIR or clone horizon-frontend beside horizon-backend`
+  );
+}
 
 const autoImportPlugin = createAutoImportPlugin({
   pool,
@@ -10950,9 +11057,27 @@ ensureSchema()
       console.log(
         `[wasabi-sql-mirror] enabled=${WASABI_SQL_MIRROR_ENABLED ? 'yes' : 'no'} prefix=${WASABI_SQL_MIRROR_PREFIX} flush=${WASABI_SQL_MIRROR_FLUSH_MS}ms buffer=${WASABI_SQL_MIRROR_MAX_BUFFER} skipTables=${Array.from(WASABI_SQL_MIRROR_SKIP_TABLE_SET).sort().join(',') || '(none)'}`
       );
+      void loadWasabiLatestStateSnapshot(true).catch((error) => {
+        console.warn('[wasabi-state] boot snapshot preload failed:', error?.message || error);
+      });
     } else {
       console.warn('[wasabi-state] snapshots disabled: configure WASABI_* and WASABI_BUCKET');
     }
+
+    const FRONTEND_STATIC_DIR = process.env.FRONTEND_STATIC_DIR
+      ? path.resolve(process.env.FRONTEND_STATIC_DIR)
+      : path.resolve(__dirname, '../horizon-frontend');
+    if (fs.existsSync(FRONTEND_STATIC_DIR)) {
+      app.use(
+        express.static(FRONTEND_STATIC_DIR, { index: ['index.html'], fallthrough: true, extensions: ['html'] })
+      );
+      console.log(`[frontend] static files (PipeShare, PipeSync, login, cPanel) from ${FRONTEND_STATIC_DIR}`);
+    } else {
+      console.warn(
+        `[frontend] static dir not found (${FRONTEND_STATIC_DIR}); PipeShare/PipeSync links will 404 until horizon-frontend is cloned beside horizon-backend`
+      );
+    }
+
     app.listen(PORT, () => {
       console.log(`Horizon backend listening on port ${PORT}`);
     });

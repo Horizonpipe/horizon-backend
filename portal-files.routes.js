@@ -1016,6 +1016,82 @@ function portalPsrScopesTouchClient(user, clientId) {
   return false;
 }
 
+/** Planner UUID and jobsite label for the same PSR row refer to one storage job. */
+function portalPsrJobIdsEquivalent(user, clientId, jobA, jobB) {
+  const a = String(jobA || '').trim();
+  const b = String(jobB || '').trim();
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const wantClient = portalPsrUpper(clientId);
+  const list = Array.isArray(user?.psrScopes) ? user.psrScopes : [];
+  for (const raw of list) {
+    const entry = portalNormalizePsrScopeEntry(raw);
+    if (!entry || entry.client !== wantClient) continue;
+    const ids = new Set([entry.recordId, entry.jobsite].filter(Boolean).map(String));
+    if (ids.has(a) && ids.has(b)) return true;
+  }
+  return false;
+}
+
+/**
+ * Resolve Wasabi `(clientId, jobId)` for a DB3 binding when the UI scope label differs
+ * from the object key (PSR jobsite vs UUID, or company folder prefix under a shared storage job).
+ * @returns {Promise<{ ok: true, clientId: string, jobId: string } | { ok: false, error: string }>}
+ */
+async function resolveDb3FileScopeForBinding(pool, user, reqClientId, reqJobId, key) {
+  const parsed = parseJobFromObjectKey(key);
+  if (!parsed) return { ok: false, error: 'Invalid db3FileId' };
+
+  const reqClient = String(reqClientId || '').trim();
+  const reqJob = String(reqJobId || '').trim();
+  const fileClient = String(parsed.clientId || '').trim();
+  const fileJob = String(parsed.jobId || '').trim();
+  if (!reqClient || !reqJob) return { ok: false, error: 'clientId and jobId are required' };
+
+  if (fileClient === reqClient && fileJob === reqJob) {
+    return { ok: true, clientId: fileClient, jobId: fileJob };
+  }
+
+  if (!(await assertPortalJobAccess(pool, user, fileClient, fileJob))) {
+    return { ok: false, error: 'db3FileId must belong to the same client/job scope' };
+  }
+  if (!(await assertPortalJobAccess(pool, user, reqClient, reqJob))) {
+    return { ok: false, error: 'Forbidden' };
+  }
+
+  const reqPref = jobPrefix(reqClient, reqJob);
+  if (key.startsWith(reqPref)) {
+    return { ok: true, clientId: reqClient, jobId: reqJob };
+  }
+
+  if (fileClient === reqClient && portalPsrJobIdsEquivalent(user, reqClient, reqJob, fileJob)) {
+    return { ok: true, clientId: fileClient, jobId: fileJob };
+  }
+
+  const filePref = jobPrefix(fileClient, fileJob);
+  let fileRel = '';
+  try {
+    fileRel = normalizeRelPath(key.slice(filePref.length));
+  } catch {
+    return { ok: false, error: 'db3FileId must belong to the same client/job scope' };
+  }
+
+  const firstSeg = fileRel.split('/').filter(Boolean)[0] || '';
+  const reqClientLabel = portalPsrUpper(reqClient);
+  if (firstSeg && reqClientLabel && portalPsrUpper(firstSeg) === reqClientLabel) {
+    if (fileJob === reqJob || portalPsrJobIdsEquivalent(user, reqClient, reqJob, fileJob)) {
+      return { ok: true, clientId: fileClient, jobId: fileJob };
+    }
+    const rest = fileRel.slice(firstSeg.length).replace(/^\//, '');
+    const reqJobNorm = normalizeRelPath(reqJob);
+    if (reqJobNorm && (rest === reqJobNorm || rest.startsWith(`${reqJobNorm}/`))) {
+      return { ok: true, clientId: fileClient, jobId: fileJob };
+    }
+  }
+
+  return { ok: false, error: 'db3FileId must belong to the same client/job scope' };
+}
+
 async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) {
   if (userIsPortalAdmin(user)) return true;
   if (!user || !userHasPortalFilesOrAutosyncMaster(user)) return false;
@@ -2369,35 +2445,58 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         const msg = err instanceof Error ? err.message : String(err);
         return res.status(400).json({ error: msg });
       }
-      if (folderPath) {
-        const treePortalMode = readPortalMode(req, body);
-        const visible = await assertRelPathMatchesPortalTreeVisibility(
-          aclPool,
-          req,
-          clientId,
-          jobId,
-          treePortalMode,
-          folderPath
-        );
-        if (!visible) return res.status(403).json({ error: 'Forbidden' });
-        const canEditPath = await assertPortalPathRel(aclPool, req.user, clientId, jobId, folderPath, 'full');
-        if (!canEditPath) return res.status(403).json({ error: 'Forbidden' });
-      }
       const db3FileIdRaw = body.db3FileId ?? body.value ?? null;
       const db3FileId = db3FileIdRaw == null ? '' : String(db3FileIdRaw).trim();
+      let pathScopeClient = String(clientId);
+      let pathScopeJob = String(jobId);
       if (db3FileId) {
         const key = idToKey(db3FileId);
         if (!key.startsWith('clients/')) return res.status(400).json({ error: 'Invalid db3FileId' });
-        const parsed = parseJobFromObjectKey(key);
-        if (!parsed || parsed.clientId !== String(clientId) || parsed.jobId !== String(jobId)) {
-          return res.status(400).json({ error: 'db3FileId must belong to the same client/job scope' });
+        const scopeResolved = await resolveDb3FileScopeForBinding(uploadMetaPool, req.user, clientId, jobId, key);
+        if (!scopeResolved.ok) {
+          return res.status(400).json({ error: scopeResolved.error });
         }
-        const pref = jobPrefix(String(clientId), String(jobId));
+        pathScopeClient = scopeResolved.clientId;
+        pathScopeJob = scopeResolved.jobId;
+      }
+      if (folderPath) {
+        const treePortalMode = readPortalMode(req, body);
+        const visible =
+          (await assertRelPathMatchesPortalTreeVisibility(
+            aclPool,
+            req,
+            pathScopeClient,
+            pathScopeJob,
+            treePortalMode,
+            folderPath
+          )) ||
+          (pathScopeClient !== String(clientId) || pathScopeJob !== String(jobId)
+            ? await assertRelPathMatchesPortalTreeVisibility(
+                aclPool,
+                req,
+                clientId,
+                jobId,
+                treePortalMode,
+                folderPath
+              )
+            : false);
+        if (!visible) return res.status(403).json({ error: 'Forbidden' });
+        const canEditPath =
+          (await assertPortalPathRel(aclPool, req.user, pathScopeClient, pathScopeJob, folderPath, 'full')) ||
+          ((pathScopeClient !== String(clientId) || pathScopeJob !== String(jobId)) &&
+            (await assertPortalPathRel(aclPool, req.user, clientId, jobId, folderPath, 'full')));
+        if (!canEditPath) return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (db3FileId) {
+        const key = idToKey(db3FileId);
+        const storageClientId = pathScopeClient;
+        const storageJobId = pathScopeJob;
+        const pref = jobPrefix(String(storageClientId), String(storageJobId));
         const relPath = key.slice(pref.length);
         if (!/\.db3$/i.test(path.basename(relPath))) {
           return res.status(400).json({ error: 'db3FileId must reference a .db3 file' });
         }
-        const canViewDb3 = await assertPortalPathRel(aclPool, req.user, clientId, jobId, relPath, 'view');
+        const canViewDb3 = await assertPortalPathRel(aclPool, req.user, storageClientId, storageJobId, relPath, 'view');
         if (!canViewDb3) return res.status(403).json({ error: 'Forbidden' });
         try {
           await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
@@ -2408,6 +2507,23 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           }
           throw he;
         }
+        await savePortalInspectionBinding(
+          uploadMetaPool,
+          storageClientId,
+          storageJobId,
+          folderPath,
+          bindingType,
+          db3FileId,
+          req.user?.username || ''
+        );
+        return res.json({
+          success: true,
+          folderPath,
+          bindingType,
+          db3FileId: db3FileId || null,
+          clientId: storageClientId,
+          jobId: storageJobId
+        });
       }
       await savePortalInspectionBinding(
         uploadMetaPool,
@@ -2422,7 +2538,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         success: true,
         folderPath,
         bindingType,
-        db3FileId: db3FileId || null
+        db3FileId: db3FileId || null,
+        clientId,
+        jobId
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

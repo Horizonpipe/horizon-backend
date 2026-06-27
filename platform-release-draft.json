@@ -1,13 +1,14 @@
 {
-  "title": "Modular PipeSync and PipeShare architecture",
-  "description": "PipeSync and PipeShare now load features as separate JavaScript modules instead of one giant app.js file. Each major tool (Plan View, Segment Planner, Footage Tracker, Pricing, Daily Reports, Jobsite Contacts, email, and PipeShare upload queue) registers through an addon manifest so failures stay isolated and future features are easier to add.\n\nPlan View includes the unified explorer, workspace, PDF library, and all modals (share, sync, bookmarks, build map). About 2,800 lines of duplicate legacy render code was removed from app.js.\n\nWho is affected: Your private OVH server team using PipeSync and PipeShare. SaaS customers are unchanged until you apply a platform release.",
+  "title": "Full platform sync — modular apps and release system",
+  "description": "Complete update for your private OVH server.\n\nPipeSync and PipeShare now load as modular addons (Plan View with modals, segment planner, footage, pricing, daily reports, jobsite contacts, PipeShare upload queue). Backend adds platform release management, SaaS billing routes, and OVH deploy tooling.\n\nHard-refresh PipeSync/PipeSync after deploy (Ctrl+Shift+R).\n\nWho is affected: Private server at 40.160.72.39. SaaS tenants unchanged until you publish and apply a platform release.",
   "changeLog": [
-    "PipeSync loads tools from pipesync/modules/ via addons.manifest.js.",
-    "Plan View page, explorer, workspace, SVG, and modals extracted to modules.",
-    "PipeShare upload queue and transfer panel modularized under client-portal/pipeshare/.",
-    "Removed legacy inline render copies from app.js (~2,800 lines).",
-    "Added static and browser smoke tests for module load order and registration.",
-    "Bumped portal runtime version for cache bust."
+    "Modular PipeSync and PipeShare frontend (manifest boot, smoke tests).",
+    "Plan View modals and ~2800 lines legacy render code removed from app.js.",
+    "Platform release API and draft notes for cPanel updates track.",
+    "SaaS billing and tenant provisioning routes (Stripe-ready).",
+    "OVH deploy scripts, GitHub Actions workflow, and performance nginx config.",
+    "Horizonpipe cPanel static pages (releases admin, billing, setup).",
+    "Portal runtime version bumped for cache bust."
   ],
-  "updatedAt": "2026-06-27T06:30:00.000Z"
+  "updatedAt": "2026-06-27T12:00:00.000Z"
 }
