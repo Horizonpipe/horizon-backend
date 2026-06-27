@@ -1,11 +1,12 @@
 {
-  "title": "Fix PDF highlight download duplicates and flat mode",
-  "description": "PipeSync \"Download plans\" highlight export showed duplicate strokes in Edge, Okular, and Adobe for both Baked in Highlights and Editable Highlights. Baked mode also stayed editable in Adobe and round caps looked wrong.\n\nRoot cause: flat export still wrote /Ink annotations (InkList + BS + /LE Round). Viewers render those alongside any prior baked ink when clear missed an annot, and /LE Round on Ink produces broken cap geometry. Flat Ink annots are also editable in Adobe by design.\n\nFix (dbg38): Baked in Highlights now draws each line once into the page content stream (pdf-lib drawLine, round caps) after stripping all Ink/Highlight annots — truly baked in, not editable. Editable Highlights keeps a single InkList + BS annot per line with no /AP or /LE; annot clear is more aggressive (InkList/QuadPoints fallback, delete empty /Annots, up to 4 passes).\n\nHard-refresh PipeSync after deploy (Ctrl+Shift+R). Check console for [hp-download-debug] — inkAfterClear should be 0 before burn; flatContentStream true for baked mode.\n\nWho is affected: Private OVH server. SaaS unchanged until you publish a platform release.",
+  "title": "Fix duplicate highlights on PDF download (mirror dedupe)",
+  "description": "Downloaded plan PDFs still showed stacked duplicate highlight strokes even after flat content-stream burn (dbg38–39). Runtime trace showed 49 export lines for 7 board highlights — seven viewer mirror copies per highlight with the same piece coordinates but different pageIds.\n\nFix (dbg40): Legacy download now dedupes mirrors by mirroredFrom + piece storageKey. Export geometry dedupe uses piece storageKey + rx/ry instead of viewer pageId, so one stroke per highlight per PDF piece. Debug trace still active for verification.\n\nHard-refresh PipeSync after deploy (Ctrl+Shift+R). After download, run __hpDownloadTraceDump() in console (type allow pasting first in Edge). Expect allLinesCount near board line count, dupGeo empty, pieceLinesCount and drawableCount much lower on highlighted pieces.\n\nWho is affected: Private OVH server. SaaS unchanged until you publish a platform release.",
   "changeLog": [
-    "Baked in Highlights: content-stream strokes (round caps, not editable in Adobe).",
-    "Editable Highlights: one InkList + BS annot per line; no /AP or /LE double layers.",
-    "Stronger pre-burn annot clear (InkList detect, empty /Annots delete, retry loop).",
-    "Cache bust dbg38 for app.js, pipesync-boot.js, and pdf-highlight-shape."
+    "Dedupe viewer mirror highlights by mirroredFrom + piece storageKey on export.",
+    "Piece-aware geometry key for download burn (storageKey + coords, not pageId).",
+    "Per-piece dedupe passes pieceSk into export dedupe before PDF burn.",
+    "Download trace helpers available at boot (__hpDownloadTraceDump / Copy).",
+    "Cache bust dbg42 for app.js and pipesync-boot.js."
   ],
-  "updatedAt": "2026-06-27T25:00:00.000Z"
+  "updatedAt": "2026-06-27T26:00:00.000Z"
 }
