@@ -1,0 +1,13 @@
+{
+  "title": "Modular PipeSync and PipeShare architecture",
+  "description": "PipeSync and PipeShare now load features as separate JavaScript modules instead of one giant app.js file. Each major tool (Plan View, Segment Planner, Footage Tracker, Pricing, Daily Reports, Jobsite Contacts, email, and PipeShare upload queue) registers through an addon manifest so failures stay isolated and future features are easier to add.\n\nPlan View includes the unified explorer, workspace, PDF library, and all modals (share, sync, bookmarks, build map). About 2,800 lines of duplicate legacy render code was removed from app.js.\n\nWho is affected: Your private OVH server team using PipeSync and PipeShare. SaaS customers are unchanged until you apply a platform release.",
+  "changeLog": [
+    "PipeSync loads tools from pipesync/modules/ via addons.manifest.js.",
+    "Plan View page, explorer, workspace, SVG, and modals extracted to modules.",
+    "PipeShare upload queue and transfer panel modularized under client-portal/pipeshare/.",
+    "Removed legacy inline render copies from app.js (~2,800 lines).",
+    "Added static and browser smoke tests for module load order and registration.",
+    "Bumped portal runtime version for cache bust."
+  ],
+  "updatedAt": "2026-06-27T06:30:00.000Z"
+}
