@@ -28,6 +28,7 @@ const { registerSaasTenantRoutes } = require('./saas-tenant.routes');
 const { registerSaasBillingWebhook, registerSaasBillingRoutes } = require('./saas-billing.routes');
 const { registerPlatformReleaseRoutes } = require('./platform-release.routes');
 const { registerOvhOpsWebhook, registerOvhOpsRoutes } = require('./ovh-ops.routes');
+const { registerCustomerSupportRoutes } = require('./customer-support.routes');
 const { startMetricsCollector, isOvhOpsEnabled } = require('./ovh-ops.service');
 const { loadUserCompanyMembership, normalizeAppFeatures } = require('./company-permissions.service');
 const {
@@ -10903,6 +10904,12 @@ registerPlatformReleaseRoutes(app, {
   wasabiBucket: WASABI_STATE_BUCKET
 });
 registerOvhOpsRoutes(app, { requireAuth, requireAdmin });
+registerCustomerSupportRoutes(app, {
+  pool,
+  requireAuth,
+  readSession,
+  currentToken
+});
 if (isOvhOpsEnabled()) {
   startMetricsCollector();
   console.log('[ovh-ops] metrics collector started');
