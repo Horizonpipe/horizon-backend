@@ -7,7 +7,11 @@ const path = require('path');
 const { execFile, spawn } = require('child_process');
 const { promisify } = require('util');
 
+const { createMetricsStore } = require('./ovh-ops-metrics-store');
+
 const execFileAsync = promisify(execFile);
+
+const metricsStore = createMetricsStore();
 
 const REPO_ROOT = process.env.HP_REPO_ROOT || '/opt/horizon';
 const BACKEND_DIR = process.env.HP_BACKEND_DIR || path.join(REPO_ROOT, 'horizon-backend');
@@ -126,11 +130,15 @@ async function readNetworkRatesMbps() {
   const sample = { rx, tx, t: now };
   let rxMbps = 0;
   let txMbps = 0;
+  let intervalRxBytes = 0;
+  let intervalTxBytes = 0;
   if (lastNetSample) {
     const dt = (now - lastNetSample.t) / 1000;
     if (dt > 0) {
-      rxMbps = Math.max(0, ((rx - lastNetSample.rx) * 8) / dt / 1e6);
-      txMbps = Math.max(0, ((tx - lastNetSample.tx) * 8) / dt / 1e6);
+      intervalRxBytes = Math.max(0, rx - lastNetSample.rx);
+      intervalTxBytes = Math.max(0, tx - lastNetSample.tx);
+      rxMbps = Math.max(0, (intervalRxBytes * 8) / dt / 1e6);
+      txMbps = Math.max(0, (intervalTxBytes * 8) / dt / 1e6);
     }
   }
   lastNetSample = sample;
@@ -138,7 +146,9 @@ async function readNetworkRatesMbps() {
     rxMbps: Math.round(rxMbps * 100) / 100,
     txMbps: Math.round(txMbps * 100) / 100,
     rxTotalGb: Math.round((rx / 1e9) * 100) / 100,
-    txTotalGb: Math.round((tx / 1e9) * 100) / 100
+    txTotalGb: Math.round((tx / 1e9) * 100) / 100,
+    intervalRxBytes,
+    intervalTxBytes
   };
 }
 
@@ -176,6 +186,14 @@ async function collectMetricsSample() {
     netRxTotalGb: net.rxTotalGb,
     netTxTotalGb: net.txTotalGb
   };
+  try {
+    metricsStore.appendSample(sample, {
+      rx: net.intervalRxBytes || 0,
+      tx: net.intervalTxBytes || 0
+    });
+  } catch (err) {
+    console.warn('[ovh-ops] metrics persist failed:', err?.message || err);
+  }
   metricsHistory.push(sample);
   if (metricsHistory.length > METRICS_HISTORY_MAX) {
     metricsHistory = metricsHistory.slice(-METRICS_HISTORY_MAX);
@@ -185,6 +203,11 @@ async function collectMetricsSample() {
 
 function startMetricsCollector() {
   if (collectorTimer || !isOvhOpsEnabled()) return;
+  try {
+    metricsHistory = metricsStore.loadRecentToMemory(METRICS_HISTORY_MAX);
+  } catch {
+    metricsHistory = [];
+  }
   void collectMetricsSample().catch(() => {});
   collectorTimer = setInterval(() => {
     void collectMetricsSample().catch(() => {});
@@ -258,6 +281,7 @@ async function getOverview() {
     platform: `${os.platform()} ${os.release()}`,
     uptimeSec: Math.round(os.uptime()),
     metrics: latest,
+    metricsMeta: metricsStore.getMetaSummary(),
     pm2,
     repos: { backend, frontend },
     activeJob,
@@ -404,6 +428,9 @@ module.exports = {
   startMetricsCollector,
   getOverview,
   getMetricsHistory: () => metricsHistory.slice(),
+  queryMetricsHistory: (opts) => metricsStore.queryMetrics(opts),
+  getMetricsMeta: () => metricsStore.getMetaSummary(),
+  listMetricsDates: (opts) => metricsStore.listAvailableDates(opts),
   readEvents,
   appendEvent,
   tailFile,

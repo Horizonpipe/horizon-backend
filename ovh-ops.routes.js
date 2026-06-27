@@ -5,6 +5,9 @@ const {
   isOvhOpsEnabled,
   getOverview,
   getMetricsHistory,
+  queryMetricsHistory,
+  getMetricsMeta,
+  listMetricsDates,
   readEvents,
   appendEvent,
   tailFile,
@@ -104,8 +107,35 @@ function registerOvhOpsRoutes(app, { requireAuth, requireAdmin }) {
     }
   });
 
-  app.get('/ops/metrics/history', requireAuth, requireAdmin, gate, (_req, res) => {
-    return res.json({ success: true, samples: getMetricsHistory() });
+  app.get('/ops/metrics/history', requireAuth, requireAdmin, gate, (req, res) => {
+    const now = Date.now();
+    const fromMs = req.query?.from != null ? Number(req.query.from) : now - 30 * 60 * 1000;
+    const toMs = req.query?.to != null ? Number(req.query.to) : now;
+    const maxPoints = Math.min(2000, Math.max(50, Number(req.query?.maxPoints) || 500));
+    if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs >= toMs) {
+      return jsonError(res, 400, 'Invalid from/to range');
+    }
+    const result = queryMetricsHistory({ fromMs, toMs, maxPoints });
+    return res.json({
+      success: true,
+      fromMs,
+      toMs,
+      meta: getMetricsMeta(),
+      ...result
+    });
+  });
+
+  app.get('/ops/metrics/meta', requireAuth, requireAdmin, gate, (_req, res) => {
+    return res.json({ success: true, meta: getMetricsMeta() });
+  });
+
+  app.get('/ops/metrics/dates', requireAuth, requireAdmin, gate, (req, res) => {
+    const year = req.query?.year != null ? Number(req.query.year) : undefined;
+    const month = req.query?.month != null ? Number(req.query.month) : undefined;
+    return res.json({
+      success: true,
+      dates: listMetricsDates({ year, month })
+    });
   });
 
   app.get('/ops/events', requireAuth, requireAdmin, gate, (req, res) => {

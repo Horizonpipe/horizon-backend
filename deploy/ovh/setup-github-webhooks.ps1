@@ -24,7 +24,7 @@ foreach ($repo in $Repos) {
   $existing = Invoke-RestMethod -Uri $listUrl -Headers $headers -Method Get
   $match = $existing | Where-Object { $_.config.url -eq $WebhookUrl }
   if ($match) {
-    Write-Host "[$repo] webhook exists (id $($match.id)) — updating secret"
+    Write-Host "[$repo] webhook exists (id $($match.id)) - updating secret"
     $body = @{
       config = @{
         url          = $WebhookUrl
@@ -37,7 +37,7 @@ foreach ($repo in $Repos) {
     } | ConvertTo-Json -Depth 5
     Invoke-RestMethod -Uri "https://api.github.com/repos/$owner/$name/hooks/$($match.id)" -Headers $headers -Method Patch -Body $body -ContentType "application/json" | Out-Null
   } else {
-    Write-Host "[$repo] creating webhook → $WebhookUrl"
+    Write-Host "[$repo] creating webhook -> $WebhookUrl"
     $body = @{
       name   = "web"
       active = $true

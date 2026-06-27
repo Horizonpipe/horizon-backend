@@ -5,18 +5,20 @@ set -euo pipefail
 REPO_ROOT="${HP_REPO_ROOT:-/opt/horizon}"
 BACKEND="${HP_BACKEND_DIR:-$REPO_ROOT/horizon-backend}"
 FRONTEND="${HP_FRONTEND_DIR:-$REPO_ROOT/horizon-frontend}"
+BACKEND_KEY="${HP_BACKEND_DEPLOY_KEY:-$REPO_ROOT/.ssh/github_ovh_deploy}"
+FRONTEND_KEY="${HP_FRONTEND_DEPLOY_KEY:-$REPO_ROOT/.ssh/github_ovh_frontend}"
 BRANCH="${HP_OVH_DEPLOY_BRANCH:-main}"
 PM2_USER="${HP_PM2_USER:-ubuntu}"
 
-echo "[github-deploy] backend → origin/$BRANCH"
+echo "[github-deploy] backend -> origin/$BRANCH"
 cd "$BACKEND"
-git fetch origin "$BRANCH"
+GIT_SSH_COMMAND="ssh -i ${BACKEND_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" git fetch origin "$BRANCH"
 git reset --hard "origin/$BRANCH"
 npm install --omit=dev
 
-echo "[github-deploy] frontend → origin/$BRANCH"
+echo "[github-deploy] frontend -> origin/$BRANCH"
 cd "$FRONTEND"
-git fetch origin "$BRANCH"
+GIT_SSH_COMMAND="ssh -i ${FRONTEND_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" git fetch origin "$BRANCH"
 git reset --hard "origin/$BRANCH"
 
 echo "[github-deploy] pm2 reload"
