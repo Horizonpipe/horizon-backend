@@ -1,11 +1,11 @@
 {
-  "title": "Fix Download plans modal — options now trigger export",
-  "description": "PipeSync \"Download plans\" modal (right-click a plan in the PDF explorer) showed three export options but clicking any of them did nothing.\n\nRoot cause: the modal buttons used data-action=\"plan-download-plans-run\" but no click handler was registered in app.js (or the modular plan-view-data-actions handler). The modal opened correctly with fileId in state, but clicks were ignored.\n\nFix: wire plan-download-plans-run to planBoardDownloadLegacyPlanWholePdf(docId, mode) for original, highlights-flat, and highlights-editable. Modal closes immediately on click (same pattern as Build map and other plan modals).\n\nHard-refresh PipeSync after deploy (Ctrl+Shift+R).\n\nWho is affected: Private OVH server. SaaS unchanged until you publish a platform release.",
+  "title": "Fix PDF highlight download duplicates and flat mode",
+  "description": "PipeSync \"Download plans\" highlight export showed duplicate strokes in Edge, Okular, and Adobe for both Baked in Highlights and Editable Highlights. Baked mode also stayed editable in Adobe and round caps looked wrong.\n\nRoot cause: flat export still wrote /Ink annotations (InkList + BS + /LE Round). Viewers render those alongside any prior baked ink when clear missed an annot, and /LE Round on Ink produces broken cap geometry. Flat Ink annots are also editable in Adobe by design.\n\nFix (dbg38): Baked in Highlights now draws each line once into the page content stream (pdf-lib drawLine, round caps) after stripping all Ink/Highlight annots — truly baked in, not editable. Editable Highlights keeps a single InkList + BS annot per line with no /AP or /LE; annot clear is more aggressive (InkList/QuadPoints fallback, delete empty /Annots, up to 4 passes).\n\nHard-refresh PipeSync after deploy (Ctrl+Shift+R). Check console for [hp-download-debug] — inkAfterClear should be 0 before burn; flatContentStream true for baked mode.\n\nWho is affected: Private OVH server. SaaS unchanged until you publish a platform release.",
   "changeLog": [
-    "Fix Download plans modal — all three export options now start download.",
-    "Modal auto-closes on option click (matches other plan modals).",
-    "Add plan-download-plans-run handler in app.js and plan-view-data-actions.js.",
-    "Cache bust dbg37 for app.js, pipesync-boot.js, and pdf-highlight-shape."
+    "Baked in Highlights: content-stream strokes (round caps, not editable in Adobe).",
+    "Editable Highlights: one InkList + BS annot per line; no /AP or /LE double layers.",
+    "Stronger pre-burn annot clear (InkList detect, empty /Annots delete, retry loop).",
+    "Cache bust dbg38 for app.js, pipesync-boot.js, and pdf-highlight-shape."
   ],
-  "updatedAt": "2026-06-27T24:30:00.000Z"
+  "updatedAt": "2026-06-27T25:00:00.000Z"
 }
