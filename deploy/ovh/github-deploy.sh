@@ -37,6 +37,13 @@ run_as_deploy_user bash -lc "cd '$BACKEND' && npm install --omit=dev"
 
 git_fetch_reset frontend "$FRONTEND" "$FRONTEND_KEY"
 
+# Never overwrite production secrets — git pull must not touch .env (gitignored).
+if [[ ! -s "$BACKEND/.env" ]] || ! grep -q '^DATABASE_URL=' "$BACKEND/.env" 2>/dev/null; then
+  echo "[github-deploy] ERROR: $BACKEND/.env missing or invalid (no DATABASE_URL)." >&2
+  echo "[github-deploy] Restore: sudo bash deploy/ovh/restore-production-env.sh" >&2
+  exit 1
+fi
+
 echo "[github-deploy] pm2 reload"
 run_as_deploy_user bash -lc "cd '$BACKEND' && pm2 reload deploy/ovh/ecosystem.config.cjs --update-env && pm2 save"
 
