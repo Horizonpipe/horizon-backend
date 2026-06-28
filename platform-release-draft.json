@@ -1,12 +1,12 @@
 {
-  "title": "PDF Viewer 90% fit + compact panel",
-  "description": "Fit-to-width uses 90% of panel width (not shrink-wrapped scroll width). Plan panel no longer forces 95vh in PDF Viewer — white box hugs sheet stack.\n\nHard-refresh PipeSync (dbg64).\n\nWho is affected: Private OVH server.",
+  "title": "PDF Viewer fit-on-load + dark toolbar restored",
+  "description": "PDF Viewer now auto-fits to 90% panel width on every open/refresh (was stuck at 100% board zoom when fit flag was missing). Restored dark toolbar — white background limited to sheet area only. Scroll container shrink-wraps pages so no grey void below sheets.\n\nHard-refresh PipeSync (dbg65).\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "Fit avail width from panel, not content-sized scroll.",
-    "Viewer panel min-height removed — no dark 95vh grey void.",
-    "90% fit safety factor for 100% browser zoom.",
-    "ResizeObserver watches panel for refit.",
-    "Cache bust dbg64."
+    "Auto fit-to-width on viewer mount (not only workspace switch).",
+    "100% button in viewer re-runs fit instead of forcing zoom 1.",
+    "Dark toolbar restored; white only on PDF sheet scroll area.",
+    "Scroll shrink-wrap fixes grey margins below/beside pages.",
+    "Cache bust dbg65."
   ],
-  "updatedAt": "2026-06-29T02:00:00.000Z"
+  "updatedAt": "2026-06-29T03:00:00.000Z"
 }
