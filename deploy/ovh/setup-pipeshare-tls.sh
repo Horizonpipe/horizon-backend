@@ -49,13 +49,15 @@ fi
 echo "==> Updating backend origin (CORS + PUBLIC_ORIGIN) ..."
 ENV=/opt/horizon/horizon-backend/.env
 ORIGIN="https://${PRIMARY}"
+SAAS_ORIGIN="https://pipeshare.net"
+CORS="${ORIGIN},https://www.pipeshare.live,${SAAS_ORIGIN},https://www.pipeshare.net,http://${OVH_IP}"
 if [[ -f "$ENV" ]]; then
   grep -v '^PUBLIC_ORIGIN=' "$ENV" | grep -v '^CORS_ORIGINS=' | grep -v '^SAAS_CPANEL_BASE_URL=' > /tmp/horizon.env.merge || true
   {
     cat /tmp/horizon.env.merge
     echo "PUBLIC_ORIGIN=${ORIGIN}"
-    echo "SAAS_CPANEL_BASE_URL=${ORIGIN}"
-    echo "CORS_ORIGINS=${ORIGIN},http://${OVH_IP}"
+    echo "SAAS_CPANEL_BASE_URL=${SAAS_ORIGIN}"
+    echo "CORS_ORIGINS=${CORS}"
   } > "$ENV"
   chown horizon:horizon "$ENV" 2>/dev/null || chown ubuntu:ubuntu "$ENV" 2>/dev/null || true
   chmod 600 "$ENV"
@@ -65,4 +67,4 @@ fi
 echo ""
 echo "Done. Test:"
 echo "  curl -sS -o /dev/null -w '%{http_code}' https://${PRIMARY}/client-portal/"
-echo "  curl -sSI https://pipeshare.net/ | head -3   # expect 301 -> pipeshare.live"
+echo "  curl -sS -o /dev/null -w '%{http_code}' https://pipeshare.net/   # expect 200 (SaaS landing)"

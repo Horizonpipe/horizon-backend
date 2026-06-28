@@ -16,44 +16,61 @@ function sanitizeAdminAttachmentFilename(name) {
   return (cleaned || 'upload.bin').slice(0, 200);
 }
 
-function buildAdminAttachmentStorageKey(fileName) {
-  const id = crypto.randomUUID();
-  return `${ADMIN_ATTACHMENT_STORAGE_PREFIX}${id}/${sanitizeAdminAttachmentFilename(fileName)}`;
+function resolveAppDataPrefix(relativePrefix, rootPrefix = '') {
+  const root = String(rootPrefix || '');
+  return root ? `${root}${relativePrefix}` : relativePrefix;
 }
 
-function buildPipesyncPlanPageStorageKey(fileName) {
-  const id = crypto.randomUUID();
-  return `${PIPESYNC_PLAN_PAGE_STORAGE_PREFIX}${id}/${sanitizeAdminAttachmentFilename(fileName)}`;
+/** Strip optional `tenants/{slug}/` for validation of stored keys. */
+function stripOptionalTenantRoot(key) {
+  const m = /^tenants\/[^/]+\/(.*)$/.exec(String(key || ''));
+  return m ? m[1] : String(key || '');
 }
 
-function isValidPipesyncPlanPageStorageKey(key) {
+function keyMatchesRelativeAppDataPrefix(key, relativePrefix, rootPrefix = '') {
   if (typeof key !== 'string') return false;
-  if (!key.startsWith(PIPESYNC_PLAN_PAGE_STORAGE_PREFIX)) return false;
-  if (key.length >= 4096 || key.includes('..')) return false;
-  return true;
+  const k = String(key);
+  if (k.startsWith(relativePrefix)) return true;
+  const tenantPref = resolveAppDataPrefix(relativePrefix, rootPrefix);
+  if (rootPrefix && k.startsWith(tenantPref)) return true;
+  return stripOptionalTenantRoot(k).startsWith(relativePrefix);
 }
 
-function buildPipesyncPlanWorkspaceSaveStorageKey(saveId) {
+function buildAdminAttachmentStorageKey(fileName, rootPrefix = '') {
+  const id = crypto.randomUUID();
+  return `${resolveAppDataPrefix(ADMIN_ATTACHMENT_STORAGE_PREFIX, rootPrefix)}${id}/${sanitizeAdminAttachmentFilename(fileName)}`;
+}
+
+function buildPipesyncPlanPageStorageKey(fileName, rootPrefix = '') {
+  const id = crypto.randomUUID();
+  return `${resolveAppDataPrefix(PIPESYNC_PLAN_PAGE_STORAGE_PREFIX, rootPrefix)}${id}/${sanitizeAdminAttachmentFilename(fileName)}`;
+}
+
+function isValidPipesyncPlanPageStorageKey(key, rootPrefix = '') {
+  if (typeof key !== 'string') return false;
+  if (key.length >= 4096 || key.includes('..')) return false;
+  return keyMatchesRelativeAppDataPrefix(key, PIPESYNC_PLAN_PAGE_STORAGE_PREFIX, rootPrefix);
+}
+
+function buildPipesyncPlanWorkspaceSaveStorageKey(saveId, rootPrefix = '') {
   const id = String(saveId || '').trim();
   if (!id || !/^[0-9a-f-]{36}$/i.test(id)) {
     throw new Error('Invalid workspace save id');
   }
-  return `${PIPESYNC_PLAN_WORKSPACE_SAVE_PREFIX}${id}.json`;
+  return `${resolveAppDataPrefix(PIPESYNC_PLAN_WORKSPACE_SAVE_PREFIX, rootPrefix)}${id}.json`;
 }
 
-function isValidPipesyncPlanWorkspaceSaveStorageKey(key) {
+function isValidPipesyncPlanWorkspaceSaveStorageKey(key, rootPrefix = '') {
   if (typeof key !== 'string') return false;
-  if (!key.startsWith(PIPESYNC_PLAN_WORKSPACE_SAVE_PREFIX)) return false;
   if (!key.endsWith('.json')) return false;
   if (key.length >= 4096 || key.includes('..')) return false;
-  return true;
+  return keyMatchesRelativeAppDataPrefix(key, PIPESYNC_PLAN_WORKSPACE_SAVE_PREFIX, rootPrefix);
 }
 
-function isValidAdminAttachmentStorageKey(key) {
+function isValidAdminAttachmentStorageKey(key, rootPrefix = '') {
   if (typeof key !== 'string') return false;
-  if (!key.startsWith(ADMIN_ATTACHMENT_STORAGE_PREFIX)) return false;
   if (key.length >= 4096 || key.includes('..')) return false;
-  return true;
+  return keyMatchesRelativeAppDataPrefix(key, ADMIN_ATTACHMENT_STORAGE_PREFIX, rootPrefix);
 }
 
 /** @param {'daily-report'|'jobsite-asset'|'pipesync-plan-view'} fileKind */
@@ -195,6 +212,8 @@ module.exports = {
   ADMIN_ATTACHMENT_STORAGE_PREFIX,
   PIPESYNC_PLAN_PAGE_STORAGE_PREFIX,
   PIPESYNC_PLAN_WORKSPACE_SAVE_PREFIX,
+  resolveAppDataPrefix,
+  stripOptionalTenantRoot,
   sanitizeAdminAttachmentFilename,
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,

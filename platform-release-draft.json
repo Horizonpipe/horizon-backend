@@ -1,13 +1,12 @@
 {
-  "title": "Remote assistance — admin live screen viewport fix",
-  "description": "Fixes remote help on pipeshare.live where the admin panel showed \"Connected\" but the customer viewport stayed empty with ghosted UI behind it and status stuck on \"Waiting for customer to finish screen share…\".\n\nRoot cause: WebRTC offer path incorrectly marked the remote SDP as applied before the customer's answer arrived, so ICE candidates were dropped and the video track never connected. Status text was also overwritten after screen-ready had already been processed.\n\nAdmin remote panel now has a pop-out (⛶) full-screen viewport mode (TeamViewer-style), opaque black video area, and clearer status progression. Cache bust dbg162.\n\nWho is affected: SaaS PipeShare admins using customer-initiated remote help over HTTPS (WebRTC). HTTP DOM frame relay unchanged.",
+  "title": "PipeShare.net SaaS landing + tenant storage alignment",
+  "description": "PipeShare is now a separate product from the Horizon Pipe dev base on pipeshare.live.\n\npipeshare.net is the public SaaS front door: brochure landing page, Business login (cPanel), and Customer login with subscription license check. Provisioned SaaS tenants store files under tenants/{slug}/ on Wasabi (Phase 1 storage alignment). pipeshare.live remains Mike's base build for development and testing.\n\nWho is affected: New SaaS customers use pipeshare.net. OVH non-SaaS paths unchanged. Deploy backend + frontend + nginx activate script on OVH.",
   "changeLog": [
-    "Fix WebRTC ICE: do not treat local offer as remote description set.",
-    "Re-queue ICE candidates when addIceCandidate fails due to SDP timing.",
-    "Fix admin status overwriting after screen-ready / offer sent.",
-    "Admin remote panel: pop-out full-screen viewport (⛶ button).",
-    "Viewport: solid black background (no admin panel bleed-through).",
-    "Video playback retries on loadedmetadata; dbg162 cache bust."
+    "PipeShare.net landing with Business and Customer login panels.",
+    "Customer login checks tenant Stripe subscription (Invalid license message).",
+    "SaaS Wasabi keys prefixed with tenants/{slug}/ for portal uploads.",
+    "nginx serves pipeshare.net landing (no redirect to .live).",
+    "CORS and SAAS_CPANEL_BASE_URL include pipeshare.net."
   ],
-  "updatedAt": "2026-06-29T00:00:00.000Z"
+  "updatedAt": "2026-06-28T22:00:00.000Z"
 }

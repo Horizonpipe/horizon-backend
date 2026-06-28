@@ -61,6 +61,11 @@ const {
   normalizeAdminFilesForPersist,
   hydrateAdminReportOrAssetRows
 } = require('./admin-attachments-wasabi');
+const {
+  resolveTenantStorageContext,
+  assertKeyWithinTenantRoot
+} = require('./lib/tenant-storage-context');
+const { evaluateSaasCustomerLoginAccess } = require('./lib/saas-customer-access');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -822,10 +827,15 @@ function isLegacyPlanPdfStorageKey(key) {
   return norm.startsWith('clients/');
 }
 
-function isPersistablePlanPdfStorageKey(key) {
+function isPersistablePlanPdfStorageKey(key, rootPrefix = '') {
   const sk = String(key || '').trim();
   if (!sk) return false;
-  return isValidPipesyncPlanPageStorageKey(sk) || isLegacyPlanPdfStorageKey(sk);
+  return isValidPipesyncPlanPageStorageKey(sk, rootPrefix) || isLegacyPlanPdfStorageKey(sk);
+}
+
+async function tenantWasabiRootForRequest(req) {
+  const ctx = await resolveTenantStorageContext(pool, req.user?.id);
+  return ctx?.wasabiRootPrefix || '';
 }
 
 function sanitizePlanBoardBranch(branch) {
@@ -6706,6 +6716,19 @@ app.post('/login', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Invalid email or password' });
     }
 
+    const loginContext = cleanString(req.body?.loginContext).toLowerCase();
+    if (loginContext === 'saas-customer') {
+      const access = await evaluateSaasCustomerLoginAccess(pool, row.id);
+      if (!access.allowed) {
+        const status = access.code === 'INVALID_LICENSE' ? 402 : 403;
+        return res.status(status).json({
+          success: false,
+          error: access.message || 'Access denied',
+          code: access.code || 'ACCESS_DENIED'
+        });
+      }
+    }
+
     if (needsRehash && !userRowFromWasabi) {
       const hash = await bcrypt.hash(submittedPassword, 10);
       const wasabiWrote = await tryWasabiStateWrite('login-rehash-password', async (data) => {
@@ -7978,11 +8001,17 @@ app.post(
       if (!adminAttachmentsWasabiConfigured()) {
         return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
       }
+      const rootPrefix = await tenantWasabiRootForRequest(req);
       const fileName = cleanString(req.body?.fileName);
       const contentType = cleanString(req.body?.contentType || 'application/octet-stream');
       const fileSize = Number(req.body?.fileSize);
       const reuseKey = cleanString(req.body?.storageKey);
-      if (reuseKey && isValidPipesyncPlanPageStorageKey(reuseKey)) {
+      if (reuseKey && isValidPipesyncPlanPageStorageKey(reuseKey, rootPrefix)) {
+        try {
+          assertKeyWithinTenantRoot(reuseKey, rootPrefix);
+        } catch {
+          return res.status(403).json({ success: false, error: 'Forbidden' });
+        }
         // Overwrite/update existing piece (e.g. bake PDF annotation into the file). fileName optional for naming.
       } else if (!fileName) {
         return res.status(400).json({ success: false, error: 'fileName is required (or provide storageKey to update existing)' });
@@ -7996,9 +8025,10 @@ app.post(
       if (!isAllowedAdminAttachmentContentType(contentType, 'pipesync-plan-view')) {
         return res.status(400).json({ success: false, error: 'Only images and PDF files are allowed for plan view.' });
       }
-      const storageKey = (reuseKey && isValidPipesyncPlanPageStorageKey(reuseKey))
-        ? reuseKey
-        : buildPipesyncPlanPageStorageKey(fileName);
+      const storageKey =
+        reuseKey && isValidPipesyncPlanPageStorageKey(reuseKey, rootPrefix)
+          ? reuseKey
+          : buildPipesyncPlanPageStorageKey(fileName, rootPrefix);
       const signed = await presignAdminAttachmentPut(
         wasabiStateClient,
         WASABI_STATE_BUCKET,
@@ -8061,9 +8091,15 @@ app.post(
       if (!adminAttachmentsWasabiConfigured()) {
         return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
       }
+      const rootPrefix = await tenantWasabiRootForRequest(req);
       const storageKey = cleanString(req.body?.storageKey);
-      if (!storageKey || !isPersistablePlanPdfStorageKey(storageKey)) {
+      if (!storageKey || !isPersistablePlanPdfStorageKey(storageKey, rootPrefix)) {
         return res.status(400).json({ success: false, error: 'A valid plan page storageKey is required.' });
+      }
+      try {
+        assertKeyWithinTenantRoot(storageKey, rootPrefix);
+      } catch {
+        return res.status(403).json({ success: false, error: 'Forbidden' });
       }
       const { url } = await presignAdminAttachmentGet(
         wasabiStateClient,
@@ -8295,8 +8331,9 @@ app.post(
       if (blobJson.length > PIPESYNC_PLAN_WORKSPACE_SAVE_MAX_BYTES) {
         return res.status(413).json({ success: false, error: 'Workspace save exceeds the maximum size.' });
       }
+      const rootPrefix = await tenantWasabiRootForRequest(req);
       const saveId = crypto.randomUUID();
-      const storageKey = buildPipesyncPlanWorkspaceSaveStorageKey(saveId);
+      const storageKey = buildPipesyncPlanWorkspaceSaveStorageKey(saveId, rootPrefix);
       const savedAt = nowIso();
       await putPipesyncPlanWorkspaceSaveBlob(storageKey, {
         savedAt,
@@ -9056,6 +9093,7 @@ app.post('/admin/attachments/upload-presign', requireAuth, requireAdmin, express
     if (!adminAttachmentsWasabiConfigured()) {
       return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
     }
+    const rootPrefix = await tenantWasabiRootForRequest(req);
     const fileName = cleanString(req.body?.fileName);
     const contentType = cleanString(req.body?.contentType || 'application/octet-stream');
     const fileSize = Number(req.body?.fileSize);
@@ -9071,7 +9109,7 @@ app.post('/admin/attachments/upload-presign', requireAuth, requireAdmin, express
     if (!isAllowedAdminAttachmentContentType(contentType, fileKind)) {
       return res.status(400).json({ success: false, error: 'Unsupported content type for this upload kind' });
     }
-    const storageKey = buildAdminAttachmentStorageKey(fileName);
+    const storageKey = buildAdminAttachmentStorageKey(fileName, rootPrefix);
     const signed = await presignAdminAttachmentPut(
       wasabiStateClient,
       WASABI_STATE_BUCKET,

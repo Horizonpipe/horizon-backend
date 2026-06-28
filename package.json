@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "smoke:portal-presign": "node scripts/smoke-portal-presign.mjs",
-    "test:db3-jobsite-duplicate": "node scripts/db3-jobsite-duplicate.test.mjs"
+    "test:db3-jobsite-duplicate": "node scripts/db3-jobsite-duplicate.test.mjs",
+    "test:tenant-storage-context": "node scripts/tenant-storage-context.test.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.758.0",

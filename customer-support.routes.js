@@ -1969,7 +1969,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       if (row.status !== 'active') return jsonError(res, 400, 'Remote session is not active');
 
       const entry = pushRemoteSignal(sessionId, req.user.id, type, payload);
-      broadcastTenant(row.tenant_id, 'remote-signal', {
+      broadcastSupportEvents(row.tenant_id, 'remote-signal', {
         sessionId,
         signalId: entry?.id,
         fromUserId: req.user.id,

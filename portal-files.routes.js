@@ -42,6 +42,16 @@ const { NodeHttpHandler } = require('@smithy/node-http-handler');
 const { canManagePortalExtras } = require('./capabilities');
 const { isValidPipesyncPlanPageStorageKey } = require('./admin-attachments-wasabi');
 const {
+  resolveTenantStorageContext,
+  fullJobPrefix,
+  fullObjectKey,
+  parseJobFromPrefixedObjectKey,
+  isPortalClientsObjectKey,
+  assertKeyWithinTenantRoot,
+  assertTenantPortalScope,
+  resolveStorageRootForJob
+} = require('./lib/tenant-storage-context');
+const {
   loadEffectivePathGrantsForUser,
   jobHasAnyEffectivePathGrants,
   migrateLegacyScopeAuthorityForUserJob,
@@ -329,13 +339,13 @@ async function s3UploadFromTempPath(s3Client, bucketName, Key, tempPath, content
   }
 }
 
-function portalUploadKey(clientId, jobId, folderPathRel, originalName, explicitCategory) {
+function portalUploadKey(clientId, jobId, folderPathRel, originalName, explicitCategory, root = '') {
   const fp = normalizeRelPath(folderPathRel || '');
   if (fp) {
-    return `${jobPrefix(String(clientId), String(jobId))}${fp}/${sanitizeFilename(originalName)}`;
+    return `${jobPrefix(String(clientId), String(jobId), root)}${fp}/${sanitizeFilename(originalName)}`;
   }
   const cat = explicitCategory || inferCategoryFromFilename(originalName);
-  return objectKey(String(clientId), String(jobId), String(cat), originalName);
+  return objectKey(String(clientId), String(jobId), String(cat), originalName, root);
 }
 
 /**
@@ -597,20 +607,32 @@ function inferCategoryFromFilename(name) {
   return 'videos';
 }
 
-function objectKey(clientId, jobId, category, filename) {
+function objectKey(clientId, jobId, category, filename, root = '') {
   assertCategory(category);
-  const safe = sanitizeFilename(filename);
-  return `clients/${segment(clientId)}/jobs/${segment(jobId)}/${category}/${safe}`;
+  return fullObjectKey(root, clientId, jobId, category, filename);
 }
 
-function jobPrefix(clientId, jobId) {
-  return `clients/${segment(clientId)}/jobs/${segment(jobId)}/`;
+function jobPrefix(clientId, jobId, root = '') {
+  return fullJobPrefix(root, clientId, jobId);
 }
 
 function parseJobFromObjectKey(key) {
-  const m = /^clients\/([^/]+)\/jobs\/([^/]+)\//.exec(String(key ?? ''));
-  if (!m) return null;
-  return { clientId: m[1], jobId: m[2] };
+  return parseJobFromPrefixedObjectKey(key);
+}
+
+function storageRoot(req) {
+  return req?.tenantStorage?.wasabiRootPrefix || '';
+}
+
+function tenantStorageMiddleware(pool) {
+  return async (req, res, next) => {
+    try {
+      req.tenantStorage = await resolveTenantStorageContext(pool, req.user?.id);
+      next();
+    } catch (e) {
+      next(e);
+    }
+  };
 }
 
 /** Guess Content-Type when S3 returns application/octet-stream so browsers decode video/PDF blobs correctly. */
@@ -1039,7 +1061,7 @@ function portalPsrJobIdsEquivalent(user, clientId, jobA, jobB) {
  * from the object key (PSR jobsite vs UUID, or company folder prefix under a shared storage job).
  * @returns {Promise<{ ok: true, clientId: string, jobId: string } | { ok: false, error: string }>}
  */
-async function resolveDb3FileScopeForBinding(pool, user, reqClientId, reqJobId, key) {
+async function resolveDb3FileScopeForBinding(pool, user, reqClientId, reqJobId, key, root = '') {
   const parsed = parseJobFromObjectKey(key);
   if (!parsed) return { ok: false, error: 'Invalid db3FileId' };
 
@@ -1060,7 +1082,7 @@ async function resolveDb3FileScopeForBinding(pool, user, reqClientId, reqJobId, 
     return { ok: false, error: 'Forbidden' };
   }
 
-  const reqPref = jobPrefix(reqClient, reqJob);
+  const reqPref = jobPrefix(reqClient, reqJob, root);
   if (key.startsWith(reqPref)) {
     return { ok: true, clientId: reqClient, jobId: reqJob };
   }
@@ -1069,7 +1091,7 @@ async function resolveDb3FileScopeForBinding(pool, user, reqClientId, reqJobId, 
     return { ok: true, clientId: fileClient, jobId: fileJob };
   }
 
-  const filePref = jobPrefix(fileClient, fileJob);
+  const filePref = jobPrefix(fileClient, fileJob, root);
   let fileRel = '';
   try {
     fileRel = normalizeRelPath(key.slice(filePref.length));
@@ -1204,6 +1226,11 @@ async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) 
 }
 
 async function assertPortalJobAccessForRequest(aclPool, req, clientId, jobId) {
+  try {
+    assertTenantPortalScope(req?.tenantStorage, clientId, jobId);
+  } catch {
+    return false;
+  }
   const isDataAutoSync = readPortalMode(req) === DATA_AUTO_SYNC_MODE;
   return assertPortalJobAccess(aclPool, req.user, clientId, jobId, {
     allowClientWideDataAutoSync: isDataAutoSync
@@ -1740,6 +1767,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
   }
   const r = express.Router();
   r.use(requireAuth);
+  r.use(tenantStorageMiddleware(pool));
   r.use((req, res, next) => {
     if (
       readPortalMode(req) === DATA_AUTO_SYNC_MODE &&
@@ -2124,6 +2152,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   const r = express.Router();
   r.use(requireAuth);
+  r.use(tenantStorageMiddleware(pool));
 
   /**
    * Persist client-reported full-object SHA-256 (presigned uploads; trusted like resumable flow).
@@ -2313,7 +2342,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         const detail = await explainPortalJobAccessDenial(aclPool, req.user, clientId, jobId);
         return res.status(403).json(detail);
       }
-      const prefix = jobPrefix(String(clientId), String(jobId));
+      const prefix = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const jobHasPathGrants = await portalOrCompanyJobHasPathGrants(aclPool, req.user, clientId, jobId);
       const permEditorList =
         readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
@@ -2374,7 +2403,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         const detail = await explainPortalJobAccessDenial(aclPool, req.user, clientId, jobId);
         return res.status(403).json(detail);
       }
-      const prefix = jobPrefix(String(clientId), String(jobId));
+      const prefix = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       let listPrefix = prefix;
       const subtreeRaw = String(req.query.pathPrefix ?? req.query.prefix ?? '').trim();
       if (subtreeRaw) {
@@ -2548,8 +2577,20 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       let pathScopeJob = String(jobId);
       if (db3FileId) {
         const key = idToKey(db3FileId);
-        if (!key.startsWith('clients/')) return res.status(400).json({ error: 'Invalid db3FileId' });
-        const scopeResolved = await resolveDb3FileScopeForBinding(uploadMetaPool, req.user, clientId, jobId, key);
+        if (!isPortalClientsObjectKey(key)) return res.status(400).json({ error: 'Invalid db3FileId' });
+        try {
+          assertKeyWithinTenantRoot(key, storageRoot(req));
+        } catch {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+        const scopeResolved = await resolveDb3FileScopeForBinding(
+          uploadMetaPool,
+          req.user,
+          clientId,
+          jobId,
+          key,
+          storageRoot(req)
+        );
         if (!scopeResolved.ok) {
           return res.status(400).json({ error: scopeResolved.error });
         }
@@ -2588,7 +2629,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         const key = idToKey(db3FileId);
         const storageClientId = pathScopeClient;
         const storageJobId = pathScopeJob;
-        const pref = jobPrefix(String(storageClientId), String(storageJobId));
+        const pref = jobPrefix(String(storageClientId), String(storageJobId), storageRoot(req));
         const relPath = key.slice(pref.length);
         if (!/\.db3$/i.test(path.basename(relPath))) {
           return res.status(400).json({ error: 'db3FileId must reference a .db3 file' });
@@ -2666,7 +2707,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (rawItems.length > max) {
         return res.status(400).json({ error: `At most ${max} paths per request.` });
       }
-      const pref = jobPrefix(String(clientId), String(jobId));
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const pathGate = await createPortalPathVisibilityChecker(aclPool, req, clientId, jobId, treePortalMode);
       /** @type {{ pathRel: string, key: string, expected: number }[]} */
       const work = [];
@@ -2750,7 +2791,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'sha256 must be 64 hex characters.' });
       }
       const treePortalMode = readPortalMode(req, body);
-      const pref = jobPrefix(String(clientId), String(jobId));
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       await ensurePortalObjectSha256Schema(uploadMetaPool);
       await ensurePortalResumeSchema(uploadMetaPool);
       const keys = new Set();
@@ -2805,7 +2846,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(403).json({ error: 'Forbidden' });
       }
       const treePortalMode = readPortalMode(req, body);
-      const pref = jobPrefix(String(clientId), String(jobId));
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const rawHashes = Array.isArray(body.hashes) ? body.hashes : [];
       const max = PORTAL_FIND_HASHES_BULK_MAX;
       if (rawHashes.length > max) {
@@ -2905,7 +2946,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!admin && !portalClientOk && !psrClientOk && !legacyClientOk) {
         return res.status(403).json({ error: 'Forbidden' });
       }
-      const probePrefix = jobPrefix(clientId, '__hp_jobs_probe__');
+      const probePrefix = jobPrefix(clientId, '__hp_jobs_probe__', storageRoot(req));
       const prefix = probePrefix.replace(/__hp_jobs_probe__\/$/, '');
       const set = await listJobIdsUnderClientJobsPrefix(s3, bucket, prefix);
       const scoped = Array.isArray(req.user?.portalScopes) ? req.user.portalScopes : [];
@@ -3009,7 +3050,6 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
    * @returns {Promise<{ ok: true, Key: string } | { ok: false, status: number, body: Record<string, unknown> }>}
    */
   async function shareViewAuthObjectKey(req, token, idParam) {
-    void req;
     const row = await loadShareLinkRowForToken(token);
     if (!row) return { ok: false, status: 404, body: { error: 'Not found' } };
     const payload = row.payload || {};
@@ -3022,14 +3062,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       return { ok: true, Key: storageKey };
     }
     const Key = idToKey(idParam);
-    if (!Key.startsWith('clients/')) {
+    if (!isPortalClientsObjectKey(Key)) {
       return { ok: false, status: 400, body: { error: 'Invalid id' } };
     }
     const parsed = parseJobFromObjectKey(Key);
     if (!parsed || parsed.clientId !== String(row.client_id) || parsed.jobId !== String(row.job_id)) {
       return { ok: false, status: 403, body: { error: 'Forbidden' } };
     }
-    const pref = jobPrefix(String(row.client_id), String(row.job_id));
+    const jobRoot = await resolveStorageRootForJob(aclPool, row.client_id, row.job_id, req);
+    const pref = jobPrefix(String(row.client_id), String(row.job_id), jobRoot);
     const rel = Key.slice(pref.length);
     if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
       return { ok: false, status: 403, body: { error: 'Not included in this share' } };
@@ -3064,7 +3105,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           shareMeta: payload && typeof payload === 'object' ? payload.shareMeta || null : null
         });
       }
-      const prefix = jobPrefix(String(row.client_id), String(row.job_id));
+      const jobRoot = await resolveStorageRootForJob(aclPool, row.client_id, row.job_id, req);
+      const prefix = jobPrefix(String(row.client_id), String(row.job_id), jobRoot);
       let listPrefix = prefix;
       const subtreeRaw = String(req.query.pathPrefix ?? req.query.prefix ?? '').trim();
       if (subtreeRaw) {
@@ -3185,7 +3227,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, rel, 'view'))) {
         return res.status(403).json({ error: 'Forbidden for this path' });
       }
-      const pref = jobPrefix(String(clientId), String(jobId));
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const markerKey = rel ? `${pref}${rel}/${FOLDER_MARKER}` : `${pref}${FOLDER_MARKER}`;
 
       const probeP = `${pref}${rel}`;
@@ -3236,7 +3278,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!userCanPortalCapability(req.user, 'edit')) {
         return res.status(403).json({ error: 'Portal edit is not enabled for this account' });
       }
-      const pref = jobPrefix(String(clientId), String(jobId));
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
 
       if (body.fileId) {
         const oldKey = idToKey(String(body.fileId));
@@ -3420,8 +3462,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       ) {
         return res.status(403).json({ error: 'Forbidden destination scope' });
       }
-      const pref = jobPrefix(String(clientId), String(jobId));
-      const targetPref = jobPrefix(String(targetClientId), String(targetJobId));
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
+      const targetPref = jobPrefix(String(targetClientId), String(targetJobId), storageRoot(req));
       const destParent = normalizeRelPath(toParentPath);
 
       if (fileId) {
@@ -3618,7 +3660,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       await recordPortalTrashDelete(aclPool, req.user, clientId, jobId, 'folder', folderRel, null, {
         name: path.basename(folderRel) || folderRel
       });
-      const pref = jobPrefix(String(clientId), String(jobId));
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const prefix = `${pref}${folderRel}/`;
       const keys = await listAllKeys(s3, bucket, prefix);
       const markerKey = `${pref}${folderRel}/${FOLDER_MARKER}`;
@@ -3642,20 +3684,26 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   async function assertWritablePresignPath(req, clientId, jobId, objectKey) {
     if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) return false;
     if (!userCanPortalCapability(req.user, 'upload')) return false;
-    const pref = jobPrefix(String(clientId), String(jobId));
     const k = String(objectKey || '');
+    try {
+      assertKeyWithinTenantRoot(k, storageRoot(req));
+    } catch {
+      return false;
+    }
+    const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
     if (!k.startsWith(pref)) return false;
     const rel = k.slice(pref.length);
     return assertPortalPathRel(aclPool, req.user, clientId, jobId, rel, 'full');
   }
 
-  function buildPresignedUploadObjectKey(clientId, jobId, body) {
+  function buildPresignedUploadObjectKey(req, clientId, jobId, body) {
     const fileName = String(body?.fileName || '').trim();
     if (!fileName) return { error: { status: 400, body: { error: 'fileName is required' } } };
     const folderPath = normalizeRelPath(body?.folderPath || '');
     const categoryRaw = String(body?.category || '').trim().toLowerCase();
+    const root = storageRoot(req);
     if (folderPath) {
-      const key = portalUploadKey(clientId, jobId, folderPath, fileName, null);
+      const key = portalUploadKey(clientId, jobId, folderPath, fileName, null, root);
       return { key };
     }
     if (!categoryRaw || !CATEGORIES.has(categoryRaw)) {
@@ -3666,7 +3714,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
       };
     }
-    const key = portalUploadKey(clientId, jobId, '', fileName, categoryRaw);
+    const key = portalUploadKey(clientId, jobId, '', fileName, categoryRaw, root);
     return { key };
   }
 
@@ -3689,7 +3737,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const scope = resolvePortalScope(req, body);
       if (scope.error) return res.status(400).json({ error: 'clientId and jobId are required' });
       const { clientId, jobId } = scope;
-      const built = buildPresignedUploadObjectKey(clientId, jobId, body);
+      const built = buildPresignedUploadObjectKey(req, clientId, jobId, body);
       if (built.error) return res.status(built.error.status).json(built.error.body);
       if (!(await assertWritablePresignPath(req, clientId, jobId, built.key))) {
         return res.status(403).json({ error: 'Forbidden for this path' });
@@ -3713,7 +3761,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }),
         { expiresIn: PORTAL_PRESIGN_TTL_SECONDS }
       );
-      const pref = jobPrefix(String(clientId), String(jobId));
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const rel = built.key.slice(pref.length);
       return res.json({
         url,
@@ -3745,7 +3793,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!Number.isFinite(fileSize) || fileSize <= 0) {
         return res.status(400).json({ error: 'fileSize must be a positive number' });
       }
-      const built = buildPresignedUploadObjectKey(clientId, jobId, body);
+      const built = buildPresignedUploadObjectKey(req, clientId, jobId, body);
       if (built.error) return res.status(built.error.status).json(built.error.body);
       if (!(await assertWritablePresignPath(req, clientId, jobId, built.key))) {
         return res.status(403).json({ error: 'Forbidden for this path' });
@@ -3764,7 +3812,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       );
       const uploadId = created.UploadId;
       if (!uploadId) return res.status(500).json({ error: 'Failed to start multipart upload' });
-      const pref = jobPrefix(String(clientId), String(jobId));
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const rel = built.key.slice(pref.length);
       return res.json({
         uploadId,
@@ -3800,7 +3848,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (partNumbers.length > 2000) {
         return res.status(400).json({ error: 'Too many part numbers in one request (max 2000)' });
       }
-      if (!key.startsWith('clients/')) return res.status(400).json({ error: 'Invalid key' });
+      if (!isPortalClientsObjectKey(key)) return res.status(400).json({ error: 'Invalid key' });
       const parsed = parseJobFromObjectKey(key);
       if (!parsed || !(await assertWritablePresignPath(req, parsed.clientId, parsed.jobId, key))) {
         return res.status(403).json({ error: 'Forbidden' });
@@ -3848,7 +3896,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!key || !uid || !Array.isArray(rawParts) || rawParts.length === 0) {
         return res.status(400).json({ error: 'key, uploadId, and parts are required' });
       }
-      if (!key.startsWith('clients/')) return res.status(400).json({ error: 'Invalid key' });
+      if (!isPortalClientsObjectKey(key)) return res.status(400).json({ error: 'Invalid key' });
       const parsed = parseJobFromObjectKey(key);
       if (!parsed || !(await assertWritablePresignPath(req, parsed.clientId, parsed.jobId, key))) {
         return res.status(403).json({ error: 'Forbidden' });
@@ -3905,7 +3953,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           /* ignore */
         }
       }
-      const pref = jobPrefix(parsed.clientId, parsed.jobId);
+      const pref = jobPrefix(parsed.clientId, parsed.jobId, storageRoot(req));
       const rel = key.slice(pref.length);
       return res.status(201).json({
         id: keyToId(key),
@@ -3927,7 +3975,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const body = req.body || {};
       const key = String(body.key || '').trim();
       const h = normalizeSha256Hex(body.sha256 || '');
-      if (!key.startsWith('clients/')) {
+      if (!isPortalClientsObjectKey(key)) {
         return res.status(400).json({ error: 'key is required' });
       }
       if (h.length !== 64) {
@@ -3958,7 +4006,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const { key: rawKey, uploadId } = req.body || {};
       const key = String(rawKey || '');
       const uid = String(uploadId || '');
-      if (!key || !uid || !key.startsWith('clients/')) {
+      if (!key || !uid || !isPortalClientsObjectKey(key)) {
         return res.status(400).json({ error: 'key and uploadId are required' });
       }
       const parsed = parseJobFromObjectKey(key);
@@ -3998,7 +4046,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!userCanPortalCapability(req.user, 'upload')) {
         return res.status(403).json({ error: 'Portal upload is not enabled for this account' });
       }
-      const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id));
+      const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id), storageRoot(req));
       const relForAcl = String(sessionRow.object_key || '').slice(pref.length);
       if (!(await assertPortalPathRel(aclPool, req.user, sessionRow.client_id, sessionRow.job_id, relForAcl, 'full'))) {
         return res.status(403).json({ error: 'Forbidden for this path' });
@@ -4060,7 +4108,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!userCanPortalCapability(req.user, 'upload')) {
         return res.status(403).json({ error: 'Portal upload is not enabled for this account' });
       }
-      const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id));
+      const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id), storageRoot(req));
       const relForAcl = String(sessionRow.object_key || '').slice(pref.length);
       if (!(await assertPortalPathRel(aclPool, req.user, sessionRow.client_id, sessionRow.job_id, relForAcl, 'full'))) {
         return res.status(403).json({ error: 'Forbidden for this path' });
@@ -4120,8 +4168,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const original = req.body.filename || f.originalname || 'upload';
       const fp = normalizeRelPath(folderPath || '');
       const catExplicit = fp ? null : body.category || null;
-      const Key = portalUploadKey(clientId, jobId, fp || '', original, catExplicit);
-      const pref = jobPrefix(String(clientId), String(jobId));
+      const Key = portalUploadKey(clientId, jobId, fp || '', original, catExplicit, storageRoot(req));
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const relForAcl = Key.slice(pref.length);
       if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, relForAcl, 'full'))) {
         fs.unlink(f.path, () => {});
@@ -4203,7 +4251,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       pathsList = files.map(() => fp);
     }
 
-    const pref = jobPrefix(String(clientId), String(jobId));
+    const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
     /** @type {Array<{ id: string, key: string, name: string, size: number, path: string, parentPath: string } | null>} */
     const okSlot = new Array(files.length).fill(null);
     /** @type {Array<{ index: number, name: string, error: string } | null>} */
@@ -4213,7 +4261,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     await runPool(files, concurrency, async (f, idx) => {
       const original = f.originalname || 'upload';
       try {
-        const Key = portalUploadKey(clientId, jobId, pathsList[idx], original, null);
+        const Key = portalUploadKey(clientId, jobId, pathsList[idx], original, null, storageRoot(req));
         const relForAcl = Key.slice(pref.length);
         if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, relForAcl, 'full'))) {
           try {
@@ -4341,8 +4389,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'fileSize must be a positive number' });
       }
       const fp = normalizeRelPath(folderPath || '');
-      const key = portalUploadKey(String(clientId), String(jobId), fp, original, fp ? null : null);
-      const pref = jobPrefix(String(clientId), String(jobId));
+      const key = portalUploadKey(String(clientId), String(jobId), fp, original, fp ? null : null, storageRoot(req));
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const relForAcl = key.slice(pref.length);
       if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, relForAcl, 'full'))) {
         return res.status(403).json({ error: 'Forbidden for this path' });
@@ -4467,7 +4515,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!userCanPortalCapability(req.user, 'upload')) {
         return res.status(403).json({ error: 'Portal upload is not enabled for this account' });
       }
-      const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id));
+      const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id), storageRoot(req));
       const relForAcl = String(sessionRow.object_key || '').slice(pref.length);
       if (!(await assertPortalPathRel(aclPool, req.user, sessionRow.client_id, sessionRow.job_id, relForAcl, 'full'))) {
         return res.status(403).json({ error: 'Forbidden for this path' });
@@ -4632,7 +4680,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
          WHERE id = $1`,
         [sessionId, actualFileSha256]
       );
-      const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id));
+      const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id), storageRoot(req));
       return res.status(201).json({
         id: keyToId(sessionRow.object_key),
         key: sessionRow.object_key,
@@ -4914,7 +4962,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       return { ok: false, status: 403, body: { error: 'Portal download is not enabled for this account' } };
     }
     const Key = idToKey(fileId);
-    if (!Key.startsWith('clients/')) {
+    if (!isPortalClientsObjectKey(Key)) {
       return { ok: false, status: 400, body: { error: 'Invalid id' } };
     }
     if (Key.endsWith(`/${FOLDER_MARKER}`) || path.basename(Key) === FOLDER_MARKER) {
@@ -4924,7 +4972,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     if (!parsed) {
       return { ok: false, status: 403, body: { error: 'Forbidden' } };
     }
-    const prefDl = jobPrefix(parsed.clientId, parsed.jobId);
+    const jobRoot = await resolveStorageRootForJob(aclPool, parsed.clientId, parsed.jobId, req);
+    try {
+      assertKeyWithinTenantRoot(Key, jobRoot || storageRoot(req));
+    } catch {
+      return { ok: false, status: 403, body: { error: 'Forbidden' } };
+    }
+    const prefDl = jobPrefix(parsed.clientId, parsed.jobId, jobRoot);
     const relPathDl = Key.slice(prefDl.length);
     let pathOk = false;
     if (userIsPortalAdmin(req.user)) {
@@ -5054,7 +5108,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(403).json({ error: 'Forbidden' });
       }
 
-      const pref = jobPrefix(String(clientId), String(jobId));
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const prefix = `${pref}${folderRel}/`;
       const rootName = safeZipSegment(basenameRel(folderRel) || 'folder') || 'folder';
 
@@ -5197,7 +5251,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(403).json({ error: 'Portal delete is not enabled for this account' });
       }
       const Key = idToKey(req.params.id);
-      if (!Key.startsWith('clients/')) {
+      if (!isPortalClientsObjectKey(Key)) {
         return res.status(400).json({ error: 'Invalid id' });
       }
       if (Key.endsWith(`/${FOLDER_MARKER}`)) {
@@ -5207,7 +5261,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!parsed || !(await assertPortalJobAccessForRequest(aclPool, req, parsed.clientId, parsed.jobId))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
-      const prefDel = jobPrefix(parsed.clientId, parsed.jobId);
+      const jobRoot = await resolveStorageRootForJob(aclPool, parsed.clientId, parsed.jobId, req);
+      try {
+        assertKeyWithinTenantRoot(Key, jobRoot || storageRoot(req));
+      } catch {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      const prefDel = jobPrefix(parsed.clientId, parsed.jobId, jobRoot);
       const relPathDel = Key.slice(prefDel.length);
       if (!(await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDel, 'full'))) {
         return res.status(403).json({ error: 'Forbidden' });
@@ -5364,14 +5424,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       return { ok: true, Key: storageKey };
     }
     const Key = idToKey(idParam);
-    if (!Key.startsWith('clients/')) {
+    if (!isPortalClientsObjectKey(Key)) {
       return { ok: false, status: 400, body: { error: 'Invalid id' } };
     }
     const parsed = parseJobFromObjectKey(Key);
     if (!parsed || parsed.clientId !== String(row.client_id) || parsed.jobId !== String(row.job_id)) {
       return { ok: false, status: 403, body: { error: 'Forbidden' } };
     }
-    const pref = jobPrefix(String(row.client_id), String(row.job_id));
+    const jobRoot = await resolveStorageRootForJob(aclPool, row.client_id, row.job_id, req);
+    const pref = jobPrefix(String(row.client_id), String(row.job_id), jobRoot);
     const rel = Key.slice(pref.length);
     if (!sharePayloadAllowsFile(rel, keyToId(Key), payload)) {
       return { ok: false, status: 403, body: { error: 'Not included in this share' } };
@@ -5442,7 +5503,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           shareMeta: payload && typeof payload === 'object' ? payload.shareMeta || null : null
         });
       }
-      const prefix = jobPrefix(String(row.client_id), String(row.job_id));
+      const jobRoot = await resolveStorageRootForJob(aclPool, row.client_id, row.job_id, req);
+      const prefix = jobPrefix(String(row.client_id), String(row.job_id), jobRoot);
       let listPrefix = prefix;
       const subtreeRaw = String(req.query.pathPrefix ?? req.query.prefix ?? '').trim();
       if (subtreeRaw) {
