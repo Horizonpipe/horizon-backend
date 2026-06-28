@@ -1,9 +1,14 @@
-# Configure GoDaddy SMTP for pipeshare.net sign-up (EmailVerification@pipeshare.net).
-# Run from PowerShell on your PC:
+# Configure Microsoft 365 SMTP for pipeshare.net sign-up verification emails.
+#
+# Shared mailbox (From): EmailVerification@pipeshare.net
+# Admin SMTP auth (User): Mstrickland@pipeshare.net
+#
+# Requires SMTP Authentication ON for the admin mailbox in GoDaddy Advanced Settings.
 #   powershell -File deploy/ovh/setup-pipeshare-signup-smtp.ps1
 param(
   [string]$SshHost = 'horizon-ovh',
-  [string]$SmtpUser = 'EmailVerification@pipeshare.net'
+  [string]$SmtpUser = 'Mstrickland@pipeshare.net',
+  [string]$SmtpFrom = 'EmailVerification@pipeshare.net'
 )
 
 $secure = Read-Host "GoDaddy mailbox password for $SmtpUser" -AsSecureString
@@ -21,8 +26,8 @@ if (-not $pass) {
 
 # Escape single quotes for bash
 $escaped = $pass -replace "'", "'\''"
-$cmd = "SMTP_PASS='$escaped' SMTP_USER='$SmtpUser' bash /opt/horizon/horizon-backend/deploy/ovh/setup-pipeshare-signup-smtp.sh"
-Write-Host "Configuring SMTP on OVH for $SmtpUser ..."
+$cmd = "SMTP_PASS='$escaped' SMTP_USER='$SmtpUser' SMTP_FROM_ADDR='$SmtpFrom' bash /opt/horizon/horizon-backend/deploy/ovh/setup-pipeshare-signup-smtp.sh"
+Write-Host "Configuring SMTP on OVH: auth $SmtpUser, From $SmtpFrom ..."
 ssh $SshHost $cmd
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

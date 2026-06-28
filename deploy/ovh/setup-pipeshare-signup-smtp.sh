@@ -13,7 +13,8 @@
 set -euo pipefail
 
 ENV="${HP_BACKEND_ENV:-/opt/horizon/horizon-backend/.env}"
-SMTP_USER="${SMTP_USER:-EmailVerification@pipeshare.net}"
+SMTP_USER="${SMTP_USER:-Mstrickland@pipeshare.net}"
+SMTP_FROM_ADDR="${SMTP_FROM_ADDR:-EmailVerification@pipeshare.net}"
 SMTP_PASS="${SMTP_PASS:-}"
 SMTP_HOST="${SMTP_HOST:-smtp.office365.com}"
 SMTP_PORT="${SMTP_PORT:-587}"
@@ -22,7 +23,7 @@ if [[ -z "${SMTP_SECURE:-}" ]]; then
 fi
 
 if [[ -z "$SMTP_PASS" ]]; then
-  echo "ERROR: Set SMTP_PASS to the GoDaddy mailbox password for ${SMTP_USER}." >&2
+  echo "ERROR: Set SMTP_PASS to the Microsoft 365 password for ${SMTP_USER}." >&2
   echo "  SMTP_PASS='...' bash $0" >&2
   exit 1
 fi
@@ -32,7 +33,12 @@ if [[ ! -f "$ENV" ]]; then
   exit 1
 fi
 
+# Strip CRLF so grep reliably removes prior SMTP blocks (Windows-edited .env files).
+sed -i 's/\r$//' "$ENV" 2>/dev/null || true
+
 grep -v -E '^(SMTP_|SIGNUP_MAIL_FROM_NAME)=' "$ENV" > /tmp/horizon.env.smtp || true
+grep -v 'PipeShare.net sign-up' /tmp/horizon.env.smtp > /tmp/horizon.env.smtp2 || true
+mv /tmp/horizon.env.smtp2 /tmp/horizon.env.smtp
 {
   cat /tmp/horizon.env.smtp
   echo ''
@@ -42,7 +48,7 @@ grep -v -E '^(SMTP_|SIGNUP_MAIL_FROM_NAME)=' "$ENV" > /tmp/horizon.env.smtp || t
   echo "SMTP_SECURE=${SMTP_SECURE}"
   echo "SMTP_USER=${SMTP_USER}"
   echo "SMTP_PASS=${SMTP_PASS}"
-  echo "SMTP_FROM=PipeShare <${SMTP_USER}>"
+  echo "SMTP_FROM=PipeShare <${SMTP_FROM_ADDR}>"
   echo 'SIGNUP_MAIL_FROM_NAME=PipeShare'
 } > "${ENV}.new"
 mv "${ENV}.new" "$ENV"
@@ -57,5 +63,5 @@ if command -v pm2 >/dev/null 2>&1; then
   echo "==> PM2 reloaded horizon-backend"
 fi
 
-echo "OK: SMTP configured for ${SMTP_USER} via ${SMTP_HOST}:${SMTP_PORT}"
+echo "OK: auth ${SMTP_USER} → From ${SMTP_FROM_ADDR} via ${SMTP_HOST}:${SMTP_PORT}"
 echo "    Test sign-up at https://pipeshare.net/ → Create account"

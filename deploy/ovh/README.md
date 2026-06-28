@@ -133,16 +133,18 @@ psql "$DATABASE_URL" -c "SELECT COUNT(*) FROM users;"
 
 #### pipeshare.net sign-up email (SMTP)
 
-Create account sends a 6-digit code from **EmailVerification@pipeshare.net** (Microsoft 365 from GoDaddy).
+Create account sends a 6-digit code **from** `EmailVerification@pipeshare.net` (shared mailbox) using **SMTP auth** as `Mstrickland@pipeshare.net` (admin).
 
-**1. Enable SMTP in GoDaddy (required once per mailbox)**
+**1. Enable SMTP in GoDaddy (required once)**
 
 1. [GoDaddy → Email & Office](https://sso.godaddy.com/email)
-2. **Manage** next to `EmailVerification@pipeshare.net`
+2. **Manage** next to **`Mstrickland@pipeshare.net`** (admin — not the shared mailbox)
 3. **Account information** → **Advanced Settings**
 4. Turn **SMTP Authentication** **ON** → Save
 
-Without this, Microsoft returns `SmtpClientAuthentication is disabled for the Tenant` and sign-up cannot send mail.
+Also ensure the admin has **Send As** permission on the `EmailVerification@pipeshare.net` shared mailbox (Microsoft 365 admin / Exchange).
+
+Without SMTP Authentication, Microsoft returns `SmtpClientAuthentication is disabled for the Tenant`.
 
 **2. Configure OVH backend**
 
