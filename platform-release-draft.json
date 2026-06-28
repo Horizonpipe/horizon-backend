@@ -1,13 +1,11 @@
 {
-  "title": "Fix blank fullscreen PDF viewer mount timing (dbg97)",
-  "description": "Opening a PDF from the Plan View explorer into fullscreen showed a blank black area and a false \"no pages\" toast even though 17 pages were loaded. The continuous PDF viewer was mounting while the fullscreen host was still 1×1 pixels (before flex layout finished).\n\ndbg97 waits for the fullscreen PDF host to reach real dimensions, scopes mount to the fullscreen overlay (not a stale global host), retries mount once after layout, and only shows the warning toast if both attempts fail. Mount reject reasons are logged for diagnosis.\n\nWho is affected: private OVH server users opening PDFs via right-click → Open in PDF Viewer. SaaS is unchanged until you apply a platform release.",
+  "title": "Fix duplicate page in fullscreen PDF viewer (dbg98)",
+  "description": "After dbg97 fixed the blank fullscreen viewer, every stacked page showed the same sheet. Archive mode was assigning pdfPageNum=1 to all slots when archivePageIndex/pageIndex were missing (defaulting to 0). Per-piece mode was loading the shared archive signed URL from page.src before the per-piece storageKey, so every slot rendered page 1 of the same multi-page PDF.\n\ndbg98 resolves page index from archivePageIndex, pdfPageIndex, pageIndex, \"NN of MM\" filename, or stack sort order; per-piece loads prefer storageKey over shared src.\n\nWho is affected: OVH private server users in PDF Viewer fullscreen. SaaS unchanged until platform release applied.",
   "changeLog": [
-    "Wait for fullscreen PDF host layout before mounting continuous viewer.",
-    "Scope PDF board host to fullscreen overlay during active session.",
-    "Retry mount after layout; defer false \"no pages\" toast.",
-    "Log mount reject reasons (no-root, not-viewer-workspace, etc.).",
-    "Fullscreen body CSS: height 100% for flex fill.",
-    "Cache bust dbg97."
+    "Resolve distinct pdfPageNum per slot (name parse + sort index fallback).",
+    "Per-piece PDF load: storageKey before shared archive src URL.",
+    "Diag: log slotPageNums at mount and first 3 renders (H-dup-page).",
+    "Cache bust dbg98."
   ],
-  "updatedAt": "2026-06-29T12:00:00.000Z"
+  "updatedAt": "2026-06-29T18:00:00.000Z"
 }
