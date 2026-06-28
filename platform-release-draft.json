@@ -1,12 +1,13 @@
 {
-  "title": "PipeShare SaaS client Forbidden fix",
-  "description": "SaaS customer accounts (e.g. Kat · Client) with Portal Files enabled and an assigned client/job scope were getting HTTP 403 Forbidden on PipeShare load after the Wasabi ACL routing fix. The tree API required non-empty folder path grants before allowing any access.\n\nJob access now allows portal-scoped users and company-role jobs to load the explorer with an empty tree when folder ACL has not been assigned yet. Tree and list routes return clearer error codes when access is legitimately denied.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "PipeShare polished site menu (dbg128)",
+  "description": "PipeShare header is now minimal like PipeSync: fixed PIPESHARE wordmark top-left, Menu button top-right only. Identity (name + role pill), theme picker, Folder view, Share access, and Admin Panel all live inside the cp-menu panel with grouped sections.\n\nAll user types (Horizon admin, employee, client) get the same menu structure; admin-only rows are permission-gated. Menu borders, role pills, and selects follow active theme and SaaS tenant brand colors via --hp-btn-accent.\n\nIncludes the site-wide SaaS client Forbidden fix: portal-scoped users can load PipeShare with an empty tree when folder ACL is not assigned yet.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "assertPortalJobAccess allows assigned portal scope without folder grants.",
-    "Company role job scope fallback for SaaS membership.",
-    "GET /api/files/tree returns coded 403 messages (PORTAL_SCOPE_DENIED, etc.).",
-    "PipeShare frontend maps tree 403 codes to plain-English banner text.",
-    "Share-link ACL routes use raw Postgres pool for membership checks."
+    "PipeShare header stripped to Menu only; logo stays in corner bar.",
+    "Site menu module: identity, theme, Admin tools inside cp-menu panel.",
+    "Share access and Folder view moved from header into Admin menu group.",
+    "Menu CSS uses tenant brand accent (--hp-btn-accent) for pills and selects.",
+    "SaaS client Forbidden fix: job access without folder grants when scope assigned.",
+    "Runtime cache bust dbg128."
   ],
-  "updatedAt": "2026-06-28T21:30:00.000Z"
+  "updatedAt": "2026-06-28T22:15:00.000Z"
 }
