@@ -1,13 +1,12 @@
 {
-  "title": "PDF Viewer scroll-inner fit (dbg72)",
-  "description": "PipeSync PDF Viewer fit width is now measured from the scroll container's inner content box (clientWidth minus scroll padding), not the wider plan panel. Panel-minus-library sizing was demoted because it over-scaled PDFs vs the visible scroll viewport and caused horizontal clipping at the scroll padding edge. Fit safety is 0.98 with no extra pixel inset.\n\nHard-refresh PipeSync (dbg72). Open PDF Viewer: each page should fit edge-to-edge inside the scroll window without clipping at the scroll area sides.",
+  "title": "PDF Viewer scrollbar gutter reserve (dbg73)",
+  "description": "PipeSync PDF Viewer fit width now reserves vertical scrollbar gutter even when the scrollbar is absent during pre-fit layout measure. Previously fit used scroll inner width minus a live gutter that was often 0 during measure, so content scaled to full column width and the scrollbar overlaid the right edge after fit.\n\nHard-refresh PipeSync (dbg73). Open PDF Viewer with multi-page PDFs: pages should fit inside the scroll viewport without clipping behind the vertical scrollbar.",
   "changeLog": [
-    "Fit avail width from scroll inner box (layout clientWidth minus scroll padding).",
-    "Clear zoom inline width before measure to avoid circular over-scale.",
-    "Demote panel-minus-library to fallback only.",
-    "Fit safety 0.90 → 0.98; inset 4px → 0.",
-    "d9d6c9 ingest logs include scrollPadL/R and layoutClientW.",
-    "Cache bust dbg72."
+    "planBoardViewerVerticalScrollbarReserve: measured gutter or window/fallback 17px.",
+    "avail = raw - max(measuredGutter, minReserve) - inset (no double-subtract).",
+    "Two-pass refit when post-fit gutter exceeds reserve.",
+    "H7 ingest: scrollbarReserve, postFit scrollClientW vs zoomportW.",
+    "Cache bust dbg73."
   ],
-  "updatedAt": "2026-06-27T12:00:00.000Z"
+  "updatedAt": "2026-06-27T14:00:00.000Z"
 }
