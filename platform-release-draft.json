@@ -1,12 +1,13 @@
 {
-  "title": "PipeShare presence 500 fix and boot perf (dbg132)",
-  "description": "Customer support presence heartbeats were returning HTTP 500 on the OVH server for all legacy numeric user ids (Kat, Mike, etc.). The cp_support_presence table stored user_id as UUID while OVH Postgres users still use numeric TEXT ids, so every POST /saas/support/presence failed with invalid input syntax for type uuid.\n\nThis release migrates support presence/chat/remote user id columns to TEXT (matching user_company_membership), adds frontend exponential backoff on failed heartbeats so 500s do not retry-storm, dedupes parallel identical file-tree fetches, and defers workspace-layout server fetch plus customer-support init until after first paint.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "PipeShare explorer instant cache + fewer parallel file API calls (dbg133)",
+  "description": "PipeShare file explorer felt slow on open because every visit refetched the full Wasabi job tree and WinCan/preview work fired parallel GET /api/files/meta and /presign calls (one pair per file id) before the folder list appeared.\n\nThis release adds a session-scoped tree cache (memory + sessionStorage, 5 minute TTL) with stale-while-revalidate: cached folders/files render immediately while one background /api/files/tree refresh runs per client+job scope. Explorer no longer sends pathPrefix tree requests on load (folder navigation filters client-side). Duplicate meta/presign pairs are cached for 90 seconds in the browser. Backend adds short private Cache-Control on tree, meta, and presign JSON.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Fix presence HTTP 500: migrate cp_support_* user id columns UUID → TEXT on OVH.",
-    "Presence heartbeat exponential backoff on errors (max 5 min); no retry storm.",
-    "Defer customer-support init and portal-workspace-layout fetch until after first paint.",
-    "Dedupe in-flight identical /api/files/tree requests in portal-files-api.",
-    "Runtime cache bust dbg132."
+    "Explorer shows cached job tree instantly; background refresh without blanking the panel.",
+    "One tree fetch per client+job (removed pathPrefix-on-load split keys).",
+    "Debounced loadRemoteTree (150ms) and defer WinCan DB3 until tree is present.",
+    "Browser meta/presign cache cuts duplicate encoded-path API storms on boot.",
+    "GET /api/files/tree, /meta/:id, /presign/:id: private Cache-Control headers.",
+    "Runtime cache bust dbg133."
   ],
-  "updatedAt": "2026-06-28T18:00:00.000Z"
+  "updatedAt": "2026-06-28T19:30:00.000Z"
 }

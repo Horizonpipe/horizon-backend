@@ -2482,6 +2482,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!skipHashMerge) {
         await mergeCompletedUploadSha256IntoTree(clientId, jobId, tree);
       }
+      res.set('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
       return res.json(tree);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -4971,6 +4972,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const auth = await portalAuthDownloadKey(req, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: auth.Key }));
+      res.set('Cache-Control', 'private, max-age=120');
       return res.json({
         size: Number(head.ContentLength || 0),
         contentType: head.ContentType || 'application/octet-stream',
@@ -5006,6 +5008,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: auth.Key }), {
         expiresIn: PORTAL_PRESIGN_TTL_SECONDS
       });
+      res.set('Cache-Control', 'private, max-age=300');
       return res.json({ url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
     } catch (e) {
       const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
