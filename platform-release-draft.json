@@ -1,13 +1,13 @@
 {
-  "title": "PDF Viewer single scroll container (dbg80)",
-  "description": "PipeSync PDF Viewer now uses one outer scroll container with pages stacked in a vertical flex column (Okular/Edge-style), instead of nested scroll areas and overlapping absolute-positioned pages.\n\nScroll chrome no longer locks height to zoomport; native PDF iframes skip sharp oversample in viewer mode and use Fit/page-width instead of FitH.\n\nHard-refresh PipeSync (dbg80). Who is affected: private OVH server users on PDF Viewer workspace.",
+  "title": "PDF Viewer pdf.js canvas stack (dbg81)",
+  "description": "PipeSync PDF Viewer now renders pages with pdf.js canvas (Okular-style vertical stack) instead of nested browser PDF iframes. Map workspace is unchanged — native iframes, highlights, structure nodes, and export alignment stay on the existing path.\n\nViewer paints at 600 DPI base and re-rasterizes on zoom (effective DPI scales with zoom up to 24k) so microscope letter-level zoom stays sharp. Hard-refresh PipeSync (dbg81).\n\nWho is affected: private OVH server users on PDF Viewer workspace.",
   "changeLog": [
-    "Single scroll container: flex column stack, no nested mini scrollbars.",
-    "Viewer pages use relative positioning instead of absolute left/top.",
-    "Native PDF iframes: no oversample transform in viewer; overflow hidden.",
-    "PDF hash view=Fit&zoom=page-width (no FitH internal scroll).",
-    "H14 scroll height / nested overflow diagnostics.",
-    "Cache bust dbg80."
+    "PDF Viewer: pdf.js canvas pages in one scroll column (no iframe mini scrollbars).",
+    "Map workspace unchanged — native PDF iframes + highlight/export coords preserved.",
+    "Viewer: 600 DPI base render, full quality on first paint (no 120 DPI preview blur).",
+    "Zoom re-rasterizes viewer canvases at min(24000, 600 × zoom) effective DPI.",
+    "Highlight layout mode for viewer pages: contain (matches canvas paint).",
+    "Cache bust dbg81."
   ],
-  "updatedAt": "2026-06-28T12:00:00.000Z"
+  "updatedAt": "2026-06-28T16:00:00.000Z"
 }
