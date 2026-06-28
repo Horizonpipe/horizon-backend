@@ -1,12 +1,12 @@
 {
-  "title": "PipeShare support queue actions wired (dbg136)",
-  "description": "dbg135 fixed context menu picks in the Customer support queue, but Request Connection and Start chat still appeared to do nothing after a click.\n\nRoot cause: menu onSelect did fire and the backend APIs were called, but the admin UI never reacted — no support widget for chat, no remote panel for pending invites, no chat-response SSE handler for admins, and API errors were swallowed silently.\n\nThis release wires admin Start chat and Request Connection through the customer-support module: opens the support widget or remote panel with a waiting status, loads chat when the customer accepts, and shows an alert if the API fails.\n\nWho is affected: Horizon admins using PipeShare (and PipeSync via shared module) Customer support queue on OVH private server. SaaS when Mike applies the platform version in releases.html.",
+  "title": "Remote invite consent reaches customer (dbg137)",
+  "description": "After dbg136 wired the admin remote panel, Mike could send a remote connection request and see \"waiting for customer to accept\", but the customer (Kat) never got the consent popup.\n\nRoot cause: remote invites were delivered only via in-memory SSE with no fallback. If the customer's EventSource was not connected yet (support init is deferred on requestIdleCallback), or the SSE event was missed during reconnect, the invite was lost. Admin retries for an existing pending session also returned success without re-broadcasting remote-request.\n\nThis release adds a customer-side poll on each presence heartbeat for pending remote invites, re-broadcasts remote-request when an admin retries a pending session, retries SSE wiring when the session token was not ready at first boot, and resolves support user id from id or userId like the backend presence heartbeat does.\n\nWho is affected: Horizon admins and customers using PipeShare/PipeSync remote support on OVH private server. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Wire admin Start chat: open support widget, wait for customer accept via SSE chat-response.",
-    "Wire admin Request Connection: show remote panel with pending invite status before WebRTC starts.",
-    "Create admin remote panel on first invite instead of no-op when panel did not exist yet.",
-    "Surface support API failures with alert instead of silent void promises.",
-    "Portal runtime cache bust dbg136; PipeSync addons.manifest dbg136."
+    "Customer poll: pending remote invite shown via GET /saas/support/remote/active on heartbeat (SSE fallback).",
+    "Backend re-broadcasts remote-request when admin retries an existing pending invite.",
+    "SSE client retries connection when session token was missing at first init.",
+    "Support user id resolves from user.id or user.userId for invite matching.",
+    "Portal runtime cache bust dbg137."
   ],
-  "updatedAt": "2026-06-28T23:55:00.000Z"
+  "updatedAt": "2026-06-29T00:30:00.000Z"
 }

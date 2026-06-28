@@ -926,6 +926,14 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       );
       if (existing.rows[0]) {
         const row = existing.rows[0];
+        if (row.status === 'pending') {
+          broadcastTenant(targetTenantId, 'remote-request', {
+            sessionId: row.id,
+            customerUserId,
+            customerTabId: cleanString(req.body?.customerTabId) || row.customer_tab_id || 'default',
+            adminUserId: req.user.id
+          });
+        }
         return res.json({
           success: true,
           sessionId: row.id,
@@ -1163,8 +1171,11 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const r = await pool.query(
         `SELECT id, tenant_id, customer_user_id, admin_user_id, status, persist_token, customer_tab_id, created_at, updated_at
          FROM cp_support_remote_sessions
-         WHERE status = 'active' AND ended_at IS NULL
-           AND (customer_user_id = $1 OR admin_user_id = $1)
+         WHERE ended_at IS NULL
+           AND (
+             (status = 'active' AND (customer_user_id = $1 OR admin_user_id = $1))
+             OR (status = 'pending' AND customer_user_id = $1)
+           )
          ORDER BY updated_at DESC LIMIT 1`,
         [uid]
       );
