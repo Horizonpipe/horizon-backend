@@ -1,11 +1,13 @@
 {
-  "title": "Fix white void after bookmark jump in PDF viewer (dbg105)",
-  "description": "Bookmark Go at unchanged zoom left a large white area on the right side of the sheet until Ctrl+wheel zoom forced a full re-render.\n\nCause: dbg104 bookmark repaint forced tile invalidation and temporarily set canvas display size to the cropped slot size (dispW×dispH) instead of the full PDF crop layout (natW×fitScale with negative margins). dbg105 keeps canvas geometry intact on scroll-only bookmark jumps and applies cached tiles synchronously when available.\n\nWho is affected: OVH private server PDF Viewer fullscreen.",
+  "title": "Fix PDF highlights, line tool, and bookmark menu order (dbg106/107)",
+  "description": "Some highlights were invisible but still deletable; new lines sometimes did not appear until a second draw. Root causes: overlay matched lines by pageId only (stale ids after workspace sync), highlight coords were not zoom-safe after viewport changes, and line-tool preview/commit did not reliably refresh continuous-viewer SVG overlays.\n\ndbg106 adds storageKey matching, normalized zoom-safe overlay coords, pointer capture for line preview, and overlay refresh on zoom/commit.\n\ndbg107 pins the Bookmarks section to the top of the PDF right-click menu (above dynamic tool order) when the current PDF set has saved bookmarks.\n\nWho is affected: OVH private server PDF Viewer fullscreen.",
   "changeLog": [
-    "Stop corrupting canvas layout when invalidating PDF tiles.",
-    "Bookmark Go scroll-only: repaint visible tiles without force-wipe.",
-    "Sync tile-cache apply on bookmark for instant sharp paint when cached.",
-    "Cache bust dbg105."
+    "Match highlight overlays by storageKey as well as pageId.",
+    "Store and render zoom-safe normalized highlight coordinates.",
+    "Refresh continuous-viewer SVG overlays after line commit and wheel zoom.",
+    "Line tool pointer capture + window pointermove for reliable preview.",
+    "Pin Bookmarks section above dynamic tool order when PDF set has saved bookmarks.",
+    "Cache bust dbg106/107."
   ],
-  "updatedAt": "2026-06-30T00:00:00.000Z"
+  "updatedAt": "2026-06-30T12:00:00.000Z"
 }
