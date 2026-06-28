@@ -367,6 +367,15 @@ async function initCustomerSupportSchema(pool) {
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_cp_support_presence_deployment ON cp_support_presence (deployment_model, last_seen_at DESC)`
   );
+  await pool.query(
+    `ALTER TABLE cp_support_presence ADD COLUMN IF NOT EXISTS support_requested_at TIMESTAMPTZ`
+  );
+  await pool.query(
+    `ALTER TABLE cp_support_presence ADD COLUMN IF NOT EXISTS support_assigned_admin_user_id TEXT`
+  );
+  await pool.query(
+    `ALTER TABLE cp_support_presence ADD COLUMN IF NOT EXISTS support_assigned_admin_name TEXT`
+  );
   await migrateSupportUserIdColumnToText(pool, 'cp_support_presence', 'user_id');
 
   await pool.query(`
@@ -572,6 +581,28 @@ function derivePresenceLabels(user, tenantScope) {
   };
 }
 
+async function assignSupportAdmin(pool, tenantId, customerUserId, customerTabId, adminUser, adminDisplayName) {
+  const tid = cleanString(tenantId);
+  const uid = cleanString(customerUserId);
+  const tab = cleanString(customerTabId) || 'default';
+  const adminId = cleanString(adminUser?.id ?? adminUser?.userId);
+  const adminName =
+    cleanString(adminDisplayName) ||
+    cleanString(adminUser?.displayName) ||
+    cleanString(adminUser?.username) ||
+    cleanString(adminUser?.email) ||
+    'Support';
+  if (!tid || !uid || !adminId) return;
+  await pool.query(
+    `UPDATE cp_support_presence
+     SET support_assigned_admin_user_id = $4,
+         support_assigned_admin_name = $5,
+         last_seen_at = NOW()
+     WHERE tenant_id = $1 AND user_id = $2 AND tab_id = $3`,
+    [tid, uid, tab, adminId, adminName]
+  );
+}
+
 async function upsertPresence(pool, user, tenantScope, body) {
   const tenantId = tenantScope.tenantId;
   const userId = cleanString(user?.id ?? user?.userId);
@@ -698,6 +729,9 @@ function groupPresenceRows(rows) {
       customerGroupLabel: row.customer_group_label,
       deploymentModel: row.deployment_model === 'non-saas' ? 'non-saas' : 'saas',
       supportRequested: row.support_requested === true,
+      supportRequestedAt: row.support_requested_at || null,
+      supportAssignedAdminUserId: row.support_assigned_admin_user_id || '',
+      supportAssignedAdminName: row.support_assigned_admin_name || '',
       pagePath: row.page_path || '',
       lastSeenAt: row.last_seen_at,
       remoteConnected: row.remote_connected === true
@@ -830,13 +864,24 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       });
       await pool.query(
         `UPDATE cp_support_presence
-         SET support_requested = true, last_seen_at = NOW()
+         SET support_requested = true,
+             support_requested_at = COALESCE(support_requested_at, NOW()),
+             support_assigned_admin_user_id = NULL,
+             support_assigned_admin_name = NULL,
+             last_seen_at = NOW()
          WHERE tenant_id = $1 AND user_id = $2 AND tab_id = $3`,
         [req.supportTenant.tenantId, req.user.id, tabId]
       );
+      const displayName =
+        cleanString(req.user.displayName) ||
+        cleanString(req.user.username) ||
+        cleanString(req.user.email) ||
+        'Customer';
       broadcastSupportEvents(req.supportTenant.tenantId, 'support-request', {
         userId: req.user.id,
-        tabId
+        tabId,
+        displayName,
+        pagePath: cleanString(req.body?.pagePath).slice(0, 500)
       });
       return res.json({ success: true });
     } catch (error) {
@@ -850,7 +895,11 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const tabId = cleanString(req.body?.tabId) || 'default';
       await pool.query(
         `UPDATE cp_support_presence
-         SET support_requested = false, last_seen_at = NOW()
+         SET support_requested = false,
+             support_requested_at = NULL,
+             support_assigned_admin_user_id = NULL,
+             support_assigned_admin_name = NULL,
+             last_seen_at = NOW()
          WHERE tenant_id = $1 AND user_id = $2 AND tab_id = $3`,
         [req.supportTenant.tenantId, req.user.id, tabId]
       );
@@ -873,7 +922,11 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       });
       await pool.query(
         `UPDATE cp_support_presence
-         SET support_requested = false, last_seen_at = NOW()
+         SET support_requested = false,
+             support_requested_at = NULL,
+             support_assigned_admin_user_id = NULL,
+             support_assigned_admin_name = NULL,
+             last_seen_at = NOW()
          WHERE tenant_id = $1 AND user_id = $2 AND tab_id = $3`,
         [targetTenantId, customerUserId, customerTabId]
       );
@@ -968,6 +1021,17 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         [targetTenantId, customerUserId, req.user.id]
       );
       const sessionId = r.rows[0].id;
+      await assignSupportAdmin(
+        pool,
+        targetTenantId,
+        customerUserId,
+        customerTabId,
+        req.user,
+        cleanString(req.user.displayName) ||
+          cleanString(req.user.username) ||
+          cleanString(req.user.email) ||
+          'Support'
+      );
       broadcastSupportEvents(targetTenantId, 'chat-invite', {
         sessionId,
         customerUserId,
@@ -1758,6 +1822,14 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
           `UPDATE cp_support_remote_sessions SET status = 'active', updated_at = NOW(), ended_at = NULL WHERE id = $1`,
           [sessionId]
         );
+        await assignSupportAdmin(
+          pool,
+          row.tenant_id,
+          row.customer_user_id,
+          cleanString(row.customer_tab_id) || 'default',
+          req.user,
+          adminDisplayName
+        );
         broadcastSupportEvents(row.tenant_id, 'remote-response', {
           sessionId,
           status: 'active',
@@ -1885,8 +1957,8 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const type = cleanString(req.body?.type).toLowerCase();
       const payload = req.body?.payload;
       if (!sessionId) return jsonError(res, 400, 'sessionId is required');
-      if (!type || !['offer', 'answer', 'ice'].includes(type)) {
-        return jsonError(res, 400, 'type must be offer, answer, or ice');
+      if (!type || !['offer', 'answer', 'ice', 'screen-ready'].includes(type)) {
+        return jsonError(res, 400, 'type must be offer, answer, ice, or screen-ready');
       }
 
       const loaded = await loadRemoteSessionForUser(pool, sessionId, req.user, {

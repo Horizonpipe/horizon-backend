@@ -1,12 +1,14 @@
 {
-  "title": "Admin sees customer screen share (WebRTC fix)",
-  "description": "Customer-initiated remote help on HTTPS was broken: the admin sent the WebRTC offer while the customer was still in the screen-share consent/picker, before the customer's peer connection existed. The offer signal was marked as processed but never handled, so the customer never sent an SDP answer and the admin never received the video track — status stayed on \"Waiting for customer screen share…\" even though the customer saw \"Screen sharing active\".\n\nFix: queue remote-signal events until remoteRtc is ready, flush after attach, and only advance lastSignalId after a signal is actually applied. Also harden admin ontrack when browsers omit e.streams[0], and update admin status to \"Connected — viewing customer screen\" when the track arrives.\n\nWho is affected: OVH PipeShare/PipeSync HTTPS remote help (dbg160). HTTP DOM relay unchanged. SaaS unchanged until version publish.",
+  "title": "Remote help video + support queue (dbg161)",
+  "description": "Customer-initiated remote help on HTTPS was still stuck on \"Waiting for customer screen share…\" because the admin WebRTC offer was sent before the customer finished getDisplayMedia and had tracks attached. dbg161 defers the admin offer until the customer sends an explicit screen-ready signal, queues ICE until remote descriptions are set, polls GET /remote/signals as a fallback, and re-offers on failure.\n\nScreen capture (chat snip) now strips oklch/lab/lch CSS, sanitizes inline styles more aggressively, and falls back to capturing the support widget region when full-page html2canvas fails.\n\nAdmins get an in-app push notification toggle (not browser Push API), toast bubbles on new support requests, and a support queue sorted by request time with Pending vs \"{Name} is currently helping\" status.\n\nWho is affected: OVH PipeShare/PipeSync HTTPS remote help and support queue (dbg161). SaaS unchanged until version publish.",
   "changeLog": [
-    "Fix lost WebRTC offer when admin connects before customer finishes screen-share picker.",
-    "Queue remote-signal until peer connection exists; flush on attach.",
-    "Admin ontrack: build MediaStream from track when streams array is empty.",
-    "Admin status: \"Connected — viewing customer screen\" when video track arrives.",
-    "Runtime cache bump dbg160."
+    "WebRTC: defer admin offer until customer screen-ready; ICE queue; signal poll fallback.",
+    "WebRTC: customer addTrack before answer; admin re-offer on ICE/connection failure.",
+    "Screen capture: oklch/lab/lch sanitizer + support-widget region fallback.",
+    "Admin support queue: requests by time, Pending vs helping status.",
+    "In-app support request toast toggle (HPUserPrefsSync + localStorage).",
+    "UI polish: SVG chat toolbar icons, widget/remote panel chrome.",
+    "Runtime cache bump dbg161."
   ],
-  "updatedAt": "2026-06-28T21:00:00.000Z"
+  "updatedAt": "2026-06-28T22:30:00.000Z"
 }
