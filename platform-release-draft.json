@@ -1,13 +1,14 @@
 {
-  "title": "Support sessions terminate cleanly; queue updates live (dbg139)",
-  "description": "After dbg138, stale chat and remote sessions could block new invites: Mike's new chat request reopened old messages on his side without re-prompting Kat; orphan Postgres rows left remote \"active\" after admin ended connection; Clear Request / Cancel pending only cleared flags or pending remote — not active chats or remote control. The customer support queue modal did not show new requests until closed and reopened (Mike's SSE was on the global tenant channel while support-request events only hit the customer's tenant).\n\nThis release: new chat or remote invite always ends prior sessions for that customer–admin pair and broadcasts chat-ended / remote-ended before sending a fresh invite. Admin Clear Request terminates all chat + remote for the customer and clears the queue flag. Cancel pending and End connection menu actions fully terminate sessions. Customer widget resets on chat-ended / remote-ended; invite handlers allow re-prompt after terminate; stale localStorage persist token cleared when server has no matching session. Queue/presence SSE events fan out to the global admin channel so Mike's open queue modal refreshes within ~400ms.\n\nWho is affected: Horizon admins and customers using PipeShare customer support (chat + remote) on the OVH private server. SaaS when Mike applies the platform version in releases.html.",
+  "title": "Customer support chat: composer gated until active (dbg142)",
+  "description": "dbg141 fixed admin chat-response SSE filtering and added /chat/active polling, but Mike and Kat could still see mismatched UI: admin \"Waiting for accept\" with a live composer and messages, customer \"Support request sent\" alongside chat messages.\n\nRoot cause (dbg142): showChatMode(true) without { live: true } re-exposed the status body on every chat-message SSE event, restoring stale hints (\"Waiting for accept\", \"Support request sent\") while the composer stayed enabled. Admin adminStartChat also opened the composer before the customer accepted even though POST /chat/messages rejects pending sessions.\n\nFix: live chat mode now exclusively controls the composer (disabled until session status is active). Admin pending shows status only — no composer. chat-message events use live mode and auto-promote admin pending→active via loadChatSessionIntoWidget. Customer prep/accept clears stale support-request status. setStatus no longer breaks live mode.\n\nIncludes uncommitted dbg140–141 backend (chat/active, chat-response adminUserId, terminate all sessions on chat/start) and frontend (supportUserId filter, poll sync).\n\nWho is affected: Horizon admins and customers using PipeShare customer support chat on the OVH private server. Deploy both frontend and backend together.",
   "changeLog": [
-    "Backend: terminateCustomerSessions ends all pending/active chat + remote; broadcasts chat-ended and remote-ended.",
-    "chat/start and remote/request always create fresh pending invites (no reuse of stale active rows).",
-    "admin/clear-request and cancel-pending terminate sessions; new POST /saas/support/admin/terminate and /chat/end.",
-    "SSE support-request, presence, session events also broadcast to global admin tenant channel.",
-    "Admin queue modal refreshes on SSE without reopening; menu actions wire full terminate.",
-    "Customer: chat-ended SSE, reset widget state, clear orphan persist token; dbg139 cache bust."
+    "Widget: live mode gates composer; setStatus cannot unhide body during live chat.",
+    "Admin: pending invite shows status only — composer hidden until accept or poll/SSE activates.",
+    "chat-message SSE uses live mode; admin auto-activates UI when message arrives on pending session.",
+    "Customer: clear stale \"Support request sent\" before invite modal and on accept.",
+    "onSendMessage blocked until session is active (both sides).",
+    "Backend (dbg140–141): GET /chat/active, chat-response adminUserId, terminate all sessions on chat/start.",
+    "Cache bust dbg142 (portal runtime + PipeSync manifest)."
   ],
-  "updatedAt": "2026-06-28T18:00:00.000Z"
+  "updatedAt": "2026-06-28T23:30:00.000Z"
 }

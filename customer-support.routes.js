@@ -807,7 +807,6 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
 
       await terminateCustomerSessions(pool, targetTenantId, customerUserId, {
-        adminUserId: String(req.user.id),
         reason: 'superseded'
       });
 
@@ -876,7 +875,12 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         `UPDATE cp_support_chat_sessions SET status = $2, updated_at = NOW() WHERE id = $1`,
         [sessionId, status]
       );
-      broadcastSupportEvents(row.tenant_id, 'chat-response', { sessionId, status, customerUserId: req.user.id });
+      broadcastSupportEvents(row.tenant_id, 'chat-response', {
+        sessionId,
+        status,
+        customerUserId: req.user.id,
+        adminUserId: row.admin_user_id
+      });
       return res.json({ success: true, sessionId, status });
     } catch (error) {
       console.error('[saas/support/chat/respond]', error);
@@ -1273,6 +1277,63 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       });
     } catch (error) {
       console.error('[saas/support/chat/pending]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.get('/saas/support/chat/active', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const uid = String(req.user.id);
+      const sessionId = cleanString(req.query?.sessionId);
+      let row = null;
+
+      if (canAccessAdminPanel(req.user)) {
+        const params = [uid];
+        let sql = `
+          SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
+          FROM cp_support_chat_sessions
+          WHERE admin_user_id = $1 AND status IN ('pending', 'active')`;
+        if (sessionId) {
+          params.push(sessionId);
+          sql += ` AND id = $${params.length}`;
+        }
+        sql += `
+          ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, updated_at DESC
+          LIMIT 1`;
+        const r = await pool.query(sql, params);
+        row = r.rows[0];
+      } else {
+        const params = [req.supportTenant.tenantId, uid];
+        let sql = `
+          SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
+          FROM cp_support_chat_sessions
+          WHERE tenant_id = $1 AND customer_user_id = $2
+            AND status IN ('pending', 'active')`;
+        if (sessionId) {
+          params.push(sessionId);
+          sql += ` AND id = $${params.length}`;
+        }
+        sql += `
+          ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, updated_at DESC
+          LIMIT 1`;
+        const r = await pool.query(sql, params);
+        row = r.rows[0];
+      }
+
+      if (!row) return res.json({ success: true, session: null });
+      return res.json({
+        success: true,
+        session: {
+          id: row.id,
+          status: row.status,
+          customerUserId: row.customer_user_id,
+          adminUserId: row.admin_user_id,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at
+        }
+      });
+    } catch (error) {
+      console.error('[saas/support/chat/active]', error);
       return jsonError(res, 500, error.message || 'Server error');
     }
   });
