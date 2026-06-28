@@ -2,6 +2,7 @@
 
 const {
   getPlatformReleaseStatus,
+  listPlatformReleases,
   registerNonSaasHeartbeat,
   publishPlatformRelease,
   applyPlatformRelease,
@@ -35,6 +36,17 @@ function registerPlatformReleaseRoutes(app, { pool, requireAuth, requireAdmin, w
     jsonError(res, 503, 'Wasabi is not configured — platform releases require object storage');
     return false;
   }
+
+  app.get('/saas/platform/releases/list', requireAuth, requireAdmin, async (req, res) => {
+    try {
+      if (!wasabiReady(res)) return;
+      const catalog = await listPlatformReleases(wasabiClient, wasabiBucket);
+      return res.json({ success: true, ...catalog });
+    } catch (error) {
+      console.error('[saas/platform/releases/list]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
 
   app.get('/saas/platform/releases/status', requireAuth, requireAdmin, async (req, res) => {
     try {

@@ -397,6 +397,34 @@ async function rollbackRepos(target, ref) {
   }
 }
 
+async function rollbackPlatformRelease(target, version) {
+  const script = path.join(BACKEND_DIR, 'deploy/ovh/rollback-platform-release.sh');
+  if (!fs.existsSync(script)) {
+    throw new Error(`Platform release rollback script missing: ${script}`);
+  }
+  const t = String(target || '').toLowerCase();
+  const v = String(version || '').trim();
+  if (!['backend', 'frontend'].includes(t)) {
+    throw new Error('target must be backend or frontend');
+  }
+  if (!/^\d+\.\d+\.\d+$/.test(v)) {
+    throw new Error('Invalid version (use semver like 0.0.1)');
+  }
+  appendEvent('rollback.start', `Platform rollback ${t} → v${v}`, { target: t, version: v });
+  try {
+    const result = await runShellScript(script, [t, v], 'rollback');
+    appendEvent('rollback.success', `Platform rollback complete (${t} → v${v})`, { target: t, version: v });
+    return result;
+  } catch (err) {
+    appendEvent('rollback.failed', err?.message || 'Platform rollback failed', { target: t, version: v });
+    throw err;
+  } finally {
+    setTimeout(() => {
+      if (activeJob && activeJob.status !== 'running') activeJob = null;
+    }, 15000);
+  }
+}
+
 function verifyGithubSignature(rawBody, signatureHeader, secret) {
   if (!secret) return false;
   const sig = String(signatureHeader || '').trim();
@@ -437,6 +465,7 @@ module.exports = {
   resolveLogPath,
   deployFromGitHub,
   rollbackRepos,
+  rollbackPlatformRelease,
   verifyGithubSignature,
   shouldDeployGithubPush,
   getActiveJob: () => activeJob,

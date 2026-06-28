@@ -1,14 +1,12 @@
 {
-  "title": "Remote help video + support queue (dbg161)",
-  "description": "Customer-initiated remote help on HTTPS was still stuck on \"Waiting for customer screen share…\" because the admin WebRTC offer was sent before the customer finished getDisplayMedia and had tracks attached. dbg161 defers the admin offer until the customer sends an explicit screen-ready signal, queues ICE until remote descriptions are set, polls GET /remote/signals as a fallback, and re-offers on failure.\n\nScreen capture (chat snip) now strips oklch/lab/lch CSS, sanitizes inline styles more aggressively, and falls back to capturing the support widget region when full-page html2canvas fails.\n\nAdmins get an in-app push notification toggle (not browser Push API), toast bubbles on new support requests, and a support queue sorted by request time with Pending vs \"{Name} is currently helping\" status.\n\nWho is affected: OVH PipeShare/PipeSync HTTPS remote help and support queue (dbg161). SaaS unchanged until version publish.",
+  "title": "cPanel shell overhaul, releases UI, and ops rollback",
+  "description": "Horizon Pipe cPanel gets a shared shell (navigation, theme, layout) across billing, dashboard, login, setup, ops, and releases. Releases admin now lists platform versions in a dropdown and can push a chosen build to SaaS tenants from the UI.\n\nOps console rollback is split into separate Frontend and Backend release dropdowns, wired to a new POST /ops/rollback/release endpoint and server-side rollback script.\n\nBackend adds GET /saas/platform/releases/list for the releases page and rollback support in ovh-ops.\n\nWho is affected: OVH-hosted PipeShare (cPanel + ops). SaaS tenants receive frontend/backend only when you publish and push from Releases.",
   "changeLog": [
-    "WebRTC: defer admin offer until customer screen-ready; ICE queue; signal poll fallback.",
-    "WebRTC: customer addTrack before answer; admin re-offer on ICE/connection failure.",
-    "Screen capture: oklch/lab/lch sanitizer + support-widget region fallback.",
-    "Admin support queue: requests by time, Pending vs helping status.",
-    "In-app support request toast toggle (HPUserPrefsSync + localStorage).",
-    "UI polish: SVG chat toolbar icons, widget/remote panel chrome.",
-    "Runtime cache bump dbg161."
+    "cPanel: shared cpanel-shell.js/css and refreshed pages (cache ?v=20260628shell1).",
+    "Releases: version dropdown, list API, Push to SaaS from admin UI.",
+    "Ops: separate Frontend/Backend rollback dropdowns and styling.",
+    "Backend: GET /saas/platform/releases/list for release picker.",
+    "Backend: POST /ops/rollback/release + deploy/ovh/rollback-platform-release.sh."
   ],
-  "updatedAt": "2026-06-28T22:30:00.000Z"
+  "updatedAt": "2026-06-28T23:00:00.000Z"
 }

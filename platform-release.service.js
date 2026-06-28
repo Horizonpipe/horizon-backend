@@ -247,11 +247,20 @@ async function saveRuntime(client, bucket, mode, payload) {
   await putJsonObject(client, bucket, key, payload);
 }
 
+function briefReleaseSummary(entry) {
+  if (!entry || typeof entry !== 'object') return 'Platform update';
+  const title = cleanString(entry.title);
+  if (title) return title.length > 96 ? `${title.slice(0, 93)}…` : title;
+  const first = Array.isArray(entry.changeLog) ? cleanString(entry.changeLog[0]) : '';
+  if (first) return first.length > 96 ? `${first.slice(0, 93)}…` : first;
+  return `Platform update ${cleanString(entry.version) || ''}`.trim();
+}
+
 function normalizeReleaseEntry(entry) {
   if (!entry || typeof entry !== 'object') return null;
   const version = cleanString(entry.version);
   if (!parseSemver(version)) return null;
-  return {
+  const normalized = {
     version,
     publishedAt: cleanString(entry.publishedAt) || new Date().toISOString(),
     publishedBy: cleanString(entry.publishedBy),
@@ -263,6 +272,8 @@ function normalizeReleaseEntry(entry) {
     artifactKeys: entry.artifactKeys && typeof entry.artifactKeys === 'object' ? entry.artifactKeys : {},
     recommended: entry.recommended === true
   };
+  normalized.briefSummary = briefReleaseSummary(normalized);
+  return normalized;
 }
 
 async function getPlatformReleaseStatus(client, bucket) {
@@ -501,15 +512,28 @@ async function previewNextRelease(client, bucket, { title = '', description = ''
   };
 }
 
+async function listPlatformReleases(client, bucket) {
+  const status = await getPlatformReleaseStatus(client, bucket);
+  return {
+    releases: status.versions,
+    latestPublished: status.manifest.latestPublished,
+    recommendedVersion: status.manifest.recommendedVersion,
+    saasDeployedVersion: status.manifest.saasDeployedVersion,
+    nonSaasCurrentVersion: status.manifest.nonSaasCurrentVersion
+  };
+}
+
 module.exports = {
   PLATFORM_RELEASES_ROOT,
   deploymentMode,
   isSaasDeployment,
   isNonSaasDeployment,
   bumpPatchVersion,
+  briefReleaseSummary,
   buildLaymanDescription,
   generateChangeLogFromGit,
   getPlatformReleaseStatus,
+  listPlatformReleases,
   registerNonSaasHeartbeat,
   publishPlatformRelease,
   applyPlatformRelease,

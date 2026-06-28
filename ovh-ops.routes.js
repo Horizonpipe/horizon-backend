@@ -14,6 +14,7 @@ const {
   resolveLogPath,
   deployFromGitHub,
   rollbackRepos,
+  rollbackPlatformRelease,
   verifyGithubSignature,
   shouldDeployGithubPush,
   getActiveJob
@@ -190,6 +191,27 @@ function registerOvhOpsRoutes(app, { requireAuth, requireAdmin }) {
     } catch (err) {
       console.error('[ops/rollback]', err);
       return jsonError(res, 500, err.message || 'Rollback failed');
+    }
+  });
+
+  app.post('/ops/rollback/release', requireAuth, requireAdmin, gate, async (req, res) => {
+    if (getActiveJob()?.status === 'running') {
+      return jsonError(res, 409, 'A deploy or rollback is already running.');
+    }
+    const target = String(req.body?.target || '').toLowerCase();
+    const version = String(req.body?.version || '').trim();
+    if (!['backend', 'frontend'].includes(target)) {
+      return jsonError(res, 400, 'target must be backend or frontend');
+    }
+    if (!/^\d+\.\d+\.\d+$/.test(version)) {
+      return jsonError(res, 400, 'Invalid version (use semver like 0.0.1)');
+    }
+    try {
+      const result = await rollbackPlatformRelease(target, version);
+      return res.json({ success: true, result });
+    } catch (err) {
+      console.error('[ops/rollback/release]', err);
+      return jsonError(res, 500, err.message || 'Platform rollback failed');
     }
   });
 
