@@ -1,12 +1,13 @@
 {
-  "title": "PDF Viewer intrinsic zoom — sharp + less lag (dbg82)",
-  "description": "PDF Viewer no longer zooms via CSS transform:scale on the whole world (that was upscaling low-res bitmaps = blurry text). Zoom now resizes page layout directly and re-rasterizes visible pages at up to 600×zoom DPI after a short debounce.\n\nMap workspace unchanged. Hard-refresh PipeSync (dbg82).",
+  "title": "PDF Viewer continuous scroll — one doc, lazy pages (dbg83)",
+  "description": "PDF Viewer workspace now uses a pdf.net-style continuous scroll viewer: one PDF.js document per archive file (136 pages = one load, not 136 URLs), lazy IntersectionObserver page render, intrinsic zoom via canvas resize (no CSS world scale). Per-page highlight SVG overlays remain read-only in the viewer.\n\nMap workspace is unchanged (native iframe sheets, highlights, export). Hard-refresh PipeSync (dbg83). Debug session d9d6c9 logs remain until Mike confirms the fix.",
   "changeLog": [
-    "Viewer: intrinsic layout zoom (no CSS world scale blur).",
-    "Debounced re-raster — visible pages only (fixes zoom lag on large PDFs).",
-    "600 DPI base + effDpi scales with zoom for microscope letter clarity.",
+    "PDF Viewer: continuous scroll mount (pdf-continuous-viewer.js).",
+    "One pdf.js doc per archiveStorageKey; lazy page tiles near viewport.",
+    "Intrinsic zoom on canvas bitmap; bypass legacy per-page canvas stack.",
+    "Per-page highlight overlays via planBoardAnchoredLinesSvgHtml.",
     "Map/highlights/export path untouched.",
-    "Cache bust dbg82."
+    "Cache bust dbg83."
   ],
-  "updatedAt": "2026-06-28T18:00:00.000Z"
+  "updatedAt": "2026-06-28T20:00:00.000Z"
 }
