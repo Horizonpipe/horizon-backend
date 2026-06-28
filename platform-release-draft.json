@@ -1,12 +1,11 @@
 {
-  "title": "Auto-highlight export + DB3 Operator (Surveyed By)",
-  "description": "DB3 Surveyed By now resolves from WinCan Operator FK (INS_Operator_REF / OP_Key → WCMETA.OPERATOR.OP_PK) at import time, so auto-highlight labels and PDF export show the operator name—not a numeric key.\n\nHighlights with Structure Nodes download adds checkboxes: Include Inspection direction and Include Surveyed By. Checked options bake arrows and inspector labels onto the PDF with the same rx/ry mapping as highlight lines.\n\nAuto-highlight positioning uses viewer page-local rx/ry (same path as manual highlights). Re-running auto-highlight replaces prior DB3 lines instead of stacking duplicates.\n\nHard-refresh PipeSync after deploy (dbg56).\n\nWho is affected: Private OVH server.",
+  "title": "PDF Viewer Gap slider fix",
+  "description": "The Gap slider (vertical spacing between stacked PDF pages in Viewer mode) no longer freezes mid-drag. Previously each tiny drag step triggered a full UI re-render, which destroyed the slider and broke pointer capture.\n\nThe fix updates page positions incrementally while dragging (rAF-throttled, light DOM sync only) and saves the full layout when you release the slider.\n\nHard-refresh PipeSync after deploy (dbg57).\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "DB3: resolve Operator name from INS_Operator_REF via OPERATOR table.",
-    "Download: optional inspection-direction arrow + Surveyed By on structure-nodes export.",
-    "Auto-highlight: viewer-local coords; replace prior auto lines on re-run.",
-    "Manual + auto highlights share download dedupe and coord pipeline.",
-    "Cache bust dbg56."
+    "Fix PDF Viewer Gap slider freezing during drag.",
+    "Gap layout updates use incremental DOM sync instead of full render.",
+    "Full bounds sync and persist on slider release only.",
+    "Cache bust dbg57."
   ],
-  "updatedAt": "2026-06-28T16:00:00.000Z"
+  "updatedAt": "2026-06-28T18:00:00.000Z"
 }
