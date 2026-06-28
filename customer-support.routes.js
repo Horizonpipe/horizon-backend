@@ -949,7 +949,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       await pool.query(`UPDATE cp_support_chat_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
       const message = ins.rows[0];
       broadcastSupportEvents(row.tenant_id, 'chat-message', {
-        sessionId,
+        sessionId: String(sessionId),
         message: {
           id: message.id,
           senderUserId: message.sender_user_id,

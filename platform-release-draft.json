@@ -1,14 +1,13 @@
 {
-  "title": "Customer support chat: composer gated until active (dbg142)",
-  "description": "dbg141 fixed admin chat-response SSE filtering and added /chat/active polling, but Mike and Kat could still see mismatched UI: admin \"Waiting for accept\" with a live composer and messages, customer \"Support request sent\" alongside chat messages.\n\nRoot cause (dbg142): showChatMode(true) without { live: true } re-exposed the status body on every chat-message SSE event, restoring stale hints (\"Waiting for accept\", \"Support request sent\") while the composer stayed enabled. Admin adminStartChat also opened the composer before the customer accepted even though POST /chat/messages rejects pending sessions.\n\nFix: live chat mode now exclusively controls the composer (disabled until session status is active). Admin pending shows status only — no composer. chat-message events use live mode and auto-promote admin pending→active via loadChatSessionIntoWidget. Customer prep/accept clears stale support-request status. setStatus no longer breaks live mode.\n\nIncludes uncommitted dbg140–141 backend (chat/active, chat-response adminUserId, terminate all sessions on chat/start) and frontend (supportUserId filter, poll sync).\n\nWho is affected: Horizon admins and customers using PipeShare customer support chat on the OVH private server. Deploy both frontend and backend together.",
+  "title": "Customer support chat: bidirectional message delivery (dbg143)",
+  "description": "After dbg142, Mike and Kat could both see an active chat session and send messages, but only each user's own messages appeared — nothing crossed in real time.\n\nRoot cause (dbg143): dbg142 added `if (!isChatComposerLive()) return` on incoming `chat-message` SSE events. That gate was meant for the send composer but silently dropped peer messages whenever live-mode state lagged session status (common on the customer side after accept, or when session IDs differed by case). Own messages still showed via optimistic POST append, which matched the screenshot.\n\nFix: never gate inbound chat-message on composer live state — always append when sessionId matches, promote widget to live mode, and dedupe by message id. Normalize session UUID comparison (case-insensitive). Poll GET /messages on heartbeat while chat is active as SSE fallback. POST response ids used for optimistic send dedupe. Backend SSE payload sessionId stringified explicitly.\n\nWho is affected: Horizon admins and customers using PipeShare customer support chat on the OVH private server. Deploy both frontend and backend together.",
   "changeLog": [
-    "Widget: live mode gates composer; setStatus cannot unhide body during live chat.",
-    "Admin: pending invite shows status only — composer hidden until accept or poll/SSE activates.",
-    "chat-message SSE uses live mode; admin auto-activates UI when message arrives on pending session.",
-    "Customer: clear stale \"Support request sent\" before invite modal and on accept.",
-    "onSendMessage blocked until session is active (both sides).",
-    "Backend (dbg140–141): GET /chat/active, chat-response adminUserId, terminate all sessions on chat/start.",
-    "Cache bust dbg142 (portal runtime + PipeSync manifest)."
+    "Remove composer-live gate on inbound chat-message SSE — peer messages always render when session matches.",
+    "Normalize sessionId comparison; stringify sessionId in backend chat-message broadcast.",
+    "Dedupe messages by id in widget; optimistic send uses POST response id.",
+    "Poll GET /messages on heartbeat during active chat as SSE fallback.",
+    "Use live supportUserId() for mine/other styling instead of stale init snapshot.",
+    "Cache bust dbg143 (portal runtime + PipeShare addon manifest + PipeSync manifest)."
   ],
-  "updatedAt": "2026-06-28T23:30:00.000Z"
+  "updatedAt": "2026-06-29T00:15:00.000Z"
 }
