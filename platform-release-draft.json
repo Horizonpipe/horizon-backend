@@ -1,11 +1,11 @@
 {
-  "title": "PDF Viewer floating menu button (dbg109)",
-  "description": "Restores the PDF Viewer workspace menu as a floating, draggable ☰ control in the top-right corner. Tap to open a small menu with Close workspace. Replaces the plain ✕ close button from dbg108.\n\nLine size and Opacity float widgets unchanged. Map workspace unchanged.\n\nWho is affected: OVH private server PipeSync Plan View PDF Viewer.",
+  "title": "PipeSync header menu + PDF Viewer workspace menu fix (dbg110)",
+  "description": "PipeSync desktop header now uses the same hamburger Menu pattern as PipeShare. Horizon Site, Refresh, Tour, Manage account settings, and Sign out are consolidated into one top-right dropdown so the header is less cluttered. Sync status and user badge stay visible.\n\nPDF Viewer workspace: fixes the missing ☰ menu. The viewer chrome was not rendering because the workspace passed the wrong state key into the chrome builder. The floating menu is pinned top-right in fullscreen and Close workspace works again.\n\nWho is affected: OVH private server PipeSync (desktop header and Plan View PDF Viewer). SaaS only when you apply the new version in releases.html.",
   "changeLog": [
-    "Floating draggable ☰ menu widget in PDF Viewer top-right.",
-    "Dropdown menu with Close workspace action.",
-    "Click outside dismisses the menu.",
-    "Cache bust dbg109."
+    "PipeShare-style Menu dropdown in PipeSync header (Horizon Site, Refresh, Tour, Account, Sign out).",
+    "Fix PDF Viewer ☰ workspace menu not appearing (chrome render state key).",
+    "PDF Viewer menu fixed top-right in fullscreen; line/opacity floats unchanged.",
+    "Cache bust dbg110."
   ],
-  "updatedAt": "2026-06-28T14:00:00.000Z"
+  "updatedAt": "2026-06-28T18:00:00.000Z"
 }
