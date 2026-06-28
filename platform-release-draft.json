@@ -1,13 +1,13 @@
 {
-  "title": "PDF opens full-screen from explorer right-click (dbg93)",
-  "description": "Plan View on the PDF tab now shows the file explorer only until you open a PDF. Right-click a PDF and choose Open in PDF Viewer or Open in Map Builder — the workspace opens in a full-screen overlay with the same tools as before. A top-right menu (☰) includes Close PDF to return to the explorer.\n\nLeft-click on PDF rows no longer auto-opens the workspace. Legacy entry points (bookmarks, modals) still open PDFs and keep the fullscreen session in sync.\n\nWho is affected: OVH private server (PipeSync Plan View). SaaS is unchanged until a platform release is applied in cPanel.",
+  "title": "Plan view explorer-only + fullscreen fixes (dbg94)",
+  "description": "Plan view now shows only the file explorer until you right-click a file. No inline raster workspace on load. PDF and raster files open in a full-screen overlay via Open in Plan/PDF Viewer or Map Builder. Fixes blank PDF viewer (mount no longer requires raster host). Close workspace returns to explorer-only.\n\nWho is affected: OVH private server (PipeSync Plan view). SaaS unchanged until platform release applied in cPanel.",
   "changeLog": [
-    "PDF tab default: file explorer only — workspace hidden until you open a file.",
-    "Right-click PDF → Open in PDF Viewer or Open in Map Builder.",
-    "Full-screen overlay reuses existing PDF workspace tools and board.",
-    "Top-right ☰ menu → Close PDF ends session and returns to explorer.",
-    "Left-click on PDF rows no longer opens workspace.",
-    "New pdf-fullscreen-shell.js module; cache bust dbg93."
+    "Explorer fills the panel on load — no raster workspace until you open a file.",
+    "Fix PDF viewer blank screen in fullscreen (mount when only PDF host exists).",
+    "Post-layout remount for continuous PDF viewer after open.",
+    "Raster files: right-click → Plan Viewer or Map Builder (same as PDF).",
+    "Left-click on raster and PDF rows no longer opens workspace.",
+    "Menu: Close workspace. Cache bust dbg94."
   ],
-  "updatedAt": "2026-06-28T20:00:00.000Z"
+  "updatedAt": "2026-06-28T22:00:00.000Z"
 }
