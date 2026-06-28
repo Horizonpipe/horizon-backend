@@ -1,13 +1,13 @@
 {
-  "title": "PDF Viewer stacked below file explorer — page scroll restored (dbg92)",
-  "description": "dbg91 locked html/body overflow which trapped users — they could not scroll back to the file explorer. dbg92 switches to a stacked layout: full file explorer on top, toolbar, then a tall PDF viewer pane (~72vh) below. Page scroll works again; Ctrl+wheel only hijacks zoom when pointer is inside the viewer pane.\n\nDeferred: open workspace only after picking a file from explorer (future UX).",
+  "title": "PDF opens full-screen from explorer right-click (dbg93)",
+  "description": "Plan View on the PDF tab now shows the file explorer only until you open a PDF. Right-click a PDF and choose Open in PDF Viewer or Open in Map Builder — the workspace opens in a full-screen overlay with the same tools as before. A top-right menu (☰) includes Close PDF to return to the explorer.\n\nLeft-click on PDF rows no longer auto-opens the workspace. Legacy entry points (bookmarks, modals) still open PDFs and keep the fullscreen session in sync.\n\nWho is affected: OVH private server (PipeSync Plan View). SaaS is unchanged until a platform release is applied in cPanel.",
   "changeLog": [
-    "Remove viewport overflow lock — file explorer reachable via page scroll.",
-    "PDF viewer pane stacks below explorer + toolbar (not absolute overlay).",
-    "Viewer pane fixed height ~72vh; width still locked to panel.",
-    "Ctrl+wheel browser zoom block only inside .hp-plan-scroll--continuous.",
-    "Restore full explorer section heights.",
-    "Cache bust dbg92."
+    "PDF tab default: file explorer only — workspace hidden until you open a file.",
+    "Right-click PDF → Open in PDF Viewer or Open in Map Builder.",
+    "Full-screen overlay reuses existing PDF workspace tools and board.",
+    "Top-right ☰ menu → Close PDF ends session and returns to explorer.",
+    "Left-click on PDF rows no longer opens workspace.",
+    "New pdf-fullscreen-shell.js module; cache bust dbg93."
   ],
-  "updatedAt": "2026-06-28T18:00:00.000Z"
+  "updatedAt": "2026-06-28T20:00:00.000Z"
 }
