@@ -1,9 +1,12 @@
 {
-  "title": "Hotfix: PipeSync black screen on reload",
-  "description": "Fixed JavaScript parse error in planBoardNormalizeViewerWorkspaceLayout (duplicate `let changed`) that prevented app.js from loading — caused black screen on reload.\n\nHard-refresh PipeSync (dbg68).\n\nWho is affected: Private OVH server.",
+  "title": "Viewer live bounds + fit fix",
+  "description": "PDF Viewer scroll/grey box now uses live page stack bounds (not stale DOM height from map layout). Fit-to-width syncs bounds before zoom; mount reflows stack first. Wider crop detection (Art/Bleed boxes).\n\nHard-refresh PipeSync (dbg69).",
   "changeLog": [
-    "Fix duplicate let changed syntax error crashing app.js load.",
-    "Cache bust dbg68."
+    "Sync world bounds before fit — removes oversized grey scroll area.",
+    "Viewport zoom reads live stack height/width from page data.",
+    "Viewer mount reflows stack then fits.",
+    "12px fit inset + Art/Bleed box auto-trim on import.",
+    "Cache bust dbg69."
   ],
-  "updatedAt": "2026-06-29T06:00:00.000Z"
+  "updatedAt": "2026-06-29T07:00:00.000Z"
 }
