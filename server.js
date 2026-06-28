@@ -7060,9 +7060,17 @@ app.post('/change-password', requireAuth, async (req, res) => {
       }
       row = result.rows[0];
     }
+    const mustChange =
+      req.user?.mustChangePassword === true ||
+      row.must_change_password === true ||
+      row.must_change_password === 'true';
+
     let currentOk = false;
-    if (!currentPassword && row.must_change_password) {
+    if (mustChange) {
+      // First-login / default-password flow: session already authenticated; new password only.
       currentOk = true;
+    } else if (!currentPassword) {
+      return res.status(400).json({ success: false, error: 'Current password is required' });
     } else if (row.password && row.password.startsWith('$2')) {
       currentOk = await bcrypt.compare(currentPassword, row.password);
     } else {
