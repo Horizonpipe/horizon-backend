@@ -1,10 +1,10 @@
 {
-  "title": "Fix first-login password change redirect loop",
-  "description": "After setting a new password on first login, PipeSync no longer bounces between login and the dashboard. The backend now mirrors password changes to Postgres even when Wasabi is the primary write path, so GET /session returns mustChangePassword:false immediately. Login re-fetches /session before redirecting instead of reusing stale pending-user state.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "Polished PipeShare workspace settings panel",
+  "description": "The client portal workspace settings (layout) panel has been redesigned for clearer structure and easier use. Layout editing is extracted into a dedicated module with dedicated styling, wired through the portal workspace layout service and file host shell.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Mirror change-password to Postgres after Wasabi write so /session clears mustChangePassword.",
-    "Login re-fetches /session and clears mustChangePassword client state before dashboard redirect.",
-    "Cache bust pwloop1 on login, PipeSync boot, and mobile shell."
+    "Redesigned workspace settings panel layout and styling (dbg126).",
+    "Extract workspace layout modal into pipeshare/modules/workspace-settings.",
+    "Portal cache bust dbg126 on index.html; shared CSS on index, mobile, and guest shells."
   ],
-  "updatedAt": "2026-06-28T24:00:00.000Z"
+  "updatedAt": "2026-06-28T16:30:00.000Z"
 }
