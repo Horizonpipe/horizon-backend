@@ -4474,6 +4474,10 @@ const DB3_SECTION_CORE_PHYSICAL_COLS = new Set(
 
 const DB3_INSPECTOR_HINT_KEYS = new Set(
   [
+    'INS_OPERATOR_REF',
+    'INS_Operator_REF',
+    'OP_KEY',
+    'OP_Key',
     'OBJ_SURVEYEDBY',
     'OBJ_SURVEYOR',
     'OBJ_SURVEYORNAME',
@@ -4490,6 +4494,7 @@ const DB3_INSPECTOR_HINT_KEYS = new Set(
     'INS_SURVEYORNAME',
     'INS_OPERATOR',
     'INS_OPERATORNAME',
+    'INS_OPERATOR_NAME',
     'INS_TECHNICIAN',
     'INS_TECHNICIANNAME',
     'INS_CREWLEADER',
@@ -4534,19 +4539,113 @@ function db3InspectorDisplay(value) {
     .replace(/\b\w/g, (m) => m.toUpperCase());
 }
 
+function db3ValueLooksLikeOperatorDisplayName(value) {
+  const s = cleanString(value);
+  if (!s) return false;
+  if (/^\d+$/.test(s)) return false;
+  return /[A-Za-z]/.test(s);
+}
+
+/**
+ * Resolve WinCan Operator display name from SECINSP FK (INS_Operator_REF / OP_Key → WCMETA.OPERATOR.OP_PK).
+ * @param {any} db
+ * @param {string[]} tables
+ * @param {Record<string, string>} imported
+ */
+function enrichDb3ImportedOperatorFromWcmeta(db, tables, imported) {
+  const out = imported && typeof imported === 'object' ? { ...imported } : {};
+  const existing = cleanString(out.HP_INSPECTOR_DISPLAY) || cleanString(out.HP_INSPECTOR_RAW);
+  if (db3ValueLooksLikeOperatorDisplayName(existing)) return out;
+
+  const operatorTable =
+    pickSqliteTable(tables, 'OPERATOR') ||
+    tables.find((t) => String(t || '').toUpperCase() === 'WCMETA.OPERATOR') ||
+    tables.find((t) => /OPERATOR$/i.test(String(t || '')) && !/SECINSP|SECTION/i.test(String(t || ''))) ||
+    '';
+  if (!operatorTable || sqliteObjectType(db, operatorTable) === 'view') return out;
+
+  const refKeys = ['INS_Operator_REF', 'INS_OPERATOR_REF', 'OP_Key', 'OP_KEY', 'INS_OPERATOR'];
+  let bindVal = '';
+  for (const k of refKeys) {
+    const ku = String(k).toUpperCase();
+    const hit = Object.keys(out).find((key) => String(key).toUpperCase() === ku);
+    const v = hit ? out[hit] : '';
+    const s = typeof v === 'number' && Number.isFinite(v) ? String(v) : cleanString(v);
+    if (s) {
+      bindVal = s;
+      break;
+    }
+  }
+  if (!bindVal) return out;
+
+  const cols = sqlitePragmaColumns(db, operatorTable);
+  if (!cols.length) return out;
+  const colNames = cols.map((c) => c.name);
+  const colSet = new Set(colNames.map((n) => String(n).toUpperCase()));
+  const pkCol =
+    colNames.find((n) => String(n).toUpperCase() === 'OP_PK') ||
+    colNames.find((n) => String(n).toUpperCase() === 'OPERATOR_PK') ||
+    colNames.find((n) => /_PK$/i.test(String(n))) ||
+    'OP_PK';
+  const nameCandidates = ['OP_Name', 'OP_NAME', 'OP_Key', 'OP_KEY', 'NAME', 'OPERATOR_NAME', 'OPERATOR'];
+  let nameCol = '';
+  for (const want of nameCandidates) {
+    const hit = colNames.find((n) => String(n).toUpperCase() === want.toUpperCase());
+    if (hit) {
+      nameCol = hit;
+      break;
+    }
+  }
+  if (!nameCol) {
+    nameCol = colNames.find((n) => /NAME|LABEL|DESCRIPTION/i.test(String(n))) || '';
+  }
+  if (!nameCol || !colSet.has(String(pkCol).toUpperCase())) return out;
+
+  const OT = sqlIdentQuoted(operatorTable);
+  let stmt;
+  try {
+    stmt = db.prepare(
+      `SELECT ${sqlIdentQuoted(nameCol)} AS operator_name FROM ${OT} WHERE ${sqlIdentQuoted(pkCol)} = ? LIMIT 1`
+    );
+    stmt.bind([bindVal]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      const resolved = db3InspectorDisplay(row.operator_name);
+      if (db3ValueLooksLikeOperatorDisplayName(resolved)) {
+        out.HP_INSPECTOR_RAW = resolved;
+        out.HP_INSPECTOR_DISPLAY = resolved;
+        out.HP_INSPECTOR_KEY = db3InspectorAliasKey(resolved);
+        out.OPERATOR_NAME = resolved.slice(0, 4000);
+      }
+    }
+  } catch {
+    /* non-fatal */
+  } finally {
+    try {
+      stmt?.free();
+    } catch {
+      /* ignore */
+    }
+  }
+  return out;
+}
+
 function db3InspectorIdentityFromImported(imported) {
   const imp = imported && typeof imported === 'object' && !Array.isArray(imported) ? imported : {};
   const read = (k) => {
     const v = imp[k];
     return typeof v === 'number' && Number.isFinite(v) ? String(v) : cleanString(v);
   };
-  let raw = read('HP_INSPECTOR_RAW') || read('HP_EDIT_INSPECTED_BY') || read('HP_INSPECTOR_DISPLAY');
+  let raw = read('HP_INSPECTOR_RAW') || read('HP_EDIT_INSPECTED_BY') || read('HP_INSPECTOR_DISPLAY') || read('OPERATOR_NAME');
   if (!raw) {
     for (const [k, v] of Object.entries(imp)) {
       const ku = String(k || '').toUpperCase();
       const vv = typeof v === 'number' && Number.isFinite(v) ? String(v) : cleanString(v);
       if (!vv) continue;
       if (DB3_INSPECTOR_HINT_KEYS.has(ku)) {
+        if ((ku === 'INS_OPERATOR_REF' || ku === 'INS_Operator_REF'.toUpperCase() || ku === 'OP_KEY') && !db3ValueLooksLikeOperatorDisplayName(vv)) {
+          continue;
+        }
         raw = vv;
         break;
       }
@@ -5130,6 +5229,7 @@ async function parseDb3(buffer) {
           imported = mergeSecinspRowIntoDb3Imported(db, sectionT, secinspRuntimeTable, mapped.reference, imported);
           imported = mergeSecinspBySectionObjKeyColumn(db, secinspRuntimeTable, mapped.reference, imported);
         }
+        imported = enrichDb3ImportedOperatorFromWcmeta(db, tables, imported);
         const inspector = db3InspectorIdentityFromImported(imported);
         if (inspector) {
           imported.HP_INSPECTOR_RAW = inspector.raw;
@@ -5221,6 +5321,7 @@ async function parseDb3(buffer) {
           imported = mergeSecinspRowIntoDb3Imported(db, sectionT, secinspRuntimeTable, mapped.reference, imported);
           imported = mergeSecinspBySectionObjKeyColumn(db, secinspRuntimeTable, mapped.reference, imported);
         }
+        imported = enrichDb3ImportedOperatorFromWcmeta(db, tables, imported);
         const inspector = db3InspectorIdentityFromImported(imported);
         if (inspector) {
           imported.HP_INSPECTOR_RAW = inspector.raw;
@@ -5297,6 +5398,7 @@ async function parseDb3(buffer) {
               imported = mergeSecinspRowIntoDb3Imported(db, sectionT, secinspRuntimeTable, mapped.reference, imported);
               imported = mergeSecinspBySectionObjKeyColumn(db, secinspRuntimeTable, mapped.reference, imported);
             }
+            imported = enrichDb3ImportedOperatorFromWcmeta(db, tables, imported);
             const inspector = db3InspectorIdentityFromImported(imported);
             if (inspector) {
               imported.HP_INSPECTOR_RAW = inspector.raw;

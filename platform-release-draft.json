@@ -1,11 +1,12 @@
 {
-  "title": "Context menu smart sort — global favorites",
-  "description": "Right-click menu usage sorting now lifts your most-used actions to the top of the whole menu (Line, Eraser, Bookmark catalog compete globally), not only within each section.\n\nAlso fixes pref reads merging localStorage with server prefs so counts are not lost when sync returns an empty object.\n\nHard-refresh PipeSync after deploy (dbg55).\n\nWho is affected: Private OVH server.",
+  "title": "Auto-highlight export + DB3 Operator (Surveyed By)",
+  "description": "DB3 Surveyed By now resolves from WinCan Operator FK (INS_Operator_REF / OP_Key → WCMETA.OPERATOR.OP_PK) at import time, so auto-highlight labels and PDF export show the operator name—not a numeric key.\n\nHighlights with Structure Nodes download adds checkboxes: Include Inspection direction and Include Surveyed By. Checked options bake arrows and inspector labels onto the PDF with the same rx/ry mapping as highlight lines.\n\nAuto-highlight positioning uses viewer page-local rx/ry (same path as manual highlights). Re-running auto-highlight replaces prior DB3 lines instead of stacking duplicates.\n\nHard-refresh PipeSync after deploy (dbg56).\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "Smart sort: frequently used menu actions pinned to top across all sections.",
-    "Merge local + Wasabi ctxMenuUsage counts on read.",
-    "Plan-view eraser toolbar picks now bump menu priority.",
-    "Cache bust dbg55."
+    "DB3: resolve Operator name from INS_Operator_REF via OPERATOR table.",
+    "Download: optional inspection-direction arrow + Surveyed By on structure-nodes export.",
+    "Auto-highlight: viewer-local coords; replace prior auto lines on re-run.",
+    "Manual + auto highlights share download dedupe and coord pipeline.",
+    "Cache bust dbg56."
   ],
-  "updatedAt": "2026-06-28T14:00:00.000Z"
+  "updatedAt": "2026-06-28T16:00:00.000Z"
 }
