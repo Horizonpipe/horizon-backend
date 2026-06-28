@@ -1,11 +1,12 @@
 {
-  "title": "PipeShare addon loader fix — files and folder view restored (dbg134)",
-  "description": "PipeShare stopped loading files and folder spaces because addon scripts (file explorer, admin panel, customer support, etc.) were 404ing. The addon loader resolved manifest paths relative to pipeshare/core/ instead of client-portal/, so every addon index.js failed to load.\n\nThis release fixes path resolution in addon-loader.js and bumps the portal cache to dbg134. After deploy, hard refresh PipeShare — explorer, Folder view picker, and addon boot should work normally again.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "PipeShare support queue context menu fix (dbg135)",
+  "description": "In the Customer support queue modal, clicking context menu items (Request Connection, Clear Request, Start chat, etc.) did nothing. Clicks were falling through to the user row underneath or losing to the document dismiss handler before the select handler ran.\n\nThis release fixes context menu hit-testing and event order: menu z-index is raised above modal layers, item picks use pointerdown with stopPropagation, and the support panel suppresses reopening the menu on the same click.\n\nWho is affected: Horizon admins using PipeShare Customer support queue on OVH private server after deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Fix PipeShare addon-loader: resolve manifest paths from client-portal/ base URL.",
-    "Restores file explorer, uploader, autosync, admin panel, customer support addon boot.",
-    "Folder view / numbered job folders work again once addons load.",
-    "Portal runtime cache bust dbg134."
+    "Fix support queue user context menu: menu item clicks now run actions.",
+    "Raise context menu z-index above cp-modal-layer so clicks hit menu items.",
+    "Select menu items on pointerdown before document dismiss click runs.",
+    "Suppress support panel row handler from reopening menu on the same click.",
+    "Portal runtime cache bust dbg135."
   ],
-  "updatedAt": "2026-06-28T22:00:00.000Z"
+  "updatedAt": "2026-06-28T23:30:00.000Z"
 }
