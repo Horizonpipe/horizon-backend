@@ -1,12 +1,12 @@
 {
-  "title": "Fix viewer shrink on browser zoom",
-  "description": "PDF Viewer no longer shrinks in a loop when changing browser zoom (90–100%). Fit now measures from stable shell width, scroll/body use 100% width instead of shrinking pixel widths, and ResizeObserver is debounced with a fit lock.\n\nHard-refresh PipeSync (dbg77).",
+  "title": "Fix PDF viewer clip/duplicate strips",
+  "description": "PDF Viewer no longer scales crop insets and natW when unifying page width — that misaligned native iframe margins and caused duplicated/clipped strips (red text doubling at sheet edges). True PDF dimensions are preserved; display scale uses CSS transform. Corrupted page dims auto-heal from legacy pieces on normalize.\n\nHard-refresh PipeSync (dbg78). Re-open Avalon or any plan if strips persist once.",
   "changeLog": [
-    "Stable shell-based column width for fit (breaks shrink feedback loop).",
-    "Viewer scroll/body width 100% — no pixel shrink on each refit.",
-    "Panel CSS flex:1 so viewer panel does not shrink-wrap to content.",
-    "Debounced ResizeObserver + fit lock on browser zoom resize.",
-    "Cache bust dbg77."
+    "Stop scaling PDF crop/nat dims on viewer width unify.",
+    "Apply viewDispScale via CSS transform on native wrap/canvas.",
+    "Skip reconcile clamp that undid unified layout width.",
+    "Heal corrupted natW from legacy piece metadata on normalize.",
+    "H12 ingest for media sync diagnostics. Cache bust dbg78."
   ],
-  "updatedAt": "2026-06-29T12:00:00.000Z"
+  "updatedAt": "2026-06-29T14:00:00.000Z"
 }
