@@ -1,12 +1,13 @@
 {
-  "title": "Remote help: HTTPS screen-share guard (dbg153)",
-  "description": "Customer-initiated remote help no longer throws a raw JavaScript error when screen sharing is unavailable. Browsers only expose getDisplayMedia in a secure context (HTTPS or localhost), so customers on http://40.160.72.39/client-portal/ could not share their screen after an admin accepted.\n\nThe portal now checks navigator.mediaDevices.getDisplayMedia before calling it, warns early when Remote help is clicked over HTTP, shows themed chat system messages (HTTPS required or share cancelled), and ends the remote session cleanly instead of leaving WebRTC stuck at Connecting. Admins see a clear status in chat and the remote panel when the customer cannot share.\n\nHTTPS note: OVH is configured for Let's Encrypt/nginx TLS (see deploy/ovh/nginx-horizon.conf), but the server is often accessed by raw IP over HTTP until DNS/TLS is in place. Remote screen share requires customers to use https://… on that host (or localhost for dev).\n\nWho is affected: Horizon admins and customers using PipeShare support remote help on the OVH private server. Deploy client-portal static assets (dbg153). No backend code change required for this fix. SaaS updates only via releases.html.",
+  "title": "HTTP remote viewport relay at 30 fps target (dbg155)",
+  "description": "Customer-initiated remote help over HTTP now targets ~30 fps (configurable to 60 via ?relayFps=60) instead of ~2–3 fps. Capture uses html2canvas at scale 0.75, JPEG quality 0.7, max width 1280px. Frames are skipped when a capture is still in flight so the relay stays steady rather than queuing unbounded work. Admin panel polls at the same rate and shows actual vs target fps in the status line; add ?debug=1 or localStorage hp-cp-relay-debug=1 for an on-screen fps counter.\n\nRealistic throughput depends on customer device — html2canvas may deliver 10–25 fps on heavy pages; prefer steady 30 over stuttering 60. On HTTPS, native getDisplayMedia + WebRTC is unchanged.\n\nWho is affected: Horizon admins and customers using PipeShare support remote help on the OVH private server. Deploy horizon-backend (frame buffer headroom) and client-portal static assets (dbg155). Set hp-portal-secure-origin when GoDaddy DNS + certbot TLS is live.",
   "changeLog": [
-    "Guard getDisplayMedia — no raw JS error on HTTP; friendly HTTPS system message in chat.",
-    "Early warning when customer clicks Remote help without a secure context.",
-    "Screen share cancelled/denied shows \"Screen share was cancelled.\" and ends session cleanly.",
-    "Admin remote panel + chat message when customer cannot share (HTTPS required).",
-    "Cache bust dbg153 (portal runtime + PipeShare manifest)."
+    "Viewport relay targets 30 fps (rAF scheduler, skip-if-in-flight); optional 60 via ?relayFps=60.",
+    "Capture tuned: html2canvas scale 0.75, JPEG q0.7, max width 1280px.",
+    "Admin panel: decode-before-swap img updates; dev fps overlay (?debug=1).",
+    "Backend frame payload limit raised to 1.2M base64 chars for higher-rate JPEG relay.",
+    "Status text shows actual/target fps during dom-relay sessions.",
+    "Cache bust dbg155 (portal runtime + PipeShare manifest)."
   ],
-  "updatedAt": "2026-06-28T23:45:00.000Z"
+  "updatedAt": "2026-06-29T00:00:00.000Z"
 }

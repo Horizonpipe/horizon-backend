@@ -114,7 +114,74 @@ psql "$DATABASE_URL" -c "SELECT COUNT(*) FROM users;"
 
 ---
 
-## Step 5 — nginx + SSL
+## Step 5 — nginx + SSL (GoDaddy DNS → OVH)
+
+**OVH server IP:** `40.160.72.39` (non-SaaS private instance; currently HTTP on IP only).
+
+### A — GoDaddy DNS (Mike does this in GoDaddy DNS manager)
+
+Pick one hostname for the Horizon app (examples: `app.horizonpipe.com`, `portal.horizonpipe.com`). Do **not** point the marketing Squarespace site (`www.horizonpipe.com`) at OVH unless you intend to move it off Squarespace.
+
+| Type | Name / Host | Value | TTL |
+|------|-------------|-------|-----|
+| **A** | `@` | `40.160.72.39` | 600 (or 300 before cutover) |
+| **A** | `www` | `40.160.72.39` | 600 |
+| **A** | `app` (or your chosen subdomain) | `40.160.72.39` | 600 |
+
+- Use **A records** to the OVH IP — not CNAME to the IP (invalid).
+- CNAME is only if you later point a subdomain at another hostname nginx already serves.
+- Lower TTL to **300** a day before cutover; raise after stable.
+- Wait for propagation (`dig app.yourdomain.com +short` should return `40.160.72.39`).
+
+### B — nginx on OVH
+
+**Option 1 — TLS vhost** (recommended once DNS resolves):
+
+```bash
+sudo sed "s/YOUR_DOMAIN/app.yourdomain.com/g" deploy/ovh/nginx-horizon.conf \
+  | sudo tee /etc/nginx/sites-available/horizon
+sudo ln -sf /etc/nginx/sites-available/horizon /etc/nginx/sites-enabled/horizon
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d app.yourdomain.com
+# If www also points here: sudo certbot --nginx -d app.yourdomain.com -d www.yourdomain.com
+```
+
+**Option 2 — performance static config** (currently live on OVH: `nginx-horizon-performance.conf`, `server_name _`, port 80 only). After DNS works, either add a second `server { listen 443 ssl; server_name app.yourdomain.com; … }` block from `nginx-horizon.conf`, or switch to the TLS template above and merge static `location` blocks from the performance file.
+
+Live check (read-only):
+
+```bash
+ssh horizon-ovh "ls /etc/nginx/sites-enabled/; head -30 /etc/nginx/sites-enabled/horizon"
+```
+
+### C — certbot (Let's Encrypt)
+
+First time on Ubuntu (if certbot not installed — `setup-server.sh` usually installs it):
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo mkdir -p /var/www/certbot
+sudo certbot --nginx -d app.yourdomain.com
+sudo certbot renew --dry-run
+```
+
+Certbot edits nginx for `ssl_certificate` paths under `/etc/letsencrypt/live/…/`.
+
+### D — After HTTPS works
+
+1. Set `PUBLIC_ORIGIN`, `SAAS_CPANEL_BASE_URL`, and `CORS_ORIGINS` in `/opt/horizon/horizon-backend/.env` to `https://app.yourdomain.com`.
+2. In `horizon-frontend/client-portal/index.html` and `mobile.html`, set:
+   ```html
+   <meta name="hp-portal-secure-origin" content="https://app.yourdomain.com" />
+   ```
+3. Stripe webhook URL → `https://app.yourdomain.com/saas/billing/webhook`
+4. Wasabi bucket CORS → include the new HTTPS origin.
+5. `pm2 reload horizon-backend`
+
+---
+
+## Step 5 (legacy one-liner)
 
 ```bash
 sudo sed "s/YOUR_DOMAIN/app.yourdomain.com/g" deploy/ovh/nginx-horizon.conf \

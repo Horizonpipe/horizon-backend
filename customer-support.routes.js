@@ -122,6 +122,12 @@ const lastPresenceWriteMs = new Map();
 /** @type {Map<string, { id: number, at: number, fromUserId: string, type: string, payload: unknown }[]>} */
 const remoteSignalsBySession = new Map();
 const REMOTE_SIGNAL_BUFFER_MAX = 120;
+/** @type {Map<string, { seq: number, mimeType: string, dataBase64: string, w: number, h: number, at: number }>} */
+const remoteFramesBySession = new Map();
+/** @type {Map<string, { id: number, at: number, fromUserId: string, payload: unknown }[]>} */
+const remoteInputBySession = new Map();
+const REMOTE_INPUT_BUFFER_MAX = 240;
+const REMOTE_FRAME_MAX_B64 = 1_200_000;
 /** @type {Map<string, { id: string, sessionId: string, tenantId: string, fromUserId: string, toUserId: string, fileName: string, fileSize: number, mimeType: string, dataBase64: string, createdAt: number }>} */
 const fileOffersById = new Map();
 const FILE_OFFER_TTL_MS = 10 * 60 * 1000;
@@ -180,6 +186,49 @@ function pushRemoteSignal(sessionId, fromUserId, type, payload) {
 
 function clearRemoteSignals(sessionId) {
   remoteSignalsBySession.delete(String(sessionId || ''));
+}
+
+function clearRemoteRelay(sessionId) {
+  const key = String(sessionId || '');
+  remoteFramesBySession.delete(key);
+  remoteInputBySession.delete(key);
+}
+
+function storeRemoteFrame(sessionId, payload) {
+  const key = String(sessionId || '');
+  if (!key) return null;
+  const dataBase64 = cleanString(payload?.dataBase64);
+  if (!dataBase64 || dataBase64.length > REMOTE_FRAME_MAX_B64) return null;
+  const seq = Math.max(1, Number(payload?.seq) || 0);
+  const entry = {
+    seq,
+    mimeType: cleanString(payload?.mimeType || 'image/jpeg') || 'image/jpeg',
+    dataBase64,
+    w: Math.max(0, Number(payload?.w) || 0),
+    h: Math.max(0, Number(payload?.h) || 0),
+    at: Date.now()
+  };
+  remoteFramesBySession.set(key, entry);
+  return entry;
+}
+
+function pushRemoteInput(sessionId, fromUserId, payload) {
+  const key = String(sessionId || '');
+  if (!key || payload == null || typeof payload !== 'object') return null;
+  let list = remoteInputBySession.get(key);
+  if (!list) {
+    list = [];
+    remoteInputBySession.set(key, list);
+  }
+  const entry = {
+    id: (list[list.length - 1]?.id || 0) + 1,
+    at: Date.now(),
+    fromUserId: String(fromUserId || ''),
+    payload
+  };
+  list.push(entry);
+  while (list.length > REMOTE_INPUT_BUFFER_MAX) list.shift();
+  return entry;
 }
 
 function broadcastTenant(tenantId, eventName, payload) {
@@ -248,6 +297,7 @@ function broadcastEndedSessions(tenantId, chatRows, remoteRows, reason) {
   }
   for (const row of remoteRows) {
     clearRemoteSignals(row.id);
+    clearRemoteRelay(row.id);
     broadcastSupportEvents(tenantId, 'remote-ended', {
       sessionId: row.id,
       customerUserId: row.customer_user_id,
@@ -1801,6 +1851,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         [sessionId]
       );
       clearRemoteSignals(sessionId);
+      clearRemoteRelay(sessionId);
       broadcastSupportEvents(row.tenant_id, 'remote-ended', {
         sessionId,
         customerUserId: row.customer_user_id,
@@ -1878,6 +1929,127 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       return res.json({ success: true, signals });
     } catch (error) {
       console.error('[saas/support/remote/signals GET]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.post('/saas/support/remote/:sessionId/frame', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const sessionId = cleanString(req.params.sessionId);
+      if (!sessionId) return jsonError(res, 400, 'sessionId is required');
+
+      const loaded = await loadRemoteSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (row.status !== 'active') return jsonError(res, 400, 'Remote session is not active');
+      if (String(row.customer_user_id) !== String(req.user.id)) {
+        return jsonError(res, 403, 'Only the customer can upload viewport frames');
+      }
+
+      const stored = storeRemoteFrame(sessionId, req.body || {});
+      if (!stored) return jsonError(res, 400, 'Valid frame data is required');
+      return res.json({ success: true, seq: stored.seq });
+    } catch (error) {
+      console.error('[saas/support/remote/frame POST]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.get('/saas/support/remote/:sessionId/frame', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const sessionId = cleanString(req.params.sessionId);
+      const afterSeq = Math.max(0, Number(req.query?.afterSeq || 0));
+      if (!sessionId) return jsonError(res, 400, 'sessionId is required');
+
+      const loaded = await loadRemoteSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (row.status !== 'active') return jsonError(res, 400, 'Remote session is not active');
+      if (String(row.admin_user_id) !== String(req.user.id) && !canAccessAdminPanel(req.user)) {
+        return jsonError(res, 403, 'Only the assigned admin can view viewport frames');
+      }
+
+      const frame = remoteFramesBySession.get(sessionId) || null;
+      if (!frame || frame.seq <= afterSeq) {
+        return res.json({ success: true, frame: null });
+      }
+      return res.json({
+        success: true,
+        frame: {
+          seq: frame.seq,
+          mimeType: frame.mimeType,
+          dataBase64: frame.dataBase64,
+          w: frame.w,
+          h: frame.h,
+          at: frame.at
+        }
+      });
+    } catch (error) {
+      console.error('[saas/support/remote/frame GET]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.post('/saas/support/remote/:sessionId/input', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const sessionId = cleanString(req.params.sessionId);
+      const payload = req.body?.payload;
+      if (!sessionId) return jsonError(res, 400, 'sessionId is required');
+      if (payload == null || typeof payload !== 'object') {
+        return jsonError(res, 400, 'payload object is required');
+      }
+
+      const loaded = await loadRemoteSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (row.status !== 'active') return jsonError(res, 400, 'Remote session is not active');
+
+      const uid = String(req.user.id);
+      const isAdminSender =
+        uid === String(row.admin_user_id) || (canAccessAdminPanel(req.user) && uid !== String(row.customer_user_id));
+      const isCustomerSender = uid === String(row.customer_user_id);
+      const msgType = cleanString(payload?.t);
+      if (msgType === 'viewport') {
+        if (!isCustomerSender) return jsonError(res, 403, 'Only the customer can publish viewport size');
+      } else if (!isAdminSender) {
+        return jsonError(res, 403, 'Only the admin can send control input');
+      }
+
+      const entry = pushRemoteInput(sessionId, req.user.id, payload);
+      return res.json({ success: true, inputId: entry?.id });
+    } catch (error) {
+      console.error('[saas/support/remote/input POST]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.get('/saas/support/remote/:sessionId/input', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const sessionId = cleanString(req.params.sessionId);
+      const afterId = Math.max(0, Number(req.query?.after || 0));
+      if (!sessionId) return jsonError(res, 400, 'sessionId is required');
+
+      const loaded = await loadRemoteSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (row.status !== 'active') return jsonError(res, 400, 'Remote session is not active');
+      if (String(row.customer_user_id) !== String(req.user.id)) {
+        return jsonError(res, 403, 'Only the customer can poll control input');
+      }
+
+      const list = remoteInputBySession.get(sessionId) || [];
+      const messages = list.filter((s) => s.id > afterId);
+      return res.json({ success: true, messages });
+    } catch (error) {
+      console.error('[saas/support/remote/input GET]', error);
       return jsonError(res, 500, error.message || 'Server error');
     }
   });
