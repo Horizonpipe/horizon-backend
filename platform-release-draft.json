@@ -1,11 +1,13 @@
 {
-  "title": "PipeSync dbg122: legacy Users modal removed, pill buttons",
-  "description": "The old Users & companies admin modal and its inline permission/settings forms are fully removed from PipeSync. User approvals and module access now rely on the dedicated admin flows added in recent dbg batches (no legacy Settings modal).\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "First-login password change persists across reload",
+  "description": "Users created with a default password must set a new password before entering PipeSync or PipeShare. Previously, reloading the login page or opening pipesync.html directly would skip the Change Default Password step and land in the dashboard with the default password still active.\n\nThis batch enforces the gate on session restore (login.html reload), PipeSync boot, and client-portal boot. The flag clears only after a successful change-password call on the backend.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Remove legacy Users admin modal type and render paths from app.js and psr-admin-modals.js.",
-    "Trim users-admin.js to companies-only rendering; drop pending-review and permission draft UI tied to the old modal.",
-    "Cache bust dbg122 on portal runtime, PipeSync, mobile, and addon manifest.",
-    "Unified pill button theme on PipeSync desktop and client portal (hp-btn tokens + control styling)."
+    "Login session restore shows Change Default Password when mustChangePassword is still true instead of redirecting to the dashboard.",
+    "PipeSync and mobile shells redirect to login until default password is replaced.",
+    "PipeShare client-portal boot redirects to unified login when mustChangePassword is set.",
+    "Portal session sync stores mustChangePassword from GET /session for reliable gate checks.",
+    "Includes prior fix: omit current password on first-login change-password (commit 9657efb).",
+    "Cache bust pwdfix on login-main, PipeSync boot, and portal runtime."
   ],
-  "updatedAt": "2026-06-28T16:08:01.435Z"
+  "updatedAt": "2026-06-28T18:00:00.000Z"
 }
