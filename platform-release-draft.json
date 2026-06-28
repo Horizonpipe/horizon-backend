@@ -1,12 +1,13 @@
 {
-  "title": "PDF Viewer fills viewport height — compact explorer (dbg90)",
-  "description": "The PDF Viewer scroll area was only a thin strip at the bottom because the unified file explorer and plan-view header consumed most of the vertical space, and the flex chain never allocated remaining height to the board body (absolute scrollport had nothing to fill).\n\ndbg90 compacts the explorer in PDF Viewer mode, hides the long plan-view blurb, and fixes flex:1 1 0 from panel → subpanel → board host → viewer body so the dark scroll viewport grows to fill the rest of the screen (~5× taller than before).\n\nWho is affected: OVH PipeSync PDF Viewer workspace.",
+  "title": "PDF Viewer viewport locked at 100% browser zoom (dbg91)",
+  "description": "At 100% Edge/browser zoom the plan view page scrolled and the PDF viewer looked like a thin strip; at 65% browser zoom everything fit. dbg91 locks the plan shell to the viewport (no page scroll), blocks Ctrl+wheel from triggering browser zoom over the viewer, and sets viewer body height to ~2.9× the old baseline or 92% of remaining viewport — whichever fills the screen.\n\nWho is affected: OVH PipeSync PDF Viewer workspace.",
   "changeLog": [
-    "PDF Viewer scrollport fills remaining viewport below toolbar.",
-    "Unified explorer compact in PDF Viewer mode (smaller max-heights).",
-    "Flex chain panel → subpanel → board host → body uses flex 1 1 0.",
-    "Hide plan-view intro paragraph when continuous viewer active.",
-    "Cache bust dbg90."
+    "Lock html/body overflow when PDF Viewer is active — fits at 100% browser zoom.",
+    "Viewer body height = max(2.9× baseline, 92% of viewport below toolbar).",
+    "Shell height tied to window.innerHeight (scales with browser zoom).",
+    "Window-level Ctrl+wheel capture over plan view → in-app zoom only.",
+    "Compact explorer/head chrome to give viewer more vertical space.",
+    "Cache bust dbg91."
   ],
-  "updatedAt": "2026-06-28T14:00:00.000Z"
+  "updatedAt": "2026-06-28T16:00:00.000Z"
 }
