@@ -1,12 +1,12 @@
 {
-  "title": "Bookmark navigation in PDF fullscreen viewer (dbg103)",
-  "description": "Bookmark Go in the continuous PDF viewer required two clicks, landed on a blurry page, and Ctrl+wheel zoom snapped back to fit-width instead of continuing from the bookmark position.\n\ndbg103 adds a continuous-viewer scroll path (stack coords + wait for page slot), force re-raster of visible pages after bookmark focus, suppresses fit/reflow while navigating, and preserves user zoom across wheel zoom after a bookmark.\n\nWho is affected: OVH private server PDF Viewer fullscreen workspace.",
+  "title": "No black flash on fast scroll or bookmark at deep zoom (dbg104)",
+  "description": "At high zoom, fast scrolling or bookmark jumps could leave half the page black for seconds before PDF tiles finished re-rendering.\n\nRoot cause: zoom/scroll invalidated tiles by shrinking canvases to 1×1 before async pdf.js paint completed. dbg104 keeps the last good bitmap visible until the new tile is ready, caps canvas size at 8192px to avoid browser partial-render failures, and repaints visible pages sooner on scroll.\n\nWho is affected: OVH private server PDF Viewer fullscreen workspace.",
   "changeLog": [
-    "Single-click bookmark Go waits for continuous viewer page slot then scrolls via stack layout.",
-    "Force sharp re-render of visible PDF tiles after bookmark navigation.",
-    "Skip fit/reflow remount on continuous viewer during bookmark focus window.",
-    "Preserve user zoom level; no auto-fit reset after Ctrl+wheel from bookmark.",
-    "Cache bust dbg103."
+    "Keep previous PDF tile visible while re-rasterizing (no 1×1 canvas wipe).",
+    "Cap deep-zoom canvas dimensions to prevent partial black tiles.",
+    "Repaint visible pages on scroll with shorter debounce.",
+    "Queue follow-up render if zoom/scroll invalidates an in-flight tile.",
+    "Cache bust dbg104."
   ],
   "updatedAt": "2026-06-30T00:00:00.000Z"
 }
