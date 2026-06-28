@@ -1,13 +1,12 @@
 {
-  "title": "PipeShare user-prefs sync storm fix (dbg131)",
-  "description": "PipeShare was firing many PATCH /me/user-prefs requests in quick succession (~1s each), making the UI feel laggy on load and theme changes. The root cause was a feedback loop: each prefs sync dispatched hp-user-prefs-synced, theme init re-applied the theme and wrote prefs back to the server even when nothing changed, and the sync layer had no in-flight guard or minimum interval between patches.\n\nThis release debounces and coalesces user-prefs writes (3s debounce, 2.5s min interval, single in-flight PATCH), skips set() when values are unchanged, and makes theme init paint-only so server sync events do not re-trigger PATCH. DAS monitor-snapshot polling is slightly slower (20s visible) to reduce background API noise.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "PipeShare presence 500 fix and boot perf (dbg132)",
+  "description": "Customer support presence heartbeats were returning HTTP 500 on the OVH server for all legacy numeric user ids (Kat, Mike, etc.). The cp_support_presence table stored user_id as UUID while OVH Postgres users still use numeric TEXT ids, so every POST /saas/support/presence failed with invalid input syntax for type uuid.\n\nThis release migrates support presence/chat/remote user id columns to TEXT (matching user_company_membership), adds frontend exponential backoff on failed heartbeats so 500s do not retry-storm, dedupes parallel identical file-tree fetches, and defers workspace-layout server fetch plus customer-support init until after first paint.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Fix user-prefs sync storm: debounce, throttle, coalesce in-flight PATCH.",
-    "Skip PATCH when pref value unchanged; break theme ↔ sync feedback loop.",
-    "Theme init paints DOM only; user theme changes still sync once.",
-    "Cache-bust user-prefs-sync.js and theme-profile.js on PipeShare portal.",
-    "DAS monitor-snapshot poll 15s → 20s when tab visible.",
-    "Runtime cache bust dbg131."
+    "Fix presence HTTP 500: migrate cp_support_* user id columns UUID → TEXT on OVH.",
+    "Presence heartbeat exponential backoff on errors (max 5 min); no retry storm.",
+    "Defer customer-support init and portal-workspace-layout fetch until after first paint.",
+    "Dedupe in-flight identical /api/files/tree requests in portal-files-api.",
+    "Runtime cache bust dbg132."
   ],
-  "updatedAt": "2026-06-28T12:00:00.000Z"
+  "updatedAt": "2026-06-28T18:00:00.000Z"
 }

@@ -157,11 +157,33 @@ function broadcastTenant(tenantId, eventName, payload) {
   }
 }
 
+/** OVH legacy users use numeric ids in Postgres (TEXT), not UUID — migrate support tables to match. */
+async function migrateSupportUserIdColumnToText(pool, table, column) {
+  const tbl = cleanString(table).replace(/[^a-z0-9_]/gi, '');
+  const col = cleanString(column).replace(/[^a-z0-9_]/gi, '');
+  if (!tbl || !col) return;
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = '${tbl}'
+          AND column_name = '${col}'
+          AND data_type <> 'text'
+      ) THEN
+        EXECUTE 'ALTER TABLE ${tbl} ALTER COLUMN ${col} TYPE TEXT USING ${col}::text';
+      END IF;
+    END $$;
+  `);
+}
+
 async function initCustomerSupportSchema(pool) {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS cp_support_presence (
       tenant_id UUID NOT NULL,
-      user_id UUID NOT NULL,
+      user_id TEXT NOT NULL,
       tab_id TEXT NOT NULL,
       display_name TEXT NOT NULL DEFAULT '',
       account_type TEXT NOT NULL DEFAULT 'employee',
@@ -188,13 +210,14 @@ async function initCustomerSupportSchema(pool) {
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_cp_support_presence_deployment ON cp_support_presence (deployment_model, last_seen_at DESC)`
   );
+  await migrateSupportUserIdColumnToText(pool, 'cp_support_presence', 'user_id');
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS cp_support_chat_sessions (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       tenant_id UUID NOT NULL,
-      customer_user_id UUID NOT NULL,
-      admin_user_id UUID,
+      customer_user_id TEXT NOT NULL,
+      admin_user_id TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -203,12 +226,14 @@ async function initCustomerSupportSchema(pool) {
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_cp_support_chat_tenant ON cp_support_chat_sessions (tenant_id, updated_at DESC)`
   );
+  await migrateSupportUserIdColumnToText(pool, 'cp_support_chat_sessions', 'customer_user_id');
+  await migrateSupportUserIdColumnToText(pool, 'cp_support_chat_sessions', 'admin_user_id');
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS cp_support_chat_messages (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       session_id UUID NOT NULL REFERENCES cp_support_chat_sessions(id) ON DELETE CASCADE,
-      sender_user_id UUID NOT NULL,
+      sender_user_id TEXT NOT NULL,
       body TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
@@ -216,13 +241,14 @@ async function initCustomerSupportSchema(pool) {
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_cp_support_chat_messages_session ON cp_support_chat_messages (session_id, created_at ASC)`
   );
+  await migrateSupportUserIdColumnToText(pool, 'cp_support_chat_messages', 'sender_user_id');
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS cp_support_remote_sessions (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       tenant_id UUID NOT NULL,
-      customer_user_id UUID NOT NULL,
-      admin_user_id UUID NOT NULL,
+      customer_user_id TEXT NOT NULL,
+      admin_user_id TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending',
       persist_token TEXT NOT NULL UNIQUE,
       customer_tab_id TEXT NOT NULL DEFAULT '',
@@ -234,6 +260,8 @@ async function initCustomerSupportSchema(pool) {
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_cp_support_remote_active ON cp_support_remote_sessions (tenant_id, status, updated_at DESC)`
   );
+  await migrateSupportUserIdColumnToText(pool, 'cp_support_remote_sessions', 'customer_user_id');
+  await migrateSupportUserIdColumnToText(pool, 'cp_support_remote_sessions', 'admin_user_id');
 }
 
 async function resolveTenantForUser(pool, user) {
@@ -327,7 +355,12 @@ function derivePresenceLabels(user, tenantScope) {
 
 async function upsertPresence(pool, user, tenantScope, body) {
   const tenantId = tenantScope.tenantId;
-  const userId = cleanString(user.id);
+  const userId = cleanString(user?.id ?? user?.userId);
+  if (!userId) {
+    const err = new Error('Missing user id');
+    err.code = 'SUPPORT_PRESENCE_NO_USER';
+    throw err;
+  }
   const tabId = cleanString(body?.tabId) || 'default';
   const labels = derivePresenceLabels(user, tenantScope);
   const supportRequested = body?.supportRequested === true;
