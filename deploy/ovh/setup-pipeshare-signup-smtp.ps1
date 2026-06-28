@@ -26,7 +26,4 @@ Write-Host "Configuring SMTP on OVH for $SmtpUser ..."
 ssh $SshHost $cmd
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host ''
-Write-Host 'Disabling dev PIN mode (production sign-up uses email)...'
-ssh $SshHost "grep -q '^SIGNUP_DEV_RETURN_PIN=' /opt/horizon/horizon-backend/.env && sed -i 's/^SIGNUP_DEV_RETURN_PIN=.*/SIGNUP_DEV_RETURN_PIN=0/' /opt/horizon/horizon-backend/.env || echo 'SIGNUP_DEV_RETURN_PIN=0' >> /opt/horizon/horizon-backend/.env; pm2 reload horizon-backend --update-env"
-Write-Host 'Done. Test Create account at https://pipeshare.net/'
+Write-Host 'Done. SaaS sign-up on https://pipeshare.net/ will send verification email from' $SmtpUser

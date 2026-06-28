@@ -3,6 +3,7 @@
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const { isSaasSignupRequest } = require('./lib/saas-signup-context');
 
 const SIGNUP_PIN_TTL_MIN = Number(process.env.SIGNUP_PIN_TTL_MIN || 30);
 const RESEND_COOLDOWN_SEC = Math.max(30, Number(process.env.SIGNUP_RESEND_COOLDOWN_SEC || 60));
@@ -293,8 +294,10 @@ function registerSignupRoutes(app, deps) {
       );
 
       const sendResult = await sendPinEmail(email, pin);
-      const devPin =
-        String(process.env.SIGNUP_DEV_RETURN_PIN || '').trim() === '1' ? pin : undefined;
+      const saasSignup = isSaasSignupRequest(req);
+      const devPinAllowed =
+        !saasSignup && String(process.env.SIGNUP_DEV_RETURN_PIN || '').trim() === '1';
+      const devPin = devPinAllowed ? pin : undefined;
 
       if (!sendResult.ok && !devPin) {
         await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
@@ -307,7 +310,9 @@ function registerSignupRoutes(app, deps) {
         success: true,
         message: sendResult.ok
           ? 'Check your email for a verification code.'
-          : 'Verification code generated (dev only — configure SMTP for production).',
+          : saasSignup
+            ? 'Check your email for a verification code.'
+            : 'Verification code generated (dev only — configure SMTP for production).',
         ...(devPin ? { devPin } : {})
       });
     } catch (error) {

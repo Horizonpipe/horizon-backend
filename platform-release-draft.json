@@ -1,11 +1,11 @@
 {
-  "title": "PipeShare.net sign-up error handling and SMTP docs",
-  "description": "Create account on pipeshare.net requires SMTP on the OVH backend to send verification codes. The API no longer exposes raw server configuration errors to end users — customers see a short, branded message instead.\n\nDeploy docs now include GoDaddy Workspace SMTP example vars for /opt/horizon/horizon-backend/.env. Until SMTP is configured, sign-up shows a friendly unavailable message.\n\nWho is affected: pipeshare.net business sign-up. pipeshare.live and existing logins unchanged.",
+  "title": "SaaS-only email verification for pipeshare.net sign-up",
+  "description": "Sign-up on pipeshare.net (SaaS) now always requires email verification — the dev PIN bypass only applies on pipeshare.live and other non-SaaS hosts.\n\nConfigure SMTP (EmailVerification@pipeshare.net) for SaaS Create account to work. pipeshare.live can still use SIGNUP_DEV_RETURN_PIN=1 for testing without mail.\n\nWho is affected: pipeshare.net business sign-up requires SMTP. pipeshare.live dev sign-up unchanged.",
   "changeLog": [
-    "Sign-up API returns user-friendly mail errors (code smtp_not_configured).",
-    "Login/sign-up page shows styled alert boxes instead of raw pink text.",
-    "PipeShare-branded verification email subject when SMTP is configured.",
-    "OVH README + .env.example document SMTP setup for sign-up."
+    "SaaS sign-up rejects dev PIN bypass; email verification only on pipeshare.net.",
+    "Non-SaaS hosts may still use SIGNUP_DEV_RETURN_PIN when SMTP is absent.",
+    "Frontend sends signupContext=saas from pipeshare.net.",
+    "Docs clarify SaaS vs non-SaaS sign-up behavior."
   ],
-  "updatedAt": "2026-06-28T22:00:00.000Z"
+  "updatedAt": "2026-06-28T22:15:00.000Z"
 }

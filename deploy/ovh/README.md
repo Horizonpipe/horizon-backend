@@ -155,15 +155,15 @@ SIGNUP_MAIL_FROM_NAME=PipeShare
 
 Then reload: `pm2 reload horizon-backend --update-env`
 
-**Pre-launch testing (no SMTP yet):** OVH may have `SIGNUP_DEV_RETURN_PIN=1` — the verification code appears on screen after you submit the form. Remove before public launch.
+**Pre-launch testing on pipeshare.live (non-SaaS):** `SIGNUP_DEV_RETURN_PIN=1` shows the verification code on screen when SMTP is not configured. **pipeshare.net (SaaS) always requires email** — configure SMTP below.
 
-**Production (GoDaddy mailbox ready):** from your PC:
+**Production SaaS email (GoDaddy mailbox ready):** from your PC:
 
 ```powershell
 powershell -File deploy/ovh/setup-pipeshare-signup-smtp.ps1
 ```
 
-Or on OVH: `SMTP_PASS='...' bash deploy/ovh/setup-pipeshare-signup-smtp.sh` (also sets `SIGNUP_DEV_RETURN_PIN=0`).
+Or on OVH: `SMTP_PASS='...' bash deploy/ovh/setup-pipeshare-signup-smtp.sh`
 
 Config files: `nginx-horizon-pipeshare.conf` (HTTP/ACME), `nginx-horizon-pipeshare-ssl.conf` (HTTPS).
 
