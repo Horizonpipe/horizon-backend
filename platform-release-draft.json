@@ -1,11 +1,12 @@
 {
-  "title": "PipeSync header menu + PDF Viewer workspace menu fix (dbg110)",
-  "description": "PipeSync desktop header now uses the same hamburger Menu pattern as PipeShare. Horizon Site, Refresh, Tour, Manage account settings, and Sign out are consolidated into one top-right dropdown so the header is less cluttered. Sync status and user badge stay visible.\n\nPDF Viewer workspace: fixes the missing ☰ menu. The viewer chrome was not rendering because the workspace passed the wrong state key into the chrome builder. The floating menu is pinned top-right in fullscreen and Close workspace works again.\n\nWho is affected: OVH private server PipeSync (desktop header and Plan View PDF Viewer). SaaS only when you apply the new version in releases.html.",
+  "title": "Footage/Pricing merge and cross-model remote support (dbg111-dbg113)",
+  "description": "PipeSync no longer shows a separate Imported — ready to sort tab; that workflow is folded into the main footage flow.\n\nFootage Tracker and Pricing Totals are one tool with sub-tabs so pricing stays next to footage without a second sidebar entry.\n\nRemote customer support is wired for both deployment models. Mike Strickland admin user menu lists online users in two groups: NON SAAS MODEL (OVH/private) and SAAS MODEL (hosted SaaS tenants). Cache bust dbg113 on PipeSync, mobile, and client portal entry HTML.\n\nWho is affected: OVH private server gets this on deploy. SaaS customers see frontend/backend support changes when Mike applies the new platform version in releases.html.",
   "changeLog": [
-    "PipeShare-style Menu dropdown in PipeSync header (Horizon Site, Refresh, Tour, Account, Sign out).",
-    "Fix PDF Viewer ☰ workspace menu not appearing (chrome render state key).",
-    "PDF Viewer menu fixed top-right in fullscreen; line/opacity floats unchanged.",
-    "Cache bust dbg110."
+    "Remove Imported — ready to sort tab (dbg111).",
+    "Merge Pricing Totals into Footage Tracker with sub-tabs (dbg112).",
+    "Remote support on SaaS and non-SaaS; Mike global menu with NON SAAS MODEL / SAAS MODEL groups (dbg113).",
+    "Backend support routes: deployment_model on presence, Mike global list scope, cross-tenant admin actions.",
+    "Cache bust dbg113; smoke test updates."
   ],
-  "updatedAt": "2026-06-28T18:00:00.000Z"
+  "updatedAt": "2026-06-28T20:00:00.000Z"
 }
