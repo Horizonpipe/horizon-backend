@@ -1,11 +1,11 @@
-﻿{
-  "title": "Context menus: Quick actions vs Admin tools (dbg119)",
-  "description": "PipeShare explorer and PipeSync planner context menus now split day-to-day operations under Quick actions from support and Create User under Admin tools.\n\nCreate User is a flyout submenu (path access, module settings); Add User on a folder or file stays a single quick action for granting access. Customer explorer menus get Add User under Access when appropriate.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+{
+  "title": "First-login password change and Users admin cleanup (dbg122)",
+  "description": "Users who must change their password on first login can set a new password without entering the temporary default password. The login flow, account settings, and PipeSync settings modal hide the current-password field and the API accepts new-password-only when mustChangePassword is active.\n\nPipeSync also drops the legacy inline Users Settings modal (dbg122); user admin stays in the modular psr-admin flow. Desktop CSS adds shared pill-button theme tokens for consistent orange-accent controls.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "PipeSync planner: ops (import, structure, move, Add User access) in Quick actions; support and Create User flyout in Admin tools.",
-    "PipeShare employee menu: Create User flyout moved to Admin tools section; customer Add User under Access on remote rows.",
-    "PipeSync app.js: ctx-create-user-menu and separate ctx-add-user-access quick action.",
-    "Cache bust dbg119 on portal runtime, PipeSync, mobile, and addon manifest."
+    "Backend: POST /change-password skips current password check when mustChangePassword is true.",
+    "Login and account settings: omit current password field and payload on forced password change.",
+    "PipeSync: legacy Users Settings modal removed from app.js (dbg122).",
+    "Desktop CSS: hp-btn pill theme custom properties for toolbar and modal buttons."
   ],
-  "updatedAt": "2026-06-28T23:45:00.000Z"
+  "updatedAt": "2026-06-28T18:30:00.000Z"
 }
