@@ -1,12 +1,12 @@
 {
-  "title": "PDF Viewer compact stack (fix inflated gaps)",
-  "description": "Viewer sheets were still stacked using inflated 5× footprint heights from old map builds, creating huge vertical gaps and an oversized container. Layout now always uses intrinsic PDF piece dimensions (natW/natH / legacy piece size), dedupes by doc+name as well as storageKey, and shrink-wraps the scroll container to the zoomport so zoom-out does not reveal a giant grey frame.\n\nHard-refresh PipeSync after deploy (dbg60).\n\nWho is affected: Private OVH server.",
+  "title": "PDF Viewer auto fit-to-width",
+  "description": "PDF Viewer sheets now auto-scale to fill the available panel width edge-to-edge. Fit uses the full board body width (not shrink-wrapped scroll), refits on window/panel resize via ResizeObserver, and clips iframe overflow to prevent the right-edge duplicate bleed.\n\nHard-refresh PipeSync after deploy (dbg61).\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "Repair inflated viewer page h/w from legacy 5× footprint.",
-    "Dedupe viewer sheets by storageKey or doc+name.",
-    "Scroll container shrink-wraps to sheet stack size.",
-    "Gap/bounds sync updates zoomport dimensions.",
-    "Cache bust dbg60."
+    "Viewer: auto fit-to-width on load, workspace switch, and panel resize.",
+    "Measure avail width from full panel, not shrink-wrapped scroll.",
+    "ResizeObserver refits sheets when screen size changes.",
+    "Clip page media overflow; hide horizontal scroll.",
+    "Cache bust dbg61."
   ],
-  "updatedAt": "2026-06-28T22:00:00.000Z"
+  "updatedAt": "2026-06-28T23:00:00.000Z"
 }
