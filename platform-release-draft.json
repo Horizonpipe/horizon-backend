@@ -1,11 +1,11 @@
-﻿{
-  "title": "dbg123 pill primaries and must-change-password gates",
-  "description": "Primary actions on PipeSync, mobile, and client portal now use the dark pill style with orange accent underline (dbg123), matching the desktop hp-btn tokens from dbg122.\n\nLogin and app boot no longer skip the default-password flow: restoring a session or opening PipeSync or the portal with mustChangePassword set sends users back to login to set a new password first.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+{
+  "title": "dbg124 site menu user identity and theme",
+  "description": "PipeSync desktop and mobile now show your display name, role badge, and theme picker inside the top-right site menu instead of separate header strips. Mojibake in role subtitles (garbled middle-dot separators) is fixed with clean role labels.\n\nMobile header layout is tightened: sync status and refresh sit next to the menu; the old full-width user bar is removed.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "dbg123: refresh ONBRAND and PIPEBUNTU primary pill styling in theme-profile.css and mobile color tokens.",
-    "Cache bust dbg123 on login bundle, portal runtime, PipeSync or mobile assets, and addon manifest entries.",
-    "Block PipeSync requireSession and client portal boot when mustChangePassword is still true.",
-    "Login (legacy and React): gate session resume on mustChangePassword; normalize snake_case flag on portal session."
+    "Move user badge and theme selector into PipeSync site menu (desktop and mobile).",
+    "Fix session role label encoding (Customer, Admin, Employee, etc.) without corrupted separators.",
+    "Keep site menu open while changing theme; focus handling for theme select.",
+    "Cache bust dbg124 on PipeSync, mobile HTML, CSS, and addon manifest."
   ],
-  "updatedAt": "2026-06-28T20:00:00.000Z"
+  "updatedAt": "2026-06-28T22:00:00.000Z"
 }
