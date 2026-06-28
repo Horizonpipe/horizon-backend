@@ -1,11 +1,11 @@
 {
-  "title": "Editable PDF highlights with round caps on download",
-  "description": "Duplicate stacked highlight lines on PDF download are fixed (dbg42 mirror dedupe). Editable Highlights download mode now adds circular line ends via /LE Round on Ink annotations — same round-cap look as Baked in Highlights, still editable in Adobe. No /AP appearance stream (avoids double-render).\n\nHard-refresh PipeSync after deploy (Ctrl+Shift+R). Download plans → Editable Highlights and confirm round ends in Adobe/Edge/Okular; no duplicate strokes.\n\nWho is affected: Private OVH server. SaaS unchanged until you publish a platform release.",
+  "title": "Editable PDF highlights: round caps match plan view",
+  "description": "Editable Highlights download now uses a round-cap /AP appearance stream (PDF operators 1 J / 1 j) matching plan-board SVG stroke-linecap=\"round\". /LE Round did not match on-screen shape. Full InkList is kept for Adobe endpoint editing; BS is omitted so only the AP stroke renders (no square-cap InkList layer).\n\nHard-refresh PipeSync after deploy. Download plans → Editable Highlights and compare line ends to plan view.\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "Editable Highlights download: /LE Round on InkList + BS for circular ends.",
-    "Save/bake path unchanged (square caps unless roundCaps opt-in later).",
-    "Mirror dedupe fix retained from dbg42.",
-    "Cache bust dbg43 for app.js, pipesync-boot.js, pdf-highlight-shape."
+    "Editable download: /AP round-cap stroke matching plan view SVG.",
+    "Remove ineffective /LE Round on Ink annotations.",
+    "Keep full InkList for Adobe editability; drop BS when AP attached.",
+    "Mirror dedupe fix retained (dbg42). Cache bust dbg44."
   ],
-  "updatedAt": "2026-06-28T00:10:00.000Z"
+  "updatedAt": "2026-06-28T00:20:00.000Z"
 }
