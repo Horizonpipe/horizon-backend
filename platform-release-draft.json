@@ -1,12 +1,13 @@
 {
-  "title": "Viewer live bounds + fit fix",
-  "description": "PDF Viewer scroll/grey box now uses live page stack bounds (not stale DOM height from map layout). Fit-to-width syncs bounds before zoom; mount reflows stack first. Wider crop detection (Art/Bleed boxes).\n\nHard-refresh PipeSync (dbg69).",
+  "title": "Viewer tighter gaps + fit-to-width fix",
+  "description": "PDF Viewer inter-page grey spacing is reduced (~80%: default 8px → 2px, legacy stored 8px migrates to 2px). Fit-to-width now measures the scroll column width (not full host width including the plan library sidebar), which was causing ~35% horizontal clipping.\n\nHard-refresh PipeSync (dbg70). Open PDF Viewer, confirm sheets fit edge-to-edge and gaps between pages are minimal.",
   "changeLog": [
-    "Sync world bounds before fit — removes oversized grey scroll area.",
-    "Viewport zoom reads live stack height/width from page data.",
-    "Viewer mount reflows stack then fits.",
-    "12px fit inset + Art/Bleed box auto-trim on import.",
-    "Cache bust dbg69."
+    "Default page gap 8px → 2px; legacy 8px pref migrates to 2px.",
+    "Fit avail width prefers scroll.clientWidth over host.clientWidth.",
+    "Fit content width uses media footprint (natW − crops).",
+    "Safety 0.95, inset 4px (was 0.9 + 12px double-shrink).",
+    "Debug ingest logs for avail/zoom/gap (session d9d6c9).",
+    "Cache bust dbg70."
   ],
-  "updatedAt": "2026-06-29T07:00:00.000Z"
+  "updatedAt": "2026-06-29T12:00:00.000Z"
 }
