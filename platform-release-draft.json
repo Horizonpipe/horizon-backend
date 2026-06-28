@@ -1,12 +1,12 @@
 {
-  "title": "PDF Viewer auto fit-to-width",
-  "description": "PDF Viewer sheets now auto-scale to fill the available panel width edge-to-edge. Fit uses the full board body width (not shrink-wrapped scroll), refits on window/panel resize via ResizeObserver, and clips iframe overflow to prevent the right-edge duplicate bleed.\n\nHard-refresh PipeSync after deploy (dbg61).\n\nWho is affected: Private OVH server.",
+  "title": "PDF Viewer: remove grey dead space + fit without clip",
+  "description": "Grey area between/outside sheets was the default map scroll background showing through an oversized flex scroll container. Viewer scroll now shrink-wraps to the sheet stack height with a forced white background.\n\nFit-to-width adds a 3.5% safety margin plus scrollbar/inset so sheets do not clip at 100% browser zoom. Page stack uses intrinsic piece dimensions by page index to eliminate inflated vertical gaps.\n\nHard-refresh PipeSync after deploy (dbg62).\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "Viewer: auto fit-to-width on load, workspace switch, and panel resize.",
-    "Measure avail width from full panel, not shrink-wrapped scroll.",
-    "ResizeObserver refits sheets when screen size changes.",
-    "Clip page media overflow; hide horizontal scroll.",
-    "Cache bust dbg61."
+    "Kill grey scroll dead space: shrink-wrap scroll to stack height, white bg.",
+    "Force viewer page h/w from intrinsic piece size every normalize.",
+    "Fit-to-width safety margin prevents edge clipping at 100% zoom.",
+    "Match legacy pieces by page index for correct sheet dimensions.",
+    "Cache bust dbg62."
   ],
-  "updatedAt": "2026-06-28T23:00:00.000Z"
+  "updatedAt": "2026-06-29T00:00:00.000Z"
 }
