@@ -537,8 +537,15 @@ async function sha256HexForReadable(stream) {
 function createWasabiClient() {
   const accessKeyId = process.env.WASABI_ACCESS_KEY_ID || process.env.WASABI_ACCESS_KEY;
   const secretAccessKey = process.env.WASABI_SECRET_ACCESS_KEY || process.env.WASABI_SECRET_KEY;
-  const region = process.env.WASABI_REGION || 'us-east-1';
-  const endpoint = process.env.WASABI_ENDPOINT || 'https://s3.us-east-1.wasabisys.com';
+  const saasMode = String(process.env.HP_DEPLOYMENT_MODE || '').trim().toLowerCase() === 'saas';
+  const region =
+    (saasMode && process.env.SAAS_WASABI_REGION) ||
+    process.env.WASABI_REGION ||
+    'us-east-1';
+  const endpoint =
+    (saasMode && process.env.SAAS_WASABI_ENDPOINT) ||
+    process.env.WASABI_ENDPOINT ||
+    `https://s3.${region}.wasabisys.com`;
   if (!accessKeyId || !secretAccessKey) return null;
   const maxSockets = Math.max(
     8,
@@ -562,6 +569,10 @@ function createWasabiClient() {
 }
 
 function bucketName() {
+  const saasMode = String(process.env.HP_DEPLOYMENT_MODE || '').trim().toLowerCase() === 'saas';
+  if (saasMode && process.env.SAAS_WASABI_BUCKET) {
+    return process.env.SAAS_WASABI_BUCKET;
+  }
   return process.env.WASABI_BUCKET || null;
 }
 

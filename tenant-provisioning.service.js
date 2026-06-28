@@ -8,6 +8,9 @@ const {
   buildTenantSkeletonKeys,
   FOLDER_MARKER
 } = require('./lib/saas-tenant-paths');
+const { buildTenantAccessUrls } = require('./lib/saas-tenant-access-urls');
+const { getSaasWasabiClient, saasWasabiBucket, saasVirtualboxConfigured } = require('./lib/saas-virtualbox-config');
+const { seedTenantAuthSnapshot } = require('./lib/saas-tenant-auth-store');
 
 function cleanString(v) {
   return String(v ?? '').trim();
@@ -37,7 +40,7 @@ function normalizeBranding(raw) {
 
 function serializeTenantRow(row) {
   if (!row) return null;
-  return {
+  const tenant = {
     id: row.id,
     companyId: row.company_id,
     ownerUserId: row.owner_user_id,
@@ -55,6 +58,8 @@ function serializeTenantRow(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
+  tenant.accessUrls = buildTenantAccessUrls(tenant.branding.businessName);
+  return tenant;
 }
 
 async function loadTenantByOwner(pool, ownerUserId) {
@@ -75,6 +80,19 @@ async function loadTenantById(pool, tenantId) {
      WHERE id = $1
      LIMIT 1`,
     [String(tenantId)]
+  );
+  return serializeTenantRow(r.rows[0] || null);
+}
+
+async function loadTenantByPortalSlug(pool, slug) {
+  const s = slugifyTenantName(slug);
+  if (!s) return null;
+  const r = await pool.query(
+    `SELECT *
+     FROM saas_tenant_instances
+     WHERE portal_client_id = $1
+     LIMIT 1`,
+    [`tenant-${s}`]
   );
   return serializeTenantRow(r.rows[0] || null);
 }
@@ -189,6 +207,8 @@ async function provisionTenantInstance(pool, s3Client, bucket, ownerUserId) {
 
   const slug = slugifyTenantName(tenant.branding.businessName);
   const skeletonKeys = buildTenantSkeletonKeys(slug);
+  const storageClient = saasVirtualboxConfigured() ? getSaasWasabiClient() : s3Client;
+  const storageBucket = saasVirtualboxConfigured() ? saasWasabiBucket() : bucket;
 
   await pool.query(
     `UPDATE saas_tenant_instances
@@ -198,7 +218,7 @@ async function provisionTenantInstance(pool, s3Client, bucket, ownerUserId) {
   );
 
   try {
-    const markerResult = await putFolderMarkers(s3Client, bucket, skeletonKeys);
+    const markerResult = await putFolderMarkers(storageClient, storageBucket, skeletonKeys);
     if (!markerResult.ok) {
       const requireWasabi = String(process.env.SAAS_REQUIRE_WASABI_PROVISION || '').trim() === '1';
       if (markerResult.reason === 'wasabi_not_configured' && !requireWasabi) {
@@ -211,6 +231,13 @@ async function provisionTenantInstance(pool, s3Client, bucket, ownerUserId) {
         );
       }
     }
+
+    const ownerRow = await pool.query(
+      `SELECT id, username, email, display_name FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
+      [String(ownerUserId)]
+    );
+    const ownerUser = ownerRow.rows[0] || null;
+    await seedTenantAuthSnapshot(slug, ownerUser);
 
     await pool.query(
       `INSERT INTO user_company_membership (user_id, company_id, role_key, override_folder_grants)
@@ -267,6 +294,7 @@ module.exports = {
   serializeTenantRow,
   loadTenantByOwner,
   loadTenantById,
+  loadTenantByPortalSlug,
   upsertTenantDraft,
   provisionTenantInstance,
   putFolderMarkers,

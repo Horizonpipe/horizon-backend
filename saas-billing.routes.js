@@ -11,6 +11,7 @@ const {
   findTenantByStripeSubscription,
   findTenantByOwnerUserId,
   updateTenantSubscription,
+  syncTenantSubscriptionFromStripe,
   ensureStripeCustomer,
   resolveCheckoutUrls,
   billingStatusSummary,
@@ -165,7 +166,15 @@ function registerSaasBillingWebhook(app, { pool }) {
 function registerSaasBillingRoutes(app, { pool, requireAuth }) {
   app.get('/saas/billing/status', requireAuth, async (req, res) => {
     try {
-      const tenant = await findTenantByOwnerUserId(pool, req.user?.id);
+      let tenant = await findTenantByOwnerUserId(pool, req.user?.id);
+      const stripe = getStripe();
+      if (stripe && tenant?.stripeCustomerId) {
+        try {
+          tenant = (await syncTenantSubscriptionFromStripe(stripe, pool, tenant)) || tenant;
+        } catch (syncErr) {
+          console.warn('[saas/billing/status] Stripe sync failed:', syncErr.message);
+        }
+      }
       return res.json({ success: true, billing: billingStatusSummary(tenant) });
     } catch (error) {
       console.error('[saas/billing/status]', error);

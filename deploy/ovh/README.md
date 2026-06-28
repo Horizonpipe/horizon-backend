@@ -196,6 +196,32 @@ Same steps for **pipeshare.net** → **DNS**:
 |------|------|-------|-----|
 | **A** | `@` | `40.160.72.39` | 600 |
 | **A** | `www` | `40.160.72.39` | 600 |
+| **A** | `*` | `40.160.72.39` | 600 |
+
+The **`*` wildcard** routes every tenant workspace (`Techpipe.pipeshare.net`, etc.) to OVH. **PipeSync** loads on the same host at `/pipesync.html` (short link `/pipesync`).
+
+#### OVH — tenant subdomain nginx + TLS
+
+After wildcard DNS propagates:
+
+```bash
+sudo bash /opt/horizon/horizon-backend/deploy/ovh/setup-saas-tenant-subdomains.sh
+```
+
+Verify:
+
+```bash
+dig +short techpipe.pipeshare.net A    # 40.160.72.39
+curl -sS -o /dev/null -w '%{http_code}\n' https://techpipe.pipeshare.net/
+```
+
+For **all future tenants** without adding each name to certbot, issue a **wildcard** cert (DNS-01 TXT challenge in GoDaddy when certbot prompts):
+
+```bash
+sudo certbot certonly --manual --preferred-challenges dns \
+  -d '*.pipeshare.net' -d pipeshare.net \
+  --cert-name pipeshare.live --expand
+```
 
 *(GoDaddy may label the host column "Name" or "@". Use `@` for the apex/root domain.)*
 

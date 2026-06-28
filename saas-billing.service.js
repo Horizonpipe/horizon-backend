@@ -160,6 +160,48 @@ async function updateTenantSubscription(pool, lookup, fields) {
   return serializeTenantRow(r.rows[0] || null);
 }
 
+/** Pull subscription state from Stripe when webhooks lag or were missed. */
+async function syncTenantSubscriptionFromStripe(stripe, pool, tenant) {
+  if (!stripe || !tenant) return tenant;
+  const customerId = cleanString(tenant.stripeCustomerId);
+  if (!customerId) return tenant;
+
+  let subscription = null;
+  const subId = cleanString(tenant.stripeSubscriptionId);
+  if (subId) {
+    try {
+      subscription = await stripe.subscriptions.retrieve(subId);
+    } catch (_) {
+      subscription = null;
+    }
+  }
+
+  if (!subscription) {
+    const list = await stripe.subscriptions.list({
+      customer: customerId,
+      status: 'all',
+      limit: 10
+    });
+    const rows = list.data || [];
+    subscription =
+      rows.find((s) => s.status === 'active' || s.status === 'trialing') || rows[0] || null;
+  }
+
+  if (!subscription) return tenant;
+
+  const mapped = mapStripeSubscriptionStatus(subscription.status);
+  const current = cleanString(tenant.subscriptionStatus).toLowerCase();
+  if (mapped === current && cleanString(tenant.stripeSubscriptionId) === cleanString(subscription.id)) {
+    return tenant;
+  }
+
+  return updateTenantSubscription(pool, { tenantId: tenant.id }, {
+    subscriptionStatus: mapped,
+    stripeCustomerId: customerId,
+    stripeSubscriptionId: subscription.id
+  });
+}
+
 async function ensureStripeCustomer(stripe, pool, user, tenant) {
   if (tenant?.stripeCustomerId) {
     try {
@@ -191,10 +233,10 @@ async function ensureStripeCustomer(stripe, pool, user, tenant) {
 function resolveCheckoutUrls(reqBody) {
   const cpanelBase = cleanString(process.env.SAAS_CPANEL_BASE_URL).replace(/\/$/, '');
   const defaultSuccess = cpanelBase
-    ? cpanelBase + '/horizonpipe-cpanel/billing.html?billing=success'
+    ? cpanelBase + '/horizonpipe-cpanel/index.html?billing=success'
     : '';
   const defaultCancel = cpanelBase
-    ? cpanelBase + '/horizonpipe-cpanel/billing.html?billing=canceled'
+    ? cpanelBase + '/horizonpipe-cpanel/index.html?billing=canceled'
     : '';
 
   const success =
@@ -254,6 +296,7 @@ module.exports = {
   findTenantByStripeSubscription,
   findTenantByOwnerUserId,
   updateTenantSubscription,
+  syncTenantSubscriptionFromStripe,
   ensureStripeCustomer,
   resolveCheckoutUrls,
   billingStatusSummary

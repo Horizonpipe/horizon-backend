@@ -66,6 +66,8 @@ const {
   assertKeyWithinTenantRoot
 } = require('./lib/tenant-storage-context');
 const { evaluateSaasCustomerLoginAccess } = require('./lib/saas-customer-access');
+const { upsertTenantDraft } = require('./tenant-provisioning.service');
+const { isSaasTenantCorsOrigin } = require('./lib/saas-cors');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -88,6 +90,9 @@ const corsOptions = {
       return callback(null, true);
     }
     if (CORS_ORIGINS.includes(origin)) {
+      return callback(null, origin);
+    }
+    if (isSaasTenantCorsOrigin(origin)) {
       return callback(null, origin);
     }
     return callback(new Error(`CORS blocked for origin: ${origin}`));
@@ -2666,11 +2671,57 @@ function snapshotUserMatchesLogin(user, submittedUsername) {
   return username === needle || displayName === needle || (!!email && email === needle);
 }
 
-async function readLoginUserFromWasabiSnapshot(submittedUsername) {
-  const snapshot = await loadWasabiLatestStateSnapshot();
-  if (!snapshotLooksFresh(snapshot, WASABI_LOGIN_FALLBACK_MAX_SNAPSHOT_AGE_MS)) return null;
+async function readLoginUserFromWasabiSnapshot(submittedUsername, force = false) {
+  const snapshot = await loadWasabiLatestStateSnapshot(force);
+  if (!snapshot) return null;
   const users = snapshotRows(snapshot, 'users');
   return users.find((row) => snapshotUserMatchesLogin(row, submittedUsername)) || null;
+}
+
+/** Persist Wasabi self-signup users in Postgres so login survives snapshot merges/refreshes. */
+async function mirrorSelfSignupUserToPostgres(userRow) {
+  if (!userRow || userRow.self_signup !== true) return;
+  const id = Number(userRow.id);
+  if (!Number.isFinite(id) || id <= 0) return;
+  const email = String(userRow.email || userRow.username || '')
+    .trim()
+    .toLowerCase();
+  if (!email) return;
+  const roles = normalizeRoles(userRow.roles);
+  await pool.query(
+    `INSERT INTO users (
+       id, username, display_name, password, is_admin, account_type, employee_role, roles,
+       must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted,
+       self_signup, email, first_name, last_name, company, title, phone, email_verified
+     ) VALUES (
+       $1, $2, $3, $4, false, 'customer', NULL, $5::jsonb, false, NULL, NULL, false,
+       true, $6, $7, $8, $9, $10, $11, true
+     )
+     ON CONFLICT (id) DO UPDATE SET
+       username = EXCLUDED.username,
+       display_name = EXCLUDED.display_name,
+       password = EXCLUDED.password,
+       email = EXCLUDED.email,
+       first_name = EXCLUDED.first_name,
+       last_name = EXCLUDED.last_name,
+       company = EXCLUDED.company,
+       self_signup = true,
+       email_verified = true,
+       updated_at = NOW()`,
+    [
+      id,
+      email,
+      String(userRow.display_name || userRow.displayName || email),
+      String(userRow.password || ''),
+      JSON.stringify(roles),
+      email,
+      String(userRow.first_name || userRow.firstName || ''),
+      String(userRow.last_name || userRow.lastName || ''),
+      String(userRow.company || ''),
+      userRow.title == null ? null : String(userRow.title),
+      userRow.phone == null ? null : String(userRow.phone)
+    ]
+  );
 }
 
 function sortPlannerRecordsForList(records) {
@@ -6685,10 +6736,16 @@ app.post('/login', async (req, res) => {
       row = result.rows[0] || null;
     } catch (queryError) {
       if (!WASABI_LOGIN_FALLBACK_ENABLED) throw queryError;
-      row = await readLoginUserFromWasabiSnapshot(submittedUsername);
+      row = await readLoginUserFromWasabiSnapshot(submittedUsername, true);
       userRowFromWasabi = !!row;
       if (!row) throw queryError;
-      console.warn('[login] using Wasabi user lookup fallback');
+      console.warn('[login] using Wasabi user lookup fallback (postgres query error)');
+    }
+
+    if (!row && WASABI_LOGIN_FALLBACK_ENABLED) {
+      row = await readLoginUserFromWasabiSnapshot(submittedUsername, true);
+      userRowFromWasabi = !!row;
+      if (row) console.warn('[login] using Wasabi user lookup (self-signup user not mirrored in Postgres)');
     }
 
     if (!row) {
@@ -10938,9 +10995,12 @@ async function querySignupDataWithWasabiFallback(text, params = []) {
   return pool.query(text, params);
 }
 
-async function verifySignupWithWasabi({ email, pin }) {
+async function verifySignupWithWasabi({ email, pin, signupContext }) {
   if (!WASABI_SIGNUP_PRIMARY_ENABLED) return null;
+  const saasSignup = String(signupContext || '').trim().toLowerCase() === 'saas';
   let response = null;
+  let createdUserRow = null;
+  let createdCompany = '';
   const wrote = await tryWasabiStateWrite('signup-verify', async (data) => {
     const verifications = ensureSnapshotTable(data, 'signup_verifications');
     const users = ensureSnapshotTable(data, 'users');
@@ -11005,6 +11065,8 @@ async function verifySignupWithWasabi({ email, pin }) {
       display_name: displayName,
       password: String(row.password_hash || ''),
       is_admin: false,
+      account_type: 'customer',
+      employee_role: null,
       roles,
       must_change_password: false,
       portal_files_client_id: null,
@@ -11024,17 +11086,55 @@ async function verifySignupWithWasabi({ email, pin }) {
     };
     users.push(userRow);
     verifications.splice(idx, 1);
-    response = {
-      status: 200,
-      body: {
-        success: true,
-        user: normalizeUser(userRow),
-        requiresApproval: true,
-        message: 'Account created. An administrator must grant access before you can sign in.'
-      }
-    };
+    createdUserRow = userRow;
+    createdCompany = String(row.company || '').trim();
+    if (!saasSignup) {
+      response = {
+        status: 200,
+        body: {
+          success: true,
+          user: normalizeUser(userRow),
+          requiresApproval: true,
+          message: 'Account created. An administrator must grant access before you can sign in.'
+        }
+      };
+    }
   });
-  if (wrote && response) return response;
+  if (!wrote) return response;
+
+  if (saasSignup && createdUserRow) {
+    const companyName = createdCompany || createdUserRow.username.split('@')[0] || 'Workspace';
+    try {
+      await upsertTenantDraft(pool, createdUserRow.id, {
+        businessName: companyName,
+        branding: { businessName: companyName }
+      });
+      await mirrorSelfSignupUserToPostgres(createdUserRow);
+      const user = await attachScopesToUser(normalizeUser(createdUserRow));
+      const token = await issueSession(createdUserRow.id, { keepSession: false });
+      return {
+        status: 200,
+        body: {
+          success: true,
+          user,
+          token,
+          capabilities: resolveCapabilities(user),
+          message: 'Account created. Taking you to your control panel.'
+        }
+      };
+    } catch (error) {
+      console.error('[signup] Wasabi SaaS verify follow-up failed:', error);
+      return {
+        status: 500,
+        body: {
+          success: false,
+          error: 'Account created but sign-in could not be completed. Please try signing in.'
+        }
+      };
+    }
+  }
+
+  if (response) return response;
   return null;
 }
 
@@ -11055,6 +11155,8 @@ registerSignupRoutes(app, {
   cleanString,
   normalizeRoles,
   issueSession,
+  attachScopesToUser,
+  resolveCapabilities,
   normalizeUser
 });
 registerAccountRoutes(app, {

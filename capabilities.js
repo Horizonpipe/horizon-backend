@@ -92,15 +92,22 @@ function inferModelFromLegacy(userLike) {
 }
 
 function deriveAccountModel(userLike) {
+  /** Self-signup (pipeshare.net SaaS or client portal request) is always a customer account. */
+  if (userLike?.self_signup === true || userLike?.selfSignup === true) {
+    return { accountType: ACCOUNT_TYPES.CUSTOMER, employeeRole: null };
+  }
   const accountType = normalizeAccountType(userLike?.accountType || userLike?.account_type);
   const explicitRole = normalizeEmployeeRole(userLike?.employeeRole || userLike?.employee_role);
-  if (accountType === ACCOUNT_TYPES.EMPLOYEE && explicitRole) {
-    return { accountType, employeeRole: explicitRole };
-  }
   if (accountType === ACCOUNT_TYPES.CUSTOMER) {
     return { accountType: ACCOUNT_TYPES.CUSTOMER, employeeRole: null };
   }
+  if (accountType === ACCOUNT_TYPES.EMPLOYEE && explicitRole) {
+    return { accountType, employeeRole: explicitRole };
+  }
   const inferred = inferModelFromLegacy(userLike);
+  if (inferred.accountType === ACCOUNT_TYPES.CUSTOMER) {
+    return { accountType: ACCOUNT_TYPES.CUSTOMER, employeeRole: null };
+  }
   return {
     accountType: ACCOUNT_TYPES.EMPLOYEE,
     employeeRole: inferred.employeeRole || EMPLOYEE_ROLES.CAMERA_OPERATOR

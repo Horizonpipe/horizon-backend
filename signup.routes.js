@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const { isSaasSignupRequest } = require('./lib/saas-signup-context');
+const { upsertTenantDraft } = require('./tenant-provisioning.service');
 
 const SIGNUP_PIN_TTL_MIN = Number(process.env.SIGNUP_PIN_TTL_MIN || 30);
 const RESEND_COOLDOWN_SEC = Math.max(30, Number(process.env.SIGNUP_RESEND_COOLDOWN_SEC || 60));
@@ -135,10 +136,20 @@ async function sendApprovalRequestEmail(payload) {
 
 /**
  * @param {import('express').Express} app
- * @param {{ pool: import('pg').Pool, query?: (text: string, params?: unknown[]) => Promise<{rows: unknown[], rowCount?: number}>, verifySignupWithWasabi?: (payload: {email: string, pin: string}) => Promise<{status: number, body: Record<string, unknown>} | null>, cleanString: (v: unknown) => string, normalizeRoles: (v: unknown) => object, normalizeUser: (row: object) => object }} deps
+ * @param {{ pool: import('pg').Pool, query?: (text: string, params?: unknown[]) => Promise<{rows: unknown[], rowCount?: number}>, verifySignupWithWasabi?: (payload: {email: string, pin: string, signupContext?: string}) => Promise<{status: number, body: Record<string, unknown>} | null>, cleanString: (v: unknown) => string, normalizeRoles: (v: unknown) => object, normalizeUser: (row: object) => object, issueSession?: (userId: string|number, options?: {keepSession?: boolean}) => Promise<string>, attachScopesToUser?: (user: object) => Promise<object>, resolveCapabilities?: (user: object) => object }} deps
  */
 function registerSignupRoutes(app, deps) {
-  const { pool, query, verifySignupWithWasabi, cleanString, normalizeRoles, normalizeUser } = deps;
+  const {
+    pool,
+    query,
+    verifySignupWithWasabi,
+    cleanString,
+    normalizeRoles,
+    normalizeUser,
+    issueSession,
+    attachScopesToUser,
+    resolveCapabilities
+  } = deps;
   const dbQuery =
     typeof query === 'function'
       ? query
@@ -332,9 +343,15 @@ function registerSignupRoutes(app, deps) {
       return res.status(400).json({ success: false, error: 'Enter the 6-digit code from your email' });
     }
 
+    const saasSignup = isSaasSignupRequest(req);
+
     if (typeof verifySignupWithWasabi === 'function') {
       try {
-        const wasabiResult = await verifySignupWithWasabi({ email, pin });
+        const wasabiResult = await verifySignupWithWasabi({
+          email,
+          pin,
+          signupContext: saasSignup ? 'saas' : 'non-saas'
+        });
         if (wasabiResult && typeof wasabiResult === 'object') {
           return res.status(Number(wasabiResult.status || 200)).json(wasabiResult.body || {});
         }
@@ -407,9 +424,51 @@ function registerSignupRoutes(app, deps) {
         throw e;
       }
 
+      const userRow = inserted.rows[0];
+
+      /** pipeshare.net business sign-up → cPanel immediately; client portal sign-up waits for admin. */
+      if (saasSignup) {
+        if (typeof issueSession !== 'function' || typeof attachScopesToUser !== 'function') {
+          console.error('[signup] SaaS verify missing issueSession/attachScopesToUser');
+          await dbQuery(`DELETE FROM users WHERE CAST(id AS text) = $1`, [String(userRow.id)]);
+          return res.status(500).json({
+            success: false,
+            error: 'Account could not be completed. Please try again or contact support.'
+          });
+        }
+        const companyName = cleanString(row.company);
+        if (!companyName) {
+          await dbQuery(`DELETE FROM users WHERE CAST(id AS text) = $1`, [String(userRow.id)]);
+          return res.status(400).json({ success: false, error: 'Company is required' });
+        }
+        try {
+          await upsertTenantDraft(pool, userRow.id, {
+            businessName: companyName,
+            branding: { businessName: companyName }
+          });
+        } catch (tenantError) {
+          console.error('[signup] SaaS tenant draft failed:', tenantError);
+          await dbQuery(`DELETE FROM users WHERE CAST(id AS text) = $1`, [String(userRow.id)]);
+          return res.status(500).json({
+            success: false,
+            error: 'Could not set up your workspace. Please try again or contact support.'
+          });
+        }
+        await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
+        const user = await attachScopesToUser(normalizeUser(userRow));
+        const token = await issueSession(userRow.id, { keepSession: false });
+        return res.json({
+          success: true,
+          user,
+          token,
+          capabilities:
+            typeof resolveCapabilities === 'function' ? resolveCapabilities(user) : undefined,
+          message: 'Account created. Taking you to your control panel.'
+        });
+      }
+
       await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
 
-      const userRow = inserted.rows[0];
       const user = normalizeUser(userRow);
       res.json({
         success: true,
