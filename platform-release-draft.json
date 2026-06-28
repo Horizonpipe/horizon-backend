@@ -1,10 +1,13 @@
 {
-  "title": "SaaS BrandColors theme + portal file fix",
-  "description": "Tenant setup colors now create a BrandColors theme and auto-apply on {Company}.pipeshare.net. The theme menu shows PIPESHARE instead of ONBRAND on SaaS hosts. Fixed portal file explorer error for SaaS tenants (Wasabi adapter blocking saas_tenant_instances queries).",
+  "title": "Remote assistance — reconnect and admin video fix",
+  "description": "Remote help on pipeshare.live is more reliable when the WebRTC path drops or the admin panel loses the customer video.\n\nCustomer and admin clients now queue signals during reconnect, restore recvonly transceivers, retry attach and signal polling, and guard teardown so a brief disconnect does not kill the session. Admin remote panel shows clearer viewport status and optional webrtcDebug.\n\nBackend remote-signal events fan out through broadcastSupportEvents so SSE subscribers (admin queue) receive offers, answers, and ICE in real time.\n\nWho is affected: PipeShare remote help over HTTPS (WebRTC). OVH non-SaaS deploy receives this via platform release dbg164.",
   "changeLog": [
-    "BrandColors theme generated from setup wizard primary/accent colors.",
-    "SaaS theme picker: ONBRAND renamed to PIPESHARE; BrandColors appears when colors are set.",
-    "saas-tenant-branding.js calls applyTenantBrandColors (was broken applyTenantBrand).",
-    "Postgres live-query allowlist includes saas_tenant_instances for tenant virtualbox file access."
-  ]
+    "Signal queue and reconnect on customer WebRTC client.",
+    "Restore recvonly transceiver and stopPublishTracks on reconnect.",
+    "Signal poll resilience, attach retry, frame backup, teardown guards.",
+    "Admin panel viewport status and webrtcDebug hook.",
+    "Remote-signal SSE fan-out via broadcastSupportEvents.",
+    "Cache bust dbg164 on portal and customer-support addon."
+  ],
+  "updatedAt": "2026-06-29T00:15:00.000Z"
 }
