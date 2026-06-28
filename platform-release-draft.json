@@ -1,10 +1,13 @@
 {
-  "title": "Fix PDF Viewer boot crash — duplicate timer declaration (dbg84)",
-  "description": "dbg83 introduced a duplicate `let planBoardViewerCanvasRepaintTimer` in app.js, which caused a SyntaxError and blocked PipeSync from loading. Removed the duplicate declaration; cache bust dbg84.\n\nPDF Viewer continuous scroll (dbg83) is otherwise unchanged. Hard-refresh PipeSync after deploy.",
+  "title": "PDF Viewer: fit-to-width, streaming load, no remount storms (dbg85)",
+  "description": "Fixes three PDF Viewer issues from dbg83/84: pages appeared over-zoomed (fit used scaled layout width instead of viewerBaseW), slow or failed loads (entire archive was downloaded into memory before pdf.js), and random refreshes (every ensure/remount destroyed and rebuilt the viewer).\n\nNow: stream PDF via URL with range requests, idempotent mount (skip if same plan signature), auto fit-to-width on first open, tile cache for scroll-back, and fit runs after mount. Hard-refresh PipeSync (dbg85).",
   "changeLog": [
-    "Fix SyntaxError: planBoardViewerCanvasRepaintTimer already declared.",
-    "PipeSync boots again; PDF Viewer continuous module can load.",
-    "Cache bust dbg84."
+    "Fit-to-width uses viewerBaseW so pages are not over-zoomed.",
+    "PDF.js streams archive URL — no full arrayBuffer download first.",
+    "Idempotent continuous viewer mount stops remount/refresh loops.",
+    "Tile cache (48 pages) for faster scroll-back.",
+    "Mount generation guard cancels stale async loads.",
+    "Cache bust dbg85."
   ],
-  "updatedAt": "2026-06-28T05:05:00.000Z"
+  "updatedAt": "2026-06-28T05:15:00.000Z"
 }
