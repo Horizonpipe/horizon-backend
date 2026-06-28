@@ -1,11 +1,11 @@
 {
-  "title": "PDF Viewer Gap slider fix",
-  "description": "The Gap slider (vertical spacing between stacked PDF pages in Viewer mode) no longer freezes mid-drag. Previously each tiny drag step triggered a full UI re-render, which destroyed the slider and broke pointer capture.\n\nThe fix updates page positions incrementally while dragging (rAF-throttled, light DOM sync only) and saves the full layout when you release the slider.\n\nHard-refresh PipeSync after deploy (dbg57).\n\nWho is affected: Private OVH server.",
+  "title": "PDF Viewer duplicate sheets + grey borders fix",
+  "description": "PDF Viewer no longer shows duplicate sheets or zoomed-in half-page copies. Viewer workspaces were built with the map board's 5× footprint multiplier, making display boxes much larger than the PDF — that looked like a zoomed duplicate next to a full sheet. Duplicate storageKeys are now deduped on load.\n\nGrey borders around the viewer stack are removed: white background, zero bounds padding, left-aligned pages (no side gutters).\n\nHard-refresh PipeSync after deploy (dbg58).\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "Fix PDF Viewer Gap slider freezing during drag.",
-    "Gap layout updates use incremental DOM sync instead of full render.",
-    "Full bounds sync and persist on slider release only.",
-    "Cache bust dbg57."
+    "Fix viewer duplicate/zoomed sheets (footprint mul only on map, dedupe by storageKey).",
+    "Repair viewer page dimensions to intrinsic PDF size on layout normalize.",
+    "Remove grey viewer borders (white background, zero pad, left align).",
+    "Cache bust dbg58."
   ],
-  "updatedAt": "2026-06-28T18:00:00.000Z"
+  "updatedAt": "2026-06-28T20:00:00.000Z"
 }
