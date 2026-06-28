@@ -108,6 +108,22 @@ function cleanString(v) {
   return String(v ?? '').trim();
 }
 
+async function lookupUserDisplayName(pool, userId) {
+  const uid = cleanString(userId);
+  if (!uid) return 'User';
+  try {
+    const r = await pool.query(
+      `SELECT display_name, username, email FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
+      [uid]
+    );
+    const row = r.rows[0];
+    if (!row) return 'User';
+    return cleanString(row.display_name) || cleanString(row.username) || cleanString(row.email) || 'User';
+  } catch {
+    return 'User';
+  }
+}
+
 function jsonError(res, status, message) {
   return res.status(status).json({ success: false, error: message });
 }
@@ -821,7 +837,9 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         sessionId,
         customerUserId,
         customerTabId,
-        adminUserId: req.user.id
+        adminUserId: req.user.id,
+        adminDisplayName:
+          cleanString(req.user.displayName) || cleanString(req.user.username) || cleanString(req.user.email) || 'Support'
       });
       return res.json({ success: true, sessionId, status: 'pending' });
     } catch (error) {
@@ -879,7 +897,9 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         sessionId,
         status,
         customerUserId: req.user.id,
-        adminUserId: row.admin_user_id
+        adminUserId: row.admin_user_id,
+        customerDisplayName:
+          cleanString(req.user.displayName) || cleanString(req.user.username) || cleanString(req.user.email) || 'Customer'
       });
       return res.json({ success: true, sessionId, status });
     } catch (error) {
@@ -896,6 +916,10 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       });
       if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
       const row = loaded.row;
+      const [customerDisplayName, adminDisplayName] = await Promise.all([
+        lookupUserDisplayName(pool, row.customer_user_id),
+        lookupUserDisplayName(pool, row.admin_user_id)
+      ]);
       const msgs = await pool.query(
         `SELECT id, session_id, sender_user_id, body, created_at
          FROM cp_support_chat_messages WHERE session_id = $1 ORDER BY created_at ASC`,
@@ -907,7 +931,9 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
           id: row.id,
           status: row.status,
           customerUserId: row.customer_user_id,
-          adminUserId: row.admin_user_id
+          adminUserId: row.admin_user_id,
+          customerDisplayName,
+          adminDisplayName
         },
         messages: msgs.rows.map((m) => ({
           id: m.id,
