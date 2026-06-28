@@ -3,6 +3,25 @@
 const crypto = require('crypto');
 const { canAccessAdminPanel, looksLikeMike, ACCOUNT_TYPES } = require('./capabilities');
 const { loadUserCompanyMembership } = require('./company-permissions.service');
+const {
+  MAX_CHAT_UPLOAD_BYTES,
+  buildChatUploadStorageKey,
+  isValidChatUploadStorageKey,
+  isChatUploadExpired,
+  createChatUploadWasabiClient,
+  chatUploadBucketName,
+  presignChatUploadPut,
+  presignChatUploadGet,
+  headChatUploadObject
+} = require('./chat-uploads-wasabi.js');
+
+/** Lazy Wasabi client for support chat file uploads (same env as portal-files). */
+let chatUploadWasabiClient = null;
+function getChatUploadWasabi() {
+  if (chatUploadWasabiClient !== null) return chatUploadWasabiClient;
+  chatUploadWasabiClient = createChatUploadWasabiClient();
+  return chatUploadWasabiClient;
+}
 
 /** Shared Postgres pool for non-SaaS (OVH) presence when user has no saas_tenant_instances row. */
 const NON_SAAS_GLOBAL_TENANT_ID = '00000000-0000-0000-0000-000000000001';
@@ -1095,6 +1114,205 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
+  /** Presign PUT to Wasabi chat-uploads/{tenantId}/{sessionId}/{fileId}-{filename}. */
+  app.post('/saas/support/chat/:sessionId/file-upload/init', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const s3 = getChatUploadWasabi();
+      const bucket = chatUploadBucketName();
+      if (!s3 || !bucket) {
+        return jsonError(res, 503, 'Chat file storage is not configured (Wasabi env missing)');
+      }
+
+      const sessionId = cleanString(req.params.sessionId);
+      const fileName = cleanString(req.body?.fileName || req.body?.name).slice(0, 255);
+      const mimeType = cleanString(req.body?.mimeType || 'application/octet-stream').slice(0, 128);
+      const fileSize = Number(req.body?.fileSize ?? req.body?.size);
+      if (!fileName) return jsonError(res, 400, 'fileName is required');
+      if (!Number.isFinite(fileSize) || fileSize <= 0) return jsonError(res, 400, 'fileSize must be a positive number');
+      if (fileSize > MAX_CHAT_UPLOAD_BYTES) {
+        return jsonError(res, 400, `File exceeds ${MAX_CHAT_UPLOAD_BYTES} byte limit`);
+      }
+
+      const loaded = await loadChatSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (row.status !== 'active') return jsonError(res, 400, 'Chat is not active');
+      const uid = String(req.user.id);
+      if (uid !== String(row.customer_user_id) && uid !== String(row.admin_user_id)) {
+        return jsonError(res, 403, 'Not a participant in this chat');
+      }
+
+      const built = buildChatUploadStorageKey(row.tenant_id, sessionId, fileName);
+      const presigned = await presignChatUploadPut(s3, bucket, built.wasabiKey, mimeType, built.expiresAt);
+      return res.json({
+        success: true,
+        fileId: built.fileId,
+        wasabiKey: built.wasabiKey,
+        uploadUrl: presigned.url,
+        uploadMethod: presigned.method,
+        uploadHeaders: presigned.headers,
+        uploadExpiresIn: presigned.expiresIn,
+        expiresAt: built.expiresAt,
+        maxBytes: MAX_CHAT_UPLOAD_BYTES
+      });
+    } catch (error) {
+      console.error('[saas/support/chat/file-upload/init POST]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  /** After browser PUT to Wasabi, persist chat message and notify both peers. */
+  app.post('/saas/support/chat/:sessionId/file-upload/complete', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const s3 = getChatUploadWasabi();
+      const bucket = chatUploadBucketName();
+      if (!s3 || !bucket) {
+        return jsonError(res, 503, 'Chat file storage is not configured (Wasabi env missing)');
+      }
+
+      const sessionId = cleanString(req.params.sessionId);
+      const wasabiKey = cleanString(req.body?.wasabiKey);
+      const fileName = cleanString(req.body?.fileName || req.body?.name).slice(0, 255);
+      const mimeType = cleanString(req.body?.mimeType || 'application/octet-stream').slice(0, 128);
+      const expiresAt = cleanString(req.body?.expiresAt);
+      const reportedSize = Number(req.body?.fileSize ?? req.body?.size);
+      if (!wasabiKey || !fileName) return jsonError(res, 400, 'wasabiKey and fileName are required');
+      if (!expiresAt) return jsonError(res, 400, 'expiresAt is required');
+      if (isChatUploadExpired(expiresAt)) return jsonError(res, 410, 'Upload slot expired');
+
+      const loaded = await loadChatSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (row.status !== 'active') return jsonError(res, 400, 'Chat is not active');
+      const uid = String(req.user.id);
+      if (uid !== String(row.customer_user_id) && uid !== String(row.admin_user_id)) {
+        return jsonError(res, 403, 'Not a participant in this chat');
+      }
+      if (!isValidChatUploadStorageKey(wasabiKey, row.tenant_id, sessionId)) {
+        return jsonError(res, 400, 'Invalid wasabiKey for this chat session');
+      }
+
+      let head;
+      try {
+        head = await headChatUploadObject(s3, bucket, wasabiKey);
+      } catch {
+        return jsonError(res, 400, 'Uploaded file not found in storage — finish PUT before complete');
+      }
+      const storedSize = Number(head.ContentLength || 0);
+      if (!storedSize || storedSize > MAX_CHAT_UPLOAD_BYTES) {
+        return jsonError(res, 400, 'Uploaded file size is invalid');
+      }
+      if (Number.isFinite(reportedSize) && reportedSize > 0 && Math.abs(storedSize - reportedSize) > 4096) {
+        return jsonError(res, 400, 'Uploaded file size mismatch');
+      }
+
+      const attachment = {
+        name: fileName,
+        mimeType,
+        size: storedSize,
+        wasabiKey,
+        expiresAt
+      };
+      const message = await insertChatMessageRow(pool, {
+        sessionId,
+        senderUserId: req.user.id,
+        body: `Shared file: ${fileName}`,
+        messageType: 'file',
+        attachment
+      });
+      const mapped = mapChatMessageRow(message);
+      broadcastSupportEvents(row.tenant_id, 'chat-message', {
+        sessionId: String(sessionId),
+        message: mapped
+      });
+      broadcastSupportEvents(row.tenant_id, 'chat-file-uploaded', {
+        sessionId: String(sessionId),
+        message: mapped
+      });
+      return res.json({ success: true, message: mapped });
+    } catch (error) {
+      console.error('[saas/support/chat/file-upload/complete POST]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  /** Presign GET for a stored chat file (checks DB message + retention). */
+  app.post('/saas/support/chat/:sessionId/file-download/presign', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const s3 = getChatUploadWasabi();
+      const bucket = chatUploadBucketName();
+      if (!s3 || !bucket) {
+        return jsonError(res, 503, 'Chat file storage is not configured (Wasabi env missing)');
+      }
+
+      const sessionId = cleanString(req.params.sessionId);
+      const messageId = cleanString(req.body?.messageId);
+      const wasabiKeyBody = cleanString(req.body?.wasabiKey);
+      if (!messageId && !wasabiKeyBody) return jsonError(res, 400, 'messageId or wasabiKey is required');
+
+      const loaded = await loadChatSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      const uid = String(req.user.id);
+      if (uid !== String(row.customer_user_id) && uid !== String(row.admin_user_id)) {
+        return jsonError(res, 403, 'Not a participant in this chat');
+      }
+
+      let attachment = null;
+      let fileName = 'download';
+      if (messageId) {
+        const msgRow = await pool.query(
+          `SELECT id, message_type, attachment FROM cp_support_chat_messages
+           WHERE id = $1 AND session_id = $2 LIMIT 1`,
+          [messageId, sessionId]
+        );
+        const m = msgRow.rows[0];
+        if (!m) return jsonError(res, 404, 'Message not found');
+        if (String(m.message_type || '') !== 'file') return jsonError(res, 400, 'Message is not a file');
+        attachment = m.attachment;
+        if (typeof attachment === 'string') {
+          try {
+            attachment = JSON.parse(attachment);
+          } catch {
+            attachment = null;
+          }
+        }
+      } else {
+        attachment = { wasabiKey: wasabiKeyBody };
+      }
+
+      const wasabiKey = cleanString(attachment?.wasabiKey);
+      if (!wasabiKey) return jsonError(res, 400, 'File is not stored in object storage');
+      if (!isValidChatUploadStorageKey(wasabiKey, row.tenant_id, sessionId)) {
+        return jsonError(res, 403, 'Invalid file key for this session');
+      }
+      const expiresAt = cleanString(attachment?.expiresAt);
+      if (isChatUploadExpired(expiresAt)) {
+        return jsonError(res, 410, 'File has expired and is no longer available');
+      }
+      fileName = cleanString(attachment?.name || attachment?.fileName || fileName).slice(0, 255) || 'download';
+
+      const presigned = await presignChatUploadGet(s3, bucket, wasabiKey);
+      return res.json({
+        success: true,
+        url: presigned.url,
+        expiresIn: presigned.expiresIn,
+        fileName,
+        mimeType: cleanString(attachment?.mimeType || 'application/octet-stream'),
+        size: Number(attachment?.size || 0) || null
+      });
+    } catch (error) {
+      console.error('[saas/support/chat/file-download/presign POST]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
   app.post('/saas/support/chat/:sessionId/file-offer', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       pruneExpiredFileOffers();
@@ -1352,6 +1570,9 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       }
       if (row.status !== 'pending') {
         return res.json({ success: true, sessionId, status: row.status, persistToken: row.persist_token });
+      }
+      if (String(row.initiated_by || 'admin') !== 'admin') {
+        return jsonError(res, 400, 'This remote session is waiting for admin response');
       }
 
       const status = accept ? 'active' : 'declined';
@@ -1781,12 +2002,13 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     try {
       const uid = String(req.user.id);
       const r = await pool.query(
-        `SELECT id, tenant_id, customer_user_id, admin_user_id, status, persist_token, customer_tab_id, created_at, updated_at
+        `SELECT id, tenant_id, customer_user_id, admin_user_id, status, persist_token, customer_tab_id, initiated_by, created_at, updated_at
          FROM cp_support_remote_sessions
          WHERE ended_at IS NULL
            AND (
              (status = 'active' AND (customer_user_id = $1 OR admin_user_id = $1))
-             OR (status = 'pending' AND customer_user_id = $1)
+             OR (status = 'pending' AND customer_user_id = $1 AND initiated_by = 'admin')
+             OR (status = 'pending' AND admin_user_id = $1 AND initiated_by = 'customer')
            )
          ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, updated_at DESC LIMIT 1`,
         [uid]
@@ -1802,6 +2024,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
           adminUserId: row.admin_user_id,
           persistToken: row.persist_token,
           customerTabId: row.customer_tab_id,
+          initiatedBy: row.initiated_by || 'admin',
           createdAt: row.created_at,
           updatedAt: row.updated_at
         }

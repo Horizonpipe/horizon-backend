@@ -1,14 +1,16 @@
 {
-  "title": "Support chat toolbar: capture, files, remote help (dbg147)",
-  "description": "PipeShare support chat now has a live-session toolbar with Minimize, Screen capture (snipping tool), Upload file, and Request remote help (customers only). Screen capture minimizes chat, lets you drag-select a region, then auto-sends the screenshot as an in-chat image.\n\nFile send works via drag-and-drop or Upload file (single file or folder zipped client-side). The peer gets an in-chat Accept/Decline prompt; accept delivers the file, decline shows themed warning system messages on each side.\n\nCustomers in an active chat can request remote help; the connected admin sees Accept/Decline in chat. If accepted, the customer shares their tab to the admin using the existing WebRTC remote session flow (customer as sharer).\n\nWho is affected: Horizon admins and customers on the OVH private server using PipeShare support chat. Deploy horizon-backend (new routes + DB column migrations) and client-portal static assets (dbg147 cache bust). SaaS updates only via releases.html.",
+  "title": "Support chat Wasabi file transfer (dbg149)",
+  "description": "PipeShare support chat file upload and download now use Wasabi object storage instead of the dbg147 in-memory base64 file-offer flow. Upload picks a single file or folder (folder is zipped client-side), shows a theme-matched progress bar, and posts a file message visible to both chat participants via SSE. Screen capture (region snip) uses the same Wasabi upload path — PNG screenshots appear inline in chat for both parties; click to download with progress.\n\nAlso includes dbg148 remote-help fixes (customer no longer sees admin consent modal; admin Accept/Decline in chat) and pill-styled chat toolbar.\n\nStorage path: chat-uploads/{tenantId}/{sessionId}/{fileId}-{filename}. Files carry a 10-day expiresAt in message metadata; expired downloads are rejected (optional lifecycle/cron cleanup can scan the prefix).\n\nWho is affected: Horizon admins and customers on the OVH private server using PipeShare support chat. Deploy horizon-backend (Wasabi routes + remote/active guards) and client-portal static assets (dbg149). SaaS updates only via releases.html.",
   "changeLog": [
-    "Chat header toolbar: Minimize, Screen capture, Upload file, Request remote help.",
-    "Snipping overlay with theme crosshair; screenshot auto-sent as chat image.",
-    "Drag-and-drop and file/folder upload with peer accept/decline flow.",
-    "Customer-initiated remote help with admin in-chat consent and WebRTC attach.",
-    "System messages: info and warning variants; image/file attachment rendering.",
-    "Backend: attachment upload, file-offer/respond, customer-request/admin-respond routes.",
-    "Cache bust dbg147 (portal runtime + PipeShare manifest)."
+    "Fix upload button doing nothing: file-offer only notified peer; replaced with direct Wasabi upload + chat message.",
+    "Fix screen capture: screenshots upload via Wasabi (same path as file upload) instead of legacy base64 /attachment.",
+    "Wasabi chat images show inline preview in chat; click image to download with progress bar.",
+    "Wasabi chat uploads: presign PUT init, complete message, presign GET download.",
+    "Theme-matched upload/download progress bars under chat messages.",
+    "File attachment bubbles in chat; click to confirm download.",
+    "SSE chat-message + chat-file-uploaded notify both peers when a file is shared.",
+    "dbg148 remote help: customer request flow + toolbar pill styling (included in same deploy batch).",
+    "Cache bust dbg149 (portal runtime + PipeShare manifest)."
   ],
-  "updatedAt": "2026-06-29T12:00:00.000Z"
+  "updatedAt": "2026-06-28T19:30:00.000Z"
 }
