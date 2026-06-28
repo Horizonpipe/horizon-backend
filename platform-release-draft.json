@@ -1,13 +1,14 @@
 {
-  "title": "Viewer tighter gaps + fit-to-width fix",
-  "description": "PDF Viewer inter-page grey spacing is reduced (~80%: default 8px → 2px, legacy stored 8px migrates to 2px). Fit-to-width now measures the scroll column width (not full host width including the plan library sidebar), which was causing ~35% horizontal clipping.\n\nHard-refresh PipeSync (dbg70). Open PDF Viewer, confirm sheets fit edge-to-edge and gaps between pages are minimal.",
+  "title": "PDF Viewer fit + tight page stack (dbg71)",
+  "description": "PipeSync PDF Viewer now fits sheets correctly at browser 100% zoom (no ~35% horizontal clipping). Fit width is measured from the plan panel, not the scroll column whose width is derived from zoom (that circular measure caused over-scaling). Stack spacing uses cropped visible page height plus a 1px default gap (legacy 8px/2px prefs migrate to 1px).\n\nHard-refresh PipeSync (dbg71). Open PDF Viewer with two stacked pages: sheets should fit with side margins, minimal grey between pages.",
   "changeLog": [
-    "Default page gap 8px → 2px; legacy 8px pref migrates to 2px.",
-    "Fit avail width prefers scroll.clientWidth over host.clientWidth.",
-    "Fit content width uses media footprint (natW − crops).",
-    "Safety 0.95, inset 4px (was 0.9 + 12px double-shrink).",
-    "Debug ingest logs for avail/zoom/gap (session d9d6c9).",
-    "Cache bust dbg70."
+    "Fit avail width from panel minus library (fixes circular scroll.clientWidth over-scale).",
+    "Fit safety 0.95 → 0.90; content width uses visible cropped footprint.",
+    "Stack Y uses planBoardViewerPageVisibleFootprint height + 1px gap default.",
+    "World bounds extents use visible footprint for tight sync.",
+    "Legacy gap prefs 8px/2px migrate to 1px.",
+    "Enhanced d9d6c9 ingest logs for 2-page stack diagnostics.",
+    "Cache bust dbg71."
   ],
-  "updatedAt": "2026-06-29T12:00:00.000Z"
+  "updatedAt": "2026-06-29T18:00:00.000Z"
 }
