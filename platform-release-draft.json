@@ -1,13 +1,14 @@
 {
-  "title": "Support chat: fix admin→customer delivery (dbg146)",
-  "description": "PipeShare support chat now delivers admin messages to customers reliably. The bug was in the customer accept flow: the 1s message poll was scheduled while the invite consent modal was still open, so isChatComposerLive() returned false and the poll timer never started. Inbound sync (poll + fetch) is now separated from composer/send gating — receiving messages no longer depends on the send box being enabled.\n\ndbg145 UI polish (avatars, display names, connected system line, theme tokens) is unchanged. Poll remains 1s during active sessions with immediate sync after send.\n\nWho is affected: Horizon admins and customers using PipeShare support chat on the OVH private server. Frontend-only fix — deploy client-portal static assets (dbg146 cache bust). No backend code change required for this fix.",
+  "title": "Support chat toolbar: capture, files, remote help (dbg147)",
+  "description": "PipeShare support chat now has a live-session toolbar with Minimize, Screen capture (snipping tool), Upload file, and Request remote help (customers only). Screen capture minimizes chat, lets you drag-select a region, then auto-sends the screenshot as an in-chat image.\n\nFile send works via drag-and-drop or Upload file (single file or folder zipped client-side). The peer gets an in-chat Accept/Decline prompt; accept delivers the file, decline shows themed warning system messages on each side.\n\nCustomers in an active chat can request remote help; the connected admin sees Accept/Decline in chat. If accepted, the customer shares their tab to the admin using the existing WebRTC remote session flow (customer as sharer).\n\nWho is affected: Horizon admins and customers on the OVH private server using PipeShare support chat. Deploy horizon-backend (new routes + DB column migrations) and client-portal static assets (dbg147 cache bust). SaaS updates only via releases.html.",
   "changeLog": [
-    "Fix customer chat poll never starting after accepting invite (admin→customer delivery).",
-    "Split isChatSessionActive (inbound sync) from isChatComposerLive (send only).",
-    "Defer scheduleChatPoll until after invite consent modal closes.",
-    "Reschedule poll when active session detected but timer missing.",
-    "dbg145 UI retained: avatars, names, connected message, theme styling.",
-    "Cache bust dbg146 (portal runtime + PipeShare/PipeSync manifests)."
+    "Chat header toolbar: Minimize, Screen capture, Upload file, Request remote help.",
+    "Snipping overlay with theme crosshair; screenshot auto-sent as chat image.",
+    "Drag-and-drop and file/folder upload with peer accept/decline flow.",
+    "Customer-initiated remote help with admin in-chat consent and WebRTC attach.",
+    "System messages: info and warning variants; image/file attachment rendering.",
+    "Backend: attachment upload, file-offer/respond, customer-request/admin-respond routes.",
+    "Cache bust dbg147 (portal runtime + PipeShare manifest)."
   ],
-  "updatedAt": "2026-06-29T03:00:00.000Z"
+  "updatedAt": "2026-06-29T12:00:00.000Z"
 }

@@ -103,6 +103,10 @@ const lastPresenceWriteMs = new Map();
 /** @type {Map<string, { id: number, at: number, fromUserId: string, type: string, payload: unknown }[]>} */
 const remoteSignalsBySession = new Map();
 const REMOTE_SIGNAL_BUFFER_MAX = 120;
+/** @type {Map<string, { id: string, sessionId: string, tenantId: string, fromUserId: string, toUserId: string, fileName: string, fileSize: number, mimeType: string, dataBase64: string, createdAt: number }>} */
+const fileOffersById = new Map();
+const FILE_OFFER_TTL_MS = 10 * 60 * 1000;
+const MAX_CHAT_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 
 function cleanString(v) {
   return String(v ?? '').trim();
@@ -326,6 +330,12 @@ async function initCustomerSupportSchema(pool) {
     `CREATE INDEX IF NOT EXISTS idx_cp_support_chat_messages_session ON cp_support_chat_messages (session_id, created_at ASC)`
   );
   await migrateSupportUserIdColumnToText(pool, 'cp_support_chat_messages', 'sender_user_id');
+  await pool.query(
+    `ALTER TABLE cp_support_chat_messages ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'text'`
+  );
+  await pool.query(
+    `ALTER TABLE cp_support_chat_messages ADD COLUMN IF NOT EXISTS attachment JSONB`
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS cp_support_remote_sessions (
@@ -346,6 +356,62 @@ async function initCustomerSupportSchema(pool) {
   );
   await migrateSupportUserIdColumnToText(pool, 'cp_support_remote_sessions', 'customer_user_id');
   await migrateSupportUserIdColumnToText(pool, 'cp_support_remote_sessions', 'admin_user_id');
+  await pool.query(
+    `ALTER TABLE cp_support_remote_sessions ADD COLUMN IF NOT EXISTS initiated_by TEXT NOT NULL DEFAULT 'admin'`
+  );
+  await pool.query(
+    `ALTER TABLE cp_support_remote_sessions ADD COLUMN IF NOT EXISTS chat_session_id UUID`
+  );
+}
+
+function pruneExpiredFileOffers() {
+  const now = Date.now();
+  for (const [id, offer] of fileOffersById) {
+    if (now - offer.createdAt > FILE_OFFER_TTL_MS) fileOffersById.delete(id);
+  }
+}
+
+function decodeAttachmentBase64(dataBase64) {
+  const raw = cleanString(dataBase64);
+  if (!raw) return null;
+  try {
+    const buf = Buffer.from(raw, 'base64');
+    if (!buf.length || buf.length > MAX_CHAT_ATTACHMENT_BYTES) return null;
+    return buf;
+  } catch {
+    return null;
+  }
+}
+
+async function insertChatMessageRow(pool, { sessionId, senderUserId, body, messageType = 'text', attachment = null }) {
+  const ins = await pool.query(
+    `INSERT INTO cp_support_chat_messages (session_id, sender_user_id, body, message_type, attachment)
+     VALUES ($1,$2,$3,$4,$5)
+     RETURNING id, session_id, sender_user_id, body, message_type, attachment, created_at`,
+    [sessionId, senderUserId, body, messageType, attachment ? JSON.stringify(attachment) : null]
+  );
+  await pool.query(`UPDATE cp_support_chat_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
+  return ins.rows[0];
+}
+
+function mapChatMessageRow(m) {
+  let attachment = m.attachment;
+  if (typeof attachment === 'string') {
+    try {
+      attachment = JSON.parse(attachment);
+    } catch {
+      attachment = null;
+    }
+  }
+  return {
+    id: m.id,
+    sessionId: m.session_id,
+    senderUserId: m.sender_user_id,
+    body: m.body,
+    messageType: m.message_type || 'text',
+    attachment,
+    createdAt: m.created_at
+  };
 }
 
 async function resolveTenantForUser(pool, user) {
@@ -921,7 +987,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         lookupUserDisplayName(pool, row.admin_user_id)
       ]);
       const msgs = await pool.query(
-        `SELECT id, session_id, sender_user_id, body, created_at
+        `SELECT id, session_id, sender_user_id, body, message_type, attachment, created_at
          FROM cp_support_chat_messages WHERE session_id = $1 ORDER BY created_at ASC`,
         [sessionId]
       );
@@ -935,13 +1001,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
           customerDisplayName,
           adminDisplayName
         },
-        messages: msgs.rows.map((m) => ({
-          id: m.id,
-          sessionId: m.session_id,
-          senderUserId: m.sender_user_id,
-          body: m.body,
-          createdAt: m.created_at
-        }))
+        messages: msgs.rows.map((m) => mapChatMessageRow(m))
       });
     } catch (error) {
       console.error('[saas/support/chat/messages GET]', error);
@@ -953,7 +1013,9 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     try {
       const sessionId = cleanString(req.params.sessionId);
       const body = cleanString(req.body?.body).slice(0, 4000);
-      if (!body) return jsonError(res, 400, 'Message body is required');
+      const messageType = cleanString(req.body?.messageType || 'text') || 'text';
+      const attachment = req.body?.attachment && typeof req.body.attachment === 'object' ? req.body.attachment : null;
+      if (!body && !attachment) return jsonError(res, 400, 'Message body or attachment is required');
 
       const loaded = await loadChatSessionForUser(pool, sessionId, req.user, {
         preferredTenantId: req.supportTenant.tenantId
@@ -966,35 +1028,214 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         return jsonError(res, 403, 'Not a participant in this chat');
       }
 
-      const ins = await pool.query(
-        `INSERT INTO cp_support_chat_messages (session_id, sender_user_id, body)
-         VALUES ($1,$2,$3)
-         RETURNING id, session_id, sender_user_id, body, created_at`,
-        [sessionId, req.user.id, body]
-      );
-      await pool.query(`UPDATE cp_support_chat_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
-      const message = ins.rows[0];
+      const message = await insertChatMessageRow(pool, {
+        sessionId,
+        senderUserId: req.user.id,
+        body: body || (attachment?.name ? `Sent ${attachment.name}` : 'Attachment'),
+        messageType,
+        attachment
+      });
       broadcastSupportEvents(row.tenant_id, 'chat-message', {
         sessionId: String(sessionId),
-        message: {
-          id: message.id,
-          senderUserId: message.sender_user_id,
-          body: message.body,
-          createdAt: message.created_at
-        }
+        message: mapChatMessageRow(message)
       });
       return res.json({
         success: true,
-        message: {
-          id: message.id,
-          sessionId: message.session_id,
-          senderUserId: message.sender_user_id,
-          body: message.body,
-          createdAt: message.created_at
-        }
+        message: mapChatMessageRow(message)
       });
     } catch (error) {
       console.error('[saas/support/chat/messages POST]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.post('/saas/support/chat/:sessionId/attachment', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const sessionId = cleanString(req.params.sessionId);
+      const messageType = cleanString(req.body?.messageType || 'image') || 'image';
+      const name = cleanString(req.body?.name || req.body?.attachment?.name || 'attachment').slice(0, 255);
+      const mimeType = cleanString(req.body?.mimeType || req.body?.attachment?.mimeType || 'application/octet-stream').slice(0, 128);
+      const dataBase64 = cleanString(req.body?.dataBase64 || req.body?.attachment?.dataBase64);
+      const caption = cleanString(req.body?.body || req.body?.caption).slice(0, 4000);
+      const buf = decodeAttachmentBase64(dataBase64);
+      if (!buf) return jsonError(res, 400, 'Valid attachment data is required (max 8 MB)');
+
+      const loaded = await loadChatSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (row.status !== 'active') return jsonError(res, 400, 'Chat is not active');
+      const uid = String(req.user.id);
+      if (uid !== String(row.customer_user_id) && uid !== String(row.admin_user_id)) {
+        return jsonError(res, 403, 'Not a participant in this chat');
+      }
+
+      const attachment = {
+        name,
+        mimeType,
+        size: buf.length,
+        dataBase64: buf.toString('base64')
+      };
+      const message = await insertChatMessageRow(pool, {
+        sessionId,
+        senderUserId: req.user.id,
+        body: caption || (messageType === 'image' ? 'Screenshot' : `File: ${name}`),
+        messageType,
+        attachment
+      });
+      broadcastSupportEvents(row.tenant_id, 'chat-message', {
+        sessionId: String(sessionId),
+        message: mapChatMessageRow(message)
+      });
+      return res.json({ success: true, message: mapChatMessageRow(message) });
+    } catch (error) {
+      console.error('[saas/support/chat/attachment POST]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.post('/saas/support/chat/:sessionId/file-offer', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      pruneExpiredFileOffers();
+      const sessionId = cleanString(req.params.sessionId);
+      const fileName = cleanString(req.body?.fileName || req.body?.name).slice(0, 255);
+      const mimeType = cleanString(req.body?.mimeType || 'application/octet-stream').slice(0, 128);
+      const dataBase64 = cleanString(req.body?.dataBase64);
+      if (!fileName) return jsonError(res, 400, 'fileName is required');
+      const buf = decodeAttachmentBase64(dataBase64);
+      if (!buf) return jsonError(res, 400, 'Valid file data is required (max 8 MB)');
+
+      const loaded = await loadChatSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (row.status !== 'active') return jsonError(res, 400, 'Chat is not active');
+      const uid = String(req.user.id);
+      if (uid !== String(row.customer_user_id) && uid !== String(row.admin_user_id)) {
+        return jsonError(res, 403, 'Not a participant in this chat');
+      }
+      const toUserId =
+        uid === String(row.customer_user_id) ? String(row.admin_user_id) : String(row.customer_user_id);
+      const offerId = crypto.randomUUID();
+      fileOffersById.set(offerId, {
+        id: offerId,
+        sessionId,
+        tenantId: row.tenant_id,
+        fromUserId: uid,
+        toUserId,
+        fileName,
+        fileSize: buf.length,
+        mimeType,
+        dataBase64: buf.toString('base64'),
+        createdAt: Date.now()
+      });
+      const fromDisplayName = await lookupUserDisplayName(pool, uid);
+      broadcastSupportEvents(row.tenant_id, 'chat-file-offer', {
+        sessionId,
+        offerId,
+        fromUserId: uid,
+        toUserId,
+        fileName,
+        fileSize: buf.length,
+        mimeType,
+        fromDisplayName
+      });
+      return res.json({ success: true, offerId });
+    } catch (error) {
+      console.error('[saas/support/chat/file-offer POST]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.post('/saas/support/chat/:sessionId/file-respond', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      pruneExpiredFileOffers();
+      const sessionId = cleanString(req.params.sessionId);
+      const offerId = cleanString(req.body?.offerId);
+      const accept = req.body?.accept === true;
+      if (!offerId) return jsonError(res, 400, 'offerId is required');
+
+      const offer = fileOffersById.get(offerId);
+      if (!offer || offer.sessionId !== sessionId) {
+        return jsonError(res, 404, 'File offer not found or expired');
+      }
+      const uid = String(req.user.id);
+      if (uid !== offer.toUserId) return jsonError(res, 403, 'Only the recipient can respond to this offer');
+
+      const loaded = await loadChatSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (row.status !== 'active') return jsonError(res, 400, 'Chat is not active');
+
+      fileOffersById.delete(offerId);
+      const senderName = await lookupUserDisplayName(pool, offer.fromUserId);
+      const responderName = await lookupUserDisplayName(pool, uid);
+
+      if (accept) {
+        const attachment = {
+          name: offer.fileName,
+          mimeType: offer.mimeType,
+          size: offer.fileSize,
+          dataBase64: offer.dataBase64
+        };
+        const fileMsg = await insertChatMessageRow(pool, {
+          sessionId,
+          senderUserId: offer.fromUserId,
+          body: `Shared file: ${offer.fileName}`,
+          messageType: 'file',
+          attachment
+        });
+        const confirmMsg = await insertChatMessageRow(pool, {
+          sessionId,
+          senderUserId: uid,
+          body: `${responderName} accepted ${offer.fileName}`,
+          messageType: 'system',
+          attachment: { variant: 'info' }
+        });
+        broadcastSupportEvents(row.tenant_id, 'chat-message', {
+          sessionId: String(sessionId),
+          message: mapChatMessageRow(fileMsg)
+        });
+        broadcastSupportEvents(row.tenant_id, 'chat-message', {
+          sessionId: String(sessionId),
+          message: mapChatMessageRow(confirmMsg)
+        });
+        return res.json({
+          success: true,
+          accepted: true,
+          message: mapChatMessageRow(fileMsg)
+        });
+      }
+
+      const declineForRequester = await insertChatMessageRow(pool, {
+        sessionId,
+        senderUserId: uid,
+        body: `${responderName} declined your file transfer (${offer.fileName})`,
+        messageType: 'system',
+        attachment: { variant: 'warning', targetUserId: offer.fromUserId }
+      });
+      const declineForDecliner = await insertChatMessageRow(pool, {
+        sessionId,
+        senderUserId: uid,
+        body: `You declined the file transfer from ${senderName}`,
+        messageType: 'system',
+        attachment: { variant: 'warning', targetUserId: uid }
+      });
+      broadcastSupportEvents(row.tenant_id, 'chat-message', {
+        sessionId: String(sessionId),
+        message: mapChatMessageRow(declineForRequester)
+      });
+      broadcastSupportEvents(row.tenant_id, 'chat-message', {
+        sessionId: String(sessionId),
+        message: mapChatMessageRow(declineForDecliner)
+      });
+      return res.json({ success: true, accepted: false });
+    } catch (error) {
+      console.error('[saas/support/chat/file-respond POST]', error);
       return jsonError(res, 500, error.message || 'Server error');
     }
   });
@@ -1132,6 +1373,178 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       });
     } catch (error) {
       console.error('[saas/support/remote/respond]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.post('/saas/support/remote/customer-request', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const chatSessionId = cleanString(req.body?.chatSessionId);
+      const customerTabId = cleanString(req.body?.tabId) || 'default';
+      if (!chatSessionId) return jsonError(res, 400, 'chatSessionId is required');
+
+      const loaded = await loadChatSessionForUser(pool, chatSessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const chatRow = loaded.row;
+      if (chatRow.status !== 'active') return jsonError(res, 400, 'Chat must be active');
+      if (String(chatRow.customer_user_id) !== String(req.user.id)) {
+        return jsonError(res, 403, 'Only the customer can request remote help');
+      }
+      if (!chatRow.admin_user_id) return jsonError(res, 400, 'No admin connected to this chat');
+
+      const pendingRemote = await pool.query(
+        `SELECT id FROM cp_support_remote_sessions
+         WHERE tenant_id = $1 AND customer_user_id = $2 AND status = 'pending' AND initiated_by = 'customer'
+         LIMIT 1`,
+        [chatRow.tenant_id, req.user.id]
+      );
+      if (pendingRemote.rows[0]) {
+        return res.json({
+          success: true,
+          sessionId: pendingRemote.rows[0].id,
+          status: 'pending',
+          alreadyPending: true
+        });
+      }
+
+      const persistToken = crypto.randomBytes(24).toString('base64url');
+      const r = await pool.query(
+        `INSERT INTO cp_support_remote_sessions (
+            tenant_id, customer_user_id, admin_user_id, status, persist_token, customer_tab_id, initiated_by, chat_session_id
+          ) VALUES ($1,$2,$3,'pending',$4,$5,'customer',$6)
+          RETURNING id, status, persist_token`,
+        [
+          chatRow.tenant_id,
+          chatRow.customer_user_id,
+          chatRow.admin_user_id,
+          persistToken,
+          customerTabId,
+          chatSessionId
+        ]
+      );
+      const session = r.rows[0];
+      const customerDisplayName = await lookupUserDisplayName(pool, chatRow.customer_user_id);
+      broadcastSupportEvents(chatRow.tenant_id, 'remote-help-request', {
+        sessionId: session.id,
+        chatSessionId,
+        customerUserId: chatRow.customer_user_id,
+        adminUserId: chatRow.admin_user_id,
+        customerDisplayName,
+        customerTabId
+      });
+      return res.json({
+        success: true,
+        sessionId: session.id,
+        status: session.status
+      });
+    } catch (error) {
+      console.error('[saas/support/remote/customer-request]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.post('/saas/support/remote/admin-respond', requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
+    try {
+      const sessionId = cleanString(req.body?.sessionId);
+      const accept = req.body?.accept === true;
+      if (!sessionId) return jsonError(res, 400, 'sessionId is required');
+
+      const r = await pool.query(
+        `SELECT * FROM cp_support_remote_sessions WHERE id = $1 LIMIT 1`,
+        [sessionId]
+      );
+      const row = r.rows[0];
+      if (!row) return jsonError(res, 404, 'Remote session not found');
+      if (String(row.admin_user_id) !== String(req.user.id)) {
+        return jsonError(res, 403, 'Only the assigned admin can respond');
+      }
+      if (row.initiated_by !== 'customer') {
+        return jsonError(res, 400, 'This remote session was not customer-initiated');
+      }
+      if (row.status !== 'pending') {
+        return res.json({
+          success: true,
+          sessionId,
+          status: row.status,
+          persistToken: row.persist_token
+        });
+      }
+
+      const adminDisplayName = await lookupUserDisplayName(pool, req.user.id);
+      const chatSessionId = cleanString(row.chat_session_id);
+
+      if (accept) {
+        await pool.query(
+          `UPDATE cp_support_remote_sessions SET status = 'active', updated_at = NOW(), ended_at = NULL WHERE id = $1`,
+          [sessionId]
+        );
+        broadcastSupportEvents(row.tenant_id, 'remote-response', {
+          sessionId,
+          status: 'active',
+          customerUserId: row.customer_user_id,
+          adminUserId: row.admin_user_id,
+          persistToken: row.persist_token,
+          initiatedBy: 'customer'
+        });
+        if (chatSessionId) {
+          const sysMsg = await insertChatMessageRow(pool, {
+            sessionId: chatSessionId,
+            senderUserId: req.user.id,
+            body: `${adminDisplayName} accepted your remote support request`,
+            messageType: 'system',
+            attachment: { variant: 'info' }
+          });
+          broadcastSupportEvents(row.tenant_id, 'chat-message', {
+            sessionId: chatSessionId,
+            message: mapChatMessageRow(sysMsg)
+          });
+        }
+        return res.json({
+          success: true,
+          sessionId,
+          status: 'active',
+          persistToken: row.persist_token
+        });
+      }
+
+      await pool.query(
+        `UPDATE cp_support_remote_sessions SET status = 'declined', updated_at = NOW(), ended_at = NOW() WHERE id = $1`,
+        [sessionId]
+      );
+      if (chatSessionId) {
+        const forCustomer = await insertChatMessageRow(pool, {
+          sessionId: chatSessionId,
+          senderUserId: req.user.id,
+          body: `${adminDisplayName} has declined your request for Remote support`,
+          messageType: 'system',
+          attachment: { variant: 'warning', targetUserId: row.customer_user_id }
+        });
+        const forAdmin = await insertChatMessageRow(pool, {
+          sessionId: chatSessionId,
+          senderUserId: req.user.id,
+          body: 'You have declined the request.',
+          messageType: 'system',
+          attachment: { variant: 'warning', targetUserId: row.admin_user_id }
+        });
+        broadcastSupportEvents(row.tenant_id, 'chat-message', {
+          sessionId: chatSessionId,
+          message: mapChatMessageRow(forCustomer)
+        });
+        broadcastSupportEvents(row.tenant_id, 'chat-message', {
+          sessionId: chatSessionId,
+          message: mapChatMessageRow(forAdmin)
+        });
+      }
+      broadcastSupportEvents(row.tenant_id, 'remote-help-declined', {
+        sessionId,
+        customerUserId: row.customer_user_id,
+        adminUserId: row.admin_user_id
+      });
+      return res.json({ success: true, sessionId, status: 'declined' });
+    } catch (error) {
+      console.error('[saas/support/remote/admin-respond]', error);
       return jsonError(res, 500, error.message || 'Server error');
     }
   });
