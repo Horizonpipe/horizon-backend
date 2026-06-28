@@ -1,11 +1,5 @@
 {
-  "title": "SaaS Virtualbox — saaspipeshare Wasabi bucket",
-  "description": "Each SaaS customer gets an isolated virtualbox inside the saaspipeshare bucket (us-east-2): Tenants/{company-slug}/ with pipeshare/, pipesync/, auth/, and portal file folders. Tenant subdomains (e.g. Techpipe.pipeshare.net) load branded login shells; per-tenant auth snapshots live in Wasabi under system-state.\n\nWho is affected: pipeshare.net SaaS customers (Techpipe first). Private OVH PipeShare server unchanged unless HP_DEPLOYMENT_MODE=saas is enabled there.",
-  "changeLog": [
-    "Dedicated SAAS_WASABI_BUCKET (saaspipeshare) with Tenants/ folder layout.",
-    "Tenant provisioning seeds Wasabi skeleton + auth snapshot on subscribe/setup.",
-    "GET /saas/tenant/public-by-host for subdomain branding on login pages.",
-    "Tenant URLs: PipeShare at /client-portal/, PipeSync at /pipesync.html on {Name}.pipeshare.net (not pipesync.net).",
-    "setup-saas-virtualbox-bucket.sh + migrate-saas-virtualbox-tenant.cjs for OVH rollout."
-  ]
+  "title": "",
+  "description": "",
+  "changeLog": []
 }
