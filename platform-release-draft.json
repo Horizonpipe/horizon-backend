@@ -1,13 +1,10 @@
 {
-  "title": "dbg125 theme stability and pill button system",
-  "description": "Theme switching no longer flickers or snaps back — local choice wins until the server confirms, and changing theme no longer rebuilds the whole PipeSync page. The dark capsule pill button style (orange dot, underline, glow) is now consistent across PipeSync and PipeShare tabs, toolbars, modals, and menus.\n\nSaaS tenants with custom primary/accent colors from setup now drive button accents at runtime via /saas/tenant/me or meta tags.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "Fix first-login password change redirect loop",
+  "description": "After setting a new password on first login, PipeSync no longer bounces between login and the dashboard. The backend now mirrors password changes to Postgres even when Wasabi is the primary write path, so GET /session returns mustChangePassword:false immediately. Login re-fetches /session before redirecting instead of reusing stale pending-user state.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Fix theme selector flicker: localStorage-first read, seed from server only on login.",
-    "Stop full app render on theme change; sync select values via hp-theme-change.",
-    "Unified --hp-btn-accent tokens derived from theme --orange / tenant branding.",
-    "Remove conflicting legacy orange-gradient tab/button overrides.",
-    "Wire SaaS tenant primaryColor into buttons on PipeSync and PipeShare boot.",
-    "Cache bust dbg125 on PipeSync, mobile, portal, CSS, and addon manifest."
+    "Mirror change-password to Postgres after Wasabi write so /session clears mustChangePassword.",
+    "Login re-fetches /session and clears mustChangePassword client state before dashboard redirect.",
+    "Cache bust pwloop1 on login, PipeSync boot, and mobile shell."
   ],
-  "updatedAt": "2026-06-28T23:30:00.000Z"
+  "updatedAt": "2026-06-28T24:00:00.000Z"
 }

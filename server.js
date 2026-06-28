@@ -7095,10 +7095,15 @@ app.post('/change-password', requireAuth, async (req, res) => {
         updated_at: nowIso()
       };
     });
-    if (!wasabiWrote) {
+    try {
       await pool.query(
         'UPDATE users SET password = $1, must_change_password = false, updated_at = NOW() WHERE id = $2',
         [hash, req.user.id]
+      );
+    } catch (pgErr) {
+      if (!wasabiWrote) throw pgErr;
+      console.warn(
+        `[change-password] Postgres mirror failed after Wasabi write: ${pgErr?.message || pgErr}`
       );
     }
 
