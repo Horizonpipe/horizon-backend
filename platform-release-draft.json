@@ -1,13 +1,12 @@
 {
-  "title": "Restore highlights and line tool in PDF viewer (dbg99)",
-  "description": "After the fullscreen continuous PDF viewer shipped, highlights did not appear and the Line tool could not draw new highlights. The continuous viewer has no data-hp-plan-world element, so worldPointFromPointer always returned null (world-point-missing).\n\ndbg99 maps pointer coords through the clicked page slot in continuous viewer mode, draws line previews on per-page overlay SVGs, syncs map/viewer highlight mirrors on open, refreshes overlay SVGs after mount, and enables line-tool pointer events on continuous overlays.\n\nWho is affected: OVH private server PDF Viewer fullscreen and Map Builder when using continuous viewer.",
+  "title": "Fix PDF fullscreen workspace tools (dbg100)",
+  "description": "After opening a PDF in the fullscreen continuous viewer, right-click menus, highlighter keybinds (1-7), and bookmarks did not work reliably.\n\ndbg100 re-wires plan board listeners after the continuous viewer mounts its page slots (mount ran before pages existed). Toolbar/keybind handlers now target the active fullscreen PDF host via planBoardHostForStateKey instead of the first [data-hp-plan-board=pdf] in the document. Context hitboxes on continuous pages get explicit pointer-events.\n\nWho is affected: OVH private server PDF Viewer fullscreen workspace.",
   "changeLog": [
-    "Fix pointer-to-world coords for continuous PDF viewer (line tool + structure nodes).",
-    "Line preview and committed lines target per-page overlay SVG in viewer mode.",
-    "Refresh highlight overlays after viewer mount and on uiMode chrome update.",
-    "Sync map/viewer highlight mirrors when entering fullscreen viewer.",
-    "CSS: line-tool pointer events on continuous overlay SVG lines.",
-    "Cache bust dbg99."
+    "Re-mount plan board listeners after continuous PDF viewer creates page slots.",
+    "Route keybind and toolbar chrome updates to fullscreen PDF host.",
+    "Explicit context hitbox pointer-events on continuous viewer pages.",
+    "Debug logs for context menu and line-color keybinds (session d9d6c9).",
+    "Cache bust dbg100."
   ],
-  "updatedAt": "2026-06-29T20:00:00.000Z"
+  "updatedAt": "2026-06-29T22:00:00.000Z"
 }
