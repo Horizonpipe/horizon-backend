@@ -10106,6 +10106,7 @@ function portalPermissionsLivePostgresSql(text) {
     sql.includes('user_folder_grants') ||
     sql.includes('user_portal_scopes') ||
     sql.includes('user_psr_scopes') ||
+    sql.includes('saas_tenant_instances') ||
     sql.includes(' from companies ') ||
     sql.includes(' join companies ') ||
     sql.includes('trash_bin_entries')

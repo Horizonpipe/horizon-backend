@@ -1,10 +1,10 @@
 {
-  "title": "SaaS tenant owner is super admin",
-  "description": "The purchasing email for each SaaS workspace is now elevated to super admin inside their own tenant (PipeShare + PipeSync), instead of showing as CLIENT.\n\nWho is affected: pipeshare.net SaaS customers who bought a subscription. Existing owners are upgraded on next login or via elevate-saas-tenant-owners.cjs.",
+  "title": "SaaS BrandColors theme + portal file fix",
+  "description": "Tenant setup colors now create a BrandColors theme and auto-apply on {Company}.pipeshare.net. The theme menu shows PIPESHARE instead of ONBRAND on SaaS hosts. Fixed portal file explorer error for SaaS tenants (Wasabi adapter blocking saas_tenant_instances queries).",
   "changeLog": [
-    "Tenant purchaser gets employee/superadmin account type in Postgres and capabilities.",
-    "deriveAccountModel no longer forces self-signup SaaS owners to CLIENT.",
-    "Provisioning and signup apply full admin role bundle for workspace owners.",
-    "Tenant auth snapshot in Wasabi stores owner as superadmin."
+    "BrandColors theme generated from setup wizard primary/accent colors.",
+    "SaaS theme picker: ONBRAND renamed to PIPESHARE; BrandColors appears when colors are set.",
+    "saas-tenant-branding.js calls applyTenantBrandColors (was broken applyTenantBrand).",
+    "Postgres live-query allowlist includes saas_tenant_instances for tenant virtualbox file access."
   ]
 }
