@@ -1,14 +1,13 @@
 {
-  "title": "PDF Viewer fit + tight page stack (dbg71)",
-  "description": "PipeSync PDF Viewer now fits sheets correctly at browser 100% zoom (no ~35% horizontal clipping). Fit width is measured from the plan panel, not the scroll column whose width is derived from zoom (that circular measure caused over-scaling). Stack spacing uses cropped visible page height plus a 1px default gap (legacy 8px/2px prefs migrate to 1px).\n\nHard-refresh PipeSync (dbg71). Open PDF Viewer with two stacked pages: sheets should fit with side margins, minimal grey between pages.",
+  "title": "PDF Viewer scroll-inner fit (dbg72)",
+  "description": "PipeSync PDF Viewer fit width is now measured from the scroll container's inner content box (clientWidth minus scroll padding), not the wider plan panel. Panel-minus-library sizing was demoted because it over-scaled PDFs vs the visible scroll viewport and caused horizontal clipping at the scroll padding edge. Fit safety is 0.98 with no extra pixel inset.\n\nHard-refresh PipeSync (dbg72). Open PDF Viewer: each page should fit edge-to-edge inside the scroll window without clipping at the scroll area sides.",
   "changeLog": [
-    "Fit avail width from panel minus library (fixes circular scroll.clientWidth over-scale).",
-    "Fit safety 0.95 → 0.90; content width uses visible cropped footprint.",
-    "Stack Y uses planBoardViewerPageVisibleFootprint height + 1px gap default.",
-    "World bounds extents use visible footprint for tight sync.",
-    "Legacy gap prefs 8px/2px migrate to 1px.",
-    "Enhanced d9d6c9 ingest logs for 2-page stack diagnostics.",
-    "Cache bust dbg71."
+    "Fit avail width from scroll inner box (layout clientWidth minus scroll padding).",
+    "Clear zoom inline width before measure to avoid circular over-scale.",
+    "Demote panel-minus-library to fallback only.",
+    "Fit safety 0.90 → 0.98; inset 4px → 0.",
+    "d9d6c9 ingest logs include scrollPadL/R and layoutClientW.",
+    "Cache bust dbg72."
   ],
-  "updatedAt": "2026-06-29T18:00:00.000Z"
+  "updatedAt": "2026-06-27T12:00:00.000Z"
 }
