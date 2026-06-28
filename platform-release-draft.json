@@ -1,11 +1,11 @@
 {
-  "title": "PDF Viewer duplicate sheets + grey borders fix",
-  "description": "PDF Viewer no longer shows duplicate sheets or zoomed-in half-page copies. Viewer workspaces were built with the map board's 5× footprint multiplier, making display boxes much larger than the PDF — that looked like a zoomed duplicate next to a full sheet. Duplicate storageKeys are now deduped on load.\n\nGrey borders around the viewer stack are removed: white background, zero bounds padding, left-aligned pages (no side gutters).\n\nHard-refresh PipeSync after deploy (dbg58).\n\nWho is affected: Private OVH server.",
+  "title": "PDF Viewer tight sheet bounds",
+  "description": "PDF Viewer container now hugs the sheet stack with no side dead space. World bounds use page rectangles only (highlight lines no longer widen the viewport). Fit-to-width uses the full scroll width with zero margin.\n\nHard-refresh PipeSync after deploy (dbg59).\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "Fix viewer duplicate/zoomed sheets (footprint mul only on map, dedupe by storageKey).",
-    "Repair viewer page dimensions to intrinsic PDF size on layout normalize.",
-    "Remove grey viewer borders (white background, zero pad, left align).",
-    "Cache bust dbg58."
+    "Viewer bounds: page rects only, not highlight line extents.",
+    "Fit-to-width: zero margin, zoomport fills scroll width.",
+    "Normalize viewer layout on every render for correct sheet size.",
+    "Cache bust dbg59."
   ],
-  "updatedAt": "2026-06-28T20:00:00.000Z"
+  "updatedAt": "2026-06-28T21:00:00.000Z"
 }
