@@ -1,12 +1,13 @@
 {
-  "title": "cPanel shell overhaul, releases UI, and ops rollback",
-  "description": "Horizon Pipe cPanel gets a shared shell (navigation, theme, layout) across billing, dashboard, login, setup, ops, and releases. Releases admin now lists platform versions in a dropdown and can push a chosen build to SaaS tenants from the UI.\n\nOps console rollback is split into separate Frontend and Backend release dropdowns, wired to a new POST /ops/rollback/release endpoint and server-side rollback script.\n\nBackend adds GET /saas/platform/releases/list for the releases page and rollback support in ovh-ops.\n\nWho is affected: OVH-hosted PipeShare (cPanel + ops). SaaS tenants receive frontend/backend only when you publish and push from Releases.",
+  "title": "Remote assistance — admin live screen viewport fix",
+  "description": "Fixes remote help on pipeshare.live where the admin panel showed \"Connected\" but the customer viewport stayed empty with ghosted UI behind it and status stuck on \"Waiting for customer to finish screen share…\".\n\nRoot cause: WebRTC offer path incorrectly marked the remote SDP as applied before the customer's answer arrived, so ICE candidates were dropped and the video track never connected. Status text was also overwritten after screen-ready had already been processed.\n\nAdmin remote panel now has a pop-out (⛶) full-screen viewport mode (TeamViewer-style), opaque black video area, and clearer status progression. Cache bust dbg162.\n\nWho is affected: SaaS PipeShare admins using customer-initiated remote help over HTTPS (WebRTC). HTTP DOM frame relay unchanged.",
   "changeLog": [
-    "cPanel: shared cpanel-shell.js/css and refreshed pages (cache ?v=20260628shell1).",
-    "Releases: version dropdown, list API, Push to SaaS from admin UI.",
-    "Ops: separate Frontend/Backend rollback dropdowns and styling.",
-    "Backend: GET /saas/platform/releases/list for release picker.",
-    "Backend: POST /ops/rollback/release + deploy/ovh/rollback-platform-release.sh."
+    "Fix WebRTC ICE: do not treat local offer as remote description set.",
+    "Re-queue ICE candidates when addIceCandidate fails due to SDP timing.",
+    "Fix admin status overwriting after screen-ready / offer sent.",
+    "Admin remote panel: pop-out full-screen viewport (⛶ button).",
+    "Viewport: solid black background (no admin panel bleed-through).",
+    "Video playback retries on loadedmetadata; dbg162 cache bust."
   ],
-  "updatedAt": "2026-06-28T23:00:00.000Z"
+  "updatedAt": "2026-06-29T00:00:00.000Z"
 }
