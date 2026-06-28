@@ -1,12 +1,12 @@
 {
-  "title": "PDF Viewer zoom-out clip fix — batch render all visible pages (dbg86)",
-  "description": "Zooming out showed cut-off PDF strips because only the last visible page was re-rendered after each zoom (debounce timer overwrote pending pages), leaving oversized stale canvases clipped by overflow:hidden. dbg86 batches all pending page renders, clears canvases immediately on zoom, uses unified fit scale from PDF aspect ratio, and scales crop insets to pdf.js page dimensions.",
+  "title": "PDF Viewer fixed scrollport — zoom does not shrink tool window (dbg87)",
+  "description": "Ctrl+wheel zoom was shrinking the entire PDF viewer pane because the scroll container used flex:0 0 auto and width:auto, sizing to page content. When pages zoomed out, the dark scrollport shrank with them. dbg87 locks the scrollport to full panel width; only page tiles inside zoom. Fit-to-width no longer re-runs on resize when continuous viewer is active (prevents shrink loop).",
   "changeLog": [
-    "Batch debounced render queue — all visible pages repaint on zoom.",
-    "Clear canvas immediately when zoom changes (no stale clip artifacts).",
-    "Slot height derived from PDF aspect ratio, not stale viewerBaseH.",
-    "Crop insets scaled to pdf.js viewport vs model natW/natH.",
-    "Cache bust dbg86."
+    "Scrollport fills panel width — does not shrink on zoom out.",
+    "planBoardLockContinuousViewerScrollport on mount and wheel zoom.",
+    "Skip fit-to-width recalc during continuous viewer resize (no shrink loop).",
+    "CSS flex:1 1 0 for continuous scroll in viewer-plans row.",
+    "Cache bust dbg87."
   ],
-  "updatedAt": "2026-06-28T05:25:00.000Z"
+  "updatedAt": "2026-06-28T05:35:00.000Z"
 }
