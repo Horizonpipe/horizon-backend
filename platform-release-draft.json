@@ -1,14 +1,14 @@
 {
-  "title": "Admin chat restore on refresh + remote help poll (dbg151)",
-  "description": "PipeShare support chat now survives browser refresh for admins as well as customers. On page load, admin tabs call GET /saas/support/chat/active and restore an active session (messages, toolbar, composer, connected state) or a pending invite (waiting-for-accept UI with poll). Previously syncChatSessionState returned immediately for admins and syncAdminChatWaitState required in-memory session id that was lost on reload.\n\nAlso ships dbg150: when a customer requests remote help, the assigned admin sees an in-chat Accept/Decline prompt within a few seconds even if the SSE event was missed (3s poll on /saas/support/remote/active).\n\nWho is affected: Horizon admins and customers on the OVH private server using PipeShare support chat. Deploy horizon-backend (chat/active display names + remote/active payload) and client-portal static assets (dbg151). SaaS updates only via releases.html.",
+  "title": "Customer remote help: screen share + chat preserved (dbg152)",
+  "description": "PipeShare support chat customer-initiated remote help now works end-to-end. When a customer requests remote help and the admin accepts, the customer keeps their active chat (no reset to the initial \"Need help?\" screen), shares their screen via WebRTC video, and the admin sees a live feed in the remote panel while controlling app windows over the data channel.\n\nFixes include: Accept/Decline prompt pinned above the composer (not in the scrollable message list), no duplicate WebRTC teardown when the admin accept SSE echoes back, poll recovery for customers when SSE is missed, and stale admin-initiated pending remote invites no longer wipe an active chat when the customer requests help.\n\nWho is affected: Horizon admins and customers on the OVH private server using PipeShare support chat remote help. Deploy horizon-backend (remote/active query + customer-request cleanup) and client-portal static assets (dbg152). SaaS updates only via releases.html.",
   "changeLog": [
-    "Fix admin losing support chat on browser refresh — restore from GET /chat/active on init and heartbeat.",
-    "Restore pending chat invite waiting state for admin after reload.",
-    "chat/active includes customerDisplayName and adminDisplayName for session restore.",
-    "Fix admin missing Accept/Decline when customer requests remote help (SSE miss poll recovery).",
-    "Admin polls /saas/support/remote/active every 3s for pending customer-initiated remote help.",
-    "Screen capture errors surfaced in chat instead of silent failure.",
-    "Cache bust dbg151 (portal runtime + PipeShare manifest)."
+    "Remote help Accept/Decline prompt sits above composer, not at top of message scroll.",
+    "Customer chat stays active when admin accepts customer-initiated remote help.",
+    "Customer shares screen (getDisplayMedia); admin remote panel shows live video feed.",
+    "Fix WebRTC stuck at Connecting — skip duplicate admin attach; customer poll token recovery.",
+    "Stale admin remote invites no longer reset customer chat during remote help request.",
+    "remote/active returns customer-initiated pending sessions for customers.",
+    "Cache bust dbg152 (portal runtime + PipeShare manifest)."
   ],
-  "updatedAt": "2026-06-28T21:00:00.000Z"
+  "updatedAt": "2026-06-28T22:30:00.000Z"
 }

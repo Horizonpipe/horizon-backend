@@ -1630,6 +1630,13 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         });
       }
 
+      await pool.query(
+        `UPDATE cp_support_remote_sessions
+         SET status = 'declined', ended_at = NOW(), updated_at = NOW()
+         WHERE tenant_id = $1 AND customer_user_id = $2 AND status = 'pending' AND initiated_by = 'admin'`,
+        [chatRow.tenant_id, chatRow.customer_user_id]
+      );
+
       const persistToken = crypto.randomBytes(24).toString('base64url');
       const r = await pool.query(
         `INSERT INTO cp_support_remote_sessions (
@@ -2014,6 +2021,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
            AND (
              (status = 'active' AND (customer_user_id = $1 OR admin_user_id = $1))
              OR (status = 'pending' AND customer_user_id = $1 AND initiated_by = 'admin')
+             OR (status = 'pending' AND customer_user_id = $1 AND initiated_by = 'customer')
              OR (status = 'pending' AND admin_user_id = $1 AND initiated_by = 'customer')
            )
          ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, updated_at DESC LIMIT 1`,
