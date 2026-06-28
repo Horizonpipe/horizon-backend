@@ -1,12 +1,12 @@
-{
-  "title": "Footage/Pricing merge and cross-model remote support (dbg111-dbg113)",
-  "description": "PipeSync no longer shows a separate Imported — ready to sort tab; that workflow is folded into the main footage flow.\n\nFootage Tracker and Pricing Totals are one tool with sub-tabs so pricing stays next to footage without a second sidebar entry.\n\nRemote customer support is wired for both deployment models. Mike Strickland admin user menu lists online users in two groups: NON SAAS MODEL (OVH/private) and SAAS MODEL (hosted SaaS tenants). Cache bust dbg113 on PipeSync, mobile, and client portal entry HTML.\n\nWho is affected: OVH private server gets this on deploy. SaaS customers see frontend/backend support changes when Mike applies the new platform version in releases.html.",
+﻿{
+  "title": "PipeShare admin presence refresh throttling (dbg115)",
+  "description": "PipeShare was refreshing the admin presence panel on every SSE event and showing a full Loading state each time, which made the UI feel laggy when many presence updates arrived.\n\nThis release throttles and debounces those refreshes, avoids duplicate customer-support init, and slows the background heartbeat when the tab is hidden.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Remove Imported — ready to sort tab (dbg111).",
-    "Merge Pricing Totals into Footage Tracker with sub-tabs (dbg112).",
-    "Remote support on SaaS and non-SaaS; Mike global menu with NON SAAS MODEL / SAAS MODEL groups (dbg113).",
-    "Backend support routes: deployment_model on presence, Mike global list scope, cross-tenant admin actions.",
-    "Cache bust dbg113; smoke test updates."
+    "Throttle admin presence panel refresh from SSE (presence, support-request, support-clear) to about 2.5s.",
+    "Debounce presence panel API refresh (~350ms) and skip Loading flash when content already rendered.",
+    "Singleton initCustomerSupport so the addon does not double-register listeners.",
+    "Heartbeat interval 20s visible / 60s when tab hidden.",
+    "Cache bust dbg115 on client portal index.html."
   ],
-  "updatedAt": "2026-06-28T20:00:00.000Z"
+  "updatedAt": "2026-06-28T22:00:00.000Z"
 }
