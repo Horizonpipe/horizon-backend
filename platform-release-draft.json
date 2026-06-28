@@ -1,12 +1,9 @@
 {
-  "title": "PDF auto-trim + visible crop panel",
-  "description": "PDF import now reads CropBox/TrimBox and auto-trims page whitespace (same as manual Refine edges). Existing viewer sheets backfill crop insets on open. Refine edges panel styled fixed bottom-right (was unstyled/buried). Fixed viewer page build footprint bug.\n\nHard-refresh PipeSync (dbg67).\n\nWho is affected: Private OVH server.",
+  "title": "Hotfix: PipeSync black screen on reload",
+  "description": "Fixed JavaScript parse error in planBoardNormalizeViewerWorkspaceLayout (duplicate `let changed`) that prevented app.js from loading — caused black screen on reload.\n\nHard-refresh PipeSync (dbg68).\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "Auto-trim PDF whitespace at split/import from CropBox/TrimBox.",
-    "Viewer backfill detects crop on open for older uploads.",
-    "Refine edges panel visible bottom-right with proper styling.",
-    "Viewer stack reflow after auto-trim removes grey dead space.",
-    "Cache bust dbg67."
+    "Fix duplicate let changed syntax error crashing app.js load.",
+    "Cache bust dbg68."
   ],
-  "updatedAt": "2026-06-29T05:00:00.000Z"
+  "updatedAt": "2026-06-29T06:00:00.000Z"
 }
