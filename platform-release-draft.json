@@ -1,12 +1,12 @@
 {
-  "title": "PDF Viewer fit-on-load + dark toolbar restored",
-  "description": "PDF Viewer now auto-fits to 90% panel width on every open/refresh (was stuck at 100% board zoom when fit flag was missing). Restored dark toolbar — white background limited to sheet area only. Scroll container shrink-wraps pages so no grey void below sheets.\n\nHard-refresh PipeSync (dbg65).\n\nWho is affected: Private OVH server.",
+  "title": "PDF Viewer stack reflow after crop",
+  "description": "Crop and gap changes now re-stack all viewer pages (fixes huge grey void between sheets). Normalized layout always persisted on load/render. Inter-page background restored to subtle grey; white is sheet paper only.\n\nHard-refresh PipeSync (dbg66).\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "Auto fit-to-width on viewer mount (not only workspace switch).",
-    "100% button in viewer re-runs fit instead of forcing zoom 1.",
-    "Dark toolbar restored; white only on PDF sheet scroll area.",
-    "Scroll shrink-wrap fixes grey margins below/beside pages.",
-    "Cache bust dbg65."
+    "Reflow viewer stack after crop apply — pages move together.",
+    "Always normalize + persist page Y positions on load/render.",
+    "Grey gap between sheets (not white); crop persists on refresh.",
+    "Gap slider uses same reflow path.",
+    "Cache bust dbg66."
   ],
-  "updatedAt": "2026-06-29T03:00:00.000Z"
+  "updatedAt": "2026-06-29T04:00:00.000Z"
 }
