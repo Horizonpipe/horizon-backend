@@ -1,12 +1,11 @@
 {
-  "title": "Fix duplicate highlights on PDF download (mirror dedupe)",
-  "description": "Downloaded plan PDFs still showed stacked duplicate highlight strokes even after flat content-stream burn (dbg38–39). Runtime trace showed 49 export lines for 7 board highlights — seven viewer mirror copies per highlight with the same piece coordinates but different pageIds.\n\nFix (dbg40): Legacy download now dedupes mirrors by mirroredFrom + piece storageKey. Export geometry dedupe uses piece storageKey + rx/ry instead of viewer pageId, so one stroke per highlight per PDF piece. Debug trace still active for verification.\n\nHard-refresh PipeSync after deploy (Ctrl+Shift+R). After download, run __hpDownloadTraceDump() in console (type allow pasting first in Edge). Expect allLinesCount near board line count, dupGeo empty, pieceLinesCount and drawableCount much lower on highlighted pieces.\n\nWho is affected: Private OVH server. SaaS unchanged until you publish a platform release.",
+  "title": "Editable PDF highlights with round caps on download",
+  "description": "Duplicate stacked highlight lines on PDF download are fixed (dbg42 mirror dedupe). Editable Highlights download mode now adds circular line ends via /LE Round on Ink annotations — same round-cap look as Baked in Highlights, still editable in Adobe. No /AP appearance stream (avoids double-render).\n\nHard-refresh PipeSync after deploy (Ctrl+Shift+R). Download plans → Editable Highlights and confirm round ends in Adobe/Edge/Okular; no duplicate strokes.\n\nWho is affected: Private OVH server. SaaS unchanged until you publish a platform release.",
   "changeLog": [
-    "Dedupe viewer mirror highlights by mirroredFrom + piece storageKey on export.",
-    "Piece-aware geometry key for download burn (storageKey + coords, not pageId).",
-    "Per-piece dedupe passes pieceSk into export dedupe before PDF burn.",
-    "Download trace helpers available at boot (__hpDownloadTraceDump / Copy).",
-    "Cache bust dbg42 for app.js and pipesync-boot.js."
+    "Editable Highlights download: /LE Round on InkList + BS for circular ends.",
+    "Save/bake path unchanged (square caps unless roundCaps opt-in later).",
+    "Mirror dedupe fix retained from dbg42.",
+    "Cache bust dbg43 for app.js, pipesync-boot.js, pdf-highlight-shape."
   ],
-  "updatedAt": "2026-06-27T26:00:00.000Z"
+  "updatedAt": "2026-06-28T00:10:00.000Z"
 }
