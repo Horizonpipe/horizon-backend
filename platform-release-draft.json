@@ -1,11 +1,13 @@
 {
-  "title": "Fix blank PDF workspace in fullscreen (dbg95)",
-  "description": "PDF Viewer in fullscreen now loads split-piece plans (per-page storageKey) when no whole-archive storageKey exists — most imported PDFs use split pieces. Also fixes double-render aborting the viewer mount on open.\n\nWho is affected: OVH PipeSync Plan view fullscreen workflow.",
+  "title": "Fix blank fullscreen PDF workspace (dbg96)",
+  "description": "Fullscreen PDF workspace was blank because scrollport lock used stacked 72vh layout inside the fixed overlay, and split-piece PDFs often load from page.src rather than archive read-url. dbg96 uses flex-fill scrollport in fullscreen, single render on open, page.src fallback for per-piece loads, and sessionStorage diag log hpPlanFullscreenDiagLog.",
   "changeLog": [
-    "Continuous PDF viewer: per-piece load when archive key missing.",
-    "Remove duplicate render on fullscreen open (mount no longer aborted).",
-    "Toast when PDF source or read-url fails.",
-    "Cache bust dbg95."
+    "Fullscreen scrollport: flex fill instead of 72vh stacked pane lock.",
+    "Single render on fullscreen open (skipRender) + finalize mount.",
+    "Continuous viewer: load from page.src when read-url unavailable.",
+    "Force initial slot render on mount.",
+    "Diag: hpPlanFullscreenDiagLog in sessionStorage during fullscreen.",
+    "Cache bust dbg96."
   ],
-  "updatedAt": "2026-06-28T23:00:00.000Z"
+  "updatedAt": "2026-06-29T00:00:00.000Z"
 }
