@@ -1,11 +1,13 @@
 {
-  "title": "Fix duplicate page in fullscreen PDF viewer (dbg98)",
-  "description": "After dbg97 fixed the blank fullscreen viewer, every stacked page showed the same sheet. Archive mode was assigning pdfPageNum=1 to all slots when archivePageIndex/pageIndex were missing (defaulting to 0). Per-piece mode was loading the shared archive signed URL from page.src before the per-piece storageKey, so every slot rendered page 1 of the same multi-page PDF.\n\ndbg98 resolves page index from archivePageIndex, pdfPageIndex, pageIndex, \"NN of MM\" filename, or stack sort order; per-piece loads prefer storageKey over shared src.\n\nWho is affected: OVH private server users in PDF Viewer fullscreen. SaaS unchanged until platform release applied.",
+  "title": "Restore highlights and line tool in PDF viewer (dbg99)",
+  "description": "After the fullscreen continuous PDF viewer shipped, highlights did not appear and the Line tool could not draw new highlights. The continuous viewer has no data-hp-plan-world element, so worldPointFromPointer always returned null (world-point-missing).\n\ndbg99 maps pointer coords through the clicked page slot in continuous viewer mode, draws line previews on per-page overlay SVGs, syncs map/viewer highlight mirrors on open, refreshes overlay SVGs after mount, and enables line-tool pointer events on continuous overlays.\n\nWho is affected: OVH private server PDF Viewer fullscreen and Map Builder when using continuous viewer.",
   "changeLog": [
-    "Resolve distinct pdfPageNum per slot (name parse + sort index fallback).",
-    "Per-piece PDF load: storageKey before shared archive src URL.",
-    "Diag: log slotPageNums at mount and first 3 renders (H-dup-page).",
-    "Cache bust dbg98."
+    "Fix pointer-to-world coords for continuous PDF viewer (line tool + structure nodes).",
+    "Line preview and committed lines target per-page overlay SVG in viewer mode.",
+    "Refresh highlight overlays after viewer mount and on uiMode chrome update.",
+    "Sync map/viewer highlight mirrors when entering fullscreen viewer.",
+    "CSS: line-tool pointer events on continuous overlay SVG lines.",
+    "Cache bust dbg99."
   ],
-  "updatedAt": "2026-06-29T18:00:00.000Z"
+  "updatedAt": "2026-06-29T20:00:00.000Z"
 }
