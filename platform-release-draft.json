@@ -1,12 +1,13 @@
 {
-  "title": "PDF Viewer scrollbar gutter reserve (dbg73)",
-  "description": "PipeSync PDF Viewer fit width now reserves vertical scrollbar gutter even when the scrollbar is absent during pre-fit layout measure. Previously fit used scroll inner width minus a live gutter that was often 0 during measure, so content scaled to full column width and the scrollbar overlaid the right edge after fit.\n\nHard-refresh PipeSync (dbg73). Open PDF Viewer with multi-page PDFs: pages should fit inside the scroll viewport without clipping behind the vertical scrollbar.",
+  "title": "PDF Viewer column viewport fit (dbg74)",
+  "description": "PipeSync PDF Viewer fit width now uses the viewer column viewport (body minus library and scrollbar gutter) as the primary width source, not scroll.clientWidth alone. Scroll container width is set to the column viewport while zoomport keeps scaled content width; a post-fit overflow clamp ensures scaled content never exceeds scroll client width.\n\nHard-refresh PipeSync (dbg74). Open PDF Viewer: the right edge of pages should be fully visible without Ctrl+drag horizontal pan.",
   "changeLog": [
-    "planBoardViewerVerticalScrollbarReserve: measured gutter or window/fallback 17px.",
-    "avail = raw - max(measuredGutter, minReserve) - inset (no double-subtract).",
-    "Two-pass refit when post-fit gutter exceeds reserve.",
-    "H7 ingest: scrollbarReserve, postFit scrollClientW vs zoomportW.",
-    "Cache bust dbg73."
+    "planBoardViewerColumnViewportWidth: body minus library and scrollbar reserve.",
+    "Fit avail width primary source is column viewport, not scroll.clientWidth.",
+    "Zoom from max(fitContentW, worldBounds.w); post-fit overflow clamp once.",
+    "Scroll chrome width = column viewport; zoomport stays lw*z.",
+    "H8 ingest: columnViewportW, scaledContentW, overflow clamp flag.",
+    "Cache bust dbg74."
   ],
-  "updatedAt": "2026-06-27T14:00:00.000Z"
+  "updatedAt": "2026-06-27T16:00:00.000Z"
 }
