@@ -1,13 +1,11 @@
-{
-  "title": "First-login password change persists across reload",
-  "description": "Users created with a default password must set a new password before entering PipeSync or PipeShare. Previously, reloading the login page or opening pipesync.html directly would skip the Change Default Password step and land in the dashboard with the default password still active.\n\nThis batch enforces the gate on session restore (login.html reload), PipeSync boot, and client-portal boot. The flag clears only after a successful change-password call on the backend.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+﻿{
+  "title": "dbg123 pill primaries and must-change-password gates",
+  "description": "Primary actions on PipeSync, mobile, and client portal now use the dark pill style with orange accent underline (dbg123), matching the desktop hp-btn tokens from dbg122.\n\nLogin and app boot no longer skip the default-password flow: restoring a session or opening PipeSync or the portal with mustChangePassword set sends users back to login to set a new password first.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Login session restore shows Change Default Password when mustChangePassword is still true instead of redirecting to the dashboard.",
-    "PipeSync and mobile shells redirect to login until default password is replaced.",
-    "PipeShare client-portal boot redirects to unified login when mustChangePassword is set.",
-    "Portal session sync stores mustChangePassword from GET /session for reliable gate checks.",
-    "Includes prior fix: omit current password on first-login change-password (commit 9657efb).",
-    "Cache bust pwdfix on login-main, PipeSync boot, and portal runtime."
+    "dbg123: refresh ONBRAND and PIPEBUNTU primary pill styling in theme-profile.css and mobile color tokens.",
+    "Cache bust dbg123 on login bundle, portal runtime, PipeSync or mobile assets, and addon manifest entries.",
+    "Block PipeSync requireSession and client portal boot when mustChangePassword is still true.",
+    "Login (legacy and React): gate session resume on mustChangePassword; normalize snake_case flag on portal session."
   ],
-  "updatedAt": "2026-06-28T18:00:00.000Z"
+  "updatedAt": "2026-06-28T20:00:00.000Z"
 }
