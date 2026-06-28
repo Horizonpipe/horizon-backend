@@ -1,11 +1,14 @@
 {
-  "title": "PipeShare GoDaddy domains (pipeshare.live + pipeshare.net)",
-  "description": "PipeShare portal is configured for GoDaddy domains pointing at the OVH server (40.160.72.39). **pipeshare.live** is the primary HTTPS origin for the client portal (`/client-portal/`), including WebRTC screen share via `hp-portal-secure-origin`. **pipeshare.net** redirects to pipeshare.live (301) so Mike only maintains one canonical URL.\n\nMike must add GoDaddy DNS A records (@ and www → 40.160.72.39) for both domains, then run `sudo bash deploy/ovh/setup-pipeshare-tls.sh` on OVH for Let's Encrypt. Until DNS propagates, the site remains reachable at http://40.160.72.39/client-portal/.\n\nWho is affected: OVH private PipeShare users. SaaS is unchanged.",
+  "title": "Screen share consent before browser picker",
+  "description": "Remote help screen sharing now shows our consent modal first — \"Would you like to share your screen?\" with Yes / No. Choosing No cancels cleanly without opening the browser picker.\n\nOn Yes, a single-step hint explains that PipeShare or PipeSync is already selected in the picker; the customer clicks Open share picker, then only needs to click Share once in Chrome/Edge (preferCurrentTab + displaySurface browser + monitorTypeSurfaces exclude). Wrong surface (whole window/screen) still shows a retry prompt instead of looping.\n\nAlso includes dbg158 fixes: single getDisplayMedia per session, screen-capture color-mix html2canvas fix, and picker-loop guards.\n\nWho is affected: OVH PipeShare and PipeSync users on HTTPS (dbg159). HTTP still uses DOM viewport relay only. SaaS unchanged.",
   "changeLog": [
-    "nginx vhost for pipeshare.live (primary) and pipeshare.net → 301 redirect.",
-    "setup-pipeshare-tls.sh: certbot + HTTPS config + PUBLIC_ORIGIN/CORS update.",
-    "Portal meta hp-portal-secure-origin set to https://pipeshare.live (dbg156).",
-    "GoDaddy DNS instructions in deploy/ovh/README.md (A records for both domains)."
+    "Yes/No screen-share consent before browser picker; No skips getDisplayMedia.",
+    "Single-step hint: app tab pre-selected — click Share in browser.",
+    "shareAppLabel() for PipeShare vs PipeSync copy.",
+    "Fix screen-share picker loop: single getDisplayMedia per remote attach.",
+    "preferCurrentTab + browser tab constraints; reject window/monitor share.",
+    "Support chat screenshot: html2canvas strips color-mix() from theme CSS.",
+    "Runtime cache bump dbg159."
   ],
-  "updatedAt": "2026-06-28T12:00:00.000Z"
+  "updatedAt": "2026-06-28T20:00:00.000Z"
 }
