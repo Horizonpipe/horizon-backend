@@ -942,6 +942,23 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         });
       }
 
+      const endedStale = await pool.query(
+        `UPDATE cp_support_remote_sessions
+         SET status = 'ended', updated_at = NOW(), ended_at = NOW()
+         WHERE tenant_id = $1 AND customer_user_id = $2
+           AND status IN ('pending', 'active') AND ended_at IS NULL
+         RETURNING id`,
+        [targetTenantId, customerUserId]
+      );
+      for (const stale of endedStale.rows) {
+        clearRemoteSignals(stale.id);
+        broadcastTenant(targetTenantId, 'remote-ended', {
+          sessionId: stale.id,
+          customerUserId,
+          reason: 'superseded'
+        });
+      }
+
       const persistToken = crypto.randomBytes(24).toString('base64url');
       const r = await pool.query(
         `INSERT INTO cp_support_remote_sessions (
@@ -1165,6 +1182,34 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
+  app.get('/saas/support/chat/pending', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const r = await pool.query(
+        `SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
+         FROM cp_support_chat_sessions
+         WHERE tenant_id = $1 AND customer_user_id = $2 AND status = 'pending'
+         ORDER BY updated_at DESC LIMIT 1`,
+        [req.supportTenant.tenantId, req.user.id]
+      );
+      const row = r.rows[0];
+      if (!row) return res.json({ success: true, session: null });
+      return res.json({
+        success: true,
+        session: {
+          id: row.id,
+          status: row.status,
+          customerUserId: row.customer_user_id,
+          adminUserId: row.admin_user_id,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at
+        }
+      });
+    } catch (error) {
+      console.error('[saas/support/chat/pending]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
   app.get('/saas/support/remote/active', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const uid = String(req.user.id);
@@ -1176,7 +1221,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
              (status = 'active' AND (customer_user_id = $1 OR admin_user_id = $1))
              OR (status = 'pending' AND customer_user_id = $1)
            )
-         ORDER BY updated_at DESC LIMIT 1`,
+         ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, updated_at DESC LIMIT 1`,
         [uid]
       );
       const row = r.rows[0];

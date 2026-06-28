@@ -1,12 +1,14 @@
 {
-  "title": "Remote invite consent reaches customer (dbg137)",
-  "description": "After dbg136 wired the admin remote panel, Mike could send a remote connection request and see \"waiting for customer to accept\", but the customer (Kat) never got the consent popup.\n\nRoot cause: remote invites were delivered only via in-memory SSE with no fallback. If the customer's EventSource was not connected yet (support init is deferred on requestIdleCallback), or the SSE event was missed during reconnect, the invite was lost. Admin retries for an existing pending session also returned success without re-broadcasting remote-request.\n\nThis release adds a customer-side poll on each presence heartbeat for pending remote invites, re-broadcasts remote-request when an admin retries a pending session, retries SSE wiring when the session token was not ready at first boot, and resolves support user id from id or userId like the backend presence heartbeat does.\n\nWho is affected: Horizon admins and customers using PipeShare/PipeSync remote support on OVH private server. SaaS when Mike applies the platform version in releases.html.",
+  "title": "Remote/chat invites arrive live; consent before WebRTC (dbg138)",
+  "description": "After dbg137, Mike could send remote and chat invites but Kat often only saw them after a hard refresh. When she did see activity, the support widget showed \"establishing control channel\" instead of the Accept/Decline modal, while Mike's panel said \"Connected to Kat\" but still waited for accept — WebRTC never completed.\n\nRoot causes: (1) Support init was deferred up to 3s on requestIdleCallback for customers too, so SSE and invite polling started late and could miss events. Chat had no poll fallback at all — only SSE. (2) Orphan \"active\" remote rows in Postgres (prior sessions not ended) made the customer auto-attach WebRTC without consent while the admin waited on a new pending invite for a different session id. (3) Admin UI opened the remote panel as \"Connected to …\" even when only a pending invite existed.\n\nThis release: customers boot support immediately; 5s poll for pending remote + chat invites; SSE reconnects faster when auth token was late; auto-restore active remote only when the stored persist token matches (proves prior accept); backend ends stale sessions when a new invite is created and prefers pending over orphan active in /remote/active; admin polls for accept when SSE is missed; remote panel shows \"Waiting for …\" until connected.\n\nWho is affected: Horizon admins and customers using PipeShare/PipeSync remote support and chat on the OVH private server. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Customer poll: pending remote invite shown via GET /saas/support/remote/active on heartbeat (SSE fallback).",
-    "Backend re-broadcasts remote-request when admin retries an existing pending invite.",
-    "SSE client retries connection when session token was missing at first init.",
-    "Support user id resolves from user.id or user.userId for invite matching.",
-    "Portal runtime cache bust dbg137."
+    "Customer support init runs immediately for non-admin users (SSE + invite poll start sooner).",
+    "5s poll: pending remote via GET /remote/active and pending chat via new GET /chat/pending.",
+    "Customer auto-reconnects WebRTC only when local persist token matches session (no orphan attach).",
+    "Backend ends superseded remote sessions on new invite; /remote/active prefers pending over stale active.",
+    "Admin polls for customer accept when remote-response SSE is missed; panel title shows waiting state.",
+    "SSE client: faster token retry, reconnect on tab visible, hello event wired.",
+    "Portal runtime cache bust dbg138."
   ],
-  "updatedAt": "2026-06-29T00:30:00.000Z"
+  "updatedAt": "2026-06-28T12:00:00.000Z"
 }
