@@ -1,12 +1,11 @@
 {
-  "title": "Context menu icons + smart sort",
-  "description": "PipeSync right-click menus had corrupted emoji (mojibake like ðŸ" instead of icons) after the modular migration — all plan sheet, board, and PSR context menu icons are restored.\n\nMenus now learn your habits: each tool or action you use moves up in that section on the next open. Counts are saved per user account via Wasabi-backed prefs (same path as other PipeSync settings).\n\nHard-refresh PipeSync after deploy (dbg54). pipesync.html boot script cache bust updated so browsers load the new boot chain.\n\nWho is affected: Private OVH server.",
+  "title": "Context menu smart sort — global favorites",
+  "description": "Right-click menu usage sorting now lifts your most-used actions to the top of the whole menu (Line, Eraser, Bookmark catalog compete globally), not only within each section.\n\nAlso fixes pref reads merging localStorage with server prefs so counts are not lost when sync returns an empty object.\n\nHard-refresh PipeSync after deploy (dbg55).\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "Fix UTF-8 mojibake on all PipeSync context menu icons.",
-    "Smart sort: menu items reorder by usage within each section.",
-    "Per-user ctxMenuUsage prefs synced to Wasabi.",
-    "Toolbar tool picks also bump menu priority.",
-    "Cache bust dbg54 on pipesync.html, boot, and app.js."
+    "Smart sort: frequently used menu actions pinned to top across all sections.",
+    "Merge local + Wasabi ctxMenuUsage counts on read.",
+    "Plan-view eraser toolbar picks now bump menu priority.",
+    "Cache bust dbg55."
   ],
-  "updatedAt": "2026-06-28T12:00:00.000Z"
+  "updatedAt": "2026-06-28T14:00:00.000Z"
 }
