@@ -1,14 +1,12 @@
 {
-  "title": "Screen share consent before browser picker",
-  "description": "Remote help screen sharing now shows our consent modal first — \"Would you like to share your screen?\" with Yes / No. Choosing No cancels cleanly without opening the browser picker.\n\nOn Yes, a single-step hint explains that PipeShare or PipeSync is already selected in the picker; the customer clicks Open share picker, then only needs to click Share once in Chrome/Edge (preferCurrentTab + displaySurface browser + monitorTypeSurfaces exclude). Wrong surface (whole window/screen) still shows a retry prompt instead of looping.\n\nAlso includes dbg158 fixes: single getDisplayMedia per session, screen-capture color-mix html2canvas fix, and picker-loop guards.\n\nWho is affected: OVH PipeShare and PipeSync users on HTTPS (dbg159). HTTP still uses DOM viewport relay only. SaaS unchanged.",
+  "title": "Admin sees customer screen share (WebRTC fix)",
+  "description": "Customer-initiated remote help on HTTPS was broken: the admin sent the WebRTC offer while the customer was still in the screen-share consent/picker, before the customer's peer connection existed. The offer signal was marked as processed but never handled, so the customer never sent an SDP answer and the admin never received the video track — status stayed on \"Waiting for customer screen share…\" even though the customer saw \"Screen sharing active\".\n\nFix: queue remote-signal events until remoteRtc is ready, flush after attach, and only advance lastSignalId after a signal is actually applied. Also harden admin ontrack when browsers omit e.streams[0], and update admin status to \"Connected — viewing customer screen\" when the track arrives.\n\nWho is affected: OVH PipeShare/PipeSync HTTPS remote help (dbg160). HTTP DOM relay unchanged. SaaS unchanged until version publish.",
   "changeLog": [
-    "Yes/No screen-share consent before browser picker; No skips getDisplayMedia.",
-    "Single-step hint: app tab pre-selected — click Share in browser.",
-    "shareAppLabel() for PipeShare vs PipeSync copy.",
-    "Fix screen-share picker loop: single getDisplayMedia per remote attach.",
-    "preferCurrentTab + browser tab constraints; reject window/monitor share.",
-    "Support chat screenshot: html2canvas strips color-mix() from theme CSS.",
-    "Runtime cache bump dbg159."
+    "Fix lost WebRTC offer when admin connects before customer finishes screen-share picker.",
+    "Queue remote-signal until peer connection exists; flush on attach.",
+    "Admin ontrack: build MediaStream from track when streams array is empty.",
+    "Admin status: \"Connected — viewing customer screen\" when video track arrives.",
+    "Runtime cache bump dbg160."
   ],
-  "updatedAt": "2026-06-28T20:00:00.000Z"
+  "updatedAt": "2026-06-28T21:00:00.000Z"
 }
