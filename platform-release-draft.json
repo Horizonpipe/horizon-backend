@@ -1,13 +1,13 @@
 {
-  "title": "Fix blank fullscreen PDF workspace (dbg96)",
-  "description": "Fullscreen PDF workspace was blank because scrollport lock used stacked 72vh layout inside the fixed overlay, and split-piece PDFs often load from page.src rather than archive read-url. dbg96 uses flex-fill scrollport in fullscreen, single render on open, page.src fallback for per-piece loads, and sessionStorage diag log hpPlanFullscreenDiagLog.",
+  "title": "Fix blank fullscreen PDF viewer mount timing (dbg97)",
+  "description": "Opening a PDF from the Plan View explorer into fullscreen showed a blank black area and a false \"no pages\" toast even though 17 pages were loaded. The continuous PDF viewer was mounting while the fullscreen host was still 1×1 pixels (before flex layout finished).\n\ndbg97 waits for the fullscreen PDF host to reach real dimensions, scopes mount to the fullscreen overlay (not a stale global host), retries mount once after layout, and only shows the warning toast if both attempts fail. Mount reject reasons are logged for diagnosis.\n\nWho is affected: private OVH server users opening PDFs via right-click → Open in PDF Viewer. SaaS is unchanged until you apply a platform release.",
   "changeLog": [
-    "Fullscreen scrollport: flex fill instead of 72vh stacked pane lock.",
-    "Single render on fullscreen open (skipRender) + finalize mount.",
-    "Continuous viewer: load from page.src when read-url unavailable.",
-    "Force initial slot render on mount.",
-    "Diag: hpPlanFullscreenDiagLog in sessionStorage during fullscreen.",
-    "Cache bust dbg96."
+    "Wait for fullscreen PDF host layout before mounting continuous viewer.",
+    "Scope PDF board host to fullscreen overlay during active session.",
+    "Retry mount after layout; defer false \"no pages\" toast.",
+    "Log mount reject reasons (no-root, not-viewer-workspace, etc.).",
+    "Fullscreen body CSS: height 100% for flex fill.",
+    "Cache bust dbg97."
   ],
-  "updatedAt": "2026-06-29T00:00:00.000Z"
+  "updatedAt": "2026-06-29T12:00:00.000Z"
 }
