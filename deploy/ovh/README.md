@@ -133,27 +133,31 @@ psql "$DATABASE_URL" -c "SELECT COUNT(*) FROM users;"
 
 #### pipeshare.net sign-up email (SMTP)
 
-Create account sends a 6-digit code from **EmailVerification@pipeshare.net** (GoDaddy Workspace mailbox).
+Create account sends a 6-digit code from **EmailVerification@pipeshare.net** (Microsoft 365 from GoDaddy).
 
-On OVH, after the mailbox password is set in GoDaddy:
+**1. Enable SMTP in GoDaddy (required once per mailbox)**
 
-```bash
-SMTP_PASS='your-mailbox-password' bash /opt/horizon/horizon-backend/deploy/ovh/setup-pipeshare-signup-smtp.sh
+1. [GoDaddy → Email & Office](https://sso.godaddy.com/email)
+2. **Manage** next to `EmailVerification@pipeshare.net`
+3. **Account information** → **Advanced Settings**
+4. Turn **SMTP Authentication** **ON** → Save
+
+Without this, Microsoft returns `SmtpClientAuthentication is disabled for the Tenant` and sign-up cannot send mail.
+
+**2. Configure OVH backend**
+
+```powershell
+powershell -File deploy/ovh/setup-pipeshare-signup-smtp.ps1
 ```
 
-Or edit `/opt/horizon/horizon-backend/.env` manually:
+Uses Microsoft 365 SMTP by default when you pass:
 
 ```bash
-SMTP_HOST=smtpout.secureserver.net
-SMTP_PORT=465
-SMTP_SECURE=true
-SMTP_USER=EmailVerification@pipeshare.net
-SMTP_PASS=your-mailbox-password
-SMTP_FROM=PipeShare <EmailVerification@pipeshare.net>
-SIGNUP_MAIL_FROM_NAME=PipeShare
+SMTP_HOST=smtp.office365.com SMTP_PORT=587 SMTP_SECURE=false SMTP_PASS='...' \
+  bash deploy/ovh/setup-pipeshare-signup-smtp.sh
 ```
 
-Then reload: `pm2 reload horizon-backend --update-env`
+Legacy GoDaddy Workspace (non-M365): `SMTP_HOST=smtpout.secureserver.net SMTP_PORT=465`
 
 **Pre-launch testing on pipeshare.live (non-SaaS):** `SIGNUP_DEV_RETURN_PIN=1` shows the verification code on screen when SMTP is not configured. **pipeshare.net (SaaS) always requires email** — configure SMTP below.
 

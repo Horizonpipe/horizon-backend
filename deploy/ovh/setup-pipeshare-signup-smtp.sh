@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Configure GoDaddy Workspace SMTP for pipeshare.net sign-up verification emails.
+# Configure GoDaddy / Microsoft 365 SMTP for pipeshare.net sign-up verification emails.
 #
-# Mailbox (GoDaddy): EmailVerification@pipeshare.net
+# Mailbox: EmailVerification@pipeshare.net
+# M365 (default): smtp.office365.com:587 — requires SMTP Authentication ON in GoDaddy Advanced Settings
+# Legacy Workspace: SMTP_HOST=smtpout.secureserver.net SMTP_PORT=465
 #
 # On OVH after git pull:
 #   SMTP_PASS='your-mailbox-password' bash /opt/horizon/horizon-backend/deploy/ovh/setup-pipeshare-signup-smtp.sh
@@ -13,8 +15,11 @@ set -euo pipefail
 ENV="${HP_BACKEND_ENV:-/opt/horizon/horizon-backend/.env}"
 SMTP_USER="${SMTP_USER:-EmailVerification@pipeshare.net}"
 SMTP_PASS="${SMTP_PASS:-}"
-SMTP_HOST="${SMTP_HOST:-smtpout.secureserver.net}"
-SMTP_PORT="${SMTP_PORT:-465}"
+SMTP_HOST="${SMTP_HOST:-smtp.office365.com}"
+SMTP_PORT="${SMTP_PORT:-587}"
+if [[ -z "${SMTP_SECURE:-}" ]]; then
+  if [[ "$SMTP_PORT" == "465" ]]; then SMTP_SECURE=true; else SMTP_SECURE=false; fi
+fi
 
 if [[ -z "$SMTP_PASS" ]]; then
   echo "ERROR: Set SMTP_PASS to the GoDaddy mailbox password for ${SMTP_USER}." >&2
@@ -31,10 +36,10 @@ grep -v -E '^(SMTP_|SIGNUP_MAIL_FROM_NAME)=' "$ENV" > /tmp/horizon.env.smtp || t
 {
   cat /tmp/horizon.env.smtp
   echo ''
-  echo '# PipeShare.net sign-up verification (GoDaddy Workspace)'
+  echo '# PipeShare.net sign-up verification email'
   echo "SMTP_HOST=${SMTP_HOST}"
   echo "SMTP_PORT=${SMTP_PORT}"
-  echo 'SMTP_SECURE=true'
+  echo "SMTP_SECURE=${SMTP_SECURE}"
   echo "SMTP_USER=${SMTP_USER}"
   echo "SMTP_PASS=${SMTP_PASS}"
   echo "SMTP_FROM=PipeShare <${SMTP_USER}>"
