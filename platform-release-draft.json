@@ -1,12 +1,12 @@
 {
-  "title": "PDF Viewer stack reflow after crop",
-  "description": "Crop and gap changes now re-stack all viewer pages (fixes huge grey void between sheets). Normalized layout always persisted on load/render. Inter-page background restored to subtle grey; white is sheet paper only.\n\nHard-refresh PipeSync (dbg66).\n\nWho is affected: Private OVH server.",
+  "title": "PDF auto-trim + visible crop panel",
+  "description": "PDF import now reads CropBox/TrimBox and auto-trims page whitespace (same as manual Refine edges). Existing viewer sheets backfill crop insets on open. Refine edges panel styled fixed bottom-right (was unstyled/buried). Fixed viewer page build footprint bug.\n\nHard-refresh PipeSync (dbg67).\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "Reflow viewer stack after crop apply — pages move together.",
-    "Always normalize + persist page Y positions on load/render.",
-    "Grey gap between sheets (not white); crop persists on refresh.",
-    "Gap slider uses same reflow path.",
-    "Cache bust dbg66."
+    "Auto-trim PDF whitespace at split/import from CropBox/TrimBox.",
+    "Viewer backfill detects crop on open for older uploads.",
+    "Refine edges panel visible bottom-right with proper styling.",
+    "Viewer stack reflow after auto-trim removes grey dead space.",
+    "Cache bust dbg67."
   ],
-  "updatedAt": "2026-06-29T04:00:00.000Z"
+  "updatedAt": "2026-06-29T05:00:00.000Z"
 }
