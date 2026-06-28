@@ -1,13 +1,11 @@
 {
-  "title": "PipeShare explorer instant cache + fewer parallel file API calls (dbg133)",
-  "description": "PipeShare file explorer felt slow on open because every visit refetched the full Wasabi job tree and WinCan/preview work fired parallel GET /api/files/meta and /presign calls (one pair per file id) before the folder list appeared.\n\nThis release adds a session-scoped tree cache (memory + sessionStorage, 5 minute TTL) with stale-while-revalidate: cached folders/files render immediately while one background /api/files/tree refresh runs per client+job scope. Explorer no longer sends pathPrefix tree requests on load (folder navigation filters client-side). Duplicate meta/presign pairs are cached for 90 seconds in the browser. Backend adds short private Cache-Control on tree, meta, and presign JSON.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "PipeShare addon loader fix — files and folder view restored (dbg134)",
+  "description": "PipeShare stopped loading files and folder spaces because addon scripts (file explorer, admin panel, customer support, etc.) were 404ing. The addon loader resolved manifest paths relative to pipeshare/core/ instead of client-portal/, so every addon index.js failed to load.\n\nThis release fixes path resolution in addon-loader.js and bumps the portal cache to dbg134. After deploy, hard refresh PipeShare — explorer, Folder view picker, and addon boot should work normally again.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Explorer shows cached job tree instantly; background refresh without blanking the panel.",
-    "One tree fetch per client+job (removed pathPrefix-on-load split keys).",
-    "Debounced loadRemoteTree (150ms) and defer WinCan DB3 until tree is present.",
-    "Browser meta/presign cache cuts duplicate encoded-path API storms on boot.",
-    "GET /api/files/tree, /meta/:id, /presign/:id: private Cache-Control headers.",
-    "Runtime cache bust dbg133."
+    "Fix PipeShare addon-loader: resolve manifest paths from client-portal/ base URL.",
+    "Restores file explorer, uploader, autosync, admin panel, customer support addon boot.",
+    "Folder view / numbered job folders work again once addons load.",
+    "Portal runtime cache bust dbg134."
   ],
-  "updatedAt": "2026-06-28T19:30:00.000Z"
+  "updatedAt": "2026-06-28T22:00:00.000Z"
 }
