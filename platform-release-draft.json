@@ -1,13 +1,12 @@
 {
-  "title": "PDF Viewer pdf.js canvas stack (dbg81)",
-  "description": "PipeSync PDF Viewer now renders pages with pdf.js canvas (Okular-style vertical stack) instead of nested browser PDF iframes. Map workspace is unchanged — native iframes, highlights, structure nodes, and export alignment stay on the existing path.\n\nViewer paints at 600 DPI base and re-rasterizes on zoom (effective DPI scales with zoom up to 24k) so microscope letter-level zoom stays sharp. Hard-refresh PipeSync (dbg81).\n\nWho is affected: private OVH server users on PDF Viewer workspace.",
+  "title": "PDF Viewer intrinsic zoom — sharp + less lag (dbg82)",
+  "description": "PDF Viewer no longer zooms via CSS transform:scale on the whole world (that was upscaling low-res bitmaps = blurry text). Zoom now resizes page layout directly and re-rasterizes visible pages at up to 600×zoom DPI after a short debounce.\n\nMap workspace unchanged. Hard-refresh PipeSync (dbg82).",
   "changeLog": [
-    "PDF Viewer: pdf.js canvas pages in one scroll column (no iframe mini scrollbars).",
-    "Map workspace unchanged — native PDF iframes + highlight/export coords preserved.",
-    "Viewer: 600 DPI base render, full quality on first paint (no 120 DPI preview blur).",
-    "Zoom re-rasterizes viewer canvases at min(24000, 600 × zoom) effective DPI.",
-    "Highlight layout mode for viewer pages: contain (matches canvas paint).",
-    "Cache bust dbg81."
+    "Viewer: intrinsic layout zoom (no CSS world scale blur).",
+    "Debounced re-raster — visible pages only (fixes zoom lag on large PDFs).",
+    "600 DPI base + effDpi scales with zoom for microscope letter clarity.",
+    "Map/highlights/export path untouched.",
+    "Cache bust dbg82."
   ],
-  "updatedAt": "2026-06-28T16:00:00.000Z"
+  "updatedAt": "2026-06-28T18:00:00.000Z"
 }
