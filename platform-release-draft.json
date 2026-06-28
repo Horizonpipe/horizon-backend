@@ -1,10 +1,13 @@
 {
-  "title": "Fix viewer page overlap in stack",
-  "description": "PDF Viewer stacked pages no longer overlap. Stack Y spacing now uses layout display height (p.h after width unify) instead of unscaled PDF footprint height, which was too short when viewDispScale > 1.\n\nHard-refresh PipeSync (dbg79).",
+  "title": "PDF Viewer single scroll container (dbg80)",
+  "description": "PipeSync PDF Viewer now uses one outer scroll container with pages stacked in a vertical flex column (Okular/Edge-style), instead of nested scroll areas and overlapping absolute-positioned pages.\n\nScroll chrome no longer locks height to zoomport; native PDF iframes skip sharp oversample in viewer mode and use Fit/page-width instead of FitH.\n\nHard-refresh PipeSync (dbg80). Who is affected: private OVH server users on PDF Viewer workspace.",
   "changeLog": [
-    "Stack spacing uses p.h layout box, not footprint.h.",
-    "World bounds and fit width use layout box dimensions.",
-    "H13 stack overlap diagnostics. Cache bust dbg79."
+    "Single scroll container: flex column stack, no nested mini scrollbars.",
+    "Viewer pages use relative positioning instead of absolute left/top.",
+    "Native PDF iframes: no oversample transform in viewer; overflow hidden.",
+    "PDF hash view=Fit&zoom=page-width (no FitH internal scroll).",
+    "H14 scroll height / nested overflow diagnostics.",
+    "Cache bust dbg80."
   ],
-  "updatedAt": "2026-06-29T15:00:00.000Z"
+  "updatedAt": "2026-06-28T12:00:00.000Z"
 }
