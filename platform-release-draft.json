@@ -1,11 +1,13 @@
 {
-  "title": "dbg124 site menu user identity and theme",
-  "description": "PipeSync desktop and mobile now show your display name, role badge, and theme picker inside the top-right site menu instead of separate header strips. Mojibake in role subtitles (garbled middle-dot separators) is fixed with clean role labels.\n\nMobile header layout is tightened: sync status and refresh sit next to the menu; the old full-width user bar is removed.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "dbg125 theme stability and pill button system",
+  "description": "Theme switching no longer flickers or snaps back — local choice wins until the server confirms, and changing theme no longer rebuilds the whole PipeSync page. The dark capsule pill button style (orange dot, underline, glow) is now consistent across PipeSync and PipeShare tabs, toolbars, modals, and menus.\n\nSaaS tenants with custom primary/accent colors from setup now drive button accents at runtime via /saas/tenant/me or meta tags.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Move user badge and theme selector into PipeSync site menu (desktop and mobile).",
-    "Fix session role label encoding (Customer, Admin, Employee, etc.) without corrupted separators.",
-    "Keep site menu open while changing theme; focus handling for theme select.",
-    "Cache bust dbg124 on PipeSync, mobile HTML, CSS, and addon manifest."
+    "Fix theme selector flicker: localStorage-first read, seed from server only on login.",
+    "Stop full app render on theme change; sync select values via hp-theme-change.",
+    "Unified --hp-btn-accent tokens derived from theme --orange / tenant branding.",
+    "Remove conflicting legacy orange-gradient tab/button overrides.",
+    "Wire SaaS tenant primaryColor into buttons on PipeSync and PipeShare boot.",
+    "Cache bust dbg125 on PipeSync, mobile, portal, CSS, and addon manifest."
   ],
-  "updatedAt": "2026-06-28T22:00:00.000Z"
+  "updatedAt": "2026-06-28T23:30:00.000Z"
 }
