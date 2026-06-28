@@ -1,12 +1,12 @@
 {
-  "title": "PipeShare support queue context menu fix (dbg135)",
-  "description": "In the Customer support queue modal, clicking context menu items (Request Connection, Clear Request, Start chat, etc.) did nothing. Clicks were falling through to the user row underneath or losing to the document dismiss handler before the select handler ran.\n\nThis release fixes context menu hit-testing and event order: menu z-index is raised above modal layers, item picks use pointerdown with stopPropagation, and the support panel suppresses reopening the menu on the same click.\n\nWho is affected: Horizon admins using PipeShare Customer support queue on OVH private server after deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "PipeShare support queue actions wired (dbg136)",
+  "description": "dbg135 fixed context menu picks in the Customer support queue, but Request Connection and Start chat still appeared to do nothing after a click.\n\nRoot cause: menu onSelect did fire and the backend APIs were called, but the admin UI never reacted — no support widget for chat, no remote panel for pending invites, no chat-response SSE handler for admins, and API errors were swallowed silently.\n\nThis release wires admin Start chat and Request Connection through the customer-support module: opens the support widget or remote panel with a waiting status, loads chat when the customer accepts, and shows an alert if the API fails.\n\nWho is affected: Horizon admins using PipeShare (and PipeSync via shared module) Customer support queue on OVH private server. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Fix support queue user context menu: menu item clicks now run actions.",
-    "Raise context menu z-index above cp-modal-layer so clicks hit menu items.",
-    "Select menu items on pointerdown before document dismiss click runs.",
-    "Suppress support panel row handler from reopening menu on the same click.",
-    "Portal runtime cache bust dbg135."
+    "Wire admin Start chat: open support widget, wait for customer accept via SSE chat-response.",
+    "Wire admin Request Connection: show remote panel with pending invite status before WebRTC starts.",
+    "Create admin remote panel on first invite instead of no-op when panel did not exist yet.",
+    "Surface support API failures with alert instead of silent void promises.",
+    "Portal runtime cache bust dbg136; PipeSync addons.manifest dbg136."
   ],
-  "updatedAt": "2026-06-28T23:30:00.000Z"
+  "updatedAt": "2026-06-28T23:55:00.000Z"
 }
