@@ -280,3 +280,21 @@ Next step: second OVH app server + Hetzner/OVH load balancer, **keep Postgres on
 | `deploy-from-local.ps1` | One-command deploy from PC via `ssh horizon-ovh` |
 | `rollback-main.sh` | Roll back backend/frontend/both on main |
 | `../ovh-ops-monitor/` | Portable Java desktop monitor |
+
+
+## Cross-host remote support presence (OVH + SaaS)
+
+OVH and Render SaaS use separate Postgres databases. Heartbeats write to local `cp_support_presence` only.
+
+**Approach:** peer read federation. Each backend exposes `GET /internal/support/presence-snapshot` (header `X-CP-Support-Peer-Secret`). Mike global GET merges local rows with peer snapshots.
+
+### Environment (both hosts)
+
+- `CP_SUPPORT_PRESENCE_PEER_SECRET` — same long random string on both
+- `CP_SUPPORT_PRESENCE_PEER_URLS` — comma-separated HTTPS base URL(s) of the other backend(s), no trailing slash
+
+Example: OVH points at Render SaaS API origin; Render SaaS points at OVH public API origin.
+
+Reload OVH (pm2) and redeploy Render after setting vars.
+
+Remote sessions/chat/SSE are not federated — presence list only.

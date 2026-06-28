@@ -1034,6 +1034,20 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
+
+  app.get('/internal/support/presence-snapshot', requirePresencePeerSecret, async (req, res) => {
+    try {
+      await ensureSchema();
+      const filter = cleanString(req.query?.filter).toLowerCase();
+      const supportOnly = filter === 'support';
+      const rows = await listAllPresenceRows(pool, { supportOnly });
+      return res.json({ success: true, rows });
+    } catch (error) {
+      console.error('[internal/support/presence-snapshot]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
   app.get('/saas/support/remote/active', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const uid = String(req.user.id);
