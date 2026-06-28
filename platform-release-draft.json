@@ -1,13 +1,12 @@
 {
-  "title": "Customer support chat: bidirectional message delivery (dbg143)",
-  "description": "After dbg142, Mike and Kat could both see an active chat session and send messages, but only each user's own messages appeared — nothing crossed in real time.\n\nRoot cause (dbg143): dbg142 added `if (!isChatComposerLive()) return` on incoming `chat-message` SSE events. That gate was meant for the send composer but silently dropped peer messages whenever live-mode state lagged session status (common on the customer side after accept, or when session IDs differed by case). Own messages still showed via optimistic POST append, which matched the screenshot.\n\nFix: never gate inbound chat-message on composer live state — always append when sessionId matches, promote widget to live mode, and dedupe by message id. Normalize session UUID comparison (case-insensitive). Poll GET /messages on heartbeat while chat is active as SSE fallback. POST response ids used for optimistic send dedupe. Backend SSE payload sessionId stringified explicitly.\n\nWho is affected: Horizon admins and customers using PipeShare customer support chat on the OVH private server. Deploy both frontend and backend together.",
+  "title": "Customer support chat: faster message delivery (dbg144)",
+  "description": "After dbg143 fixed bidirectional chat delivery, messages still arrived with long delays — often 10–20 seconds — especially on the admin side. Kat could see her own \"lol\" immediately (optimistic POST append) while Mike's chat stayed empty until much later.\n\nRoot cause (dbg144): dbg143 added GET /messages polling only inside the presence heartbeat, which runs every 20 seconds (HEARTBEAT_VISIBLE_MS). When SSE chat-message events were missed or slow (admin init deferred up to 3s, SSE reconnect at 3s, presence backoff skipping heartbeat entirely), the only recovery path was that 20s poll. Backend broadcast is synchronous and instant — latency was entirely client-side.\n\nFix: dedicated 2s chat poll while a session is live (independent of presence heartbeat/backoff). Start poll when chat goes active; stop on end. SSE reconnect reduced to 1.5s. Admin support init idle timeout cut from 3s to 500ms so SSE connects sooner.\n\nWho is affected: Horizon admins and customers using PipeShare customer support chat on the OVH private server. Frontend-only deploy is sufficient.",
   "changeLog": [
-    "Remove composer-live gate on inbound chat-message SSE — peer messages always render when session matches.",
-    "Normalize sessionId comparison; stringify sessionId in backend chat-message broadcast.",
-    "Dedupe messages by id in widget; optimistic send uses POST response id.",
-    "Poll GET /messages on heartbeat during active chat as SSE fallback.",
-    "Use live supportUserId() for mine/other styling instead of stale init snapshot.",
-    "Cache bust dbg143 (portal runtime + PipeShare addon manifest + PipeSync manifest)."
+    "Poll GET /messages every 2s during active chat — no longer tied to 20s presence heartbeat.",
+    "Chat poll runs even when presence heartbeat is in backoff; removed sync from heartbeat.",
+    "Start/stop chat poll on session live/end; immediate poll on tab visible.",
+    "SSE reconnect retry 3s → 1.5s; admin support init idle timeout 3s → 500ms.",
+    "Cache bust dbg144 (portal runtime + PipeShare addon manifest + PipeSync manifest)."
   ],
-  "updatedAt": "2026-06-29T00:15:00.000Z"
+  "updatedAt": "2026-06-29T01:00:00.000Z"
 }
