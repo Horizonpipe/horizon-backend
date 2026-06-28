@@ -1,12 +1,11 @@
 {
-  "title": "Fix invisible highlights and menus in PDF fullscreen (dbg101)",
-  "description": "In the fullscreen PDF viewer, highlights saved to state but did not appear on screen, the color-selection popup was missing, and the right-click sheet menu seemed broken.\n\nRoot causes: (1) context menu and color HUD used z-index 2000–2600 while the fullscreen shell is z-index 9200, so menus opened behind the workspace. (2) continuous viewer pages kept map-board world x/y coordinates while rendering as a vertical stack, so highlight ink coordinates were off-canvas.\n\ndbg101 raises menu/HUD z-index above fullscreen, normalizes viewer page stack layout (p.x=0, p.y=stacked), and keeps overlays in sync on zoom.\n\nWho is affected: OVH private server PDF Viewer fullscreen.",
+  "title": "Modals and bookmark dialog above PDF fullscreen (dbg102)",
+  "description": "Create Bookmark and other modals opened behind the fullscreen PDF workspace (modal z-index 999 vs fullscreen 9200). Mike confirmed closing the workspace revealed the bookmark dialog underneath.\n\ndbg102 raises modals, bookmark catalog, edge/mask floats, and nested context submenus above the fullscreen shell (z-index 9301+), with a JS elevation pass after each render.\n\nWho is affected: OVH private server PDF Viewer / Map Builder fullscreen.",
   "changeLog": [
-    "Raise context menu and color HUD z-index above fullscreen overlay.",
-    "Normalize continuous viewer page x/y to vertical stack layout for highlight coords.",
-    "Store pageId on line-tool first click; improve line preview targeting.",
-    "Refresh highlight overlays after zoom with correct page layout.",
-    "Cache bust dbg101."
+    "Raise plan modals and bookmark-create dialog above fullscreen overlay.",
+    "Raise bookmark catalog and nested context submenus above fullscreen.",
+    "JS elevation pass after render when fullscreen session active.",
+    "Cache bust dbg102."
   ],
-  "updatedAt": "2026-06-29T23:30:00.000Z"
+  "updatedAt": "2026-06-30T00:00:00.000Z"
 }
