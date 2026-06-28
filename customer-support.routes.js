@@ -1981,6 +1981,10 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       }
 
       if (!row) return res.json({ success: true, session: null });
+      const [customerDisplayName, adminDisplayName] = await Promise.all([
+        lookupUserDisplayName(pool, row.customer_user_id),
+        lookupUserDisplayName(pool, row.admin_user_id)
+      ]);
       return res.json({
         success: true,
         session: {
@@ -1988,6 +1992,8 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
           status: row.status,
           customerUserId: row.customer_user_id,
           adminUserId: row.admin_user_id,
+          customerDisplayName,
+          adminDisplayName,
           createdAt: row.created_at,
           updatedAt: row.updated_at
         }
@@ -2002,7 +2008,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     try {
       const uid = String(req.user.id);
       const r = await pool.query(
-        `SELECT id, tenant_id, customer_user_id, admin_user_id, status, persist_token, customer_tab_id, initiated_by, created_at, updated_at
+        `SELECT id, tenant_id, customer_user_id, admin_user_id, status, persist_token, customer_tab_id, initiated_by, chat_session_id, created_at, updated_at
          FROM cp_support_remote_sessions
          WHERE ended_at IS NULL
            AND (
@@ -2015,6 +2021,10 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       );
       const row = r.rows[0];
       if (!row) return res.json({ success: true, session: null });
+      let customerDisplayName = '';
+      if (row.status === 'pending' && row.initiated_by === 'customer') {
+        customerDisplayName = await lookupUserDisplayName(pool, row.customer_user_id);
+      }
       return res.json({
         success: true,
         session: {
@@ -2025,6 +2035,8 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
           persistToken: row.persist_token,
           customerTabId: row.customer_tab_id,
           initiatedBy: row.initiated_by || 'admin',
+          chatSessionId: row.chat_session_id || null,
+          customerDisplayName: customerDisplayName || undefined,
           createdAt: row.created_at,
           updatedAt: row.updated_at
         }

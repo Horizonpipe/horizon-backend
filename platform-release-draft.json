@@ -1,16 +1,14 @@
 {
-  "title": "Support chat Wasabi file transfer (dbg149)",
-  "description": "PipeShare support chat file upload and download now use Wasabi object storage instead of the dbg147 in-memory base64 file-offer flow. Upload picks a single file or folder (folder is zipped client-side), shows a theme-matched progress bar, and posts a file message visible to both chat participants via SSE. Screen capture (region snip) uses the same Wasabi upload path — PNG screenshots appear inline in chat for both parties; click to download with progress.\n\nAlso includes dbg148 remote-help fixes (customer no longer sees admin consent modal; admin Accept/Decline in chat) and pill-styled chat toolbar.\n\nStorage path: chat-uploads/{tenantId}/{sessionId}/{fileId}-{filename}. Files carry a 10-day expiresAt in message metadata; expired downloads are rejected (optional lifecycle/cron cleanup can scan the prefix).\n\nWho is affected: Horizon admins and customers on the OVH private server using PipeShare support chat. Deploy horizon-backend (Wasabi routes + remote/active guards) and client-portal static assets (dbg149). SaaS updates only via releases.html.",
+  "title": "Admin chat restore on refresh + remote help poll (dbg151)",
+  "description": "PipeShare support chat now survives browser refresh for admins as well as customers. On page load, admin tabs call GET /saas/support/chat/active and restore an active session (messages, toolbar, composer, connected state) or a pending invite (waiting-for-accept UI with poll). Previously syncChatSessionState returned immediately for admins and syncAdminChatWaitState required in-memory session id that was lost on reload.\n\nAlso ships dbg150: when a customer requests remote help, the assigned admin sees an in-chat Accept/Decline prompt within a few seconds even if the SSE event was missed (3s poll on /saas/support/remote/active).\n\nWho is affected: Horizon admins and customers on the OVH private server using PipeShare support chat. Deploy horizon-backend (chat/active display names + remote/active payload) and client-portal static assets (dbg151). SaaS updates only via releases.html.",
   "changeLog": [
-    "Fix upload button doing nothing: file-offer only notified peer; replaced with direct Wasabi upload + chat message.",
-    "Fix screen capture: screenshots upload via Wasabi (same path as file upload) instead of legacy base64 /attachment.",
-    "Wasabi chat images show inline preview in chat; click image to download with progress bar.",
-    "Wasabi chat uploads: presign PUT init, complete message, presign GET download.",
-    "Theme-matched upload/download progress bars under chat messages.",
-    "File attachment bubbles in chat; click to confirm download.",
-    "SSE chat-message + chat-file-uploaded notify both peers when a file is shared.",
-    "dbg148 remote help: customer request flow + toolbar pill styling (included in same deploy batch).",
-    "Cache bust dbg149 (portal runtime + PipeShare manifest)."
+    "Fix admin losing support chat on browser refresh — restore from GET /chat/active on init and heartbeat.",
+    "Restore pending chat invite waiting state for admin after reload.",
+    "chat/active includes customerDisplayName and adminDisplayName for session restore.",
+    "Fix admin missing Accept/Decline when customer requests remote help (SSE miss poll recovery).",
+    "Admin polls /saas/support/remote/active every 3s for pending customer-initiated remote help.",
+    "Screen capture errors surfaced in chat instead of silent failure.",
+    "Cache bust dbg151 (portal runtime + PipeShare manifest)."
   ],
-  "updatedAt": "2026-06-28T19:30:00.000Z"
+  "updatedAt": "2026-06-28T21:00:00.000Z"
 }
