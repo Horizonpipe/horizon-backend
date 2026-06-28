@@ -1,14 +1,12 @@
 {
-  "title": "Customer remote help: screen share + chat preserved (dbg152)",
-  "description": "PipeShare support chat customer-initiated remote help now works end-to-end. When a customer requests remote help and the admin accepts, the customer keeps their active chat (no reset to the initial \"Need help?\" screen), shares their screen via WebRTC video, and the admin sees a live feed in the remote panel while controlling app windows over the data channel.\n\nFixes include: Accept/Decline prompt pinned above the composer (not in the scrollable message list), no duplicate WebRTC teardown when the admin accept SSE echoes back, poll recovery for customers when SSE is missed, and stale admin-initiated pending remote invites no longer wipe an active chat when the customer requests help.\n\nWho is affected: Horizon admins and customers on the OVH private server using PipeShare support chat remote help. Deploy horizon-backend (remote/active query + customer-request cleanup) and client-portal static assets (dbg152). SaaS updates only via releases.html.",
+  "title": "Remote help: HTTPS screen-share guard (dbg153)",
+  "description": "Customer-initiated remote help no longer throws a raw JavaScript error when screen sharing is unavailable. Browsers only expose getDisplayMedia in a secure context (HTTPS or localhost), so customers on http://40.160.72.39/client-portal/ could not share their screen after an admin accepted.\n\nThe portal now checks navigator.mediaDevices.getDisplayMedia before calling it, warns early when Remote help is clicked over HTTP, shows themed chat system messages (HTTPS required or share cancelled), and ends the remote session cleanly instead of leaving WebRTC stuck at Connecting. Admins see a clear status in chat and the remote panel when the customer cannot share.\n\nHTTPS note: OVH is configured for Let's Encrypt/nginx TLS (see deploy/ovh/nginx-horizon.conf), but the server is often accessed by raw IP over HTTP until DNS/TLS is in place. Remote screen share requires customers to use https://… on that host (or localhost for dev).\n\nWho is affected: Horizon admins and customers using PipeShare support remote help on the OVH private server. Deploy client-portal static assets (dbg153). No backend code change required for this fix. SaaS updates only via releases.html.",
   "changeLog": [
-    "Remote help Accept/Decline prompt sits above composer, not at top of message scroll.",
-    "Customer chat stays active when admin accepts customer-initiated remote help.",
-    "Customer shares screen (getDisplayMedia); admin remote panel shows live video feed.",
-    "Fix WebRTC stuck at Connecting — skip duplicate admin attach; customer poll token recovery.",
-    "Stale admin remote invites no longer reset customer chat during remote help request.",
-    "remote/active returns customer-initiated pending sessions for customers.",
-    "Cache bust dbg152 (portal runtime + PipeShare manifest)."
+    "Guard getDisplayMedia — no raw JS error on HTTP; friendly HTTPS system message in chat.",
+    "Early warning when customer clicks Remote help without a secure context.",
+    "Screen share cancelled/denied shows \"Screen share was cancelled.\" and ends session cleanly.",
+    "Admin remote panel + chat message when customer cannot share (HTTPS required).",
+    "Cache bust dbg153 (portal runtime + PipeShare manifest)."
   ],
-  "updatedAt": "2026-06-28T22:30:00.000Z"
+  "updatedAt": "2026-06-28T23:45:00.000Z"
 }
