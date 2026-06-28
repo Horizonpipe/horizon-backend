@@ -1,14 +1,12 @@
 {
-  "title": "PDF Viewer unified page width (dbg75)",
-  "description": "PipeSync PDF Viewer now normalizes every page in a stack to the same layout width before fit/zoom. Crop-trimmed pages no longer keep stale per-page widths that made later pages render smaller than page 1. Native dimensions and crop insets scale together so PDF media still fills each unified box.\n\nHard-refresh PipeSync (dbg75). Open PDF Viewer on plans that previously showed page 1 large and pages 2–3 smaller — all pages should share the same horizontal scale.",
+  "title": "Fix viewer shrink on browser zoom",
+  "description": "PDF Viewer no longer shrinks in a loop when changing browser zoom (90–100%). Fit now measures from stable shell width, scroll/body use 100% width instead of shrinking pixel widths, and ResizeObserver is debounced with a fit lock.\n\nHard-refresh PipeSync (dbg77).",
   "changeLog": [
-    "planBoardNormalizeViewerWorkspaceLayout: unify pass sets all pages to maxW.",
-    "Crop pages use piece intrinsic w/h baseline before unify, not stale p.w.",
-    "planBoardScaleViewerPageDims scales natW/natH and crop insets with layout.",
-    "Fit/reflow sync planBoardSyncPageDomBox after layout normalize.",
-    "H9 ingest: pageWs before/after unify, unifyW, per-page scales.",
-    "Keeps dbg74 column viewport fit and overflow clamp.",
-    "Cache bust dbg75."
+    "Stable shell-based column width for fit (breaks shrink feedback loop).",
+    "Viewer scroll/body width 100% — no pixel shrink on each refit.",
+    "Panel CSS flex:1 so viewer panel does not shrink-wrap to content.",
+    "Debounced ResizeObserver + fit lock on browser zoom resize.",
+    "Cache bust dbg77."
   ],
-  "updatedAt": "2026-06-27T18:00:00.000Z"
+  "updatedAt": "2026-06-29T12:00:00.000Z"
 }
