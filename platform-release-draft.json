@@ -1,13 +1,13 @@
 {
-  "title": "PipeShare explorer column sort + filter (dbg130)",
-  "description": "The PipeShare file explorer table now behaves more like Windows 11 Explorer. Name, Type, Size, and Modified column headers show stacked sort arrows — click the arrow area to toggle ascending or descending. Click the column label to open a dark filter menu with contextual sort options (A to Z, Smallest first, Oldest first, etc.) and, for Type, checkbox filters for Folder, PDF, WinCan DB3, Video, and other file types.\n\nSort and type-filter preferences persist in localStorage. Logic lives in shared/explorer-column-controls.js and the modular file-explorer addon — not in the monolithic host app. PipeSync plan/unified explorers use a tree layout without Type/Size/Modified columns; a PipeSync bridge module is registered for future tabular explorers.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "PipeShare user-prefs sync storm fix (dbg131)",
+  "description": "PipeShare was firing many PATCH /me/user-prefs requests in quick succession (~1s each), making the UI feel laggy on load and theme changes. The root cause was a feedback loop: each prefs sync dispatched hp-user-prefs-synced, theme init re-applied the theme and wrote prefs back to the server even when nothing changed, and the sync layer had no in-flight guard or minimum interval between patches.\n\nThis release debounces and coalesces user-prefs writes (3s debounce, 2.5s min interval, single in-flight PATCH), skips set() when values are unchanged, and makes theme init paint-only so server sync events do not re-trigger PATCH. DAS monitor-snapshot polling is slightly slower (20s visible) to reduce background API noise.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Windows-style sort arrows on Name, Type, Size, Modified columns.",
-    "Click column label opens filter popover with sort + type checkboxes.",
-    "Type filter supports Folder, Jobsite, PDF, Video, WinCan DB3, File.",
-    "localStorage-persisted sort/filter preferences.",
-    "Shared module at shared/explorer-column-controls.js.",
-    "Runtime cache bust dbg130."
+    "Fix user-prefs sync storm: debounce, throttle, coalesce in-flight PATCH.",
+    "Skip PATCH when pref value unchanged; break theme ↔ sync feedback loop.",
+    "Theme init paints DOM only; user theme changes still sync once.",
+    "Cache-bust user-prefs-sync.js and theme-profile.js on PipeShare portal.",
+    "DAS monitor-snapshot poll 15s → 20s when tab visible.",
+    "Runtime cache bust dbg131."
   ],
-  "updatedAt": "2026-06-28T00:00:00.000Z"
+  "updatedAt": "2026-06-28T12:00:00.000Z"
 }
