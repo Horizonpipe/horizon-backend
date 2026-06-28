@@ -246,8 +246,11 @@ Optional: UptimeRobot (free) HTTP check on `https://app.yourdomain.com/horizonpi
 sudo bash deploy/ovh/setup-github-deploy-keys.sh   # on OVH — tests SSH pull
 # From your PC (GITHUB_TOKEN set):
 pwsh deploy/ovh/setup-github-deploy-keys.ps1 -OvhHost YOUR_OVH_IP
-bash deploy/ovh/github-deploy.sh                   # manual pull + pm2 reload
+bash deploy/ovh/github-deploy.sh                   # manual pull + pm2 reload (on server)
+pwsh deploy/ovh/deploy-from-local.ps1              # from your PC (uses ~/.ssh/config → horizon-ovh)
 ```
+
+**Local SSH:** `~/.ssh/config` Host `horizon-ovh` (or `40.160.72.39`) → `IdentityFile ~/.ssh/id_ed25519_horizon_ovh`, `IdentitiesOnly yes`.
 
 **Desktop monitor:** Java app in `ovh-ops-monitor/` — see `ovh-ops-monitor/README.md`.
 
@@ -274,5 +277,6 @@ Next step: second OVH app server + Hetzner/OVH load balancer, **keep Postgres on
 | `nginx-horizon.conf` | Reverse proxy + SSL |
 | `backup-postgres.sh` | Daily dump + optional Wasabi |
 | `github-deploy.sh` | Pull main + npm install + pm2 reload (webhook / manual) |
+| `deploy-from-local.ps1` | One-command deploy from PC via `ssh horizon-ovh` |
 | `rollback-main.sh` | Roll back backend/frontend/both on main |
 | `../ovh-ops-monitor/` | Portable Java desktop monitor |
