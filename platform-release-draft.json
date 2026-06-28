@@ -1,11 +1,12 @@
 {
-  "title": "Modals and bookmark dialog above PDF fullscreen (dbg102)",
-  "description": "Create Bookmark and other modals opened behind the fullscreen PDF workspace (modal z-index 999 vs fullscreen 9200). Mike confirmed closing the workspace revealed the bookmark dialog underneath.\n\ndbg102 raises modals, bookmark catalog, edge/mask floats, and nested context submenus above the fullscreen shell (z-index 9301+), with a JS elevation pass after each render.\n\nWho is affected: OVH private server PDF Viewer / Map Builder fullscreen.",
+  "title": "Bookmark navigation in PDF fullscreen viewer (dbg103)",
+  "description": "Bookmark Go in the continuous PDF viewer required two clicks, landed on a blurry page, and Ctrl+wheel zoom snapped back to fit-width instead of continuing from the bookmark position.\n\ndbg103 adds a continuous-viewer scroll path (stack coords + wait for page slot), force re-raster of visible pages after bookmark focus, suppresses fit/reflow while navigating, and preserves user zoom across wheel zoom after a bookmark.\n\nWho is affected: OVH private server PDF Viewer fullscreen workspace.",
   "changeLog": [
-    "Raise plan modals and bookmark-create dialog above fullscreen overlay.",
-    "Raise bookmark catalog and nested context submenus above fullscreen.",
-    "JS elevation pass after render when fullscreen session active.",
-    "Cache bust dbg102."
+    "Single-click bookmark Go waits for continuous viewer page slot then scrolls via stack layout.",
+    "Force sharp re-render of visible PDF tiles after bookmark navigation.",
+    "Skip fit/reflow remount on continuous viewer during bookmark focus window.",
+    "Preserve user zoom level; no auto-fit reset after Ctrl+wheel from bookmark.",
+    "Cache bust dbg103."
   ],
   "updatedAt": "2026-06-30T00:00:00.000Z"
 }
