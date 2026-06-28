@@ -1,10 +1,11 @@
 {
-  "title": "Polished PipeShare workspace settings panel",
-  "description": "The client portal workspace settings (layout) panel has been redesigned for clearer structure and easier use. Layout editing is extracted into a dedicated module with dedicated styling, wired through the portal workspace layout service and file host shell.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "PipeShare site menu identity and Wasabi ACL routing",
+  "description": "PipeShare now shows user identity and theme controls in the site menu (dbg127), using shared site-menu-identity.js and portal shell styling aligned with PipeSync.\n\nOn the backend, portal file and share routes use live Postgres for job access checks when Wasabi portal-data-primary is enabled, and permission-related SQL is routed to Postgres instead of the Wasabi adapter. That fixes \"Portal Wasabi adapter does not support this query shape\" for customer users loading the file tree.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Redesigned workspace settings panel layout and styling (dbg126).",
-    "Extract workspace layout modal into pipeshare/modules/workspace-settings.",
-    "Portal cache bust dbg126 on index.html; shared CSS on index, mobile, and guest shells."
+    "PipeShare site menu: user identity and theme selector (dbg127).",
+    "Shared site-menu-identity.js; portal shell CSS; cache bust dbg127.",
+    "Portal ACL checks use aclPool on share-link and file routes.",
+    "portalPermissionsLivePostgresSql routes membership and folder grants to Postgres under Wasabi primary."
   ],
-  "updatedAt": "2026-06-28T16:30:00.000Z"
+  "updatedAt": "2026-06-28T20:00:00.000Z"
 }

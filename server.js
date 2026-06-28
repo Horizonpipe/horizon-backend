@@ -9970,6 +9970,27 @@ function portalShareDataLivePostgresSql(text) {
 }
 
 /**
+ * SaaS unified permissions (company membership, role folder grants, per-user folder grants, legacy scopes)
+ * live only in Postgres — not in the Wasabi auth snapshot. PipeShare boot and `/api/files/tree` read these
+ * on every request via `loadEffectivePathGrantsForUser`; routing them through portal-data-primary strict
+ * mode throws "Portal Wasabi adapter does not support this query shape" for customer/client users.
+ */
+function portalPermissionsLivePostgresSql(text) {
+  const sql = normalizeSqlForPortalData(text);
+  if (!sql) return false;
+  return (
+    sql.includes('user_company_membership') ||
+    sql.includes('company_folder_grants') ||
+    sql.includes('user_folder_grants') ||
+    sql.includes('user_portal_scopes') ||
+    sql.includes('user_psr_scopes') ||
+    sql.includes(' from companies ') ||
+    sql.includes(' join companies ') ||
+    sql.includes('trash_bin_entries')
+  );
+}
+
+/**
  * When WASABI_PORTAL_DATA_PRIMARY is on, mutating portal SQL is applied inside latest.json only.
  * PipeShare reads `portal_path_grants` (and share-link rows used by guests) from **live Postgres** (`aclPool`),
  * so Wasabi-only writes would look successful yet vanish on refresh — same class of bug as planner Postgres mirror.
@@ -10499,6 +10520,9 @@ async function queryPortalDataWithWasabiFallback(text, params = []) {
     return pool.query(text, params);
   }
   if (portalShareDataLivePostgresSql(text)) {
+    return pool.query(text, params);
+  }
+  if (portalPermissionsLivePostgresSql(text)) {
     return pool.query(text, params);
   }
   if (!WASABI_PORTAL_DATA_PRIMARY_ENABLED || !WASABI_WRITES_PRIMARY_ENABLED) {

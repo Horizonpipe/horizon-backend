@@ -1114,9 +1114,9 @@ async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) 
   return false;
 }
 
-async function assertPortalJobAccessForRequest(pool, req, clientId, jobId) {
+async function assertPortalJobAccessForRequest(aclPool, req, clientId, jobId) {
   const isDataAutoSync = readPortalMode(req) === DATA_AUTO_SYNC_MODE;
-  return assertPortalJobAccess(pool, req.user, clientId, jobId, {
+  return assertPortalJobAccess(aclPool, req.user, clientId, jobId, {
     allowClientWideDataAutoSync: isDataAutoSync
   });
 }
@@ -1477,6 +1477,11 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
     throw new Error('registerPortalShareLinkRoutes requires either pool.query or options.query.');
   }
   const pool = { query: dbQuery };
+  /** Job access checks must read live Postgres permission tables (see portalPermissionsLivePostgresSql). */
+  const aclPool =
+    poolOption && typeof poolOption.query === 'function'
+      ? { query: (text, params) => poolOption.query(text, params) }
+      : pool;
   const PORTAL_SHARE_LINK_TTL_DAYS = clampIntEnv('PORTAL_SHARE_LINK_TTL_DAYS', 7, 1, 90);
   const PORTAL_SHARE_META_MAX_BYTES = clampIntEnv('PORTAL_SHARE_META_MAX_BYTES', 512 * 1024, 8 * 1024, 2 * 1024 * 1024);
   /**
@@ -1690,7 +1695,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
               'Plan share validation failed: selected plan key was not accepted. Ensure selectedPdf.storageKey points to a synced plan page key.'
           });
         }
-      } else if (!(await assertPortalJobAccess(pool, req.user, resolvedClientId, resolvedJobId))) {
+      } else if (!(await assertPortalJobAccess(aclPool, req.user, resolvedClientId, resolvedJobId))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const fp = Array.isArray(folderPaths) ? folderPaths : [];
@@ -1730,7 +1735,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
       if (!clientId || !jobId) {
         return res.status(400).json({ error: 'clientId and jobId query params are required' });
       }
-      if (!(await assertPortalJobAccess(pool, req.user, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccess(aclPool, req.user, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const r2 = await pool.query(
@@ -1757,7 +1762,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
       const found = await pool.query(`SELECT * FROM portal_share_links WHERE token = $1`, [token]);
       const row = found.rows[0] || null;
       if (!row) return res.status(404).json({ error: 'Link not found (expired, revoked, or invalid)' });
-      if (!(await assertPortalJobAccess(pool, req.user, String(row.client_id), String(row.job_id)))) {
+      if (!(await assertPortalJobAccess(aclPool, req.user, String(row.client_id), String(row.job_id)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (row.revoked_at) {
@@ -2215,7 +2220,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'clientId and jobId query params are required' });
       }
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
@@ -2275,7 +2280,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'clientId and jobId query params are required' });
       }
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
@@ -2398,7 +2403,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const scope = resolvePortalScope(req, req.query);
       if (scope.error) return res.status(400).json({ error: scope.error });
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const treePortalMode = readPortalMode(req, req.query);
@@ -2431,7 +2436,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const scope = resolvePortalScope(req, body);
       if (scope.error) return res.status(400).json({ error: scope.error });
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const bindingType = normalizeInspectionBindingType(body.bindingType || body.type || '');
@@ -2560,7 +2565,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const scope = resolvePortalScope(req, body);
       if (scope.error) return res.status(400).json({ error: scope.error });
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const treePortalMode = readPortalMode(req, body);
@@ -2645,7 +2650,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const scope = resolvePortalScope(req, body);
       if (scope.error) return res.status(400).json({ error: scope.error });
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const hash = normalizeSha256Hex(String(body.sha256 ?? body.hash ?? ''));
@@ -2704,7 +2709,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const scope = resolvePortalScope(req, body);
       if (scope.error) return res.status(400).json({ error: scope.error });
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const treePortalMode = readPortalMode(req, body);
@@ -2850,7 +2855,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!userCanManagePortalExtras(req.user)) {
         return res.status(403).json({ error: 'Forbidden' });
       }
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const r2 = await aclPool.query(
@@ -3081,7 +3086,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'clientId, jobId, and name are required' });
       }
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const rel = joinRel(parentPath || '', name);
@@ -3133,7 +3138,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'clientId, jobId, and newName are required' });
       }
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'edit')) {
@@ -3299,7 +3304,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'clientId, jobId, and toParentPath are required' });
       }
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'edit')) {
@@ -3317,7 +3322,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const mode = readPortalMode(req, body);
       const allowClientWideDataAutoSync = mode === DATA_AUTO_SYNC_MODE;
       if (
-        !(await assertPortalJobAccess(pool, req.user, String(targetClientId), String(targetJobId), {
+        !(await assertPortalJobAccess(aclPool, req.user, String(targetClientId), String(targetJobId), {
           allowClientWideDataAutoSync
         }))
       ) {
@@ -3505,7 +3510,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'clientId, jobId, and non-empty path query params are required' });
       }
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'delete')) {
@@ -3543,7 +3548,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   });
 
   async function assertWritablePresignPath(req, clientId, jobId, objectKey) {
-    if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) return false;
+    if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) return false;
     if (!userCanPortalCapability(req.user, 'upload')) return false;
     const pref = jobPrefix(String(clientId), String(jobId));
     const k = String(objectKey || '');
@@ -3838,7 +3843,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const parsed = parseJobFromObjectKey(key);
       if (!parsed) return res.status(400).json({ error: 'Invalid key' });
-      if (!(await assertPortalJobAccessForRequest(pool, req, parsed.clientId, parsed.jobId))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, parsed.clientId, parsed.jobId))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!(await assertWritablePresignPath(req, parsed.clientId, parsed.jobId, key))) {
@@ -3895,7 +3900,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!isUploadSessionOpen(sessionRow)) {
         return res.status(404).json({ error: 'Upload session not found or closed' });
       }
-      if (!(await assertPortalJobAccessForRequest(pool, req, sessionRow.client_id, sessionRow.job_id))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, sessionRow.client_id, sessionRow.job_id))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'upload')) {
@@ -3957,7 +3962,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!isUploadSessionOpen(sessionRow)) {
         return res.status(404).json({ error: 'Upload session not found or closed' });
       }
-      if (!(await assertPortalJobAccessForRequest(pool, req, sessionRow.client_id, sessionRow.job_id))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, sessionRow.client_id, sessionRow.job_id))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'upload')) {
@@ -4012,7 +4017,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'clientId and jobId are required' });
       }
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         fs.unlink(f.path, () => {});
         return res.status(403).json({ error: 'Forbidden' });
       }
@@ -4063,7 +4068,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       return res.status(400).json({ error: 'clientId and jobId are required' });
     }
     const { clientId, jobId } = scope;
-    if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+    if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
       for (const f of files) fs.unlink(f.path, () => {});
       return res.status(403).json({ error: 'Forbidden' });
     }
@@ -4227,7 +4232,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'clientId and jobId are required' });
       }
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'upload')) {
@@ -4364,7 +4369,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!isUploadSessionOpen(sessionRow)) {
         return res.status(404).json({ error: 'Upload session not found or closed' });
       }
-      if (!(await assertPortalJobAccessForRequest(pool, req, sessionRow.client_id, sessionRow.job_id))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, sessionRow.client_id, sessionRow.job_id))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'upload')) {
@@ -4439,7 +4444,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!isUploadSessionOpen(sessionRow)) {
         return res.status(404).json({ error: 'Upload session not found or closed' });
       }
-      if (!(await assertPortalJobAccessForRequest(pool, req, sessionRow.client_id, sessionRow.job_id))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, sessionRow.client_id, sessionRow.job_id))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       if (!userCanPortalCapability(req.user, 'upload')) {
@@ -4944,7 +4949,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'clientId, jobId, and folder path are required' });
       }
       const { clientId, jobId } = scope;
-      if (!(await assertPortalJobAccessForRequest(pool, req, String(clientId), String(jobId)))) {
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const folderRel = normalizeRelPath(pathParam);
@@ -5105,7 +5110,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'Use DELETE /api/files/folders to remove folders' });
       }
       const parsed = parseJobFromObjectKey(Key);
-      if (!parsed || !(await assertPortalJobAccessForRequest(pool, req, parsed.clientId, parsed.jobId))) {
+      if (!parsed || !(await assertPortalJobAccessForRequest(aclPool, req, parsed.clientId, parsed.jobId))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
       const prefDel = jobPrefix(parsed.clientId, parsed.jobId);
