@@ -1,13 +1,13 @@
 {
-  "title": "PipeShare polished site menu (dbg128)",
-  "description": "PipeShare header is now minimal like PipeSync: fixed PIPESHARE wordmark top-left, Menu button top-right only. Identity (name + role pill), theme picker, Folder view, Share access, and Admin Panel all live inside the cp-menu panel with grouped sections.\n\nAll user types (Horizon admin, employee, client) get the same menu structure; admin-only rows are permission-gated. Menu borders, role pills, and selects follow active theme and SaaS tenant brand colors via --hp-btn-accent.\n\nIncludes the site-wide SaaS client Forbidden fix: portal-scoped users can load PipeShare with an empty tree when folder ACL is not assigned yet.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "PipeShare explorer column sort + filter (dbg130)",
+  "description": "The PipeShare file explorer table now behaves more like Windows Explorer. Type, Size, and Modified column headers show sort arrows — click to toggle ascending or descending. Click the column label text to open a dark filter menu with sort options and (for Type) checkbox filters for Folder, PDF, WinCan DB3, and other file types.\n\nSort preferences persist for the browser session. The feature lives in the modular file-explorer addon, not in the monolithic host app.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "PipeShare header stripped to Menu only; logo stays in corner bar.",
-    "Site menu module: identity, theme, Admin tools inside cp-menu panel.",
-    "Share access and Folder view moved from header into Admin menu group.",
-    "Menu CSS uses tenant brand accent (--hp-btn-accent) for pills and selects.",
-    "SaaS client Forbidden fix: job access without folder grants when scope assigned.",
-    "Runtime cache bust dbg128."
+    "Windows-style sort arrows on Type, Size, Modified columns.",
+    "Click column label opens filter popover with sort + type checkboxes.",
+    "Type filter supports Folder, PDF, Video, WinCan DB3, File, Jobsite.",
+    "Session-persisted sort/filter preferences.",
+    "Modular implementation in pipeshare/modules/file-explorer/.",
+    "Runtime cache bust dbg130."
   ],
-  "updatedAt": "2026-06-28T22:15:00.000Z"
+  "updatedAt": "2026-06-29T00:00:00.000Z"
 }
