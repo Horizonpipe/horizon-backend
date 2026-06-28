@@ -1,13 +1,14 @@
 {
-  "title": "Fix PDF highlights, line tool, and bookmark menu order (dbg106/107)",
-  "description": "Some highlights were invisible but still deletable; new lines sometimes did not appear until a second draw. Root causes: overlay matched lines by pageId only (stale ids after workspace sync), highlight coords were not zoom-safe after viewport changes, and line-tool preview/commit did not reliably refresh continuous-viewer SVG overlays.\n\ndbg106 adds storageKey matching, normalized zoom-safe overlay coords, pointer capture for line preview, and overlay refresh on zoom/commit.\n\ndbg107 pins the Bookmarks section to the top of the PDF right-click menu (above dynamic tool order) when the current PDF set has saved bookmarks.\n\nWho is affected: OVH private server PDF Viewer fullscreen.",
+  "title": "PDF Viewer chromeless workspace UI (dbg108)",
+  "description": "PDF Viewer no longer shows the large header/toolbar — the continuous PDF canvas uses the full pane height. Map workspace keeps its existing toolbar unchanged.\n\nIn PDF Viewer fullscreen: floating ✕ close (top-right); draggable Line size and Opacity widgets when Line/Eraser tool is active (+/− and Ctrl+/Ctrl− keybinds unchanged). Export assembled PDF is Map-only. Map/Viewer workspace toggle removed — open each mode from the unified explorer right-click menu.\n\nWho is affected: OVH private server PipeSync Plan View PDF Viewer.",
   "changeLog": [
-    "Match highlight overlays by storageKey as well as pageId.",
-    "Store and render zoom-safe normalized highlight coordinates.",
-    "Refresh continuous-viewer SVG overlays after line commit and wheel zoom.",
-    "Line tool pointer capture + window pointermove for reliable preview.",
-    "Pin Bookmarks section above dynamic tool order when PDF set has saved bookmarks.",
-    "Cache bust dbg106/107."
+    "Remove PDF Viewer header/toolbar; full-height continuous canvas.",
+    "Floating close button top-right in PDF Viewer fullscreen.",
+    "Draggable Line size and Opacity widgets when Line tool is active.",
+    "Export assembled PDF Map-only; removed from PDF Viewer.",
+    "Remove Map/PDF Viewer dropdown; use explorer context menu.",
+    "Eraser in right-click Tools menu for PDF Viewer.",
+    "Cache bust dbg108."
   ],
-  "updatedAt": "2026-06-30T12:00:00.000Z"
+  "updatedAt": "2026-06-28T12:00:00.000Z"
 }
