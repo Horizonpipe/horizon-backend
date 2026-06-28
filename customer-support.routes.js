@@ -157,6 +157,74 @@ function broadcastTenant(tenantId, eventName, payload) {
   }
 }
 
+/** Fan-out queue/presence/session events to global admin SSE (OVH Mike) as well as tenant channel. */
+function broadcastSupportEvents(tenantId, eventName, payload) {
+  broadcastTenant(tenantId, eventName, payload);
+  const globalId = NON_SAAS_GLOBAL_TENANT_ID;
+  if (String(tenantId) !== globalId) {
+    broadcastTenant(globalId, eventName, payload);
+  }
+}
+
+async function endChatSessionsForCustomer(pool, tenantId, customerUserId, { adminUserId } = {}) {
+  const params = [tenantId, customerUserId];
+  let sql = `
+    UPDATE cp_support_chat_sessions
+    SET status = 'closed', updated_at = NOW()
+    WHERE tenant_id = $1 AND customer_user_id = $2
+      AND status IN ('pending', 'active')`;
+  if (adminUserId) {
+    params.push(adminUserId);
+    sql += ` AND admin_user_id = $${params.length}`;
+  }
+  sql += ` RETURNING id, customer_user_id, admin_user_id`;
+  const r = await pool.query(sql, params);
+  return r.rows;
+}
+
+async function endRemoteSessionsForCustomer(pool, tenantId, customerUserId, { adminUserId } = {}) {
+  const params = [tenantId, customerUserId];
+  let sql = `
+    UPDATE cp_support_remote_sessions
+    SET status = 'ended', updated_at = NOW(), ended_at = NOW()
+    WHERE tenant_id = $1 AND customer_user_id = $2
+      AND status IN ('pending', 'active') AND ended_at IS NULL`;
+  if (adminUserId) {
+    params.push(adminUserId);
+    sql += ` AND admin_user_id = $${params.length}`;
+  }
+  sql += ` RETURNING id, customer_user_id, admin_user_id`;
+  const r = await pool.query(sql, params);
+  return r.rows;
+}
+
+function broadcastEndedSessions(tenantId, chatRows, remoteRows, reason) {
+  for (const row of chatRows) {
+    broadcastSupportEvents(tenantId, 'chat-ended', {
+      sessionId: row.id,
+      customerUserId: row.customer_user_id,
+      adminUserId: row.admin_user_id,
+      reason
+    });
+  }
+  for (const row of remoteRows) {
+    clearRemoteSignals(row.id);
+    broadcastSupportEvents(tenantId, 'remote-ended', {
+      sessionId: row.id,
+      customerUserId: row.customer_user_id,
+      adminUserId: row.admin_user_id,
+      reason
+    });
+  }
+}
+
+async function terminateCustomerSessions(pool, tenantId, customerUserId, { adminUserId, reason } = {}) {
+  const chatRows = await endChatSessionsForCustomer(pool, tenantId, customerUserId, { adminUserId });
+  const remoteRows = await endRemoteSessionsForCustomer(pool, tenantId, customerUserId, { adminUserId });
+  broadcastEndedSessions(tenantId, chatRows, remoteRows, reason || 'terminated');
+  return { chatEnded: chatRows.length, remoteEnded: remoteRows.length };
+}
+
 /** OVH legacy users use numeric ids in Postgres (TEXT), not UUID — migrate support tables to match. */
 async function migrateSupportUserIdColumnToText(pool, table, column) {
   const tbl = cleanString(table).replace(/[^a-z0-9_]/gi, '');
@@ -415,7 +483,7 @@ async function upsertPresence(pool, user, tenantScope, body) {
     ]
   );
 
-  broadcastTenant(tenantId, 'presence', { tenantId, userId, tabId });
+  broadcastSupportEvents(tenantId, 'presence', { tenantId, userId, tabId });
   return { skipped: false };
 }
 
@@ -615,7 +683,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
          WHERE tenant_id = $1 AND user_id = $2 AND tab_id = $3`,
         [req.supportTenant.tenantId, req.user.id, tabId]
       );
-      broadcastTenant(req.supportTenant.tenantId, 'support-request', {
+      broadcastSupportEvents(req.supportTenant.tenantId, 'support-request', {
         userId: req.user.id,
         tabId
       });
@@ -635,7 +703,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
          WHERE tenant_id = $1 AND user_id = $2 AND tab_id = $3`,
         [req.supportTenant.tenantId, req.user.id, tabId]
       );
-      broadcastTenant(req.supportTenant.tenantId, 'support-clear', { userId: req.user.id, tabId });
+      broadcastSupportEvents(req.supportTenant.tenantId, 'support-clear', { userId: req.user.id, tabId });
       return res.json({ success: true });
     } catch (error) {
       console.error('[saas/support/clear-request]', error);
@@ -649,19 +717,39 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const customerTabId = cleanString(req.body?.customerTabId) || 'default';
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
       const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
+      const ended = await terminateCustomerSessions(pool, targetTenantId, customerUserId, {
+        reason: 'clear-request'
+      });
       await pool.query(
         `UPDATE cp_support_presence
          SET support_requested = false, last_seen_at = NOW()
          WHERE tenant_id = $1 AND user_id = $2 AND tab_id = $3`,
         [targetTenantId, customerUserId, customerTabId]
       );
-      broadcastTenant(targetTenantId, 'support-clear', {
+      broadcastSupportEvents(targetTenantId, 'support-clear', {
         userId: customerUserId,
         tabId: customerTabId
       });
-      return res.json({ success: true });
+      return res.json({ success: true, ...ended });
     } catch (error) {
       console.error('[saas/support/admin/clear-request]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.post('/saas/support/admin/terminate', requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
+    try {
+      const customerUserId = cleanString(req.body?.customerUserId);
+      if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
+      const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
+      const adminUserId = req.body?.adminOnly === true ? String(req.user.id) : undefined;
+      const ended = await terminateCustomerSessions(pool, targetTenantId, customerUserId, {
+        adminUserId,
+        reason: cleanString(req.body?.reason) || 'admin-terminate'
+      });
+      return res.json({ success: true, ...ended });
+    } catch (error) {
+      console.error('[saas/support/admin/terminate]', error);
       return jsonError(res, 500, error.message || 'Server error');
     }
   });
@@ -718,15 +806,10 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
       const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
 
-      const existing = await pool.query(
-        `SELECT id, status FROM cp_support_chat_sessions
-         WHERE tenant_id = $1 AND customer_user_id = $2 AND status IN ('pending','active')
-         ORDER BY updated_at DESC LIMIT 1`,
-        [targetTenantId, customerUserId]
-      );
-      if (existing.rows[0]) {
-        return res.json({ success: true, sessionId: existing.rows[0].id, status: existing.rows[0].status });
-      }
+      await terminateCustomerSessions(pool, targetTenantId, customerUserId, {
+        adminUserId: String(req.user.id),
+        reason: 'superseded'
+      });
 
       const r = await pool.query(
         `INSERT INTO cp_support_chat_sessions (tenant_id, customer_user_id, admin_user_id, status)
@@ -735,7 +818,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         [targetTenantId, customerUserId, req.user.id]
       );
       const sessionId = r.rows[0].id;
-      broadcastTenant(targetTenantId, 'chat-invite', {
+      broadcastSupportEvents(targetTenantId, 'chat-invite', {
         sessionId,
         customerUserId,
         customerTabId,
@@ -793,7 +876,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         `UPDATE cp_support_chat_sessions SET status = $2, updated_at = NOW() WHERE id = $1`,
         [sessionId, status]
       );
-      broadcastTenant(row.tenant_id, 'chat-response', { sessionId, status, customerUserId: req.user.id });
+      broadcastSupportEvents(row.tenant_id, 'chat-response', { sessionId, status, customerUserId: req.user.id });
       return res.json({ success: true, sessionId, status });
     } catch (error) {
       console.error('[saas/support/chat/respond]', error);
@@ -861,7 +944,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       );
       await pool.query(`UPDATE cp_support_chat_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
       const message = ins.rows[0];
-      broadcastTenant(row.tenant_id, 'chat-message', {
+      broadcastSupportEvents(row.tenant_id, 'chat-message', {
         sessionId,
         message: {
           id: message.id,
@@ -882,6 +965,37 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       });
     } catch (error) {
       console.error('[saas/support/chat/messages POST]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.post('/saas/support/chat/end', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const sessionId = cleanString(req.body?.sessionId);
+      if (!sessionId) return jsonError(res, 400, 'sessionId is required');
+
+      const loaded = await loadChatSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (row.status === 'closed' || row.status === 'declined') {
+        return res.json({ success: true, sessionId, status: row.status });
+      }
+
+      await pool.query(
+        `UPDATE cp_support_chat_sessions SET status = 'closed', updated_at = NOW() WHERE id = $1`,
+        [sessionId]
+      );
+      broadcastSupportEvents(row.tenant_id, 'chat-ended', {
+        sessionId,
+        customerUserId: row.customer_user_id,
+        adminUserId: row.admin_user_id,
+        reason: 'ended'
+      });
+      return res.json({ success: true, sessionId, status: 'closed' });
+    } catch (error) {
+      console.error('[saas/support/chat/end]', error);
       return jsonError(res, 500, error.message || 'Server error');
     }
   });
@@ -918,46 +1032,10 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
       const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
 
-      const existing = await pool.query(
-        `SELECT id, status FROM cp_support_remote_sessions
-         WHERE tenant_id = $1 AND customer_user_id = $2 AND admin_user_id = $3 AND status IN ('pending','active')
-         ORDER BY updated_at DESC LIMIT 1`,
-        [targetTenantId, customerUserId, req.user.id]
-      );
-      if (existing.rows[0]) {
-        const row = existing.rows[0];
-        if (row.status === 'pending') {
-          broadcastTenant(targetTenantId, 'remote-request', {
-            sessionId: row.id,
-            customerUserId,
-            customerTabId: cleanString(req.body?.customerTabId) || row.customer_tab_id || 'default',
-            adminUserId: req.user.id
-          });
-        }
-        return res.json({
-          success: true,
-          sessionId: row.id,
-          status: row.status,
-          existing: true
-        });
-      }
-
-      const endedStale = await pool.query(
-        `UPDATE cp_support_remote_sessions
-         SET status = 'ended', updated_at = NOW(), ended_at = NOW()
-         WHERE tenant_id = $1 AND customer_user_id = $2
-           AND status IN ('pending', 'active') AND ended_at IS NULL
-         RETURNING id`,
-        [targetTenantId, customerUserId]
-      );
-      for (const stale of endedStale.rows) {
-        clearRemoteSignals(stale.id);
-        broadcastTenant(targetTenantId, 'remote-ended', {
-          sessionId: stale.id,
-          customerUserId,
-          reason: 'superseded'
-        });
-      }
+      await terminateCustomerSessions(pool, targetTenantId, customerUserId, {
+        adminUserId: String(req.user.id),
+        reason: 'superseded'
+      });
 
       const persistToken = crypto.randomBytes(24).toString('base64url');
       const r = await pool.query(
@@ -968,7 +1046,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         [targetTenantId, customerUserId, req.user.id, persistToken, customerTabId]
       );
       const session = r.rows[0];
-      broadcastTenant(targetTenantId, 'remote-request', {
+      broadcastSupportEvents(targetTenantId, 'remote-request', {
         sessionId: session.id,
         customerUserId,
         customerTabId,
@@ -1010,7 +1088,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         `UPDATE cp_support_remote_sessions SET status = $2, updated_at = NOW(), ended_at = CASE WHEN $2 = 'declined' THEN NOW() ELSE NULL END WHERE id = $1`,
         [sessionId, status]
       );
-      broadcastTenant(req.supportTenant.tenantId, 'remote-response', {
+      broadcastSupportEvents(req.supportTenant.tenantId, 'remote-response', {
         sessionId,
         status,
         customerUserId: req.user.id,
@@ -1052,9 +1130,10 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         [sessionId]
       );
       clearRemoteSignals(sessionId);
-      broadcastTenant(row.tenant_id, 'remote-ended', {
+      broadcastSupportEvents(row.tenant_id, 'remote-ended', {
         sessionId,
-        customerUserId: row.customer_user_id
+        customerUserId: row.customer_user_id,
+        adminUserId: row.admin_user_id
       });
       return res.json({ success: true, sessionId, status: 'ended' });
     } catch (error) {
@@ -1068,22 +1147,10 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const customerUserId = cleanString(req.body?.customerUserId);
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
       const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
-      const r = await pool.query(
-        `UPDATE cp_support_remote_sessions
-         SET status = 'ended', updated_at = NOW(), ended_at = NOW()
-         WHERE tenant_id = $1 AND customer_user_id = $2 AND admin_user_id = $3 AND status = 'pending'
-         RETURNING id`,
-        [targetTenantId, customerUserId, req.user.id]
-      );
-      for (const row of r.rows) {
-        clearRemoteSignals(row.id);
-        broadcastTenant(targetTenantId, 'remote-ended', {
-          sessionId: row.id,
-          customerUserId,
-          reason: 'cancelled'
-        });
-      }
-      return res.json({ success: true, cancelled: r.rows.length });
+      const ended = await terminateCustomerSessions(pool, targetTenantId, customerUserId, {
+        reason: 'cancelled'
+      });
+      return res.json({ success: true, ...ended });
     } catch (error) {
       console.error('[saas/support/remote/cancel-pending]', error);
       return jsonError(res, 500, error.message || 'Server error');

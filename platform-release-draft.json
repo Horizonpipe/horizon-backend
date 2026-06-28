@@ -1,14 +1,13 @@
 {
-  "title": "Remote/chat invites arrive live; consent before WebRTC (dbg138)",
-  "description": "After dbg137, Mike could send remote and chat invites but Kat often only saw them after a hard refresh. When she did see activity, the support widget showed \"establishing control channel\" instead of the Accept/Decline modal, while Mike's panel said \"Connected to Kat\" but still waited for accept — WebRTC never completed.\n\nRoot causes: (1) Support init was deferred up to 3s on requestIdleCallback for customers too, so SSE and invite polling started late and could miss events. Chat had no poll fallback at all — only SSE. (2) Orphan \"active\" remote rows in Postgres (prior sessions not ended) made the customer auto-attach WebRTC without consent while the admin waited on a new pending invite for a different session id. (3) Admin UI opened the remote panel as \"Connected to …\" even when only a pending invite existed.\n\nThis release: customers boot support immediately; 5s poll for pending remote + chat invites; SSE reconnects faster when auth token was late; auto-restore active remote only when the stored persist token matches (proves prior accept); backend ends stale sessions when a new invite is created and prefers pending over orphan active in /remote/active; admin polls for accept when SSE is missed; remote panel shows \"Waiting for …\" until connected.\n\nWho is affected: Horizon admins and customers using PipeShare/PipeSync remote support and chat on the OVH private server. SaaS when Mike applies the platform version in releases.html.",
+  "title": "Support sessions terminate cleanly; queue updates live (dbg139)",
+  "description": "After dbg138, stale chat and remote sessions could block new invites: Mike's new chat request reopened old messages on his side without re-prompting Kat; orphan Postgres rows left remote \"active\" after admin ended connection; Clear Request / Cancel pending only cleared flags or pending remote — not active chats or remote control. The customer support queue modal did not show new requests until closed and reopened (Mike's SSE was on the global tenant channel while support-request events only hit the customer's tenant).\n\nThis release: new chat or remote invite always ends prior sessions for that customer–admin pair and broadcasts chat-ended / remote-ended before sending a fresh invite. Admin Clear Request terminates all chat + remote for the customer and clears the queue flag. Cancel pending and End connection menu actions fully terminate sessions. Customer widget resets on chat-ended / remote-ended; invite handlers allow re-prompt after terminate; stale localStorage persist token cleared when server has no matching session. Queue/presence SSE events fan out to the global admin channel so Mike's open queue modal refreshes within ~400ms.\n\nWho is affected: Horizon admins and customers using PipeShare customer support (chat + remote) on the OVH private server. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Customer support init runs immediately for non-admin users (SSE + invite poll start sooner).",
-    "5s poll: pending remote via GET /remote/active and pending chat via new GET /chat/pending.",
-    "Customer auto-reconnects WebRTC only when local persist token matches session (no orphan attach).",
-    "Backend ends superseded remote sessions on new invite; /remote/active prefers pending over stale active.",
-    "Admin polls for customer accept when remote-response SSE is missed; panel title shows waiting state.",
-    "SSE client: faster token retry, reconnect on tab visible, hello event wired.",
-    "Portal runtime cache bust dbg138."
+    "Backend: terminateCustomerSessions ends all pending/active chat + remote; broadcasts chat-ended and remote-ended.",
+    "chat/start and remote/request always create fresh pending invites (no reuse of stale active rows).",
+    "admin/clear-request and cancel-pending terminate sessions; new POST /saas/support/admin/terminate and /chat/end.",
+    "SSE support-request, presence, session events also broadcast to global admin tenant channel.",
+    "Admin queue modal refreshes on SSE without reopening; menu actions wire full terminate.",
+    "Customer: chat-ended SSE, reset widget state, clear orphan persist token; dbg139 cache bust."
   ],
-  "updatedAt": "2026-06-28T12:00:00.000Z"
+  "updatedAt": "2026-06-28T18:00:00.000Z"
 }
