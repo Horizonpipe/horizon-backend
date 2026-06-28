@@ -282,19 +282,48 @@ Next step: second OVH app server + Hetzner/OVH load balancer, **keep Postgres on
 | `../ovh-ops-monitor/` | Portable Java desktop monitor |
 
 
-## Cross-host remote support presence (OVH + SaaS)
+## Cross-host remote support presence (non-SaaS OVH ↔ SaaS OVH)
 
-OVH and Render SaaS use separate Postgres databases. Heartbeats write to local `cp_support_presence` only.
+Both deployment models run on **OVH** (not Render). Each backend has its own Postgres; heartbeats write to local `cp_support_presence` only.
 
-**Approach:** peer read federation. Each backend exposes `GET /internal/support/presence-snapshot` (header `X-CP-Support-Peer-Secret`). Mike global GET merges local rows with peer snapshots.
+| Host | `HP_DEPLOYMENT_MODE` | Typical role |
+|------|----------------------|--------------|
+| Non-SaaS OVH | `non-saas` | Municipal / private PipeShare + PipeSync |
+| SaaS OVH | `saas` | Horizonpipe SaaS tenants + cPanel apply target |
 
-### Environment (both hosts)
+They may be **two OVH servers** (different public origins) or **two PM2/nginx vhosts on one box** (different domains or ports → different `.env` per instance). Peer URLs must be the **public HTTPS API origin** of the other instance (`PUBLIC_ORIGIN` or `SAAS_CPANEL_BASE_URL` — no trailing slash).
 
-- `CP_SUPPORT_PRESENCE_PEER_SECRET` — same long random string on both
-- `CP_SUPPORT_PRESENCE_PEER_URLS` — comma-separated HTTPS base URL(s) of the other backend(s), no trailing slash
+**Approach:** peer read federation. Each backend exposes `GET /internal/support/presence-snapshot` (header `X-CP-Support-Peer-Secret`). Mike’s global `GET /saas/support/presence` merges local rows with peer snapshots.
 
-Example: OVH points at Render SaaS API origin; Render SaaS points at OVH public API origin.
+### Environment (set on both backends)
 
-Reload OVH (pm2) and redeploy Render after setting vars.
+- `CP_SUPPORT_PRESENCE_PEER_SECRET` — same long random string on both (generate once; do not commit)
+- `CP_SUPPORT_PRESENCE_PEER_URLS` — comma-separated HTTPS base URL(s) of the **other** backend(s), no trailing slash
 
-Remote sessions/chat/SSE are not federated — presence list only.
+**Example — non-SaaS OVH** (`/opt/horizon/horizon-backend/.env` on the private instance):
+
+```env
+HP_DEPLOYMENT_MODE=non-saas
+PUBLIC_ORIGIN=https://app.example.com
+SAAS_CPANEL_BASE_URL=https://app.example.com
+CP_SUPPORT_PRESENCE_PEER_SECRET=<same-secret-on-both>
+CP_SUPPORT_PRESENCE_PEER_URLS=https://saas.example.com
+```
+
+**Example — SaaS OVH** (dedicated SaaS instance):
+
+```env
+HP_DEPLOYMENT_MODE=saas
+PUBLIC_ORIGIN=https://saas.example.com
+SAAS_CPANEL_BASE_URL=https://saas.example.com
+CP_SUPPORT_PRESENCE_PEER_SECRET=<same-secret-on-both>
+CP_SUPPORT_PRESENCE_PEER_URLS=https://app.example.com
+```
+
+Replace `app.example.com` / `saas.example.com` with your real domains. This repo’s OVH scripts often use **`40.160.72.39`** as the non-SaaS origin until DNS/TLS is in place — use `https://YOUR_DOMAIN` in production peer URLs so federation works from browsers and between nginx fronts.
+
+**Same physical server:** run two backend processes (e.g. ports 3000 and 3001), each with its own `.env` and `HP_DEPLOYMENT_MODE`, nginx `server_name` per hostname, then point each side’s `CP_SUPPORT_PRESENCE_PEER_URLS` at the other hostname’s public origin.
+
+After editing `.env` on each host: `pm2 reload horizon-backend` (or reload both app names if you run two instances).
+
+Remote sessions, chat, and SSE are **not** federated — presence list only.

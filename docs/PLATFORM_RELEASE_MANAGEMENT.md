@@ -44,7 +44,7 @@ HP_RELEASE_ADMIN_TOKEN=<your admin session token>
 HP_REPO_ROOT=/opt/horizon
 ```
 
-### SaaS platform host (Render or a dedicated server)
+### SaaS platform host (dedicated OVH instance)
 
 ```env
 HP_DEPLOYMENT_MODE=saas
@@ -98,6 +98,6 @@ Apply runs only on hosts with `HP_DEPLOYMENT_MODE=saas`.
 
 ## Current OVH setup note
 
-Your OVH server today runs **both** non-SaaS apps and the cPanel UI with `HP_DEPLOYMENT_MODE=non-saas`. That is correct for development. When you split SaaS onto Render or a second server, set `HP_DEPLOYMENT_MODE=saas` there and configure `HP_PLATFORM_APPLY_SCRIPT`.
+Your OVH server today runs **both** non-SaaS apps and the cPanel UI with `HP_DEPLOYMENT_MODE=non-saas`. That is correct for development. When you split SaaS onto a second OVH host (or a second PM2/nginx vhost on the same box), set `HP_DEPLOYMENT_MODE=saas` there and configure `HP_PLATFORM_APPLY_SCRIPT`.
 
 Until then, use cPanel to **publish** release records and upload artifacts; **apply** will activate once a dedicated SaaS host exists.
