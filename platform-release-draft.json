@@ -1,13 +1,11 @@
 {
-  "title": "HTTP remote viewport relay at 30 fps target (dbg155)",
-  "description": "Customer-initiated remote help over HTTP now targets ~30 fps (configurable to 60 via ?relayFps=60) instead of ~2–3 fps. Capture uses html2canvas at scale 0.75, JPEG quality 0.7, max width 1280px. Frames are skipped when a capture is still in flight so the relay stays steady rather than queuing unbounded work. Admin panel polls at the same rate and shows actual vs target fps in the status line; add ?debug=1 or localStorage hp-cp-relay-debug=1 for an on-screen fps counter.\n\nRealistic throughput depends on customer device — html2canvas may deliver 10–25 fps on heavy pages; prefer steady 30 over stuttering 60. On HTTPS, native getDisplayMedia + WebRTC is unchanged.\n\nWho is affected: Horizon admins and customers using PipeShare support remote help on the OVH private server. Deploy horizon-backend (frame buffer headroom) and client-portal static assets (dbg155). Set hp-portal-secure-origin when GoDaddy DNS + certbot TLS is live.",
+  "title": "PipeShare GoDaddy domains (pipeshare.live + pipeshare.net)",
+  "description": "PipeShare portal is configured for GoDaddy domains pointing at the OVH server (40.160.72.39). **pipeshare.live** is the primary HTTPS origin for the client portal (`/client-portal/`), including WebRTC screen share via `hp-portal-secure-origin`. **pipeshare.net** redirects to pipeshare.live (301) so Mike only maintains one canonical URL.\n\nMike must add GoDaddy DNS A records (@ and www → 40.160.72.39) for both domains, then run `sudo bash deploy/ovh/setup-pipeshare-tls.sh` on OVH for Let's Encrypt. Until DNS propagates, the site remains reachable at http://40.160.72.39/client-portal/.\n\nWho is affected: OVH private PipeShare users. SaaS is unchanged.",
   "changeLog": [
-    "Viewport relay targets 30 fps (rAF scheduler, skip-if-in-flight); optional 60 via ?relayFps=60.",
-    "Capture tuned: html2canvas scale 0.75, JPEG q0.7, max width 1280px.",
-    "Admin panel: decode-before-swap img updates; dev fps overlay (?debug=1).",
-    "Backend frame payload limit raised to 1.2M base64 chars for higher-rate JPEG relay.",
-    "Status text shows actual/target fps during dom-relay sessions.",
-    "Cache bust dbg155 (portal runtime + PipeShare manifest)."
+    "nginx vhost for pipeshare.live (primary) and pipeshare.net → 301 redirect.",
+    "setup-pipeshare-tls.sh: certbot + HTTPS config + PUBLIC_ORIGIN/CORS update.",
+    "Portal meta hp-portal-secure-origin set to https://pipeshare.live (dbg156).",
+    "GoDaddy DNS instructions in deploy/ovh/README.md (A records for both domains)."
   ],
-  "updatedAt": "2026-06-29T00:00:00.000Z"
+  "updatedAt": "2026-06-28T12:00:00.000Z"
 }

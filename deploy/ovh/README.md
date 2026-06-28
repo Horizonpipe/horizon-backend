@@ -118,7 +118,74 @@ psql "$DATABASE_URL" -c "SELECT COUNT(*) FROM users;"
 
 **OVH server IP:** `40.160.72.39` (non-SaaS private instance; currently HTTP on IP only).
 
-### A — GoDaddy DNS (Mike does this in GoDaddy DNS manager)
+### PipeShare domains (pipeshare.live + pipeshare.net)
+
+| Domain | Role |
+|--------|------|
+| **pipeshare.live** | Primary — `https://pipeshare.live/client-portal/` |
+| **pipeshare.net** | 301 redirect → pipeshare.live |
+
+**Recommendation:** Use **pipeshare.live** as the only canonical URL. pipeshare.net redirects so bookmarks and typos still work.
+
+#### GoDaddy DNS — pipeshare.live
+
+1. Log in at [godaddy.com](https://www.godaddy.com) → **My Products** → **pipeshare.live** → **DNS** (or **Manage DNS**).
+2. Remove or edit conflicting records (old A/CNAME/forwarding for `@` and `www`).
+3. Add:
+
+| Type | Name | Value | TTL |
+|------|------|-------|-----|
+| **A** | `@` | `40.160.72.39` | 600 |
+| **A** | `www` | `40.160.72.39` | 600 |
+
+4. Save. Propagation usually 5–30 minutes (up to 48h).
+
+#### GoDaddy DNS — pipeshare.net
+
+Same steps for **pipeshare.net** → **DNS**:
+
+| Type | Name | Value | TTL |
+|------|------|-------|-----|
+| **A** | `@` | `40.160.72.39` | 600 |
+| **A** | `www` | `40.160.72.39` | 600 |
+
+*(GoDaddy may label the host column "Name" or "@". Use `@` for the apex/root domain.)*
+
+**Verify propagation** (from your PC or OVH):
+
+```bash
+dig pipeshare.live +short
+dig pipeshare.net +short
+# both should return 40.160.72.39
+```
+
+#### OVH — nginx + certbot (after DNS resolves)
+
+```bash
+# On OVH (or from PC: scp configs then ssh)
+sudo bash /opt/horizon/horizon-backend/deploy/ovh/setup-pipeshare-tls.sh
+```
+
+If certbot fails with "DNS problem", wait for GoDaddy propagation and re-run:
+
+```bash
+sudo certbot certonly --webroot -w /var/www/certbot \
+  -d pipeshare.live -d www.pipeshare.live -d pipeshare.net -d www.pipeshare.net \
+  --cert-name pipeshare.live
+sudo bash /opt/horizon/horizon-backend/deploy/ovh/setup-pipeshare-tls.sh --ssl-only
+```
+
+**Test URLs:**
+
+- `https://pipeshare.live/client-portal/` — portal (200)
+- `https://pipeshare.net/` — 301 → pipeshare.live
+- `https://pipeshare.live/session` — 401 JSON (API up)
+
+Config files: `nginx-horizon-pipeshare.conf` (HTTP/ACME), `nginx-horizon-pipeshare-ssl.conf` (HTTPS).
+
+---
+
+### A — GoDaddy DNS (generic / other hostnames)
 
 Pick one hostname for the Horizon app (examples: `app.horizonpipe.com`, `portal.horizonpipe.com`). Do **not** point the marketing Squarespace site (`www.horizonpipe.com`) at OVH unless you intend to move it off Squarespace.
 
