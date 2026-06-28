@@ -1,13 +1,11 @@
 {
-  "title": "Plan view explorer-only + fullscreen fixes (dbg94)",
-  "description": "Plan view now shows only the file explorer until you right-click a file. No inline raster workspace on load. PDF and raster files open in a full-screen overlay via Open in Plan/PDF Viewer or Map Builder. Fixes blank PDF viewer (mount no longer requires raster host). Close workspace returns to explorer-only.\n\nWho is affected: OVH private server (PipeSync Plan view). SaaS unchanged until platform release applied in cPanel.",
+  "title": "Fix blank PDF workspace in fullscreen (dbg95)",
+  "description": "PDF Viewer in fullscreen now loads split-piece plans (per-page storageKey) when no whole-archive storageKey exists — most imported PDFs use split pieces. Also fixes double-render aborting the viewer mount on open.\n\nWho is affected: OVH PipeSync Plan view fullscreen workflow.",
   "changeLog": [
-    "Explorer fills the panel on load — no raster workspace until you open a file.",
-    "Fix PDF viewer blank screen in fullscreen (mount when only PDF host exists).",
-    "Post-layout remount for continuous PDF viewer after open.",
-    "Raster files: right-click → Plan Viewer or Map Builder (same as PDF).",
-    "Left-click on raster and PDF rows no longer opens workspace.",
-    "Menu: Close workspace. Cache bust dbg94."
+    "Continuous PDF viewer: per-piece load when archive key missing.",
+    "Remove duplicate render on fullscreen open (mount no longer aborted).",
+    "Toast when PDF source or read-url fails.",
+    "Cache bust dbg95."
   ],
-  "updatedAt": "2026-06-28T22:00:00.000Z"
+  "updatedAt": "2026-06-28T23:00:00.000Z"
 }
