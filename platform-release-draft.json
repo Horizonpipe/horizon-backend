@@ -1,13 +1,14 @@
 {
-  "title": "PDF Viewer column viewport fit (dbg74)",
-  "description": "PipeSync PDF Viewer fit width now uses the viewer column viewport (body minus library and scrollbar gutter) as the primary width source, not scroll.clientWidth alone. Scroll container width is set to the column viewport while zoomport keeps scaled content width; a post-fit overflow clamp ensures scaled content never exceeds scroll client width.\n\nHard-refresh PipeSync (dbg74). Open PDF Viewer: the right edge of pages should be fully visible without Ctrl+drag horizontal pan.",
+  "title": "PDF Viewer unified page width (dbg75)",
+  "description": "PipeSync PDF Viewer now normalizes every page in a stack to the same layout width before fit/zoom. Crop-trimmed pages no longer keep stale per-page widths that made later pages render smaller than page 1. Native dimensions and crop insets scale together so PDF media still fills each unified box.\n\nHard-refresh PipeSync (dbg75). Open PDF Viewer on plans that previously showed page 1 large and pages 2–3 smaller — all pages should share the same horizontal scale.",
   "changeLog": [
-    "planBoardViewerColumnViewportWidth: body minus library and scrollbar reserve.",
-    "Fit avail width primary source is column viewport, not scroll.clientWidth.",
-    "Zoom from max(fitContentW, worldBounds.w); post-fit overflow clamp once.",
-    "Scroll chrome width = column viewport; zoomport stays lw*z.",
-    "H8 ingest: columnViewportW, scaledContentW, overflow clamp flag.",
-    "Cache bust dbg74."
+    "planBoardNormalizeViewerWorkspaceLayout: unify pass sets all pages to maxW.",
+    "Crop pages use piece intrinsic w/h baseline before unify, not stale p.w.",
+    "planBoardScaleViewerPageDims scales natW/natH and crop insets with layout.",
+    "Fit/reflow sync planBoardSyncPageDomBox after layout normalize.",
+    "H9 ingest: pageWs before/after unify, unifyW, per-page scales.",
+    "Keeps dbg74 column viewport fit and overflow clamp.",
+    "Cache bust dbg75."
   ],
-  "updatedAt": "2026-06-27T16:00:00.000Z"
+  "updatedAt": "2026-06-27T18:00:00.000Z"
 }
