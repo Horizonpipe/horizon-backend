@@ -1,13 +1,12 @@
 {
-  "title": "PDF Viewer: fit-to-width, streaming load, no remount storms (dbg85)",
-  "description": "Fixes three PDF Viewer issues from dbg83/84: pages appeared over-zoomed (fit used scaled layout width instead of viewerBaseW), slow or failed loads (entire archive was downloaded into memory before pdf.js), and random refreshes (every ensure/remount destroyed and rebuilt the viewer).\n\nNow: stream PDF via URL with range requests, idempotent mount (skip if same plan signature), auto fit-to-width on first open, tile cache for scroll-back, and fit runs after mount. Hard-refresh PipeSync (dbg85).",
+  "title": "PDF Viewer zoom-out clip fix — batch render all visible pages (dbg86)",
+  "description": "Zooming out showed cut-off PDF strips because only the last visible page was re-rendered after each zoom (debounce timer overwrote pending pages), leaving oversized stale canvases clipped by overflow:hidden. dbg86 batches all pending page renders, clears canvases immediately on zoom, uses unified fit scale from PDF aspect ratio, and scales crop insets to pdf.js page dimensions.",
   "changeLog": [
-    "Fit-to-width uses viewerBaseW so pages are not over-zoomed.",
-    "PDF.js streams archive URL — no full arrayBuffer download first.",
-    "Idempotent continuous viewer mount stops remount/refresh loops.",
-    "Tile cache (48 pages) for faster scroll-back.",
-    "Mount generation guard cancels stale async loads.",
-    "Cache bust dbg85."
+    "Batch debounced render queue — all visible pages repaint on zoom.",
+    "Clear canvas immediately when zoom changes (no stale clip artifacts).",
+    "Slot height derived from PDF aspect ratio, not stale viewerBaseH.",
+    "Crop insets scaled to pdf.js viewport vs model natW/natH.",
+    "Cache bust dbg86."
   ],
-  "updatedAt": "2026-06-28T05:15:00.000Z"
+  "updatedAt": "2026-06-28T05:25:00.000Z"
 }
