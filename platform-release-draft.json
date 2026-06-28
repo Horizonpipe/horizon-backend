@@ -1,13 +1,13 @@
 {
-  "title": "PDF Viewer viewport locked at 100% browser zoom (dbg91)",
-  "description": "At 100% Edge/browser zoom the plan view page scrolled and the PDF viewer looked like a thin strip; at 65% browser zoom everything fit. dbg91 locks the plan shell to the viewport (no page scroll), blocks Ctrl+wheel from triggering browser zoom over the viewer, and sets viewer body height to ~2.9× the old baseline or 92% of remaining viewport — whichever fills the screen.\n\nWho is affected: OVH PipeSync PDF Viewer workspace.",
+  "title": "PDF Viewer stacked below file explorer — page scroll restored (dbg92)",
+  "description": "dbg91 locked html/body overflow which trapped users — they could not scroll back to the file explorer. dbg92 switches to a stacked layout: full file explorer on top, toolbar, then a tall PDF viewer pane (~72vh) below. Page scroll works again; Ctrl+wheel only hijacks zoom when pointer is inside the viewer pane.\n\nDeferred: open workspace only after picking a file from explorer (future UX).",
   "changeLog": [
-    "Lock html/body overflow when PDF Viewer is active — fits at 100% browser zoom.",
-    "Viewer body height = max(2.9× baseline, 92% of viewport below toolbar).",
-    "Shell height tied to window.innerHeight (scales with browser zoom).",
-    "Window-level Ctrl+wheel capture over plan view → in-app zoom only.",
-    "Compact explorer/head chrome to give viewer more vertical space.",
-    "Cache bust dbg91."
+    "Remove viewport overflow lock — file explorer reachable via page scroll.",
+    "PDF viewer pane stacks below explorer + toolbar (not absolute overlay).",
+    "Viewer pane fixed height ~72vh; width still locked to panel.",
+    "Ctrl+wheel browser zoom block only inside .hp-plan-scroll--continuous.",
+    "Restore full explorer section heights.",
+    "Cache bust dbg92."
   ],
-  "updatedAt": "2026-06-28T16:00:00.000Z"
+  "updatedAt": "2026-06-28T18:00:00.000Z"
 }
