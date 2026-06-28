@@ -1,8 +1,15 @@
 'use strict';
 
 const crypto = require('crypto');
-const { deploymentMode, canAccessAdminPanel, ACCOUNT_TYPES } = require('./capabilities');
+const { canAccessAdminPanel, looksLikeMike, ACCOUNT_TYPES } = require('./capabilities');
 const { loadUserCompanyMembership } = require('./company-permissions.service');
+
+/** Shared Postgres pool for non-SaaS (OVH) presence when user has no saas_tenant_instances row. */
+const NON_SAAS_GLOBAL_TENANT_ID = '00000000-0000-0000-0000-000000000001';
+const DEPLOYMENT_GROUP_LABELS = Object.freeze({
+  'non-saas': 'NON SAAS MODEL',
+  saas: 'SAAS MODEL'
+});
 
 const PRESENCE_TTL_MS = Math.max(
   15_000,
@@ -27,13 +34,6 @@ function cleanString(v) {
 
 function jsonError(res, status, message) {
   return res.status(status).json({ success: false, error: message });
-}
-
-function requireSaas(_req, res, next) {
-  if (deploymentMode() !== 'saas') {
-    return jsonError(res, 404, 'Customer support is only available on SaaS deployments');
-  }
-  return next();
 }
 
 function requireSupportAdmin(req, res, next) {
@@ -104,6 +104,13 @@ async function initCustomerSupportSchema(pool) {
   );
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_cp_support_presence_support ON cp_support_presence (tenant_id, support_requested, last_seen_at DESC)`
+  );
+  await pool.query(`
+    ALTER TABLE cp_support_presence
+      ADD COLUMN IF NOT EXISTS deployment_model TEXT NOT NULL DEFAULT 'saas'
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_cp_support_presence_deployment ON cp_support_presence (deployment_model, last_seen_at DESC)`
   );
 
   await pool.query(`
@@ -202,6 +209,31 @@ async function resolveTenantForUser(pool, user) {
   return null;
 }
 
+async function resolveSupportScope(pool, user) {
+  const saasScope = await resolveTenantForUser(pool, user);
+  if (saasScope?.tenantId) {
+    return {
+      ...saasScope,
+      deploymentModel: 'saas'
+    };
+  }
+  return {
+    tenantId: NON_SAAS_GLOBAL_TENANT_ID,
+    companyId: null,
+    portalClientId: '',
+    portalJobId: '',
+    companyName: cleanString(user?.company) || 'Horizon Pipe',
+    membershipRoleKey: '',
+    deploymentModel: 'non-saas'
+  };
+}
+
+function resolveTargetTenantId(req, bodyTenantId) {
+  const requested = cleanString(bodyTenantId);
+  if (requested && looksLikeMike(req.user)) return requested;
+  return req.supportTenant.tenantId;
+}
+
 function derivePresenceLabels(user, tenantScope) {
   const accountType = cleanString(user?.accountType ?? user?.account_type).toLowerCase() || 'employee';
   const companyName = tenantScope?.companyName || cleanString(user?.company) || 'Direct client';
@@ -236,12 +268,14 @@ async function upsertPresence(pool, user, tenantScope, body) {
   const displayName =
     cleanString(user.displayName) || cleanString(user.username) || cleanString(user.email) || 'User';
 
+  const deploymentModel = tenantScope?.deploymentModel === 'non-saas' ? 'non-saas' : 'saas';
+
   await pool.query(
     `INSERT INTO cp_support_presence (
         tenant_id, user_id, tab_id, display_name, account_type, role_key,
         company_name, direct_client_label, customer_group_label,
-        support_requested, page_path, last_seen_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+        support_requested, page_path, deployment_model, last_seen_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
       ON CONFLICT (tenant_id, user_id, tab_id) DO UPDATE SET
         display_name = EXCLUDED.display_name,
         account_type = EXCLUDED.account_type,
@@ -249,6 +283,7 @@ async function upsertPresence(pool, user, tenantScope, body) {
         company_name = EXCLUDED.company_name,
         direct_client_label = EXCLUDED.direct_client_label,
         customer_group_label = EXCLUDED.customer_group_label,
+        deployment_model = EXCLUDED.deployment_model,
         support_requested = CASE
           WHEN EXCLUDED.support_requested THEN true
           ELSE cp_support_presence.support_requested
@@ -266,7 +301,8 @@ async function upsertPresence(pool, user, tenantScope, body) {
       labels.directClientLabel,
       labels.customerGroupLabel,
       supportRequested,
-      pagePath
+      pagePath,
+      deploymentModel
     ]
   );
 
@@ -274,10 +310,8 @@ async function upsertPresence(pool, user, tenantScope, body) {
   return { skipped: false };
 }
 
-async function listPresenceRows(pool, tenantId, { supportOnly = false } = {}) {
-  const cutoff = new Date(Date.now() - PRESENCE_TTL_MS).toISOString();
-  const params = [tenantId, cutoff];
-  let sql = `
+function presenceSelectSql(whereClause) {
+  return `
     SELECT p.*,
       EXISTS (
         SELECT 1 FROM cp_support_remote_sessions r
@@ -287,11 +321,33 @@ async function listPresenceRows(pool, tenantId, { supportOnly = false } = {}) {
           AND r.ended_at IS NULL
       ) AS remote_connected
     FROM cp_support_presence p
-    WHERE p.tenant_id = $1 AND p.last_seen_at >= $2`;
+    WHERE ${whereClause}`;
+}
+
+async function listPresenceRows(pool, tenantId, { supportOnly = false, deploymentModel } = {}) {
+  const cutoff = new Date(Date.now() - PRESENCE_TTL_MS).toISOString();
+  const params = [tenantId, cutoff];
+  let sql = presenceSelectSql(`p.tenant_id = $1 AND p.last_seen_at >= $2`);
+  if (deploymentModel) {
+    params.push(deploymentModel);
+    sql += ` AND p.deployment_model = $${params.length}`;
+  }
   if (supportOnly) {
     sql += ` AND p.support_requested = true`;
   }
   sql += ` ORDER BY p.display_name ASC`;
+  const r = await pool.query(sql, params);
+  return r.rows;
+}
+
+async function listAllPresenceRows(pool, { supportOnly = false } = {}) {
+  const cutoff = new Date(Date.now() - PRESENCE_TTL_MS).toISOString();
+  const params = [cutoff];
+  let sql = presenceSelectSql(`p.last_seen_at >= $1`);
+  if (supportOnly) {
+    sql += ` AND p.support_requested = true`;
+  }
+  sql += ` ORDER BY p.deployment_model ASC, p.display_name ASC`;
   const r = await pool.query(sql, params);
   return r.rows;
 }
@@ -303,6 +359,7 @@ function groupPresenceRows(rows) {
 
   for (const row of rows) {
     const entry = {
+      tenantId: row.tenant_id,
       userId: row.user_id,
       tabId: row.tab_id,
       displayName: row.display_name,
@@ -311,6 +368,7 @@ function groupPresenceRows(rows) {
       companyName: row.company_name,
       directClientLabel: row.direct_client_label,
       customerGroupLabel: row.customer_group_label,
+      deploymentModel: row.deployment_model === 'non-saas' ? 'non-saas' : 'saas',
       supportRequested: row.support_requested === true,
       pagePath: row.page_path || '',
       lastSeenAt: row.last_seen_at,
@@ -330,6 +388,43 @@ function groupPresenceRows(rows) {
   return {
     directClients,
     customerGroups: [...customerGroups.values()]
+  };
+}
+
+function buildDeploymentGroup(deploymentModel, rows) {
+  const grouped = groupPresenceRows(rows);
+  return {
+    deploymentModel,
+    label: DEPLOYMENT_GROUP_LABELS[deploymentModel] || deploymentModel,
+    ...grouped
+  };
+}
+
+function buildPresenceListResponse(req, rows, { supportOnly = false } = {}) {
+  const filter = supportOnly ? 'support' : 'all';
+  if (looksLikeMike(req.user)) {
+    const nonSaasRows = rows.filter((row) => row.deployment_model === 'non-saas');
+    const saasRows = rows.filter((row) => row.deployment_model !== 'non-saas');
+    return {
+      success: true,
+      scope: 'global',
+      filter,
+      deploymentGroups: [
+        buildDeploymentGroup('non-saas', nonSaasRows),
+        buildDeploymentGroup('saas', saasRows)
+      ]
+    };
+  }
+
+  const deploymentModel = req.supportTenant.deploymentModel === 'non-saas' ? 'non-saas' : 'saas';
+  const grouped = groupPresenceRows(rows);
+  return {
+    success: true,
+    scope: 'tenant',
+    filter,
+    deploymentModel,
+    label: DEPLOYMENT_GROUP_LABELS[deploymentModel] || deploymentModel,
+    ...grouped
   };
 }
 
@@ -353,19 +448,16 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
   async function tenantMiddleware(req, res, next) {
     try {
       await ensureSchema();
-      const scope = await resolveTenantForUser(pool, req.user);
-      if (!scope?.tenantId) {
-        return jsonError(res, 403, 'No SaaS tenant scope for this account');
-      }
+      const scope = await resolveSupportScope(pool, req.user);
       req.supportTenant = scope;
       return next();
     } catch (error) {
-      console.error('[saas/support] tenant scope', error);
+      console.error('[support] tenant scope', error);
       return jsonError(res, 500, error.message || 'Server error');
     }
   }
 
-  app.post('/saas/support/presence', requireSaas, requireAuth, tenantMiddleware, async (req, res) => {
+  app.post('/saas/support/presence', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const result = await upsertPresence(pool, req.user, req.supportTenant, req.body || {});
       return res.json({ success: true, skipped: result.skipped === true });
@@ -375,20 +467,32 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.get('/saas/support/presence', requireSaas, requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
+  app.get('/saas/support/presence', requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
     try {
       const filter = cleanString(req.query?.filter).toLowerCase();
       const supportOnly = filter === 'support';
-      const rows = await listPresenceRows(pool, req.supportTenant.tenantId, { supportOnly });
-      const grouped = groupPresenceRows(rows);
-      return res.json({ success: true, filter: supportOnly ? 'support' : 'all', ...grouped });
+      let rows;
+      if (looksLikeMike(req.user)) {
+        rows = await listAllPresenceRows(pool, { supportOnly });
+      } else if (req.supportTenant.deploymentModel === 'saas') {
+        rows = await listPresenceRows(pool, req.supportTenant.tenantId, {
+          supportOnly,
+          deploymentModel: 'saas'
+        });
+      } else {
+        rows = await listPresenceRows(pool, NON_SAAS_GLOBAL_TENANT_ID, {
+          supportOnly,
+          deploymentModel: 'non-saas'
+        });
+      }
+      return res.json(buildPresenceListResponse(req, rows, { supportOnly }));
     } catch (error) {
       console.error('[saas/support/presence GET]', error);
       return jsonError(res, 500, error.message || 'Server error');
     }
   });
 
-  app.post('/saas/support/request', requireSaas, requireAuth, tenantMiddleware, async (req, res) => {
+  app.post('/saas/support/request', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const tabId = cleanString(req.body?.tabId) || 'default';
       await upsertPresence(pool, req.user, req.supportTenant, {
@@ -413,7 +517,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.post('/saas/support/clear-request', requireSaas, requireAuth, tenantMiddleware, async (req, res) => {
+  app.post('/saas/support/clear-request', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const tabId = cleanString(req.body?.tabId) || 'default';
       await pool.query(
@@ -430,18 +534,19 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.post('/saas/support/admin/clear-request', requireSaas, requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
+  app.post('/saas/support/admin/clear-request', requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
     try {
       const customerUserId = cleanString(req.body?.customerUserId);
       const customerTabId = cleanString(req.body?.customerTabId) || 'default';
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
+      const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
       await pool.query(
         `UPDATE cp_support_presence
          SET support_requested = false, last_seen_at = NOW()
          WHERE tenant_id = $1 AND user_id = $2 AND tab_id = $3`,
-        [req.supportTenant.tenantId, customerUserId, customerTabId]
+        [targetTenantId, customerUserId, customerTabId]
       );
-      broadcastTenant(req.supportTenant.tenantId, 'support-clear', {
+      broadcastTenant(targetTenantId, 'support-clear', {
         userId: customerUserId,
         tabId: customerTabId
       });
@@ -452,15 +557,15 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.get('/saas/support/events', requireSaas, async (req, res) => {
+  app.get('/saas/support/events', async (req, res) => {
     try {
       await ensureSchema();
       const token = cleanString(req.query?.access_token) || currentToken(req);
       const user = await readSession(token);
       if (!user) return jsonError(res, 401, 'Authentication required');
 
-      const scope = await resolveTenantForUser(pool, user);
-      if (!scope?.tenantId) return jsonError(res, 403, 'No SaaS tenant scope for this account');
+      const scope = await resolveSupportScope(pool, user);
+      if (!scope?.tenantId) return jsonError(res, 403, 'No support scope for this account');
 
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -497,17 +602,18 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.post('/saas/support/chat/start', requireSaas, requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
+  app.post('/saas/support/chat/start', requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
     try {
       const customerUserId = cleanString(req.body?.customerUserId);
       const customerTabId = cleanString(req.body?.customerTabId) || 'default';
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
+      const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
 
       const existing = await pool.query(
         `SELECT id, status FROM cp_support_chat_sessions
          WHERE tenant_id = $1 AND customer_user_id = $2 AND status IN ('pending','active')
          ORDER BY updated_at DESC LIMIT 1`,
-        [req.supportTenant.tenantId, customerUserId]
+        [targetTenantId, customerUserId]
       );
       if (existing.rows[0]) {
         return res.json({ success: true, sessionId: existing.rows[0].id, status: existing.rows[0].status });
@@ -517,10 +623,10 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         `INSERT INTO cp_support_chat_sessions (tenant_id, customer_user_id, admin_user_id, status)
          VALUES ($1,$2,$3,'pending')
          RETURNING id, status`,
-        [req.supportTenant.tenantId, customerUserId, req.user.id]
+        [targetTenantId, customerUserId, req.user.id]
       );
       const sessionId = r.rows[0].id;
-      broadcastTenant(req.supportTenant.tenantId, 'chat-invite', {
+      broadcastTenant(targetTenantId, 'chat-invite', {
         sessionId,
         customerUserId,
         customerTabId,
@@ -533,7 +639,28 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.post('/saas/support/chat/respond', requireSaas, requireAuth, tenantMiddleware, async (req, res) => {
+  async function loadChatSessionForUser(pool, sessionId, user, { preferredTenantId } = {}) {
+    let row = null;
+    if (preferredTenantId) {
+      const r = await pool.query(
+        `SELECT * FROM cp_support_chat_sessions WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
+        [sessionId, preferredTenantId]
+      );
+      row = r.rows[0];
+    }
+    if (!row && canAccessAdminPanel(user)) {
+      const r = await pool.query(`SELECT * FROM cp_support_chat_sessions WHERE id = $1 LIMIT 1`, [sessionId]);
+      row = r.rows[0];
+    }
+    if (!row) return { ok: false, status: 404, message: 'Chat session not found' };
+    const uid = String(user.id);
+    if (uid !== String(row.customer_user_id) && uid !== String(row.admin_user_id) && !canAccessAdminPanel(user)) {
+      return { ok: false, status: 403, message: 'Not a participant in this chat' };
+    }
+    return { ok: true, row };
+  }
+
+  app.post('/saas/support/chat/respond', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const sessionId = cleanString(req.body?.sessionId);
       const accept = req.body?.accept === true;
@@ -557,7 +684,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         `UPDATE cp_support_chat_sessions SET status = $2, updated_at = NOW() WHERE id = $1`,
         [sessionId, status]
       );
-      broadcastTenant(req.supportTenant.tenantId, 'chat-response', { sessionId, status, customerUserId: req.user.id });
+      broadcastTenant(row.tenant_id, 'chat-response', { sessionId, status, customerUserId: req.user.id });
       return res.json({ success: true, sessionId, status });
     } catch (error) {
       console.error('[saas/support/chat/respond]', error);
@@ -565,19 +692,14 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.get('/saas/support/chat/:sessionId/messages', requireSaas, requireAuth, tenantMiddleware, async (req, res) => {
+  app.get('/saas/support/chat/:sessionId/messages', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const sessionId = cleanString(req.params.sessionId);
-      const session = await pool.query(
-        `SELECT * FROM cp_support_chat_sessions WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
-        [sessionId, req.supportTenant.tenantId]
-      );
-      const row = session.rows[0];
-      if (!row) return jsonError(res, 404, 'Chat session not found');
-      const uid = String(req.user.id);
-      if (uid !== String(row.customer_user_id) && uid !== String(row.admin_user_id) && !canAccessAdminPanel(req.user)) {
-        return jsonError(res, 403, 'Not a participant in this chat');
-      }
+      const loaded = await loadChatSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
       const msgs = await pool.query(
         `SELECT id, session_id, sender_user_id, body, created_at
          FROM cp_support_chat_messages WHERE session_id = $1 ORDER BY created_at ASC`,
@@ -605,18 +727,17 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.post('/saas/support/chat/:sessionId/messages', requireSaas, requireAuth, tenantMiddleware, async (req, res) => {
+  app.post('/saas/support/chat/:sessionId/messages', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const sessionId = cleanString(req.params.sessionId);
       const body = cleanString(req.body?.body).slice(0, 4000);
       if (!body) return jsonError(res, 400, 'Message body is required');
 
-      const session = await pool.query(
-        `SELECT * FROM cp_support_chat_sessions WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
-        [sessionId, req.supportTenant.tenantId]
-      );
-      const row = session.rows[0];
-      if (!row) return jsonError(res, 404, 'Chat session not found');
+      const loaded = await loadChatSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
       if (row.status !== 'active') return jsonError(res, 400, 'Chat is not active');
       const uid = String(req.user.id);
       if (uid !== String(row.customer_user_id) && uid !== String(row.admin_user_id)) {
@@ -631,7 +752,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       );
       await pool.query(`UPDATE cp_support_chat_sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
       const message = ins.rows[0];
-      broadcastTenant(req.supportTenant.tenantId, 'chat-message', {
+      broadcastTenant(row.tenant_id, 'chat-message', {
         sessionId,
         message: {
           id: message.id,
@@ -656,12 +777,19 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  async function loadRemoteSessionForUser(pool, tenantId, sessionId, user) {
-    const r = await pool.query(
-      `SELECT * FROM cp_support_remote_sessions WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
-      [sessionId, tenantId]
-    );
-    const row = r.rows[0];
+  async function loadRemoteSessionForUser(pool, sessionId, user, { preferredTenantId } = {}) {
+    let row = null;
+    if (preferredTenantId) {
+      const r = await pool.query(
+        `SELECT * FROM cp_support_remote_sessions WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
+        [sessionId, preferredTenantId]
+      );
+      row = r.rows[0];
+    }
+    if (!row && canAccessAdminPanel(user)) {
+      const r = await pool.query(`SELECT * FROM cp_support_remote_sessions WHERE id = $1 LIMIT 1`, [sessionId]);
+      row = r.rows[0];
+    }
     if (!row) return { ok: false, status: 404, message: 'Remote session not found' };
     const uid = String(user.id);
     if (
@@ -674,17 +802,18 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     return { ok: true, row };
   }
 
-  app.post('/saas/support/remote/request', requireSaas, requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
+  app.post('/saas/support/remote/request', requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
     try {
       const customerUserId = cleanString(req.body?.customerUserId);
       const customerTabId = cleanString(req.body?.customerTabId) || 'default';
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
+      const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
 
       const existing = await pool.query(
         `SELECT id, status FROM cp_support_remote_sessions
          WHERE tenant_id = $1 AND customer_user_id = $2 AND admin_user_id = $3 AND status IN ('pending','active')
          ORDER BY updated_at DESC LIMIT 1`,
-        [req.supportTenant.tenantId, customerUserId, req.user.id]
+        [targetTenantId, customerUserId, req.user.id]
       );
       if (existing.rows[0]) {
         const row = existing.rows[0];
@@ -702,10 +831,10 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
             tenant_id, customer_user_id, admin_user_id, status, persist_token, customer_tab_id
           ) VALUES ($1,$2,$3,'pending',$4,$5)
           RETURNING id, status, persist_token`,
-        [req.supportTenant.tenantId, customerUserId, req.user.id, persistToken, customerTabId]
+        [targetTenantId, customerUserId, req.user.id, persistToken, customerTabId]
       );
       const session = r.rows[0];
-      broadcastTenant(req.supportTenant.tenantId, 'remote-request', {
+      broadcastTenant(targetTenantId, 'remote-request', {
         sessionId: session.id,
         customerUserId,
         customerTabId,
@@ -723,7 +852,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.post('/saas/support/remote/respond', requireSaas, requireAuth, tenantMiddleware, async (req, res) => {
+  app.post('/saas/support/remote/respond', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const sessionId = cleanString(req.body?.sessionId);
       const accept = req.body?.accept === true;
@@ -765,17 +894,16 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.post('/saas/support/remote/end', requireSaas, requireAuth, tenantMiddleware, async (req, res) => {
+  app.post('/saas/support/remote/end', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const sessionId = cleanString(req.body?.sessionId);
       if (!sessionId) return jsonError(res, 400, 'sessionId is required');
 
-      const r = await pool.query(
-        `SELECT * FROM cp_support_remote_sessions WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
-        [sessionId, req.supportTenant.tenantId]
-      );
-      const row = r.rows[0];
-      if (!row) return jsonError(res, 404, 'Remote session not found');
+      const loaded = await loadRemoteSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
       const uid = String(req.user.id);
       if (
         uid !== String(row.customer_user_id) &&
@@ -790,7 +918,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         [sessionId]
       );
       clearRemoteSignals(sessionId);
-      broadcastTenant(req.supportTenant.tenantId, 'remote-ended', {
+      broadcastTenant(row.tenant_id, 'remote-ended', {
         sessionId,
         customerUserId: row.customer_user_id
       });
@@ -801,20 +929,21 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.post('/saas/support/remote/cancel-pending', requireSaas, requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
+  app.post('/saas/support/remote/cancel-pending', requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
     try {
       const customerUserId = cleanString(req.body?.customerUserId);
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
+      const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
       const r = await pool.query(
         `UPDATE cp_support_remote_sessions
          SET status = 'ended', updated_at = NOW(), ended_at = NOW()
          WHERE tenant_id = $1 AND customer_user_id = $2 AND admin_user_id = $3 AND status = 'pending'
          RETURNING id`,
-        [req.supportTenant.tenantId, customerUserId, req.user.id]
+        [targetTenantId, customerUserId, req.user.id]
       );
       for (const row of r.rows) {
         clearRemoteSignals(row.id);
-        broadcastTenant(req.supportTenant.tenantId, 'remote-ended', {
+        broadcastTenant(targetTenantId, 'remote-ended', {
           sessionId: row.id,
           customerUserId,
           reason: 'cancelled'
@@ -827,7 +956,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.post('/saas/support/remote/:sessionId/signal', requireSaas, requireAuth, tenantMiddleware, async (req, res) => {
+  app.post('/saas/support/remote/:sessionId/signal', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const sessionId = cleanString(req.params.sessionId);
       const type = cleanString(req.body?.type).toLowerCase();
@@ -837,13 +966,15 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         return jsonError(res, 400, 'type must be offer, answer, or ice');
       }
 
-      const loaded = await loadRemoteSessionForUser(pool, req.supportTenant.tenantId, sessionId, req.user);
+      const loaded = await loadRemoteSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
       if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
       const row = loaded.row;
       if (row.status !== 'active') return jsonError(res, 400, 'Remote session is not active');
 
       const entry = pushRemoteSignal(sessionId, req.user.id, type, payload);
-      broadcastTenant(req.supportTenant.tenantId, 'remote-signal', {
+      broadcastTenant(row.tenant_id, 'remote-signal', {
         sessionId,
         signalId: entry?.id,
         fromUserId: req.user.id,
@@ -857,13 +988,15 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.get('/saas/support/remote/:sessionId/signals', requireSaas, requireAuth, tenantMiddleware, async (req, res) => {
+  app.get('/saas/support/remote/:sessionId/signals', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const sessionId = cleanString(req.params.sessionId);
       const afterId = Math.max(0, Number(req.query?.after || 0));
       if (!sessionId) return jsonError(res, 400, 'sessionId is required');
 
-      const loaded = await loadRemoteSessionForUser(pool, req.supportTenant.tenantId, sessionId, req.user);
+      const loaded = await loadRemoteSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
       if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
       const row = loaded.row;
       if (row.status !== 'active') return jsonError(res, 400, 'Remote session is not active');
@@ -877,17 +1010,19 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.post('/saas/support/remote/:sessionId/virtual-call', requireSaas, requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
+  app.post('/saas/support/remote/:sessionId/virtual-call', requireAuth, tenantMiddleware, requireSupportAdmin, async (req, res) => {
     try {
       const sessionId = cleanString(req.params.sessionId);
       if (!sessionId) return jsonError(res, 400, 'sessionId is required');
 
-      const loaded = await loadRemoteSessionForUser(pool, req.supportTenant.tenantId, sessionId, req.user);
+      const loaded = await loadRemoteSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
       if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
       const row = loaded.row;
       if (row.status !== 'active') return jsonError(res, 400, 'Remote session must be active');
 
-      broadcastTenant(req.supportTenant.tenantId, 'virtual-call-invite', {
+      broadcastTenant(row.tenant_id, 'virtual-call-invite', {
         sessionId,
         customerUserId: row.customer_user_id,
         adminUserId: req.user.id
@@ -899,16 +1034,16 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.get('/saas/support/remote/active', requireSaas, requireAuth, tenantMiddleware, async (req, res) => {
+  app.get('/saas/support/remote/active', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const uid = String(req.user.id);
       const r = await pool.query(
         `SELECT id, tenant_id, customer_user_id, admin_user_id, status, persist_token, customer_tab_id, created_at, updated_at
          FROM cp_support_remote_sessions
-         WHERE tenant_id = $1 AND status = 'active' AND ended_at IS NULL
-           AND (customer_user_id = $2 OR admin_user_id = $2)
+         WHERE status = 'active' AND ended_at IS NULL
+           AND (customer_user_id = $1 OR admin_user_id = $1)
          ORDER BY updated_at DESC LIMIT 1`,
-        [req.supportTenant.tenantId, uid]
+        [uid]
       );
       const row = r.rows[0];
       if (!row) return res.json({ success: true, session: null });
