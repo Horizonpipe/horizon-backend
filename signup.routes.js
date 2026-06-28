@@ -7,6 +7,22 @@ const nodemailer = require('nodemailer');
 const SIGNUP_PIN_TTL_MIN = Number(process.env.SIGNUP_PIN_TTL_MIN || 30);
 const RESEND_COOLDOWN_SEC = Math.max(30, Number(process.env.SIGNUP_RESEND_COOLDOWN_SEC || 60));
 const PASSWORD_MIN_LEN = Math.max(6, Number(process.env.SIGNUP_PASSWORD_MIN || 8));
+const SIGNUP_MAIL_FROM_NAME = (process.env.SIGNUP_MAIL_FROM_NAME || process.env.SMTP_FROM_NAME || 'PipeShare').trim();
+
+function publicSignupMailError(reason, detailMessage) {
+  if (reason === 'not_configured') {
+    return {
+      code: 'smtp_not_configured',
+      error:
+        'We could not send a verification email right now. Account creation is temporarily unavailable — please try again later or contact support.'
+    };
+  }
+  return {
+    code: 'smtp_send_failed',
+    error:
+      'We could not send a verification email. Please confirm your email address and try again in a few minutes.'
+  };
+}
 
 function normalizeEmail(value) {
   return String(value || '')
@@ -52,9 +68,9 @@ function getMailer() {
  * @returns {Promise<{ ok: true } | { ok: false, reason: 'not_configured' | 'send_failed', message?: string }>}
  */
 async function sendPinEmail(to, pin) {
-  const from = (process.env.SMTP_FROM || process.env.SMTP_USER || 'Horizon Pipe').trim();
+  const from = (process.env.SMTP_FROM || process.env.SMTP_USER || `${SIGNUP_MAIL_FROM_NAME} <noreply@pipeshare.net>`).trim();
   const transporter = getMailer();
-  const subject = 'Your Horizon Pipe verification code';
+  const subject = `Your ${SIGNUP_MAIL_FROM_NAME} verification code`;
   const text = `Your verification code is: ${pin}\n\nEnter this code on the sign-up screen to finish creating your account. This code expires in ${SIGNUP_PIN_TTL_MIN} minutes.\n\nIf you did not request this, you can ignore this email.`;
   if (!transporter) {
     console.warn('[signup] SMTP is not configured (set SMTP_URL or SMTP_HOST).');
@@ -282,17 +298,9 @@ function registerSignupRoutes(app, deps) {
 
       if (!sendResult.ok && !devPin) {
         await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
-        if (sendResult.reason === 'not_configured') {
-          return res.status(503).json({
-            success: false,
-            error:
-              'Email could not be sent: SMTP is not configured. On the backend host, set SMTP_URL or SMTP_HOST (and usually SMTP_USER, SMTP_PASS, SMTP_FROM). See deployment docs for your mail provider.'
-          });
-        }
-        return res.status(503).json({
-          success: false,
-          error: `Email could not be sent: ${sendResult.message || 'SMTP error'}. Check SMTP credentials and SMTP_FROM.`
-        });
+        const pub = publicSignupMailError(sendResult.reason, sendResult.message);
+        console.error('[signup] verification email failed:', sendResult.reason, sendResult.message || '');
+        return res.status(503).json({ success: false, ...pub });
       }
 
       res.json({

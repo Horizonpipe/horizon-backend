@@ -123,11 +123,40 @@ psql "$DATABASE_URL" -c "SELECT COUNT(*) FROM users;"
 | Domain | Role |
 |--------|------|
 | **pipeshare.live** | Primary — `https://pipeshare.live/client-portal/` |
-| **pipeshare.net** | 301 redirect → pipeshare.live |
+| **pipeshare.net** | SaaS landing — business + customer login at `/` |
 
-**Recommendation:** Use **pipeshare.live** as the only canonical URL. pipeshare.net redirects so bookmarks and typos still work.
+**Test URLs:**
 
-#### GoDaddy DNS — pipeshare.live
+- `https://pipeshare.live/client-portal/` — dev/base portal (200)
+- `https://pipeshare.net/` — SaaS landing + sign-up (200)
+- `https://pipeshare.live/session` — 401 JSON (API up)
+
+#### pipeshare.net sign-up email (SMTP)
+
+Create account on pipeshare.net sends a 6-digit verification code. The OVH backend **must** have SMTP configured in `/opt/horizon/horizon-backend/.env`:
+
+```bash
+# GoDaddy Workspace (example — use your mailbox credentials)
+SMTP_HOST=smtpout.secureserver.net
+SMTP_PORT=465
+SMTP_SECURE=true
+SMTP_USER=noreply@pipeshare.net
+SMTP_PASS=your-mailbox-password
+SMTP_FROM=PipeShare <noreply@pipeshare.net>
+SIGNUP_MAIL_FROM_NAME=PipeShare
+```
+
+Then reload: `pm2 reload horizon-backend --update-env`
+
+Verify: `curl -sS -X POST https://pipeshare.net/signup/request -H 'Content-Type: application/json' -d '{"firstName":"Test","lastName":"User","company":"Co","email":"you@example.com","password":"testpass12"}'`
+
+Without SMTP, sign-up returns a user-friendly error (no raw server config text).
+
+Config files: `nginx-horizon-pipeshare.conf` (HTTP/ACME), `nginx-horizon-pipeshare-ssl.conf` (HTTPS).
+
+---
+
+### A — GoDaddy DNS (generic / other hostnames)
 
 1. Log in at [godaddy.com](https://www.godaddy.com) → **My Products** → **pipeshare.live** → **DNS** (or **Manage DNS**).
 2. Remove or edit conflicting records (old A/CNAME/forwarding for `@` and `www`).

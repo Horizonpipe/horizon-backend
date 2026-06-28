@@ -1,12 +1,11 @@
 {
-  "title": "PipeShare.net SaaS landing + tenant storage alignment",
-  "description": "PipeShare is now a separate product from the Horizon Pipe dev base on pipeshare.live.\n\npipeshare.net is the public SaaS front door: brochure landing page, Business login (cPanel), and Customer login with subscription license check. Provisioned SaaS tenants store files under tenants/{slug}/ on Wasabi (Phase 1 storage alignment). pipeshare.live remains Mike's base build for development and testing.\n\nWho is affected: New SaaS customers use pipeshare.net. OVH non-SaaS paths unchanged. Deploy backend + frontend + nginx activate script on OVH.",
+  "title": "PipeShare.net sign-up error handling and SMTP docs",
+  "description": "Create account on pipeshare.net requires SMTP on the OVH backend to send verification codes. The API no longer exposes raw server configuration errors to end users — customers see a short, branded message instead.\n\nDeploy docs now include GoDaddy Workspace SMTP example vars for /opt/horizon/horizon-backend/.env. Until SMTP is configured, sign-up shows a friendly unavailable message.\n\nWho is affected: pipeshare.net business sign-up. pipeshare.live and existing logins unchanged.",
   "changeLog": [
-    "PipeShare.net landing with Business and Customer login panels.",
-    "Customer login checks tenant Stripe subscription (Invalid license message).",
-    "SaaS Wasabi keys prefixed with tenants/{slug}/ for portal uploads.",
-    "nginx serves pipeshare.net landing (no redirect to .live).",
-    "CORS and SAAS_CPANEL_BASE_URL include pipeshare.net."
+    "Sign-up API returns user-friendly mail errors (code smtp_not_configured).",
+    "Login/sign-up page shows styled alert boxes instead of raw pink text.",
+    "PipeShare-branded verification email subject when SMTP is configured.",
+    "OVH README + .env.example document SMTP setup for sign-up."
   ],
   "updatedAt": "2026-06-28T22:00:00.000Z"
 }
