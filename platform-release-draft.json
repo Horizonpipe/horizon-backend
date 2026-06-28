@@ -1,12 +1,12 @@
-﻿{
-  "title": "PipeShare admin presence refresh throttling (dbg115)",
-  "description": "PipeShare was refreshing the admin presence panel on every SSE event and showing a full Loading state each time, which made the UI feel laggy when many presence updates arrived.\n\nThis release throttles and debounces those refreshes, avoids duplicate customer-support init, and slows the background heartbeat when the tab is hidden.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+{
+  "title": "PipeShare dual menu headers and Add User submenu (dbg118)",
+  "description": "PipeShare and PipeSync context menus now show separate section headers for customer vs employee actions, and admins get an Add User entry with a submenu for the usual user-creation paths.\n\nPortal shell CSS supports submenu flyouts; explorer and planner menu builders pass submenu items through to the shared context menu component.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Throttle admin presence panel refresh from SSE (presence, support-request, support-clear) to about 2.5s.",
-    "Debounce presence panel API refresh (~350ms) and skip Loading flash when content already rendered.",
-    "Singleton initCustomerSupport so the addon does not double-register listeners.",
-    "Heartbeat interval 20s visible / 60s when tab hidden.",
-    "Cache bust dbg115 on client portal index.html."
+    "Dual section headers on PipeShare explorer and PipeSync planner context menus (customer vs employee).",
+    "Add User admin action with submenu (from prior menu work, cache-bust dbg118).",
+    "Context menu component renders nested submenu flyouts.",
+    "Explorer context menu typedef documents submenu items.",
+    "Cache bust dbg118 on portal, PipeSync, and mobile entry HTML."
   ],
-  "updatedAt": "2026-06-28T22:00:00.000Z"
+  "updatedAt": "2026-06-28T23:30:00.000Z"
 }
