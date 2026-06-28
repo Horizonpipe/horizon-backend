@@ -1,11 +1,12 @@
 {
-  "title": "Auto-highlight alignment + Highlights with Structure Nodes download",
-  "description": "DB3 auto-generated highlight paths now use the same page-anchored line builder as manual highlight drawing (planBoardBuildAnchoredLinesFromWorldStroke), so segment lines land on structure nodes correctly.\n\nDownload plans on map PDFs with structure nodes now shows a fourth option: Highlights with Structure Nodes — flat baked highlights plus node markers using the same rx/ry → PDF coordinate mapping as normal highlights.\n\nHard-refresh PipeSync after deploy (dbg53).\n\nWho is affected: Private OVH server.",
+  "title": "Context menu icons + smart sort",
+  "description": "PipeSync right-click menus had corrupted emoji (mojibake like ðŸ" instead of icons) after the modular migration — all plan sheet, board, and PSR context menu icons are restored.\n\nMenus now learn your habits: each tool or action you use moves up in that section on the next open. Counts are saved per user account via Wasabi-backed prefs (same path as other PipeSync settings).\n\nHard-refresh PipeSync after deploy (dbg54). pipesync.html boot script cache bust updated so browsers load the new boot chain.\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "Auto-highlight: same anchoring path as manual highlight tool.",
-    "Download: dynamic Highlights with Structure Nodes option when map has nodes.",
-    "Structure node PDF bake uses planPdfAnchoredPointToPdfUser (shared with highlights).",
-    "Auto-highlight logic consolidated in pipesync/modules/plan-view/tools/auto-highlight.js."
+    "Fix UTF-8 mojibake on all PipeSync context menu icons.",
+    "Smart sort: menu items reorder by usage within each section.",
+    "Per-user ctxMenuUsage prefs synced to Wasabi.",
+    "Toolbar tool picks also bump menu priority.",
+    "Cache bust dbg54 on pipesync.html, boot, and app.js."
   ],
-  "updatedAt": "2026-06-28T01:00:00.000Z"
+  "updatedAt": "2026-06-28T12:00:00.000Z"
 }
