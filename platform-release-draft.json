@@ -1,12 +1,11 @@
-{
-  "title": "PipeShare dual menu headers and Add User submenu (dbg118)",
-  "description": "PipeShare and PipeSync context menus now show separate section headers for customer vs employee actions, and admins get an Add User entry with a submenu for the usual user-creation paths.\n\nPortal shell CSS supports submenu flyouts; explorer and planner menu builders pass submenu items through to the shared context menu component.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+﻿{
+  "title": "Context menus: Quick actions vs Admin tools (dbg119)",
+  "description": "PipeShare explorer and PipeSync planner context menus now split day-to-day operations under Quick actions from support and Create User under Admin tools.\n\nCreate User is a flyout submenu (path access, module settings); Add User on a folder or file stays a single quick action for granting access. Customer explorer menus get Add User under Access when appropriate.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Dual section headers on PipeShare explorer and PipeSync planner context menus (customer vs employee).",
-    "Add User admin action with submenu (from prior menu work, cache-bust dbg118).",
-    "Context menu component renders nested submenu flyouts.",
-    "Explorer context menu typedef documents submenu items.",
-    "Cache bust dbg118 on portal, PipeSync, and mobile entry HTML."
+    "PipeSync planner: ops (import, structure, move, Add User access) in Quick actions; support and Create User flyout in Admin tools.",
+    "PipeShare employee menu: Create User flyout moved to Admin tools section; customer Add User under Access on remote rows.",
+    "PipeSync app.js: ctx-create-user-menu and separate ctx-add-user-access quick action.",
+    "Cache bust dbg119 on portal runtime, PipeSync, mobile, and addon manifest."
   ],
-  "updatedAt": "2026-06-28T23:30:00.000Z"
+  "updatedAt": "2026-06-28T23:45:00.000Z"
 }
