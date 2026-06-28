@@ -1,12 +1,13 @@
 {
-  "title": "PDF Viewer fixed scrollport — zoom does not shrink tool window (dbg87)",
-  "description": "Ctrl+wheel zoom was shrinking the entire PDF viewer pane because the scroll container used flex:0 0 auto and width:auto, sizing to page content. When pages zoomed out, the dark scrollport shrank with them. dbg87 locks the scrollport to full panel width; only page tiles inside zoom. Fit-to-width no longer re-runs on resize when continuous viewer is active (prevents shrink loop).",
+  "title": "PDF Viewer fixed viewport — zoom and pan inside full pane (dbg89)",
+  "description": "The PDF Viewer scroll box was still resizing with page content on Ctrl+wheel because the container lived in normal document flow and styles-desktop.css was cached at an old version (20260605a), so layout fixes never loaded.\n\ndbg89 pins the dark scroll viewport to the full board with absolute inset layout — only PDF pages inside zoom. Two-axis overflow enables Ctrl+drag pan when zoomed in. Styles cache bust updated so the fix actually applies.\n\nWho is affected: private OVH PipeSync users on PDF Viewer workspace. Map workspace unchanged.",
   "changeLog": [
-    "Scrollport fills panel width — does not shrink on zoom out.",
-    "planBoardLockContinuousViewerScrollport on mount and wheel zoom.",
-    "Skip fit-to-width recalc during continuous viewer resize (no shrink loop).",
-    "CSS flex:1 1 0 for continuous scroll in viewer-plans row.",
-    "Cache bust dbg87."
+    "Scroll viewport fills board edge-to-edge; does not shrink on zoom out.",
+    "PDF pages zoom inside fixed container (max-content inner layer).",
+    "Ctrl+drag pan works vertically and horizontally when zoomed in.",
+    "Fixed Ctrl+wheel zoom anchor for continuous viewer.",
+    "styles-desktop.css cache bust 20260628dbg89 (was stale 20260605a).",
+    "Cache bust dbg89 on app.js and plan-view modules."
   ],
-  "updatedAt": "2026-06-28T05:35:00.000Z"
+  "updatedAt": "2026-06-28T12:00:00.000Z"
 }
