@@ -1,13 +1,13 @@
 {
   "title": "PipeShare explorer column sort + filter (dbg130)",
-  "description": "The PipeShare file explorer table now behaves more like Windows Explorer. Type, Size, and Modified column headers show sort arrows — click to toggle ascending or descending. Click the column label text to open a dark filter menu with sort options and (for Type) checkbox filters for Folder, PDF, WinCan DB3, and other file types.\n\nSort preferences persist for the browser session. The feature lives in the modular file-explorer addon, not in the monolithic host app.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "description": "The PipeShare file explorer table now behaves more like Windows 11 Explorer. Name, Type, Size, and Modified column headers show stacked sort arrows — click the arrow area to toggle ascending or descending. Click the column label to open a dark filter menu with contextual sort options (A to Z, Smallest first, Oldest first, etc.) and, for Type, checkbox filters for Folder, PDF, WinCan DB3, Video, and other file types.\n\nSort and type-filter preferences persist in localStorage. Logic lives in shared/explorer-column-controls.js and the modular file-explorer addon — not in the monolithic host app. PipeSync plan/unified explorers use a tree layout without Type/Size/Modified columns; a PipeSync bridge module is registered for future tabular explorers.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "Windows-style sort arrows on Type, Size, Modified columns.",
+    "Windows-style sort arrows on Name, Type, Size, Modified columns.",
     "Click column label opens filter popover with sort + type checkboxes.",
-    "Type filter supports Folder, PDF, Video, WinCan DB3, File, Jobsite.",
-    "Session-persisted sort/filter preferences.",
-    "Modular implementation in pipeshare/modules/file-explorer/.",
+    "Type filter supports Folder, Jobsite, PDF, Video, WinCan DB3, File.",
+    "localStorage-persisted sort/filter preferences.",
+    "Shared module at shared/explorer-column-controls.js.",
     "Runtime cache bust dbg130."
   ],
-  "updatedAt": "2026-06-29T00:00:00.000Z"
+  "updatedAt": "2026-06-28T00:00:00.000Z"
 }
