@@ -10,6 +10,82 @@ const DEPLOYMENT_GROUP_LABELS = Object.freeze({
   'non-saas': 'NON SAAS MODEL',
   saas: 'SAAS MODEL'
 });
+function parsePresencePeerUrls() {
+  const raw = cleanString(process.env.CP_SUPPORT_PRESENCE_PEER_URLS);
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((u) => u.replace(/\/+$/, ''))
+    .filter(Boolean);
+}
+
+function presencePeerSecret() {
+  return cleanString(process.env.CP_SUPPORT_PRESENCE_PEER_SECRET);
+}
+
+function requirePresencePeerSecret(req, res, next) {
+  const expected = presencePeerSecret();
+  if (!expected) return jsonError(res, 503, 'Peer federation not configured');
+  const got = cleanString(req.headers['x-cp-support-peer-secret']);
+  if (!got || got !== expected) return jsonError(res, 403, 'Invalid peer secret');
+  return next();
+}
+
+function presenceRowKey(row) {
+  return `${row.tenant_id}:${row.user_id}:${row.tab_id}`;
+}
+
+function mergePresenceRowSets(...sets) {
+  const byKey = new Map();
+  for (const rows of sets) {
+    for (const row of rows || []) {
+      const key = presenceRowKey(row);
+      const prev = byKey.get(key);
+      if (!prev) {
+        byKey.set(key, row);
+        continue;
+      }
+      const prevAt = new Date(prev.last_seen_at).getTime();
+      const nextAt = new Date(row.last_seen_at).getTime();
+      if (nextAt >= prevAt) byKey.set(key, row);
+    }
+  }
+  return [...byKey.values()];
+}
+
+async function fetchPeerPresenceRows(supportOnly) {
+  const secret = presencePeerSecret();
+  const peers = parsePresencePeerUrls();
+  if (!secret || !peers.length) return [];
+
+  const filter = supportOnly ? 'support' : 'all';
+  const out = [];
+  await Promise.all(
+    peers.map(async (base) => {
+      const url = `${base}/internal/support/presence-snapshot?filter=${encodeURIComponent(filter)}`;
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 8000);
+        const resp = await fetch(url, {
+          method: 'GET',
+          headers: { 'X-CP-Support-Peer-Secret': secret },
+          signal: ctrl.signal
+        });
+        clearTimeout(timer);
+        if (!resp.ok) {
+          console.warn('[support] peer presence', base, resp.status);
+          return;
+        }
+        const data = await resp.json();
+        if (Array.isArray(data?.rows)) out.push(...data.rows);
+      } catch (err) {
+        console.warn('[support] peer presence fetch failed', base, err?.message || err);
+      }
+    })
+  );
+  return out;
+}
+
 
 const PRESENCE_TTL_MS = Math.max(
   15_000,
