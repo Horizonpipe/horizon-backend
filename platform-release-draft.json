@@ -1,11 +1,11 @@
 {
-  "title": "Editable PDF highlights: round caps match plan view",
-  "description": "Editable Highlights download now uses a round-cap /AP appearance stream (PDF operators 1 J / 1 j) matching plan-board SVG stroke-linecap=\"round\". /LE Round did not match on-screen shape. Full InkList is kept for Adobe endpoint editing; BS is omitted so only the AP stroke renders (no square-cap InkList layer).\n\nHard-refresh PipeSync after deploy. Download plans → Editable Highlights and compare line ends to plan view.\n\nWho is affected: Private OVH server.",
+  "title": "Auto-highlight alignment + Highlights with Structure Nodes download",
+  "description": "DB3 auto-generated highlight paths now use the same page-anchored line builder as manual highlight drawing (planBoardBuildAnchoredLinesFromWorldStroke), so segment lines land on structure nodes correctly.\n\nDownload plans on map PDFs with structure nodes now shows a fourth option: Highlights with Structure Nodes — flat baked highlights plus node markers using the same rx/ry → PDF coordinate mapping as normal highlights.\n\nHard-refresh PipeSync after deploy (dbg53).\n\nWho is affected: Private OVH server.",
   "changeLog": [
-    "Editable download: /AP round-cap stroke matching plan view SVG.",
-    "Remove ineffective /LE Round on Ink annotations.",
-    "Keep full InkList for Adobe editability; drop BS when AP attached.",
-    "Mirror dedupe fix retained (dbg42). Cache bust dbg44."
+    "Auto-highlight: same anchoring path as manual highlight tool.",
+    "Download: dynamic Highlights with Structure Nodes option when map has nodes.",
+    "Structure node PDF bake uses planPdfAnchoredPointToPdfUser (shared with highlights).",
+    "Auto-highlight logic consolidated in pipesync/modules/plan-view/tools/auto-highlight.js."
   ],
-  "updatedAt": "2026-06-28T00:20:00.000Z"
+  "updatedAt": "2026-06-28T01:00:00.000Z"
 }
