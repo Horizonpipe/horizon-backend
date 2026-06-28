@@ -1,13 +1,12 @@
 {
-  "title": "PDF Viewer fixed viewport — zoom and pan inside full pane (dbg89)",
-  "description": "The PDF Viewer scroll box was still resizing with page content on Ctrl+wheel because the container lived in normal document flow and styles-desktop.css was cached at an old version (20260605a), so layout fixes never loaded.\n\ndbg89 pins the dark scroll viewport to the full board with absolute inset layout — only PDF pages inside zoom. Two-axis overflow enables Ctrl+drag pan when zoomed in. Styles cache bust updated so the fix actually applies.\n\nWho is affected: private OVH PipeSync users on PDF Viewer workspace. Map workspace unchanged.",
+  "title": "PDF Viewer fills viewport height — compact explorer (dbg90)",
+  "description": "The PDF Viewer scroll area was only a thin strip at the bottom because the unified file explorer and plan-view header consumed most of the vertical space, and the flex chain never allocated remaining height to the board body (absolute scrollport had nothing to fill).\n\ndbg90 compacts the explorer in PDF Viewer mode, hides the long plan-view blurb, and fixes flex:1 1 0 from panel → subpanel → board host → viewer body so the dark scroll viewport grows to fill the rest of the screen (~5× taller than before).\n\nWho is affected: OVH PipeSync PDF Viewer workspace.",
   "changeLog": [
-    "Scroll viewport fills board edge-to-edge; does not shrink on zoom out.",
-    "PDF pages zoom inside fixed container (max-content inner layer).",
-    "Ctrl+drag pan works vertically and horizontally when zoomed in.",
-    "Fixed Ctrl+wheel zoom anchor for continuous viewer.",
-    "styles-desktop.css cache bust 20260628dbg89 (was stale 20260605a).",
-    "Cache bust dbg89 on app.js and plan-view modules."
+    "PDF Viewer scrollport fills remaining viewport below toolbar.",
+    "Unified explorer compact in PDF Viewer mode (smaller max-heights).",
+    "Flex chain panel → subpanel → board host → body uses flex 1 1 0.",
+    "Hide plan-view intro paragraph when continuous viewer active.",
+    "Cache bust dbg90."
   ],
-  "updatedAt": "2026-06-28T12:00:00.000Z"
+  "updatedAt": "2026-06-28T14:00:00.000Z"
 }
