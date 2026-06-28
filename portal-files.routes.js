@@ -47,6 +47,7 @@ const {
   migrateLegacyScopeAuthorityForUserJob,
   recordTrashBinEntry,
   loadUserCompanyMembership,
+  companyJobHasFolderGrants,
   buildSkeletonPath
 } = require('./company-permissions.service');
 
@@ -1092,6 +1093,90 @@ async function resolveDb3FileScopeForBinding(pool, user, reqClientId, reqJobId, 
   return { ok: false, error: 'db3FileId must belong to the same client/job scope' };
 }
 
+/**
+ * Session / legacy scope for `(clientId, jobId)` — aligned with `GET /api/files/jobs` client checks.
+ * Portal files users with assigned scope may load the explorer (empty tree when folder ACL applies).
+ * @param {import('express').Request['user'] | null | undefined} user
+ */
+function userMatchesPortalJobScope(user, clientId, jobId) {
+  if (!user || !userHasPortalFilesOrAutosyncMaster(user)) return false;
+  const c = String(clientId || '').trim();
+  const j = String(jobId || '').trim();
+  if (!c || !j) return false;
+
+  const scopes = Array.isArray(user.portalScopes) ? user.portalScopes : [];
+  for (const s of scopes) {
+    const sc = String(s?.clientId || s?.client_id || '').trim();
+    const sj = String(s?.jobId || s?.job_id || '').trim();
+    if (!sc || !sj) continue;
+    if (sc === c && (sj === j || portalPsrJobIdsEquivalent(user, c, sj, j))) return true;
+  }
+
+  const legacyClient = String(user.portalFilesClientId || '').trim();
+  const legacyJob = String(user.portalFilesJobId || '').trim();
+  if (legacyClient === c && legacyJob && (legacyJob === j || portalPsrJobIdsEquivalent(user, c, legacyJob, j))) {
+    return true;
+  }
+
+  return portalJobAllowedByPsrScopes(user, c, j);
+}
+
+async function userHasCompanyRoleJobScope(pool, user, clientId, jobId) {
+  if (!user?.id) return false;
+  const membership = await loadUserCompanyMembership(pool, user.id);
+  if (!membership) return false;
+  const c = String(clientId || '').trim();
+  const j = String(jobId || '').trim();
+  if (!c || !j) return false;
+  if (await companyJobHasFolderGrants(pool, membership.companyId, c, j, membership.roleKey)) return true;
+  const wantClient = c.toLowerCase();
+  const wantJob = j.toLowerCase();
+  return (membership.overrideFolderGrants || []).some((entry) => {
+    const entryClient = String(entry?.clientId || entry?.client_id || '').trim().toLowerCase();
+    const entryJob = String(entry?.jobId || entry?.job_id || '').trim().toLowerCase();
+    return entryClient === wantClient && entryJob === wantJob;
+  });
+}
+
+/**
+ * @returns {Promise<{ error: string, code: string }>}
+ */
+async function explainPortalJobAccessDenial(pool, user, clientId, jobId) {
+  if (!user) return { error: 'Sign in required', code: 'AUTH_REQUIRED' };
+  if (!userHasPortalFilesOrAutosyncMaster(user)) {
+    return {
+      error: 'Portal file access is not enabled for this account. Ask your admin to enable Portal Files.',
+      code: 'PORTAL_FILES_DISABLED'
+    };
+  }
+  const c = String(clientId || '').trim();
+  const j = String(jobId || '').trim();
+  if (!c || !j) {
+    return { error: 'clientId and jobId are required', code: 'SCOPE_REQUIRED' };
+  }
+  if (!userMatchesPortalJobScope(user, c, j)) {
+    const membership = user?.id ? await loadUserCompanyMembership(pool, user.id) : null;
+    if (!membership) {
+      return {
+        error: 'This client/job is not assigned to your account.',
+        code: 'PORTAL_SCOPE_DENIED'
+      };
+    }
+    const roleHasGrants = await companyJobHasFolderGrants(pool, membership.companyId, c, j, membership.roleKey);
+    if (!roleHasGrants) {
+      return {
+        error: 'Your company role has no folder access configured for this job yet.',
+        code: 'COMPANY_GRANTS_EMPTY'
+      };
+    }
+    return {
+      error: 'You do not have folder permissions for this job. Contact your admin.',
+      code: 'FOLDER_GRANTS_EMPTY'
+    };
+  }
+  return { error: 'Forbidden', code: 'FORBIDDEN' };
+}
+
 async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) {
   if (userIsPortalAdmin(user)) return true;
   if (!user || !userHasPortalFilesOrAutosyncMaster(user)) return false;
@@ -1110,6 +1195,10 @@ async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) 
     const migratedGrants = await loadEffectivePathGrantsForUser(pool, user, c, j);
     if (migratedGrants.length) return true;
   }
+
+  // Assigned portal scope or company role job — empty tree OK, not HTTP 403.
+  if (userMatchesPortalJobScope(user, c, j)) return true;
+  if (await userHasCompanyRoleJobScope(pool, user, c, j)) return true;
 
   return false;
 }
@@ -1903,7 +1992,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     poolOption && typeof poolOption.query === 'function'
       ? { query: (text, params) => poolOption.query(text, params) }
       : pool;
-  registerPortalShareLinkRoutes(app, { pool, query: dbQuery, requireAuth, requireAdmin });
+  registerPortalShareLinkRoutes(app, { pool: poolOption, query: dbQuery, requireAuth, requireAdmin });
 
   const s3 = createWasabiClient();
   const bucket = bucketName();
@@ -2221,7 +2310,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const { clientId, jobId } = scope;
       if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
-        return res.status(403).json({ error: 'Forbidden' });
+        const detail = await explainPortalJobAccessDenial(aclPool, req.user, clientId, jobId);
+        return res.status(403).json(detail);
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
       const jobHasPathGrants = await portalOrCompanyJobHasPathGrants(aclPool, req.user, clientId, jobId);
@@ -2281,7 +2371,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const { clientId, jobId } = scope;
       if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
-        return res.status(403).json({ error: 'Forbidden' });
+        const detail = await explainPortalJobAccessDenial(aclPool, req.user, clientId, jobId);
+        return res.status(403).json(detail);
       }
       const prefix = jobPrefix(String(clientId), String(jobId));
       let listPrefix = prefix;

@@ -1,11 +1,12 @@
 {
-  "title": "PipeShare site menu identity and Wasabi ACL routing",
-  "description": "PipeShare now shows user identity and theme controls in the site menu (dbg127), using shared site-menu-identity.js and portal shell styling aligned with PipeSync.\n\nOn the backend, portal file and share routes use live Postgres for job access checks when Wasabi portal-data-primary is enabled, and permission-related SQL is routed to Postgres instead of the Wasabi adapter. That fixes \"Portal Wasabi adapter does not support this query shape\" for customer users loading the file tree.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
+  "title": "PipeShare SaaS client Forbidden fix",
+  "description": "SaaS customer accounts (e.g. Kat · Client) with Portal Files enabled and an assigned client/job scope were getting HTTP 403 Forbidden on PipeShare load after the Wasabi ACL routing fix. The tree API required non-empty folder path grants before allowing any access.\n\nJob access now allows portal-scoped users and company-role jobs to load the explorer with an empty tree when folder ACL has not been assigned yet. Tree and list routes return clearer error codes when access is legitimately denied.\n\nWho is affected: OVH private server on deploy. SaaS when Mike applies the platform version in releases.html.",
   "changeLog": [
-    "PipeShare site menu: user identity and theme selector (dbg127).",
-    "Shared site-menu-identity.js; portal shell CSS; cache bust dbg127.",
-    "Portal ACL checks use aclPool on share-link and file routes.",
-    "portalPermissionsLivePostgresSql routes membership and folder grants to Postgres under Wasabi primary."
+    "assertPortalJobAccess allows assigned portal scope without folder grants.",
+    "Company role job scope fallback for SaaS membership.",
+    "GET /api/files/tree returns coded 403 messages (PORTAL_SCOPE_DENIED, etc.).",
+    "PipeShare frontend maps tree 403 codes to plain-English banner text.",
+    "Share-link ACL routes use raw Postgres pool for membership checks."
   ],
-  "updatedAt": "2026-06-28T20:00:00.000Z"
+  "updatedAt": "2026-06-28T21:30:00.000Z"
 }
