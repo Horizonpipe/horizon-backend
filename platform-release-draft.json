@@ -1,12 +1,11 @@
 {
-  "title": "No black flash on fast scroll or bookmark at deep zoom (dbg104)",
-  "description": "At high zoom, fast scrolling or bookmark jumps could leave half the page black for seconds before PDF tiles finished re-rendering.\n\nRoot cause: zoom/scroll invalidated tiles by shrinking canvases to 1×1 before async pdf.js paint completed. dbg104 keeps the last good bitmap visible until the new tile is ready, caps canvas size at 8192px to avoid browser partial-render failures, and repaints visible pages sooner on scroll.\n\nWho is affected: OVH private server PDF Viewer fullscreen workspace.",
+  "title": "Fix white void after bookmark jump in PDF viewer (dbg105)",
+  "description": "Bookmark Go at unchanged zoom left a large white area on the right side of the sheet until Ctrl+wheel zoom forced a full re-render.\n\nCause: dbg104 bookmark repaint forced tile invalidation and temporarily set canvas display size to the cropped slot size (dispW×dispH) instead of the full PDF crop layout (natW×fitScale with negative margins). dbg105 keeps canvas geometry intact on scroll-only bookmark jumps and applies cached tiles synchronously when available.\n\nWho is affected: OVH private server PDF Viewer fullscreen.",
   "changeLog": [
-    "Keep previous PDF tile visible while re-rasterizing (no 1×1 canvas wipe).",
-    "Cap deep-zoom canvas dimensions to prevent partial black tiles.",
-    "Repaint visible pages on scroll with shorter debounce.",
-    "Queue follow-up render if zoom/scroll invalidates an in-flight tile.",
-    "Cache bust dbg104."
+    "Stop corrupting canvas layout when invalidating PDF tiles.",
+    "Bookmark Go scroll-only: repaint visible tiles without force-wipe.",
+    "Sync tile-cache apply on bookmark for instant sharp paint when cached.",
+    "Cache bust dbg105."
   ],
   "updatedAt": "2026-06-30T00:00:00.000Z"
 }
