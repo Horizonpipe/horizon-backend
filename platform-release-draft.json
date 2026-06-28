@@ -1,13 +1,10 @@
 {
-  "title": "PDF Viewer continuous scroll — one doc, lazy pages (dbg83)",
-  "description": "PDF Viewer workspace now uses a pdf.net-style continuous scroll viewer: one PDF.js document per archive file (136 pages = one load, not 136 URLs), lazy IntersectionObserver page render, intrinsic zoom via canvas resize (no CSS world scale). Per-page highlight SVG overlays remain read-only in the viewer.\n\nMap workspace is unchanged (native iframe sheets, highlights, export). Hard-refresh PipeSync (dbg83). Debug session d9d6c9 logs remain until Mike confirms the fix.",
+  "title": "Fix PDF Viewer boot crash — duplicate timer declaration (dbg84)",
+  "description": "dbg83 introduced a duplicate `let planBoardViewerCanvasRepaintTimer` in app.js, which caused a SyntaxError and blocked PipeSync from loading. Removed the duplicate declaration; cache bust dbg84.\n\nPDF Viewer continuous scroll (dbg83) is otherwise unchanged. Hard-refresh PipeSync after deploy.",
   "changeLog": [
-    "PDF Viewer: continuous scroll mount (pdf-continuous-viewer.js).",
-    "One pdf.js doc per archiveStorageKey; lazy page tiles near viewport.",
-    "Intrinsic zoom on canvas bitmap; bypass legacy per-page canvas stack.",
-    "Per-page highlight overlays via planBoardAnchoredLinesSvgHtml.",
-    "Map/highlights/export path untouched.",
-    "Cache bust dbg83."
+    "Fix SyntaxError: planBoardViewerCanvasRepaintTimer already declared.",
+    "PipeSync boots again; PDF Viewer continuous module can load.",
+    "Cache bust dbg84."
   ],
-  "updatedAt": "2026-06-28T20:00:00.000Z"
+  "updatedAt": "2026-06-28T05:05:00.000Z"
 }
