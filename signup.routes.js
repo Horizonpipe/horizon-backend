@@ -68,7 +68,7 @@ function getMailer() {
  * @returns {Promise<{ ok: true } | { ok: false, reason: 'not_configured' | 'send_failed', message?: string }>}
  */
 async function sendPinEmail(to, pin) {
-  const from = (process.env.SMTP_FROM || process.env.SMTP_USER || `${SIGNUP_MAIL_FROM_NAME} <noreply@pipeshare.net>`).trim();
+  const from = (process.env.SMTP_FROM || process.env.SMTP_USER || `${SIGNUP_MAIL_FROM_NAME} <EmailVerification@pipeshare.net>`).trim();
   const transporter = getMailer();
   const subject = `Your ${SIGNUP_MAIL_FROM_NAME} verification code`;
   const text = `Your verification code is: ${pin}\n\nEnter this code on the sign-up screen to finish creating your account. This code expires in ${SIGNUP_PIN_TTL_MIN} minutes.\n\nIf you did not request this, you can ignore this email.`;

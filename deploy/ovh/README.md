@@ -133,16 +133,23 @@ psql "$DATABASE_URL" -c "SELECT COUNT(*) FROM users;"
 
 #### pipeshare.net sign-up email (SMTP)
 
-Create account on pipeshare.net sends a 6-digit verification code. The OVH backend **must** have SMTP configured in `/opt/horizon/horizon-backend/.env`:
+Create account sends a 6-digit code from **EmailVerification@pipeshare.net** (GoDaddy Workspace mailbox).
+
+On OVH, after the mailbox password is set in GoDaddy:
 
 ```bash
-# GoDaddy Workspace (example — use your mailbox credentials)
+SMTP_PASS='your-mailbox-password' bash /opt/horizon/horizon-backend/deploy/ovh/setup-pipeshare-signup-smtp.sh
+```
+
+Or edit `/opt/horizon/horizon-backend/.env` manually:
+
+```bash
 SMTP_HOST=smtpout.secureserver.net
 SMTP_PORT=465
 SMTP_SECURE=true
-SMTP_USER=noreply@pipeshare.net
+SMTP_USER=EmailVerification@pipeshare.net
 SMTP_PASS=your-mailbox-password
-SMTP_FROM=PipeShare <noreply@pipeshare.net>
+SMTP_FROM=PipeShare <EmailVerification@pipeshare.net>
 SIGNUP_MAIL_FROM_NAME=PipeShare
 ```
 
