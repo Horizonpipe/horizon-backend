@@ -1,14 +1,11 @@
 {
-  "title": "PDF Viewer chromeless workspace UI (dbg108)",
-  "description": "PDF Viewer no longer shows the large header/toolbar — the continuous PDF canvas uses the full pane height. Map workspace keeps its existing toolbar unchanged.\n\nIn PDF Viewer fullscreen: floating ✕ close (top-right); draggable Line size and Opacity widgets when Line/Eraser tool is active (+/− and Ctrl+/Ctrl− keybinds unchanged). Export assembled PDF is Map-only. Map/Viewer workspace toggle removed — open each mode from the unified explorer right-click menu.\n\nWho is affected: OVH private server PipeSync Plan View PDF Viewer.",
+  "title": "PDF Viewer floating menu button (dbg109)",
+  "description": "Restores the PDF Viewer workspace menu as a floating, draggable ☰ control in the top-right corner. Tap to open a small menu with Close workspace. Replaces the plain ✕ close button from dbg108.\n\nLine size and Opacity float widgets unchanged. Map workspace unchanged.\n\nWho is affected: OVH private server PipeSync Plan View PDF Viewer.",
   "changeLog": [
-    "Remove PDF Viewer header/toolbar; full-height continuous canvas.",
-    "Floating close button top-right in PDF Viewer fullscreen.",
-    "Draggable Line size and Opacity widgets when Line tool is active.",
-    "Export assembled PDF Map-only; removed from PDF Viewer.",
-    "Remove Map/PDF Viewer dropdown; use explorer context menu.",
-    "Eraser in right-click Tools menu for PDF Viewer.",
-    "Cache bust dbg108."
+    "Floating draggable ☰ menu widget in PDF Viewer top-right.",
+    "Dropdown menu with Close workspace action.",
+    "Click outside dismisses the menu.",
+    "Cache bust dbg109."
   ],
-  "updatedAt": "2026-06-28T12:00:00.000Z"
+  "updatedAt": "2026-06-28T14:00:00.000Z"
 }
