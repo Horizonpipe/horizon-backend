@@ -155,9 +155,15 @@ SIGNUP_MAIL_FROM_NAME=PipeShare
 
 Then reload: `pm2 reload horizon-backend --update-env`
 
-Verify: `curl -sS -X POST https://pipeshare.net/signup/request -H 'Content-Type: application/json' -d '{"firstName":"Test","lastName":"User","company":"Co","email":"you@example.com","password":"testpass12"}'`
+**Pre-launch testing (no SMTP yet):** OVH may have `SIGNUP_DEV_RETURN_PIN=1` — the verification code appears on screen after you submit the form. Remove before public launch.
 
-Without SMTP, sign-up returns a user-friendly error (no raw server config text).
+**Production (GoDaddy mailbox ready):** from your PC:
+
+```powershell
+powershell -File deploy/ovh/setup-pipeshare-signup-smtp.ps1
+```
+
+Or on OVH: `SMTP_PASS='...' bash deploy/ovh/setup-pipeshare-signup-smtp.sh` (also sets `SIGNUP_DEV_RETURN_PIN=0`).
 
 Config files: `nginx-horizon-pipeshare.conf` (HTTP/ACME), `nginx-horizon-pipeshare-ssl.conf` (HTTPS).
 
