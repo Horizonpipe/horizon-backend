@@ -1,12 +1,12 @@
 {
-  "title": "Fix PDF fullscreen workspace tools (dbg100)",
-  "description": "After opening a PDF in the fullscreen continuous viewer, right-click menus, highlighter keybinds (1-7), and bookmarks did not work reliably.\n\ndbg100 re-wires plan board listeners after the continuous viewer mounts its page slots (mount ran before pages existed). Toolbar/keybind handlers now target the active fullscreen PDF host via planBoardHostForStateKey instead of the first [data-hp-plan-board=pdf] in the document. Context hitboxes on continuous pages get explicit pointer-events.\n\nWho is affected: OVH private server PDF Viewer fullscreen workspace.",
+  "title": "Fix invisible highlights and menus in PDF fullscreen (dbg101)",
+  "description": "In the fullscreen PDF viewer, highlights saved to state but did not appear on screen, the color-selection popup was missing, and the right-click sheet menu seemed broken.\n\nRoot causes: (1) context menu and color HUD used z-index 2000–2600 while the fullscreen shell is z-index 9200, so menus opened behind the workspace. (2) continuous viewer pages kept map-board world x/y coordinates while rendering as a vertical stack, so highlight ink coordinates were off-canvas.\n\ndbg101 raises menu/HUD z-index above fullscreen, normalizes viewer page stack layout (p.x=0, p.y=stacked), and keeps overlays in sync on zoom.\n\nWho is affected: OVH private server PDF Viewer fullscreen.",
   "changeLog": [
-    "Re-mount plan board listeners after continuous PDF viewer creates page slots.",
-    "Route keybind and toolbar chrome updates to fullscreen PDF host.",
-    "Explicit context hitbox pointer-events on continuous viewer pages.",
-    "Debug logs for context menu and line-color keybinds (session d9d6c9).",
-    "Cache bust dbg100."
+    "Raise context menu and color HUD z-index above fullscreen overlay.",
+    "Normalize continuous viewer page x/y to vertical stack layout for highlight coords.",
+    "Store pageId on line-tool first click; improve line preview targeting.",
+    "Refresh highlight overlays after zoom with correct page layout.",
+    "Cache bust dbg101."
   ],
-  "updatedAt": "2026-06-29T22:00:00.000Z"
+  "updatedAt": "2026-06-29T23:30:00.000Z"
 }
