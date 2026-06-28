@@ -10,7 +10,8 @@ const {
 } = require('./lib/saas-tenant-paths');
 const { buildTenantAccessUrls } = require('./lib/saas-tenant-access-urls');
 const { getSaasWasabiClient, saasWasabiBucket, saasVirtualboxConfigured } = require('./lib/saas-virtualbox-config');
-const { seedTenantAuthSnapshot } = require('./lib/saas-tenant-auth-store');
+const { seedTenantAuthSnapshot, upsertTenantOwnerAuthSnapshot } = require('./lib/saas-tenant-auth-store');
+const { applySaasTenantOwnerPrivileges } = require('./lib/saas-tenant-owner');
 
 function cleanString(v) {
   return String(v ?? '').trim();
@@ -238,6 +239,8 @@ async function provisionTenantInstance(pool, s3Client, bucket, ownerUserId) {
     );
     const ownerUser = ownerRow.rows[0] || null;
     await seedTenantAuthSnapshot(slug, ownerUser);
+    await upsertTenantOwnerAuthSnapshot(slug, ownerUser);
+    await applySaasTenantOwnerPrivileges(pool, ownerUserId);
 
     await pool.query(
       `INSERT INTO user_company_membership (user_id, company_id, role_key, override_folder_grants)

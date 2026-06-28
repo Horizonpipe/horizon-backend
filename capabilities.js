@@ -92,17 +92,25 @@ function inferModelFromLegacy(userLike) {
 }
 
 function deriveAccountModel(userLike) {
-  /** Self-signup (pipeshare.net SaaS or client portal request) is always a customer account. */
+  /** SaaS workspace purchaser — super admin inside their own tenant instance. */
+  if (userLike?.saasTenantOwner === true || userLike?.isSaasTenantOwner === true) {
+    return { accountType: ACCOUNT_TYPES.EMPLOYEE, employeeRole: EMPLOYEE_ROLES.SUPERADMIN };
+  }
+  const explicitRole = normalizeEmployeeRole(userLike?.employeeRole || userLike?.employee_role);
+  if (explicitRole === EMPLOYEE_ROLES.SUPERADMIN) {
+    return { accountType: ACCOUNT_TYPES.EMPLOYEE, employeeRole: EMPLOYEE_ROLES.SUPERADMIN };
+  }
+  /** Self-signup client portal requests (not SaaS purchasers) start as customer. */
   if (userLike?.self_signup === true || userLike?.selfSignup === true) {
     return { accountType: ACCOUNT_TYPES.CUSTOMER, employeeRole: null };
   }
   const accountType = normalizeAccountType(userLike?.accountType || userLike?.account_type);
-  const explicitRole = normalizeEmployeeRole(userLike?.employeeRole || userLike?.employee_role);
+  const explicitRoleAfterType = normalizeEmployeeRole(userLike?.employeeRole || userLike?.employee_role);
   if (accountType === ACCOUNT_TYPES.CUSTOMER) {
     return { accountType: ACCOUNT_TYPES.CUSTOMER, employeeRole: null };
   }
-  if (accountType === ACCOUNT_TYPES.EMPLOYEE && explicitRole) {
-    return { accountType, employeeRole: explicitRole };
+  if (accountType === ACCOUNT_TYPES.EMPLOYEE && explicitRoleAfterType) {
+    return { accountType, employeeRole: explicitRoleAfterType };
   }
   const inferred = inferModelFromLegacy(userLike);
   if (inferred.accountType === ACCOUNT_TYPES.CUSTOMER) {

@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const { isSaasSignupRequest } = require('./lib/saas-signup-context');
 const { upsertTenantDraft } = require('./tenant-provisioning.service');
+const { applySaasTenantOwnerPrivileges } = require('./lib/saas-tenant-owner');
 
 const SIGNUP_PIN_TTL_MIN = Number(process.env.SIGNUP_PIN_TTL_MIN || 30);
 const RESEND_COOLDOWN_SEC = Math.max(30, Number(process.env.SIGNUP_RESEND_COOLDOWN_SEC || 60));
@@ -446,6 +447,7 @@ function registerSignupRoutes(app, deps) {
             businessName: companyName,
             branding: { businessName: companyName }
           });
+          await applySaasTenantOwnerPrivileges(pool, userRow.id);
         } catch (tenantError) {
           console.error('[signup] SaaS tenant draft failed:', tenantError);
           await dbQuery(`DELETE FROM users WHERE CAST(id AS text) = $1`, [String(userRow.id)]);
@@ -455,7 +457,16 @@ function registerSignupRoutes(app, deps) {
           });
         }
         await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
-        const user = await attachScopesToUser(normalizeUser(userRow));
+        const refreshed = await dbQuery(
+          `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password,
+                  portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup,
+                  email, first_name, last_name, company, title, phone, email_verified
+           FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
+          [String(userRow.id)]
+        );
+        const user = await attachScopesToUser(
+          normalizeUser(refreshed.rows[0] || userRow, { saasTenantOwner: true })
+        );
         const token = await issueSession(userRow.id, { keepSession: false });
         return res.json({
           success: true,

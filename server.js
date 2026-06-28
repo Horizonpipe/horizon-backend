@@ -66,6 +66,7 @@ const {
   assertKeyWithinTenantRoot
 } = require('./lib/tenant-storage-context');
 const { evaluateSaasCustomerLoginAccess } = require('./lib/saas-customer-access');
+const { isSaasTenantOwner, applySaasTenantOwnerPrivileges } = require('./lib/saas-tenant-owner');
 const { upsertTenantDraft } = require('./tenant-provisioning.service');
 const { isSaasTenantCorsOrigin } = require('./lib/saas-cors');
 
@@ -2097,7 +2098,7 @@ function mergeUserPrefsPatch(current, patch) {
   return parseUserPrefs({ user_prefs: merged });
 }
 
-function normalizeUser(row) {
+function normalizeUser(row, context = {}) {
   const accountModel = deriveAccountModel({
     accountType: row?.account_type,
     employeeRole: row?.employee_role,
@@ -2105,7 +2106,10 @@ function normalizeUser(row) {
     roles: row?.roles,
     username: row?.username,
     display_name: row?.display_name,
-    email: row?.email
+    email: row?.email,
+    self_signup: row?.self_signup,
+    selfSignup: row?.self_signup === true,
+    saasTenantOwner: context.saasTenantOwner === true
   });
   const legacyRoles = normalizeRoles(row?.roles);
   const canonicalRoles = legacyRolesForAccountModel(accountModel, legacyRoles);
@@ -4006,6 +4010,10 @@ async function readSessionFromWasabiSnapshot(token, snapshotOverride = null) {
 async function readFreshUserFromPostgresById(userId) {
   const id = String(userId || '').trim();
   if (!id) return null;
+  const saasTenantOwner = await isSaasTenantOwner(pool, id);
+  if (saasTenantOwner) {
+    await applySaasTenantOwnerPrivileges(pool, id);
+  }
   const result = await pool.query(
     `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id,
             portal_permissions_access, portal_files_access_granted, autosync_master_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
@@ -4016,7 +4024,7 @@ async function readFreshUserFromPostgresById(userId) {
     [id]
   );
   if (!result.rows.length) return null;
-  return attachScopesToUser(normalizeUser(result.rows[0]));
+  return attachScopesToUser(normalizeUser(result.rows[0], { saasTenantOwner }));
 }
 
 async function extendWasabiSessionExpiry(token, keepSession = false) {
@@ -4058,7 +4066,7 @@ async function readSessionFromPostgres(token) {
   await pool.query(`DELETE FROM auth_sessions WHERE expires_at < NOW()`);
   const result = await pool.query(
     `SELECT s.token, s.user_id, s.keep_session, s.expires_at, u.id, u.username, u.display_name, u.password,
-            u.is_admin, u.roles, u.must_change_password, u.portal_files_client_id, u.portal_files_job_id,
+            u.is_admin, u.account_type, u.employee_role, u.roles, u.must_change_password, u.portal_files_client_id, u.portal_files_job_id,
             u.portal_permissions_access, u.portal_files_access_granted, u.autosync_master_granted, u.self_signup, u.email, u.first_name, u.last_name, u.company, u.title, u.phone, u.email_verified,
             u.product_tutorials_seen, u.portal_workspace_layouts, u.user_prefs
      FROM auth_sessions s
@@ -4083,7 +4091,23 @@ async function readSessionFromPostgres(token) {
     [token, ttlMinutes]
   );
   return {
-    user: await attachScopesToUser(normalizeUser(row)),
+    user: await (async () => {
+      const saasTenantOwner = await isSaasTenantOwner(pool, row.id);
+      if (saasTenantOwner) {
+        await applySaasTenantOwnerPrivileges(pool, row.id);
+        const refreshed = await pool.query(
+          `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id,
+                  portal_permissions_access, portal_files_access_granted, autosync_master_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
+                  product_tutorials_seen, portal_workspace_layouts, user_prefs
+           FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
+          [String(row.id)]
+        );
+        if (refreshed.rows[0]) {
+          return attachScopesToUser(normalizeUser(refreshed.rows[0], { saasTenantOwner: true }));
+        }
+      }
+      return attachScopesToUser(normalizeUser(row, { saasTenantOwner }));
+    })(),
     keepSession
   };
 }
@@ -6803,7 +6827,10 @@ app.post('/login', async (req, res) => {
       }
     }
 
-    const user = await attachScopesToUser(normalizeUser(row));
+    const user = await readFreshUserFromPostgresById(row.id);
+    if (!user) {
+      return res.status(500).json({ success: false, error: 'Account could not be loaded' });
+    }
     const keepRaw = req.body?.keepSession;
     const keepSession = keepRaw === true || keepRaw === 1 || String(keepRaw || '').trim().toLowerCase() === 'true';
     const token = await issueSession(row.id, { keepSession });
