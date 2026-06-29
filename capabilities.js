@@ -220,9 +220,11 @@ function resolveCapabilities(user) {
   const roles = legacyRolesForAccountModel(model, user?.roles);
   const saasOwner = isSaasWorkspaceOwner(user);
   const tenantPurchaser = user?.tenantPurchaser === true;
+  const platformCpanelSuperAdmin = looksLikeMike(user) && canAccessAdminPanel(user);
   return {
     version: 2,
     superAdmin: isSuperAdmin(user),
+    platformCpanelSuperAdmin,
     saasTenantOwner: saasOwner,
     tenantAdmin: saasOwner,
     tenantPurchaser,

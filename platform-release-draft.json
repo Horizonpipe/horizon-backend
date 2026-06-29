@@ -1,12 +1,12 @@
 {
-  "title": "Fix SaaS billing API; Customer badge; welcome subscribe page",
-  "description": "Billing and Home failed with loadTenantByOwner is not a function due to a circular import between tenant-provisioning and saas-billing. Fixed by moving subscription constants to a shared module.\n\nSAAS_SKIP_SUBSCRIPTION_CHECK was enabled on OVH, which treated every purchaser as subscribed and showed Workspace owner immediately — disabled for real Stripe gating.\n\nPre-subscribe purchasers now show Customer in the sidebar. Home restores the Buy Subscription button and product bullet showcase when billing API hiccups. Script cache versions bumped on cPanel pages.\n\nWho is affected: pipeshare.net cPanel sign-ups (e.g. new tenant purchasers).",
+  "title": "cPanel nav locked to platform super-admin only",
+  "description": "SaaS cPanel sidebar no longer shows Platform updates, Server, PipeShare, PipeSync, or Account to workspace purchasers or other sign-ins. Only Mike Strickland (PipeShare platform super-admin) sees the full operator menu.\n\nBackend adds platformCpanelSuperAdmin on session capabilities. Frontend filters nav to Home, Billing, and Setup for everyone else. Server and Platform updates pages redirect unauthorized users to Home.\n\nWho is affected: all pipeshare.net cPanel users except platform super-admin. Log out and back in after deploy to refresh session capabilities.",
   "changeLog": [
-    "Fix loadTenantByOwner circular import breaking /saas/billing/status.",
-    "Disable SAAS_SKIP_SUBSCRIPTION_CHECK on OVH so expired means expired.",
-    "Sidebar shows Customer until subscription activates on login.",
-    "Home welcome page: big Buy button + PipeShare/PipeSync bullet cards restored.",
-    "Bump cPanel script cache versions so nav and badges update after deploy."
+    "Add platformCpanelSuperAdmin capability for Mike-only cPanel operator nav.",
+    "Hide Platform updates, Server, PipeShare, PipeSync, and Account from SaaS purchasers.",
+    "Guard Server and Platform updates pages against direct URL access.",
+    "Fix role badge so purchasers never show Horizon admin.",
+    "Bump cPanel script cache to 20260629saas2."
   ],
-  "updatedAt": "2026-06-29T04:30:00.000Z"
+  "updatedAt": "2026-06-29T12:00:00.000Z"
 }
