@@ -78,7 +78,16 @@ const {
 } = require('./lib/tenant-storage-context');
 const { evaluateSaasCustomerLoginAccess } = require('./lib/saas-customer-access');
 const { parseSaasTenantSlugFromHost } = require('./lib/saas-tenant-access-urls');
-const { isSaasTenantOwner, applySaasTenantOwnerPrivileges } = require('./lib/saas-tenant-owner');
+const {
+  isSaasTenantOwner,
+  getSaasOwnerSessionContext,
+  refreshSaasTenantOwnerAccess
+} = require('./lib/saas-tenant-owner');
+const {
+  findTenantByOwnerUserId,
+  getStripe,
+  syncTenantSubscriptionFromStripe
+} = require('./saas-billing.service');
 const {
   userHasGlobalPsrBypass,
   isTenantBoundUser,
@@ -1132,30 +1141,18 @@ async function loadSnapshotTablesForRequest(req, force = false) {
   return readWasabiSnapshotDataTables(snapshot || {}, { strict: false });
 }
 
-async function ensureSaasTenantOwnerWorkspaceReady(pool, userId) {
-  const uid = String(userId || '').trim();
-  if (!uid) return;
-  const owner = await isSaasTenantOwner(pool, uid);
-  if (!owner) return;
-  await applySaasTenantOwnerPrivileges(pool, uid);
+async function syncSaasSubscriptionOnLogin(userId) {
+  const id = String(userId || '').trim();
+  if (!id) return;
   try {
-    const row = await pool.query(
-      `SELECT wasabi_root_prefix FROM saas_tenant_instances WHERE CAST(owner_user_id AS text) = $1 LIMIT 1`,
-      [uid]
-    );
-    const slug = tenantSlugFromWasabiRoot(row.rows[0]?.wasabi_root_prefix);
-    if (slug) {
-      const ownerRow = await pool.query(
-        `SELECT id, username, email, display_name FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
-        [uid]
-      );
-      if (ownerRow.rows[0]) {
-        await upsertTenantOwnerAuthSnapshot(slug, ownerRow.rows[0]);
-      }
-      await seedTenantAppDataSnapshot(slug);
+    let tenant = await findTenantByOwnerUserId(pool, id);
+    if (!tenant) return;
+    const stripe = getStripe();
+    if (stripe && tenant.stripeCustomerId) {
+      tenant = (await syncTenantSubscriptionFromStripe(stripe, pool, tenant)) || tenant;
     }
   } catch (error) {
-    console.warn('[saas] tenant app snapshot seed failed:', error?.message || error);
+    console.warn('[login] SaaS subscription sync failed:', error?.message || error);
   }
 }
 
@@ -2217,6 +2214,7 @@ function mergeUserPrefsPatch(current, patch) {
 
 function normalizeUser(row, context = {}) {
   const isSaasOwner = context.saasTenantOwner === true;
+  const isTenantPurchaser = context.tenantPurchaser === true;
   const accountModel = deriveAccountModel({
     accountType: row?.account_type,
     employeeRole: row?.employee_role,
@@ -2298,6 +2296,8 @@ function normalizeUser(row, context = {}) {
     title: row.title || undefined,
     phone: row.phone || undefined,
     emailVerified: row.email_verified !== false,
+    tenantPurchaser: isTenantPurchaser,
+    subscriptionStatus: context.subscriptionStatus || undefined,
     saasTenantOwner: isSaasOwner,
     isAdmin: canonicalIsAdmin,
     isSuperAdmin:
@@ -4136,11 +4136,13 @@ async function readSessionFromWasabiSnapshot(token, snapshotOverride = null) {
   };
 }
 
-async function readFreshUserFromPostgresById(userId) {
+async function readFreshUserFromPostgresById(userId, options = {}) {
   const id = String(userId || '').trim();
   if (!id) return null;
-  await ensureSaasTenantOwnerWorkspaceReady(pool, id);
-  const saasTenantOwner = await isSaasTenantOwner(pool, id);
+  if (options.refreshSaasAccess !== false) {
+    await refreshSaasTenantOwnerAccess(pool, id);
+  }
+  const ownerCtx = await getSaasOwnerSessionContext(pool, id);
   const result = await pool.query(
     `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id,
             portal_permissions_access, portal_files_access_granted, autosync_master_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
@@ -4151,7 +4153,13 @@ async function readFreshUserFromPostgresById(userId) {
     [id]
   );
   if (!result.rows.length) return null;
-  return attachScopesToUser(normalizeUser(result.rows[0], { saasTenantOwner }));
+  return attachScopesToUser(
+    normalizeUser(result.rows[0], {
+      tenantPurchaser: ownerCtx.tenantPurchaser,
+      saasTenantOwner: ownerCtx.saasTenantOwner,
+      subscriptionStatus: ownerCtx.subscriptionStatus
+    })
+  );
 }
 
 async function extendWasabiSessionExpiry(token, keepSession = false) {
@@ -4218,23 +4226,7 @@ async function readSessionFromPostgres(token) {
     [token, ttlMinutes]
   );
   return {
-    user: await (async () => {
-      await ensureSaasTenantOwnerWorkspaceReady(pool, row.id);
-      const saasTenantOwner = await isSaasTenantOwner(pool, row.id);
-      if (saasTenantOwner) {
-        const refreshed = await pool.query(
-          `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-                  portal_permissions_access, portal_files_access_granted, autosync_master_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
-                  product_tutorials_seen, portal_workspace_layouts, user_prefs
-           FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
-          [String(row.id)]
-        );
-        if (refreshed.rows[0]) {
-          return attachScopesToUser(normalizeUser(refreshed.rows[0], { saasTenantOwner: true }));
-        }
-      }
-      return attachScopesToUser(normalizeUser(row, { saasTenantOwner }));
-    })(),
+    user: await readFreshUserFromPostgresById(row.id, { refreshSaasAccess: false }),
     keepSession
   };
 }
@@ -6333,8 +6325,8 @@ async function ensureSchema() {
       portal_client_id TEXT NOT NULL DEFAULT '',
       portal_job_id TEXT NOT NULL DEFAULT '1',
       branding JSONB NOT NULL DEFAULT '{}'::jsonb,
-      subscription_status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (subscription_status IN ('pending', 'trialing', 'active', 'past_due', 'canceled')),
+      subscription_status TEXT NOT NULL DEFAULT 'expired'
+        CHECK (subscription_status IN ('pending', 'expired', 'trialing', 'active', 'past_due', 'canceled')),
       stripe_customer_id TEXT,
       stripe_subscription_id TEXT,
       setup_status TEXT NOT NULL DEFAULT 'draft'
@@ -6352,6 +6344,28 @@ async function ensureSchema() {
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_saas_tenant_instances_subscription ON saas_tenant_instances (subscription_status)`
   );
+  await pool.query(`
+    DO $$ BEGIN
+      ALTER TABLE saas_tenant_instances DROP CONSTRAINT IF EXISTS saas_tenant_instances_subscription_status_check;
+    EXCEPTION WHEN undefined_object THEN NULL;
+    END $$;
+  `);
+  await pool.query(`
+    ALTER TABLE saas_tenant_instances
+    ADD CONSTRAINT saas_tenant_instances_subscription_status_check
+    CHECK (subscription_status IN ('pending', 'expired', 'trialing', 'active', 'past_due', 'canceled'))
+  `);
+  await pool.query(`
+    ALTER TABLE saas_tenant_instances
+    ALTER COLUMN subscription_status SET DEFAULT 'expired'
+  `);
+  await pool.query(`
+    UPDATE saas_tenant_instances
+    SET subscription_status = 'expired', updated_at = NOW()
+    WHERE subscription_status = 'pending'
+      AND COALESCE(stripe_subscription_id, '') = ''
+      AND COALESCE(stripe_customer_id, '') = ''
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS platform_release_events (
@@ -7021,7 +7035,10 @@ app.post('/login', async (req, res) => {
       }
     }
 
-    const user = await readFreshUserFromPostgresById(row.id);
+    const user = await (async () => {
+      await syncSaasSubscriptionOnLogin(row.id);
+      return readFreshUserFromPostgresById(row.id);
+    })();
     if (!user) {
       return res.status(500).json({ success: false, error: 'Account could not be loaded' });
     }
@@ -11336,10 +11353,14 @@ async function createSignupUserWithWasabi({ email, verificationRow, saasSignup }
         businessName: companyName,
         branding: { businessName: companyName }
       });
-      await applySaasTenantOwnerPrivileges(pool, createdUserRow.id);
       await mirrorSelfSignupUserToPostgres(createdUserRow);
+      const ownerCtx = await getSaasOwnerSessionContext(pool, createdUserRow.id);
       const user = await attachScopesToUser(
-        normalizeUser(createdUserRow, { saasTenantOwner: true })
+        normalizeUser(createdUserRow, {
+          tenantPurchaser: ownerCtx.tenantPurchaser,
+          saasTenantOwner: false,
+          subscriptionStatus: ownerCtx.subscriptionStatus
+        })
       );
       const token = await issueSession(createdUserRow.id, { keepSession: false });
       return {

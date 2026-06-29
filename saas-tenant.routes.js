@@ -210,7 +210,7 @@ function registerSaasTenantRoutes(app, { pool, requireAuth, wasabiClient, wasabi
         return res.json({
           success: true,
           status: 'none',
-          subscriptionStatus: 'pending',
+          subscriptionStatus: 'expired',
           setupStatus: 'draft'
         });
       }

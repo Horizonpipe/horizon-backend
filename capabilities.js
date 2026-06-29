@@ -219,11 +219,14 @@ function resolveCapabilities(user) {
   const model = deriveAccountModel(user || {});
   const roles = legacyRolesForAccountModel(model, user?.roles);
   const saasOwner = isSaasWorkspaceOwner(user);
+  const tenantPurchaser = user?.tenantPurchaser === true;
   return {
     version: 2,
     superAdmin: isSuperAdmin(user),
     saasTenantOwner: saasOwner,
     tenantAdmin: saasOwner,
+    tenantPurchaser,
+    subscriptionStatus: user?.subscriptionStatus || null,
     canAccessAdminPanel: canAccessAdminPanel(user),
     canManagePortalExtras: canManagePortalExtras(user),
     canViewInspectionDiagnostics: canViewInspectionDiagnostics(user),

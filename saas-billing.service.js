@@ -54,6 +54,9 @@ function mapStripeSubscriptionStatus(stripeStatus) {
   return 'pending';
 }
 
+/** Default for new SaaS workspace owners who have never subscribed. */
+const SAAS_INITIAL_SUBSCRIPTION_STATUS = 'expired';
+
 function defaultBusinessNameFromUser(user) {
   const company = cleanString(user?.company);
   if (company) return company;
@@ -262,14 +265,14 @@ function billingStatusSummary(tenant) {
     return {
       configured: stripeConfigured(),
       hasTenant: false,
-      subscriptionStatus: 'pending',
+      subscriptionStatus: SAAS_INITIAL_SUBSCRIPTION_STATUS,
       stripeCustomerId: '',
       stripeSubscriptionId: '',
       allowsProvisioning: false
     };
   }
 
-  const status = tenant.subscriptionStatus || 'pending';
+  const status = tenant.subscriptionStatus || SAAS_INITIAL_SUBSCRIPTION_STATUS;
   const allows =
     process.env.SAAS_SKIP_SUBSCRIPTION_CHECK === '1' || status === 'active' || status === 'trialing';
 
@@ -299,5 +302,6 @@ module.exports = {
   syncTenantSubscriptionFromStripe,
   ensureStripeCustomer,
   resolveCheckoutUrls,
-  billingStatusSummary
+  billingStatusSummary,
+  SAAS_INITIAL_SUBSCRIPTION_STATUS
 };

@@ -13,6 +13,7 @@ const { getSaasWasabiClient, saasWasabiBucket, saasVirtualboxConfigured } = requ
 const { seedTenantAuthSnapshot, upsertTenantOwnerAuthSnapshot } = require('./lib/saas-tenant-auth-store');
 const { applySaasTenantOwnerPrivileges, isHorizonPlatformAdmin } = require('./lib/saas-tenant-owner');
 const { seedTenantAppDataSnapshot } = require('./lib/tenant-wasabi-state');
+const { SAAS_INITIAL_SUBSCRIPTION_STATUS } = require('./saas-billing.service');
 
 function cleanString(v) {
   return String(v ?? '').trim();
@@ -51,7 +52,7 @@ function serializeTenantRow(row) {
     portalClientId: row.portal_client_id || '',
     portalJobId: row.portal_job_id || '1',
     branding: normalizeBranding(row.branding),
-    subscriptionStatus: row.subscription_status || 'pending',
+    subscriptionStatus: row.subscription_status || SAAS_INITIAL_SUBSCRIPTION_STATUS,
     stripeCustomerId: row.stripe_customer_id || '',
     stripeSubscriptionId: row.stripe_subscription_id || '',
     setupStatus: row.setup_status || 'draft',
@@ -163,7 +164,7 @@ async function upsertTenantDraft(pool, ownerUserId, payload) {
     `INSERT INTO saas_tenant_instances (
        company_id, owner_user_id, website_url, wasabi_root_prefix,
        portal_client_id, portal_job_id, branding, setup_status, subscription_status
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'draft', 'pending')
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'draft', $8)
      RETURNING *`,
     [
       companyId,
@@ -172,7 +173,8 @@ async function upsertTenantDraft(pool, ownerUserId, payload) {
       wasabiRoot,
       scope.clientId,
       scope.jobId,
-      JSON.stringify({ ...branding, businessName, websiteUrl })
+      JSON.stringify({ ...branding, businessName, websiteUrl }),
+      SAAS_INITIAL_SUBSCRIPTION_STATUS
     ]
   );
   return serializeTenantRow(r.rows[0]);
