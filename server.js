@@ -11248,45 +11248,15 @@ async function querySignupDataWithWasabiFallback(text, params = []) {
   return pool.query(text, params);
 }
 
-async function verifySignupWithWasabi({ email, pin, signupContext }) {
-  if (!WASABI_SIGNUP_PRIMARY_ENABLED) return null;
-  const saasSignup = String(signupContext || '').trim().toLowerCase() === 'saas';
+async function createSignupUserWithWasabi({ email, verificationRow, saasSignup }) {
+  if (!WASABI_SIGNUP_PRIMARY_ENABLED || !verificationRow) return null;
+  const row = verificationRow;
   let response = null;
   let createdUserRow = null;
   let createdCompany = '';
-  const wrote = await tryWasabiStateWrite('signup-verify', async (data) => {
-    const verifications = ensureSnapshotTable(data, 'signup_verifications');
+  const wrote = await tryWasabiStateWrite('signup-create-user', async (data) => {
     const users = ensureSnapshotTable(data, 'users');
     const emailNeedle = String(email || '').trim().toLowerCase();
-    const idx = verifications.findIndex(
-      (row) => String(row.email_normalized || '').trim().toLowerCase() === emailNeedle
-    );
-    if (idx < 0) {
-      response = {
-        status: 400,
-        body: { success: false, error: 'No pending sign-up for this email. Start again.' }
-      };
-      return;
-    }
-    const row = verifications[idx];
-    if (new Date(String(row.expires_at || '')).getTime() < Date.now()) {
-      verifications.splice(idx, 1);
-      response = {
-        status: 400,
-        body: { success: false, error: 'That code has expired. Request a new one.' }
-      };
-      return;
-    }
-
-    const pinOk = await bcrypt.compare(String(pin || ''), String(row.pin_hash || ''));
-    if (!pinOk) {
-      response = {
-        status: 400,
-        body: { success: false, error: 'Invalid verification code' }
-      };
-      return;
-    }
-
     const duplicate = users.some((user) => {
       const username = String(user.username || '').trim().toLowerCase();
       const userEmail = String(user.email || '').trim().toLowerCase();
@@ -11338,7 +11308,6 @@ async function verifySignupWithWasabi({ email, pin, signupContext }) {
       updated_at: now
     };
     users.push(userRow);
-    verifications.splice(idx, 1);
     createdUserRow = userRow;
     createdCompany = String(row.company || '').trim();
     if (!saasSignup) {
@@ -11362,8 +11331,11 @@ async function verifySignupWithWasabi({ email, pin, signupContext }) {
         businessName: companyName,
         branding: { businessName: companyName }
       });
+      await applySaasTenantOwnerPrivileges(pool, createdUserRow.id);
       await mirrorSelfSignupUserToPostgres(createdUserRow);
-      const user = await attachScopesToUser(normalizeUser(createdUserRow));
+      const user = await attachScopesToUser(
+        normalizeUser(createdUserRow, { saasTenantOwner: true })
+      );
       const token = await issueSession(createdUserRow.id, { keepSession: false });
       return {
         status: 200,
@@ -11404,7 +11376,8 @@ registerUserGrantsRoutes(app, { pool, requireAuth, requireAdminPanelAccess });
 registerSignupRoutes(app, {
   pool,
   query: querySignupDataWithWasabiFallback,
-  verifySignupWithWasabi,
+  createSignupUserWithWasabi,
+  signupPrimaryStrict: WASABI_SIGNUP_PRIMARY_STRICT,
   cleanString,
   normalizeRoles,
   issueSession,

@@ -1,12 +1,10 @@
 {
-  "title": "SaaS PSR create, HTTPS mixed-content fix, wildcard TLS tooling",
-  "description": "SaaS tenants on *.pipeshare.net could not add new PSR clients/jobsites because scope checks ran before the first record existed, and planner writes still hit the base Wasabi snapshot. Tenant-bound users with planner access can now create jobs in their isolated tenant snapshot; scopes are granted automatically on create.\n\nBrowsers showed \"Not secure\" despite a valid wildcard cert when Wasabi presigned URLs or subresources used http://. Presigned URLs and S3 endpoints are forced to HTTPS; SaaS nginx sends upgrade-insecure-requests.\n\nGoDaddy DNS-01 scripts issue and renew *.pipeshare.net certs for tenant subdomains.\n\nWho is affected: SaaS customers on techpipe.pipeshare.net and future *.pipeshare.net tenants.",
+  "title": "Fix SaaS cPanel sign-up verification",
+  "description": "SaaS sign-up on pipeshare.net stored pending verification codes in the Wasabi snapshot. Concurrent snapshot writes from other API workers could overwrite the code before verify ran, producing \"No pending sign-up for this email\" even after a valid email was sent.\n\nPending PINs now live in Postgres (reliable, short-lived). Verify checks Postgres first, then creates the account in Wasabi for SaaS tenants.\n\nWho is affected: anyone signing up for a new pipeshare.net cPanel workspace.",
   "changeLog": [
-    "SaaS PSR Add Client / Create jobsite works for tenant workspace owners.",
-    "Planner records and scopes write to per-tenant Wasabi snapshot, not base PipeShare.",
-    "Wasabi presigned GET/PUT URLs forced to HTTPS (fixes mixed-content warnings).",
-    "nginx SaaS vhost: upgrade-insecure-requests CSP header.",
-    "GoDaddy certbot hooks + apply-saas-tenant-nginx-ssl.sh for *.pipeshare.net TLS."
+    "SaaS sign-up verification codes stored in Postgres, not Wasabi snapshot.",
+    "Verify PIN against Postgres before creating tenant account in Wasabi.",
+    "SaaS owner privileges applied on Wasabi sign-up path (parity with Postgres path)."
   ],
-  "updatedAt": "2026-06-29T02:30:00.000Z"
+  "updatedAt": "2026-06-29T03:00:00.000Z"
 }

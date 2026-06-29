@@ -137,13 +137,14 @@ async function sendApprovalRequestEmail(payload) {
 
 /**
  * @param {import('express').Express} app
- * @param {{ pool: import('pg').Pool, query?: (text: string, params?: unknown[]) => Promise<{rows: unknown[], rowCount?: number}>, verifySignupWithWasabi?: (payload: {email: string, pin: string, signupContext?: string}) => Promise<{status: number, body: Record<string, unknown>} | null>, cleanString: (v: unknown) => string, normalizeRoles: (v: unknown) => object, normalizeUser: (row: object) => object, issueSession?: (userId: string|number, options?: {keepSession?: boolean}) => Promise<string>, attachScopesToUser?: (user: object) => Promise<object>, resolveCapabilities?: (user: object) => object }} deps
+ * @param {{ pool: import('pg').Pool, query?: (text: string, params?: unknown[]) => Promise<{rows: unknown[], rowCount?: number}>, createSignupUserWithWasabi?: (payload: {email: string, verificationRow: object, saasSignup?: boolean}) => Promise<{status: number, body: Record<string, unknown>} | null>, signupPrimaryStrict?: boolean, cleanString: (v: unknown) => string, normalizeRoles: (v: unknown) => object, normalizeUser: (row: object) => object, issueSession?: (userId: string|number, options?: {keepSession?: boolean}) => Promise<string>, attachScopesToUser?: (user: object) => Promise<object>, resolveCapabilities?: (user: object) => object }} deps
  */
 function registerSignupRoutes(app, deps) {
   const {
     pool,
     query,
-    verifySignupWithWasabi,
+    createSignupUserWithWasabi,
+    signupPrimaryStrict = false,
     cleanString,
     normalizeRoles,
     normalizeUser,
@@ -269,7 +270,8 @@ function registerSignupRoutes(app, deps) {
         return res.status(409).json({ success: false, error: 'An account with this email already exists' });
       }
 
-      const existing = await dbQuery(
+      /** Pending PINs stay in Postgres — Wasabi snapshot races lose short-lived verification rows. */
+      const existing = await pool.query(
         `SELECT created_at FROM signup_verifications WHERE email_normalized = $1 LIMIT 1`,
         [email]
       );
@@ -287,8 +289,8 @@ function registerSignupRoutes(app, deps) {
       const pinHash = await bcrypt.hash(pin, 10);
       const passwordHash = await bcrypt.hash(password, 10);
 
-      await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
-      await dbQuery(
+      await pool.query(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
+      await pool.query(
         `INSERT INTO signup_verifications (
            email_normalized, pin_hash, password_hash, first_name, last_name, company, title, phone, expires_at
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + ($9::int * INTERVAL '1 minute'))`,
@@ -312,7 +314,7 @@ function registerSignupRoutes(app, deps) {
       const devPin = devPinAllowed ? pin : undefined;
 
       if (!sendResult.ok && !devPin) {
-        await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
+        await pool.query(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
         const pub = publicSignupMailError(sendResult.reason, sendResult.message);
         console.error('[signup] verification email failed:', sendResult.reason, sendResult.message || '');
         return res.status(503).json({ success: false, ...pub });
@@ -346,24 +348,8 @@ function registerSignupRoutes(app, deps) {
 
     const saasSignup = isSaasSignupRequest(req);
 
-    if (typeof verifySignupWithWasabi === 'function') {
-      try {
-        const wasabiResult = await verifySignupWithWasabi({
-          email,
-          pin,
-          signupContext: saasSignup ? 'saas' : 'non-saas'
-        });
-        if (wasabiResult && typeof wasabiResult === 'object') {
-          return res.status(Number(wasabiResult.status || 200)).json(wasabiResult.body || {});
-        }
-      } catch (error) {
-        console.error('SIGNUP VERIFY WASABI PATH ERROR:', error);
-        return res.status(500).json({ success: false, error: error.message });
-      }
-    }
-
     try {
-      const v = await dbQuery(
+      const v = await pool.query(
         `SELECT * FROM signup_verifications WHERE email_normalized = $1 LIMIT 1 FOR UPDATE`,
         [email]
       );
@@ -372,13 +358,38 @@ function registerSignupRoutes(app, deps) {
       }
       const row = v.rows[0];
       if (new Date(row.expires_at).getTime() < Date.now()) {
-        await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
+        await pool.query(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
         return res.status(400).json({ success: false, error: 'That code has expired. Request a new one.' });
       }
 
       const pinOk = await bcrypt.compare(pin, row.pin_hash);
       if (!pinOk) {
         return res.status(400).json({ success: false, error: 'Invalid verification code' });
+      }
+
+      if (typeof createSignupUserWithWasabi === 'function') {
+        try {
+          const wasabiResult = await createSignupUserWithWasabi({
+            email,
+            verificationRow: row,
+            saasSignup
+          });
+          if (wasabiResult && typeof wasabiResult === 'object') {
+            await pool.query(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
+            return res.status(Number(wasabiResult.status || 200)).json(wasabiResult.body || {});
+          }
+          if (signupPrimaryStrict) {
+            return res.status(500).json({
+              success: false,
+              error: 'Account could not be completed. Please try again or contact support.'
+            });
+          }
+        } catch (error) {
+          console.error('SIGNUP VERIFY WASABI PATH ERROR:', error);
+          if (signupPrimaryStrict) {
+            return res.status(500).json({ success: false, error: error.message });
+          }
+        }
       }
 
       const displayName = `${row.first_name} ${row.last_name}`.trim() || email;
@@ -456,7 +467,7 @@ function registerSignupRoutes(app, deps) {
             error: 'Could not set up your workspace. Please try again or contact support.'
           });
         }
-        await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
+        await pool.query(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
         const refreshed = await dbQuery(
           `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password,
                   portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup,
@@ -478,7 +489,7 @@ function registerSignupRoutes(app, deps) {
         });
       }
 
-      await dbQuery(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
+      await pool.query(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
 
       const user = normalizeUser(userRow);
       res.json({
