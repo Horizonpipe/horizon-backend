@@ -6,6 +6,8 @@ const nodemailer = require('nodemailer');
 const { isSaasSignupRequest } = require('./lib/saas-signup-context');
 const { upsertTenantDraft } = require('./tenant-provisioning.service');
 const { getSaasOwnerSessionContext } = require('./lib/saas-tenant-owner');
+const { loadTenantScopeByHost } = require('./lib/saas-tenant-scope');
+const { upsertTenantAuthUserFromRow } = require('./lib/saas-tenant-auth-store');
 
 const SIGNUP_PIN_TTL_MIN = Number(process.env.SIGNUP_PIN_TTL_MIN || 30);
 const RESEND_COOLDOWN_SEC = Math.max(30, Number(process.env.SIGNUP_RESEND_COOLDOWN_SEC || 60));
@@ -494,6 +496,35 @@ function registerSignupRoutes(app, deps) {
       }
 
       await pool.query(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
+
+      const requestHost = String(req.get('x-forwarded-host') || req.get('host') || '').trim();
+      const hostScope = await loadTenantScopeByHost(pool, requestHost);
+      if (hostScope.mode === 'tenant') {
+        await pool.query(
+          `UPDATE users
+           SET portal_files_client_id = $2,
+               portal_files_job_id = $3,
+               self_signup = true
+           WHERE CAST(id AS text) = $1`,
+          [String(userRow.id), hostScope.portalClientId, hostScope.portalJobId || '1']
+        );
+        await pool.query(
+          `INSERT INTO user_company_membership (user_id, company_id, role_key, override_folder_grants)
+           VALUES ($1, $2, 'customer', '[]'::jsonb)
+           ON CONFLICT (user_id) DO UPDATE
+           SET company_id = EXCLUDED.company_id,
+               role_key = 'customer',
+               updated_at = NOW()`,
+          [String(userRow.id), hostScope.companyId]
+        );
+        const boundUser = await pool.query(
+          `SELECT * FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
+          [String(userRow.id)]
+        );
+        if (hostScope.tenantSlug && boundUser.rows[0]) {
+          await upsertTenantAuthUserFromRow(hostScope.tenantSlug, boundUser.rows[0]);
+        }
+      }
 
       const user = normalizeUser(userRow);
       res.json({

@@ -1,12 +1,12 @@
 {
-  "title": "Fix Setup save; tighten SaaS cPanel nav to Home-only pre-subscribe",
-  "description": "Setup Save was reloading the page because setup-wizard.js had a syntax error (missing brandingState declaration) so the form submit handler never ran.\n\nSaaS purchaser nav is now staged correctly: Home only until subscription is active, then Home + Setup + Billing. Billing and Setup pages redirect to Home without an active license. Stale localStorage session no longer expands the sidebar to operator menus on Billing.\n\nWho is affected: pipeshare.net cPanel sign-ups. Hard refresh after deploy.",
+  "title": "SaaS tenant isolation — scoped users, login DB schema, tenant auth store",
+  "description": "Each SaaS virtualbox now gets its own Postgres schema (tenant_*) with a login_users mirror table and Wasabi auth/latest.json, created when the tenant draft is first saved.\n\nGET /users, create/update/delete user, permissions tree, and companies list are scoped to the signed-in tenant. Tenant subdomain login rejects accounts from other workspaces. Portal self-signup on a tenant subdomain binds new users to that tenant only — no more global user directory leak in Settings.\n\nWho is affected: all pipeshare.net SaaS tenants and workspace owners. Existing tenants receive postgres_schema on next setup save or provision.",
   "changeLog": [
-    "Fix setup-wizard.js syntax error breaking Save setup.",
-    "Pre-subscribe sidebar: Home only (Buy Subscription stays on Home).",
-    "After active subscription: Home, Setup, and Billing only.",
-    "Block Billing/Setup URLs without active subscription.",
-    "Stop stale session cache from showing operator nav items."
+    "Create per-tenant Postgres schema + login_users table on tenant draft.",
+    "Scope GET /users to tenant portal_client_id and company membership.",
+    "Tenant owners can manage users only inside their workspace.",
+    "Block cross-tenant login on company subdomains.",
+    "Bind portal sign-ups on tenant hosts to that tenant; sync auth snapshot."
   ],
-  "updatedAt": "2026-06-29T16:00:00.000Z"
+  "updatedAt": "2026-06-29T18:00:00.000Z"
 }

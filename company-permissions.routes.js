@@ -18,7 +18,8 @@ function normalizeRoleKey(raw) {
   return COMPANY_ROLE_KEYS.includes(key) ? key : '';
 }
 
-function registerCompanyPermissionsRoutes(app, { pool, requireAuth, requireAdminPanelAccess }) {
+function registerCompanyPermissionsRoutes(app, { pool, requireAuth, requireAdminPanelAccess, requireAdminPanelOrTenantUserManagement }) {
+  const requireCompanyAdmin = requireAdminPanelOrTenantUserManagement || requireAdminPanelAccess;
   function jsonError(res, status, message) {
     return res.status(status).json({ success: false, error: message });
   }
@@ -56,13 +57,21 @@ function registerCompanyPermissionsRoutes(app, { pool, requireAuth, requireAdmin
     }
   }
 
-  app.get('/companies', requireAuth, requireAdminPanelAccess, async (_req, res) => {
+  app.get('/companies', requireAuth, requireCompanyAdmin, async (req, res) => {
     try {
+      const tenantScope = req.tenantScope || { mode: 'platform' };
+      const params = [];
+      let whereSql = '';
+      if (tenantScope.mode === 'tenant') {
+        whereSql = ' WHERE c.id = $1::uuid';
+        params.push(tenantScope.companyId);
+      }
       const r = await pool.query(
         `SELECT c.id, c.name, c.slug, c.app_features, c.customer_enabled, c.created_at, c.updated_at,
                 (SELECT COUNT(*)::int FROM user_company_membership m WHERE m.company_id = c.id) AS member_count
-         FROM companies c
-         ORDER BY lower(c.name) ASC`
+         FROM companies c${whereSql}
+         ORDER BY lower(c.name) ASC`,
+        params
       );
       return res.json({
         success: true,

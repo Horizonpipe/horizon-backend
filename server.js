@@ -98,9 +98,21 @@ const {
   seedTenantAppDataSnapshot
 } = require('./lib/tenant-wasabi-state');
 const { tenantSlugFromWasabiRoot } = require('./lib/saas-tenant-access-urls');
-const { upsertTenantOwnerAuthSnapshot } = require('./lib/saas-tenant-auth-store');
+const { upsertTenantOwnerAuthSnapshot, upsertTenantAuthUserFromRow, removeTenantAuthUser } = require('./lib/saas-tenant-auth-store');
 const { upsertTenantDraft } = require('./tenant-provisioning.service');
 const { isSaasTenantCorsOrigin } = require('./lib/saas-cors');
+const {
+  TENANT_USERS_WHERE_SQL,
+  userCanManageTenantUsers,
+  tenantUserFilterParams,
+  resolveActorTenantScope,
+  assertUserIdInTenantScope,
+  assertLoginAllowedForTenantHost
+} = require('./lib/saas-tenant-scope');
+const {
+  mirrorUserToTenantLoginSchema,
+  removeUserFromTenantLoginSchema
+} = require('./lib/saas-tenant-postgres');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -4380,6 +4392,51 @@ function requireAdminPanelAccess(req, res, next) {
   return res.status(403).json({ success: false, error: 'Admin access required' });
 }
 
+function requestHostFromReq(req) {
+  return String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
+}
+
+async function syncTenantUserMirrors(scope, userRow) {
+  if (!scope || scope.mode !== 'tenant' || !userRow) return;
+  const slug = scope.tenantSlug;
+  if (slug) {
+    try {
+      await upsertTenantAuthUserFromRow(slug, userRow);
+    } catch (error) {
+      console.warn('[tenant-sync] auth snapshot failed:', error?.message || error);
+    }
+  }
+  if (scope.postgresSchema) {
+    try {
+      await mirrorUserToTenantLoginSchema(pool, scope.postgresSchema, userRow);
+    } catch (error) {
+      console.warn('[tenant-sync] postgres mirror failed:', error?.message || error);
+    }
+  }
+}
+
+/** Platform admin panel or SaaS tenant owner managing users inside their virtualbox only. */
+async function requireAdminPanelOrTenantUserManagement(req, res, next) {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ success: false, error: 'Authentication required' });
+    }
+    if (canAccessAdminPanel(req.user)) {
+      req.tenantScope = { mode: 'platform' };
+      return next();
+    }
+    const scope = await resolveActorTenantScope(pool, req.user, { requestHost: requestHostFromReq(req) });
+    req.tenantScope = scope;
+    if (scope.mode === 'tenant' && userCanManageTenantUsers(req.user, scope)) {
+      return next();
+    }
+    return res.status(403).json({ success: false, error: 'Admin access required' });
+  } catch (error) {
+    console.error('TENANT ADMIN AUTH ERROR:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+}
+
 function userRoleEnabled(user, roleKey) {
   if (!user || !roleKey) return false;
   if (isAdminUser(user)) return true;
@@ -6341,9 +6398,10 @@ async function ensureSchema() {
   await pool.query(
     `CREATE INDEX IF NOT EXISTS idx_saas_tenant_instances_owner ON saas_tenant_instances (owner_user_id)`
   );
-  await pool.query(
-    `CREATE INDEX IF NOT EXISTS idx_saas_tenant_instances_subscription ON saas_tenant_instances (subscription_status)`
-  );
+  await pool.query(`
+    ALTER TABLE saas_tenant_instances
+    ADD COLUMN IF NOT EXISTS postgres_schema TEXT NOT NULL DEFAULT ''
+  `);
   await pool.query(`
     DO $$ BEGIN
       ALTER TABLE saas_tenant_instances DROP CONSTRAINT IF EXISTS saas_tenant_instances_subscription_status_check;
@@ -6794,23 +6852,32 @@ app.get('/sync-state', requireAuth, async (req, res) => {
 app.get('/users', requireAuth, async (req, res) => {
   try {
     const currentUser = req.user;
-    /** Permissions UI must reflect Postgres immediately after saves — do not prefer stale Wasabi snapshots here. */
-    const result = await pool.query(
-      `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup
-       FROM users
-       ORDER BY LOWER(COALESCE(display_name, username)), LOWER(username)`
-    );
-    const normalizedRows = await attachScopesToUsers(result.rows.map((row) => normalizeUser(row)));
-    const users = normalizedRows.map((normalized) => {
-      if (!canAccessAdminPanel(currentUser)) {
-        return {
-          id: normalized.id,
-          username: normalized.username,
-          displayName: normalized.displayName
-        };
-      }
-      return normalized;
+    const scope = await resolveActorTenantScope(pool, currentUser, {
+      requestHost: requestHostFromReq(req)
     });
+    const canPlatformList = canAccessAdminPanel(currentUser) && scope.mode !== 'tenant';
+    const canTenantList = scope.mode === 'tenant' && userCanManageTenantUsers(currentUser, scope);
+
+    if (!canPlatformList && !canTenantList) {
+      const self = normalizeUser(currentUser);
+      return res.json({
+        success: true,
+        users: [{ id: self.id, username: self.username, displayName: self.displayName }]
+      });
+    }
+
+    let sql = `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup
+       FROM users`;
+    const params = [];
+    if (scope.mode === 'tenant') {
+      sql += ` WHERE ${TENANT_USERS_WHERE_SQL}`;
+      params.push(...tenantUserFilterParams(scope));
+    }
+    sql += ` ORDER BY LOWER(COALESCE(display_name, username)), LOWER(username)`;
+
+    const result = await pool.query(sql, params);
+    const normalizedRows = await attachScopesToUsers(result.rows.map((row) => normalizeUser(row)));
+    const users = normalizedRows.map((normalized) => normalized);
     res.json({ success: true, users });
   } catch (error) {
     console.error('USERS ERROR:', error);
@@ -6818,8 +6885,17 @@ app.get('/users', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/permissions/tree', requireAuth, requireAdminPanelAccess, async (req, res) => {
+app.get('/permissions/tree', requireAuth, requireAdminPanelOrTenantUserManagement, async (req, res) => {
   try {
+    const tenantScope = req.tenantScope || { mode: 'platform' };
+    const tenantFilterSql =
+      tenantScope.mode === 'tenant'
+        ? ` AND company_id = $1::uuid AND client_id = $2`
+        : '';
+    const tenantFilterParams =
+      tenantScope.mode === 'tenant'
+        ? [tenantScope.companyId, tenantScope.portalClientId]
+        : [];
     /**
      * Portal scopes and path grants stay live from Postgres.
      * When planner canonical data is Wasabi-only, job labels and PSR tree come from the snapshot — not `planner_records` in Postgres.
@@ -6828,14 +6904,14 @@ app.get('/permissions/tree', requireAuth, requireAdminPanelAccess, async (req, r
          FROM company_folder_grants
          WHERE enabled = true
            AND client_id IS NOT NULL AND BTRIM(client_id) <> ''
-           AND job_id IS NOT NULL AND BTRIM(job_id) <> ''
+           AND job_id IS NOT NULL AND BTRIM(job_id) <> ''${tenantFilterSql}
          ORDER BY client_id, job_id, path_prefix`;
 
     if (PLANNER_STORE_WASABI_ONLY) {
       const scopePairsSql = `WITH scope_pairs AS (
            SELECT client_id, job_id
            FROM company_folder_grants
-           WHERE enabled = true
+           WHERE enabled = true${tenantFilterSql}
          ),
          scope_pairs_clean AS (
            SELECT DISTINCT BTRIM(client_id) AS client_id, BTRIM(job_id) AS job_id
@@ -6847,10 +6923,19 @@ app.get('/permissions/tree', requireAuth, requireAdminPanelAccess, async (req, r
          FROM scope_pairs_clean
          ORDER BY client_id, job_id`;
       const [scopePairsRes, portalPathRows] = await Promise.all([
-        pool.query(scopePairsSql),
-        pool.query(portalPathGrantsSql)
+        tenantFilterParams.length
+          ? pool.query(scopePairsSql, tenantFilterParams)
+          : pool.query(scopePairsSql),
+        tenantFilterParams.length
+          ? pool.query(portalPathGrantsSql, tenantFilterParams)
+          : pool.query(portalPathGrantsSql)
       ]);
-      const snapshot = await loadWasabiLatestStateSnapshot(true);
+      const snapshot =
+        tenantScope.mode === 'tenant'
+          ? await loadTenantWasabiStateSnapshot(pool, req.user?.id, {
+              requestHost: requestHostFromReq(req)
+            })
+          : await loadWasabiLatestStateSnapshot(true);
       const plannerRecords = snapshotRows(snapshot, 'planner_records');
       const portalRows = attachPlannerLabelsToScopeRows(scopePairsRes.rows, plannerRecords);
       const psrRows = plannerRecords
@@ -6936,6 +7021,7 @@ app.post('/login', async (req, res) => {
   }
 
   try {
+    const requestHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
     let row = null;
     let userRowFromWasabi = false;
     try {
@@ -6989,8 +7075,12 @@ app.post('/login', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Invalid email or password' });
     }
 
+    const tenantLogin = await assertLoginAllowedForTenantHost(pool, row, requestHost);
+    if (!tenantLogin.allowed) {
+      return res.status(403).json({ success: false, error: tenantLogin.error });
+    }
+
     const loginContext = cleanString(req.body?.loginContext).toLowerCase();
-    const requestHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
     const loginProfile = getPublicDeploymentConfig({ requestHost });
     const tenantSlugOnHost =
       loginProfile.tenantSlugFromHost || parseSaasTenantSlugFromHost(requestHost);
@@ -7442,7 +7532,7 @@ app.post('/change-password', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) => {
+app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, async (req, res) => {
   const username = cleanString(req.body?.username);
   const displayName = cleanString(req.body?.displayName || username);
   const password = cleanString(req.body?.password || '1234');
@@ -7518,17 +7608,39 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
       `INSERT INTO users (
          username, display_name, password, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, true, NULL, NULL, false, false)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, true, $8, $9, $10, false)
        RETURNING id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, self_signup`,
-      [username, displayName, hash, isAdmin, accountType, employeeRole, JSON.stringify(roles)]
+      [
+        username,
+        displayName,
+        hash,
+        isAdmin,
+        accountType,
+        employeeRole,
+        JSON.stringify(roles),
+        req.tenantScope?.mode === 'tenant' ? req.tenantScope.portalClientId : null,
+        req.tenantScope?.mode === 'tenant' ? req.tenantScope.portalJobId || '1' : null,
+        false
+      ]
     );
     insertedPgId = result.rows[0].id;
+
+    if (req.tenantScope?.mode === 'tenant') {
+      await pool.query(
+        `INSERT INTO user_company_membership (user_id, company_id, role_key, override_folder_grants)
+         VALUES ($1, $2, 'employee', '[]'::jsonb)
+         ON CONFLICT (user_id) DO UPDATE
+         SET company_id = EXCLUDED.company_id,
+             updated_at = NOW()`,
+        [String(insertedPgId), req.tenantScope.companyId]
+      );
+    }
 
     /**
      * GET /users reads Postgres for the permissions UI. When Wasabi writes are primary, mirror new users into the
      * snapshot using the same id as Postgres so PUT /users/:id stays aligned with the snapshot.
      */
-    if (WASABI_WRITES_PRIMARY_ENABLED) {
+    if (WASABI_WRITES_PRIMARY_ENABLED && req.tenantScope?.mode !== 'tenant') {
       const wrote = await tryWasabiStateWrite('create-user', async (data) => {
         const users = ensureSnapshotTable(data, 'users');
         const usernameLower = String(username).trim().toLowerCase();
@@ -7567,6 +7679,9 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
     }
 
     const user = await attachScopesToUser(normalizeUser(result.rows[0]));
+    if (req.tenantScope?.mode === 'tenant') {
+      await syncTenantUserMirrors(req.tenantScope, result.rows[0]);
+    }
     const assignedAtCreate = userHasAnyAssignedAccess({
       account_type: user?.accountType,
       employee_role: user?.employeeRole,
@@ -7596,10 +7711,16 @@ app.post('/create-user', requireAuth, requireAdminPanelAccess, async (req, res) 
   }
 });
 
-app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => {
+app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, async (req, res) => {
   const id = cleanString(req.params.id);
   if (!id) {
     return res.status(400).json({ success: false, error: 'User id is required' });
+  }
+  if (req.tenantScope?.mode === 'tenant') {
+    const allowed = await assertUserIdInTenantScope(pool, id, req.tenantScope);
+    if (!allowed) {
+      return res.status(403).json({ success: false, error: 'User is outside your workspace' });
+    }
   }
   const displayName = cleanString(req.body?.displayName || req.body?.name);
   const hasAccountTypePayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'accountType');
@@ -7966,6 +8087,9 @@ app.put('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => 
     }
 
     const user = await attachScopesToUser(normalizeUser(updatedResult.rows[0]));
+    if (req.tenantScope?.mode === 'tenant') {
+      await syncTenantUserMirrors(req.tenantScope, updatedResult.rows[0]);
+    }
     res.json({
       success: true,
       user,
@@ -8008,10 +8132,16 @@ app.post('/users/:id/elevate-horizon-admin', requireAuth, requireAdminPanelAcces
   }
 });
 
-app.delete('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) => {
+app.delete('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, async (req, res) => {
   const id = cleanString(req.params.id);
   if (!id) {
     return res.status(400).json({ success: false, error: 'User id is required' });
+  }
+  if (req.tenantScope?.mode === 'tenant') {
+    const allowed = await assertUserIdInTenantScope(pool, id, req.tenantScope);
+    if (!allowed) {
+      return res.status(403).json({ success: false, error: 'User is outside your workspace' });
+    }
   }
   if (String(req.user?.id || '') === id) {
     return res.status(400).json({ success: false, error: 'You cannot delete your own account.' });
@@ -8071,7 +8201,7 @@ app.delete('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) 
           .json({ success: false, error: 'Cannot delete the last admin account.' });
       }
     }
-    if (WASABI_WRITES_PRIMARY_ENABLED) {
+    if (WASABI_WRITES_PRIMARY_ENABLED && req.tenantScope?.mode !== 'tenant') {
       await runWasabiStateWrite('delete-user', async (data) => {
         const sessions = ensureSnapshotTable(data, 'auth_sessions');
         data.auth_sessions = sessions.filter((row) => String(row.user_id || '') !== String(id || ''));
@@ -8088,6 +8218,14 @@ app.delete('/users/:id', requireAuth, requireAdminPanelAccess, async (req, res) 
     } else {
       await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [id]);
       await pool.query('DELETE FROM users WHERE id = $1', [id]);
+    }
+    if (req.tenantScope?.mode === 'tenant') {
+      if (req.tenantScope.tenantSlug) {
+        await removeTenantAuthUser(req.tenantScope.tenantSlug, id).catch(() => {});
+      }
+      if (req.tenantScope.postgresSchema) {
+        await removeUserFromTenantLoginSchema(pool, req.tenantScope.postgresSchema, id).catch(() => {});
+      }
     }
     return res.json({ success: true, deletedUserId: id, username: target.username });
   } catch (error) {
@@ -11397,7 +11535,12 @@ registerOutlookRoutes(app, {
   corsOrigins: CORS_ORIGINS
 });
 registerPortalFilesRoutes(app, { pool, query: queryPortalDataWithWasabiFallback, requireAuth, requireAdmin });
-registerCompanyPermissionsRoutes(app, { pool, requireAuth, requireAdminPanelAccess });
+registerCompanyPermissionsRoutes(app, {
+  pool,
+  requireAuth,
+  requireAdminPanelAccess,
+  requireAdminPanelOrTenantUserManagement
+});
 registerUserGrantsRoutes(app, { pool, requireAuth, requireAdminPanelAccess });
 registerSignupRoutes(app, {
   pool,

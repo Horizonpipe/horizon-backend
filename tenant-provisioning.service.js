@@ -11,6 +11,7 @@ const {
 const { buildTenantAccessUrls } = require('./lib/saas-tenant-access-urls');
 const { getSaasWasabiClient, saasWasabiBucket, saasVirtualboxConfigured } = require('./lib/saas-virtualbox-config');
 const { seedTenantAuthSnapshot, upsertTenantOwnerAuthSnapshot } = require('./lib/saas-tenant-auth-store');
+const { provisionTenantPostgresSchema, mirrorUserToTenantLoginSchema } = require('./lib/saas-tenant-postgres');
 const { applySaasTenantOwnerPrivileges, isHorizonPlatformAdmin } = require('./lib/saas-tenant-owner');
 const { seedTenantAppDataSnapshot } = require('./lib/tenant-wasabi-state');
 const { SAAS_INITIAL_SUBSCRIPTION_STATUS } = require('./lib/saas-subscription-constants');
@@ -58,6 +59,7 @@ function serializeTenantRow(row) {
     setupStatus: row.setup_status || 'draft',
     setupCompletedAt: row.setup_completed_at || null,
     provisioningError: row.provisioning_error || '',
+    postgresSchema: row.postgres_schema || '',
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -114,6 +116,7 @@ async function upsertTenantDraft(pool, ownerUserId, payload) {
 
   const wasabiRoot = buildTenantWasabiRoot(slug);
   const scope = buildTenantPortalScope(slug);
+  const pgProvision = await provisionTenantPostgresSchema(pool, slug);
 
   if (existing) {
     const r = await pool.query(
@@ -123,6 +126,7 @@ async function upsertTenantDraft(pool, ownerUserId, payload) {
            portal_client_id = $4,
            portal_job_id = $5,
            branding = $6::jsonb,
+           postgres_schema = COALESCE(NULLIF(BTRIM(postgres_schema), ''), $7),
            updated_at = NOW()
        WHERE owner_user_id = $1
        RETURNING *`,
@@ -132,7 +136,8 @@ async function upsertTenantDraft(pool, ownerUserId, payload) {
         wasabiRoot,
         scope.clientId,
         scope.jobId,
-        JSON.stringify({ ...branding, businessName, websiteUrl })
+        JSON.stringify({ ...branding, businessName, websiteUrl }),
+        pgProvision.schema || ''
       ]
     );
     return serializeTenantRow(r.rows[0]);
@@ -163,8 +168,8 @@ async function upsertTenantDraft(pool, ownerUserId, payload) {
   const r = await pool.query(
     `INSERT INTO saas_tenant_instances (
        company_id, owner_user_id, website_url, wasabi_root_prefix,
-       portal_client_id, portal_job_id, branding, setup_status, subscription_status
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'draft', $8)
+       portal_client_id, portal_job_id, branding, setup_status, subscription_status, postgres_schema
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'draft', $8, $9)
      RETURNING *`,
     [
       companyId,
@@ -174,7 +179,8 @@ async function upsertTenantDraft(pool, ownerUserId, payload) {
       scope.clientId,
       scope.jobId,
       JSON.stringify({ ...branding, businessName, websiteUrl }),
-      SAAS_INITIAL_SUBSCRIPTION_STATUS
+      SAAS_INITIAL_SUBSCRIPTION_STATUS,
+      pgProvision.schema || ''
     ]
   );
   return serializeTenantRow(r.rows[0]);
@@ -244,6 +250,18 @@ async function provisionTenantInstance(pool, s3Client, bucket, ownerUserId) {
     await seedTenantAuthSnapshot(slug, ownerUser);
     await upsertTenantOwnerAuthSnapshot(slug, ownerUser);
     await seedTenantAppDataSnapshot(slug);
+    if (tenant.postgresSchema) {
+      await mirrorUserToTenantLoginSchema(pool, tenant.postgresSchema, ownerUser);
+    } else {
+      const pg = await provisionTenantPostgresSchema(pool, slug);
+      if (pg.schema) {
+        await pool.query(
+          `UPDATE saas_tenant_instances SET postgres_schema = $2, updated_at = NOW() WHERE owner_user_id = $1`,
+          [String(ownerUserId), pg.schema]
+        );
+        await mirrorUserToTenantLoginSchema(pool, pg.schema, ownerUser);
+      }
+    }
     await applySaasTenantOwnerPrivileges(pool, ownerUserId);
 
     await pool.query(
