@@ -173,17 +173,6 @@ async function insertRemoteSignalPg(pool, sessionId, fromUserId, type, payload) 
   );
   const row = ins.rows[0];
   if (!row) return null;
-  await pool.query(
-    `DELETE FROM cp_support_remote_signals
-     WHERE session_id = $1
-       AND id NOT IN (
-         SELECT id FROM cp_support_remote_signals
-         WHERE session_id = $1
-         ORDER BY id DESC
-         LIMIT $2
-       )`,
-    [key, REMOTE_SIGNAL_BUFFER_MAX]
-  );
   return {
     id: Number(row.id) || 0,
     at: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
@@ -278,17 +267,6 @@ async function insertRemoteInputPg(pool, sessionId, fromUserId, payload) {
   );
   const row = ins.rows[0];
   if (!row) return null;
-  await pool.query(
-    `DELETE FROM cp_support_remote_inputs
-     WHERE session_id = $1
-       AND id NOT IN (
-         SELECT id FROM cp_support_remote_inputs
-         WHERE session_id = $1
-         ORDER BY id DESC
-         LIMIT $2
-       )`,
-    [key, REMOTE_INPUT_BUFFER_MAX]
-  );
   return {
     id: Number(row.id) || 0,
     fromUserId: String(row.from_user_id || ''),
@@ -2108,13 +2086,15 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
 
       const entry = await insertRemoteSignalPg(pool, sessionId, req.user.id, type, payload);
       if (!entry) return jsonError(res, 500, 'Failed to store signal');
-      broadcastSupportEvents(row.tenant_id, 'remote-signal', {
-        sessionId,
-        signalId: entry?.id,
-        fromUserId: req.user.id,
-        type,
-        payload
-      });
+      if (type !== 'ice') {
+        broadcastSupportEvents(row.tenant_id, 'remote-signal', {
+          sessionId,
+          signalId: entry?.id,
+          fromUserId: req.user.id,
+          type,
+          payload
+        });
+      }
       return res.json({ success: true, signalId: entry?.id });
     } catch (error) {
       console.error('[saas/support/remote/signal POST]', error);
