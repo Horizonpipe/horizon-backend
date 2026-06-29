@@ -1,11 +1,12 @@
 {
-  "title": "Fix Mike Strickland BASE login on pipeshare.live",
-  "description": "Mike Strickland (platform operator) is restored as a BASE user on pipeshare.live. SaaS tenant membership and mis-provisioned portal scope no longer block his sign-in on the private base server.\n\nWho is affected: Mike and any future platform operators accidentally linked to a SaaS tenant row.",
+  "title": "PipeShare DB3 pipe graph and saved workspace layouts",
+  "description": "Remote folder DB3 bindings now follow the same client/job scope as the file explorer, so the pipe graph and inspection data stay aligned when you browse cloud jobs. Changing the selected video or editing a folder DB3 binding reloads inspection instead of showing stale graph data.\n\nWorkspace settings now let you save named panel layouts (quick load dropdown, Save current as, delete) in addition to workspace tabs. Layouts sync to your account on BASE and SaaS PipeShare.\n\nWho is affected: PipeShare users on pipeshare.live (private BASE server) with remote/cloud jobs and custom workspace layouts.",
   "changeLog": [
-    "Platform operator bypass on pipeshare.live login environment check.",
-    "Startup migration clears SaaS tenant owner/membership rows for Mike.",
-    "Restores portal-users scope when mis-provisioned as tenant-*.",
-    "BASE vs SAAS tier labels corrected in session and admin UI."
+    "DB3 folder bindings scoped to active remote tree client/job.",
+    "Inspection reloads when video selection or DB3 binding changes.",
+    "Saved layouts section in workspace settings with quick load.",
+    "Save current layout as named preset (up to 12).",
+    "Delete selected saved layout from settings modal."
   ],
-  "updatedAt": "2026-06-29T13:30:00.000Z"
+  "updatedAt": "2026-06-29T18:00:00.000Z"
 }
