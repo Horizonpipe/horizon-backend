@@ -1,11 +1,12 @@
 {
-  "title": "Plan View PDF highlight zoom alignment",
-  "description": "Highlights and auto-drawn lines on the Plan View PDF continuous viewer now stay in the right place when you zoom in or out. Page height scaling matches the visible PDF area, overlays refresh after the viewer adjusts slot height, and new auto-highlight lines store normalized coordinates plus the zoom level they were drawn at.\n\nWho is affected: PipeSync users on the private BASE server (pipeshare.live) who use Plan View with the PDF map and highlighting tools. SaaS tenants get this when the next platform version is applied in cPanel releases.",
+  "title": "Support chat invite delivery fix",
+  "description": "When support staff clicked Start chat, the admin side showed \"Chat invite sent\" but the customer never got the accept popup. The invite was created in the database but the customer browser did not run the incoming-invite path — especially for admin-capable accounts and when the session tenant did not match the customer's presence tenant.\n\nThis update fixes invite delivery: the API returns pending invites to the customer participant first, sessions are stored under the correct tenant from the presence list, and all users poll for incoming chat invites (not only non-admin accounts).\n\nWho is affected: PipeShare support chat on the private OVH server (pipeshare.live). SaaS tenants receive this when the next platform version is applied in cPanel releases.",
   "changeLog": [
-    "PDF continuous viewer uses base height for zoomed slot display height.",
-    "Highlight overlays refresh when a page slot height is corrected after render.",
-    "Auto-highlight lines save nrx/nry normalized coords and overlay zoom.",
-    "Reduces highlight drift when changing PDF map zoom in Plan View."
+    "Customer browsers poll for pending support chat invites regardless of admin role.",
+    "Chat/active API prioritizes pending sessions where the user is the invited customer.",
+    "Chat start uses the customer's presence tenant so invites reach the right SSE channel.",
+    "Chat respond finds sessions by participant, not only strict tenant middleware scope.",
+    "Admin support UI no longer shows \"invite sent\" when the user is the invitee."
   ],
-  "updatedAt": "2026-06-29T20:00:00.000Z"
+  "updatedAt": "2026-06-29T22:00:00.000Z"
 }

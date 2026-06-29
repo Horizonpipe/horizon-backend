@@ -677,10 +677,19 @@ async function resolveSupportScope(pool, user) {
   };
 }
 
-function resolveTargetTenantId(req, bodyTenantId) {
+async function resolveTargetTenantId(pool, req, bodyTenantId, customerUserId) {
   const requested = cleanString(bodyTenantId);
+  const fallback = req.supportTenant.tenantId;
   if (requested && looksLikeMike(req.user)) return requested;
-  return req.supportTenant.tenantId;
+  const uid = cleanString(customerUserId);
+  if (requested && uid) {
+    const check = await pool.query(
+      `SELECT 1 FROM cp_support_presence WHERE tenant_id = $1 AND user_id = $2 LIMIT 1`,
+      [requested, uid]
+    );
+    if (check.rows[0]) return requested;
+  }
+  return fallback;
 }
 
 function derivePresenceLabels(user, tenantScope) {
@@ -1033,7 +1042,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const customerUserId = cleanString(req.body?.customerUserId);
       const customerTabId = cleanString(req.body?.customerTabId) || 'default';
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
-      const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
+      const targetTenantId = await resolveTargetTenantId(pool, req, req.body?.tenantId, customerUserId);
       const ended = await terminateCustomerSessions(pool, targetTenantId, customerUserId, {
         reason: 'clear-request'
       });
@@ -1062,8 +1071,8 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     try {
       const customerUserId = cleanString(req.body?.customerUserId);
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
-      const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
-      const adminUserId = req.body?.adminOnly === true ? String(req.user.id) : undefined;
+      const targetTenantId = await resolveTargetTenantId(pool, req, req.body?.tenantId, customerUserId);
+      const adminUserId = req.body?.adminOnly === true ? cleanString(req.user?.id ?? req.user?.userId) : undefined;
       const ended = await terminateCustomerSessions(pool, targetTenantId, customerUserId, {
         adminUserId,
         reason: cleanString(req.body?.reason) || 'admin-terminate'
@@ -1125,7 +1134,8 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const customerUserId = cleanString(req.body?.customerUserId);
       const customerTabId = cleanString(req.body?.customerTabId) || 'default';
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
-      const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
+      const targetTenantId = await resolveTargetTenantId(pool, req, req.body?.tenantId, customerUserId);
+      const adminUserId = cleanString(req.user?.id ?? req.user?.userId);
 
       await terminateCustomerSessions(pool, targetTenantId, customerUserId, {
         reason: 'superseded'
@@ -1135,7 +1145,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         `INSERT INTO cp_support_chat_sessions (tenant_id, customer_user_id, admin_user_id, status)
          VALUES ($1,$2,$3,'pending')
          RETURNING id, status`,
-        [targetTenantId, customerUserId, req.user.id]
+        [targetTenantId, customerUserId, adminUserId]
       );
       const sessionId = r.rows[0].id;
       await assignSupportAdmin(
@@ -1153,7 +1163,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         sessionId,
         customerUserId,
         customerTabId,
-        adminUserId: req.user.id,
+        adminUserId: adminUserId,
         adminDisplayName:
           cleanString(req.user.displayName) || cleanString(req.user.username) || cleanString(req.user.email) || 'Support'
       });
@@ -1191,12 +1201,11 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const accept = req.body?.accept === true;
       if (!sessionId) return jsonError(res, 400, 'sessionId is required');
 
-      const r = await pool.query(
-        `SELECT * FROM cp_support_chat_sessions WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
-        [sessionId, req.supportTenant.tenantId]
-      );
-      const row = r.rows[0];
-      if (!row) return jsonError(res, 404, 'Chat session not found');
+      const loaded = await loadChatSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
       if (String(row.customer_user_id) !== String(req.user.id)) {
         return jsonError(res, 403, 'Only the invited customer can respond');
       }
@@ -1750,10 +1759,11 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const customerUserId = cleanString(req.body?.customerUserId);
       const customerTabId = cleanString(req.body?.customerTabId) || 'default';
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
-      const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
+      const targetTenantId = await resolveTargetTenantId(pool, req, req.body?.tenantId, customerUserId);
+      const adminUserId = cleanString(req.user?.id ?? req.user?.userId);
 
       await terminateCustomerSessions(pool, targetTenantId, customerUserId, {
-        adminUserId: String(req.user.id),
+        adminUserId,
         reason: 'superseded'
       });
 
@@ -1763,7 +1773,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
             tenant_id, customer_user_id, admin_user_id, status, persist_token, customer_tab_id
           ) VALUES ($1,$2,$3,'pending',$4,$5)
           RETURNING id, status, persist_token`,
-        [targetTenantId, customerUserId, req.user.id, persistToken, customerTabId]
+        [targetTenantId, customerUserId, adminUserId, persistToken, customerTabId]
       );
       const session = r.rows[0];
       broadcastSupportEvents(targetTenantId, 'remote-request', {
@@ -2056,7 +2066,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     try {
       const customerUserId = cleanString(req.body?.customerUserId);
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
-      const targetTenantId = resolveTargetTenantId(req, req.body?.tenantId);
+      const targetTenantId = await resolveTargetTenantId(pool, req, req.body?.tenantId, customerUserId);
       const ended = await terminateCustomerSessions(pool, targetTenantId, customerUserId, {
         reason: 'cancelled'
       });
@@ -2312,32 +2322,32 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
 
   app.get('/saas/support/chat/active', requireAuth, tenantMiddleware, async (req, res) => {
     try {
-      const uid = String(req.user.id);
+      const uid = cleanString(req.user?.id ?? req.user?.userId);
       const sessionId = cleanString(req.query?.sessionId);
       let row = null;
 
-      if (canAccessAdminPanel(req.user)) {
+      const customerParams = [req.supportTenant.tenantId, uid];
+      let customerSql = `
+          SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
+          FROM cp_support_chat_sessions
+          WHERE tenant_id = $1 AND customer_user_id = $2
+            AND status IN ('pending', 'active')`;
+      if (sessionId) {
+        customerParams.push(sessionId);
+        customerSql += ` AND id = $${customerParams.length}`;
+      }
+      customerSql += `
+          ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, updated_at DESC
+          LIMIT 1`;
+      const customerHit = await pool.query(customerSql, customerParams);
+      row = customerHit.rows[0];
+
+      if (!row && canAccessAdminPanel(req.user)) {
         const params = [uid];
         let sql = `
           SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
           FROM cp_support_chat_sessions
           WHERE admin_user_id = $1 AND status IN ('pending', 'active')`;
-        if (sessionId) {
-          params.push(sessionId);
-          sql += ` AND id = $${params.length}`;
-        }
-        sql += `
-          ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, updated_at DESC
-          LIMIT 1`;
-        const r = await pool.query(sql, params);
-        row = r.rows[0];
-      } else {
-        const params = [req.supportTenant.tenantId, uid];
-        let sql = `
-          SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
-          FROM cp_support_chat_sessions
-          WHERE tenant_id = $1 AND customer_user_id = $2
-            AND status IN ('pending', 'active')`;
         if (sessionId) {
           params.push(sessionId);
           sql += ` AND id = $${params.length}`;
