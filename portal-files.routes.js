@@ -40,6 +40,10 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { Upload } = require('@aws-sdk/lib-storage');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
 const { canManagePortalExtras } = require('./capabilities');
+const {
+  resolveStorageBackend,
+  resolveStorageBackendForProcess
+} = require('./lib/portal-storage-backend');
 const { isValidPipesyncPlanPageStorageKey } = require('./admin-attachments-wasabi');
 const {
   resolveTenantStorageContext,
@@ -534,48 +538,6 @@ async function sha256HexForReadable(stream) {
   });
 }
 
-function createWasabiClient() {
-  const accessKeyId = process.env.WASABI_ACCESS_KEY_ID || process.env.WASABI_ACCESS_KEY;
-  const secretAccessKey = process.env.WASABI_SECRET_ACCESS_KEY || process.env.WASABI_SECRET_KEY;
-  const saasMode = String(process.env.HP_DEPLOYMENT_MODE || '').trim().toLowerCase() === 'saas';
-  const region =
-    (saasMode && process.env.SAAS_WASABI_REGION) ||
-    process.env.WASABI_REGION ||
-    'us-east-1';
-  const endpoint =
-    (saasMode && process.env.SAAS_WASABI_ENDPOINT) ||
-    process.env.WASABI_ENDPOINT ||
-    `https://s3.${region}.wasabisys.com`;
-  if (!accessKeyId || !secretAccessKey) return null;
-  const maxSockets = Math.max(
-    8,
-    Math.min(128, Number(process.env.WASABI_MAX_SOCKETS || process.env.PORTAL_S3_MAX_SOCKETS || 32))
-  );
-  const socketTimeoutMs = Math.max(
-    30000,
-    Math.min(600000, Number(process.env.WASABI_SOCKET_TIMEOUT_MS || 120000))
-  );
-  return new S3Client({
-    region,
-    endpoint,
-    credentials: { accessKeyId, secretAccessKey },
-    forcePathStyle: true,
-    requestHandler: new NodeHttpHandler({
-      connectionTimeout: 30000,
-      socketTimeout: socketTimeoutMs,
-      maxSockets
-    })
-  });
-}
-
-function bucketName() {
-  const saasMode = String(process.env.HP_DEPLOYMENT_MODE || '').trim().toLowerCase() === 'saas';
-  if (saasMode && process.env.SAAS_WASABI_BUCKET) {
-    return process.env.SAAS_WASABI_BUCKET;
-  }
-  return process.env.WASABI_BUCKET || null;
-}
-
 function segment(s) {
   const t = String(s ?? '').trim();
   if (!t || t.includes('..') || t.includes('/') || t.includes('\\')) {
@@ -632,13 +594,18 @@ function parseJobFromObjectKey(key) {
 }
 
 function storageRoot(req) {
-  return req?.tenantStorage?.wasabiRootPrefix || '';
+  return resolveStorageBackend(req).rootPrefix;
+}
+
+function portalWasabi(req) {
+  return resolveStorageBackend(req);
 }
 
 function tenantStorageMiddleware(pool) {
   return async (req, res, next) => {
     try {
-      req.tenantStorage = await resolveTenantStorageContext(pool, req.user?.id);
+      const requestHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
+      req.tenantStorage = await resolveTenantStorageContext(pool, req.user?.id, { requestHost });
       next();
     } catch (e) {
       next(e);
@@ -1237,10 +1204,12 @@ async function assertPortalJobAccess(pool, user, clientId, jobId, options = {}) 
 }
 
 async function assertPortalJobAccessForRequest(aclPool, req, clientId, jobId) {
-  try {
-    assertTenantPortalScope(req?.tenantStorage, clientId, jobId);
-  } catch {
-    return false;
+  if (!userIsPortalAdmin(req?.user)) {
+    try {
+      assertTenantPortalScope(req?.tenantStorage, clientId, jobId);
+    } catch {
+      return false;
+    }
   }
   const isDataAutoSync = readPortalMode(req) === DATA_AUTO_SYNC_MODE;
   return assertPortalJobAccess(aclPool, req.user, clientId, jobId, {
@@ -2033,8 +2002,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       : pool;
   registerPortalShareLinkRoutes(app, { pool: poolOption, query: dbQuery, requireAuth, requireAdmin });
 
-  const s3 = createWasabiClient();
-  const bucket = bucketName();
+  const processStorage = resolveStorageBackendForProcess();
+  const s3 = processStorage.s3;
+  const bucket = processStorage.bucket;
 
   if (!s3 || !bucket) {
     console.warn(

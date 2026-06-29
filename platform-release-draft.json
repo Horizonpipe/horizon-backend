@@ -1,13 +1,12 @@
 {
-  "title": "Remote assistance — reconnect and admin video fix",
-  "description": "Remote help on pipeshare.live is more reliable when the WebRTC path drops or the admin panel loses the customer video.\n\nCustomer and admin clients now queue signals during reconnect, restore recvonly transceivers, retry attach and signal polling, and guard teardown so a brief disconnect does not kill the session. Admin remote panel shows clearer viewport status and optional webrtcDebug.\n\nBackend remote-signal events fan out through broadcastSupportEvents so SSE subscribers (admin queue) receive offers, answers, and ICE in real time.\n\nWho is affected: PipeShare remote help over HTTPS (WebRTC). OVH non-SaaS deploy receives this via platform release dbg164.",
+  "title": "Base + SaaS dual deployment profile and storage abstraction",
+  "description": "PipeShare now runs from one codebase with a shared deploymentProfile (feature flags, storage layout, tenant host detection) on both Mike's private base and the subscription SaaS platform.\n\nAdded resolveStorageBackend for portal Wasabi access, migrated login/signup/inspection/cPanel branches off scattered hostname checks, auto subscription gate on tenant subdomain customer login, and OVH dual-PM2 templates (Base :3000, SaaS :3001).\n\nDeploy dual backend: copy env.base + env.saas templates, run deploy/ovh/setup-dual-backend.sh, reload nginx.\n\nWho is affected: OVH operators; SaaS tenants unchanged except customer login gate on unpaid subscriptions.",
   "changeLog": [
-    "Signal queue and reconnect on customer WebRTC client.",
-    "Restore recvonly transceiver and stopPublishTracks on reconnect.",
-    "Signal poll resilience, attach retry, frame backup, teardown guards.",
-    "Admin panel viewport status and webrtcDebug hook.",
-    "Remote-signal SSE fan-out via broadcastSupportEvents.",
-    "Cache bust dbg164 on portal and customer-support addon."
+    "lib/deployment-profile.js + /public/deployment-bootstrap.js for browsers.",
+    "lib/portal-storage-backend.js — unified Wasabi bucket/client selection.",
+    "Login subscription gate on tenant hosts for customer accounts.",
+    "Frontend: deployment-profile.js replaces scattered mode/host checks.",
+    "OVH: ecosystem.dual.config.cjs, nginx Base 3000 / SaaS 3001."
   ],
-  "updatedAt": "2026-06-29T00:15:00.000Z"
+  "updatedAt": "2026-06-28T18:00:00.000Z"
 }

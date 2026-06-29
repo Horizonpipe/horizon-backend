@@ -11,7 +11,7 @@ const {
 const { buildTenantAccessUrls } = require('./lib/saas-tenant-access-urls');
 const { getSaasWasabiClient, saasWasabiBucket, saasVirtualboxConfigured } = require('./lib/saas-virtualbox-config');
 const { seedTenantAuthSnapshot, upsertTenantOwnerAuthSnapshot } = require('./lib/saas-tenant-auth-store');
-const { applySaasTenantOwnerPrivileges } = require('./lib/saas-tenant-owner');
+const { applySaasTenantOwnerPrivileges, isHorizonPlatformAdmin } = require('./lib/saas-tenant-owner');
 
 function cleanString(v) {
   return String(v ?? '').trim();
@@ -252,22 +252,34 @@ async function provisionTenantInstance(pool, s3Client, bucket, ownerUserId) {
       [String(ownerUserId), tenant.companyId]
     );
 
-    await pool.query(
-      `UPDATE users
-       SET portal_files_client_id = $2,
-           portal_files_job_id = $3,
-           portal_files_access_granted = true,
-           portal_permissions_access = true,
-           company = COALESCE(NULLIF(BTRIM(company), ''), $4),
-           updated_at = NOW()
-       WHERE CAST(id AS text) = $1`,
-      [
-        String(ownerUserId),
-        tenant.portalClientId,
-        tenant.portalJobId,
-        tenant.branding.businessName
-      ]
-    );
+    const skipPortalScopeBind = isHorizonPlatformAdmin(ownerUser);
+    if (!skipPortalScopeBind) {
+      await pool.query(
+        `UPDATE users
+         SET portal_files_client_id = $2,
+             portal_files_job_id = $3,
+             portal_files_access_granted = true,
+             portal_permissions_access = true,
+             company = COALESCE(NULLIF(BTRIM(company), ''), $4),
+             updated_at = NOW()
+         WHERE CAST(id AS text) = $1`,
+        [
+          String(ownerUserId),
+          tenant.portalClientId,
+          tenant.portalJobId,
+          tenant.branding.businessName
+        ]
+      );
+    } else {
+      await pool.query(
+        `UPDATE users
+         SET portal_files_access_granted = true,
+             portal_permissions_access = true,
+             updated_at = NOW()
+         WHERE CAST(id AS text) = $1`,
+        [String(ownerUserId)]
+      );
+    }
 
     const updated = await pool.query(
       `UPDATE saas_tenant_instances

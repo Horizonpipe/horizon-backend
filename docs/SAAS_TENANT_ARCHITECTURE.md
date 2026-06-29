@@ -172,3 +172,61 @@ Enable **Stripe Customer Portal** in Dashboard settings for **Manage billing** (
 | **2** | Stripe Checkout + webhooks (implemented), presigned branding uploads, subscription gating |
 | **3** | Tenant-scoped auth/capabilities, custom domains, per-tenant Wasabi state prefix |
 | **4** | Leased addons folder wiring, automated PipeShare instance URL, ops monitoring |
+
+## PipeShare Base + PipeShare SaaS (one codebase)
+
+Mike's **private base** (`pipeshare.live`, `HP_DEPLOYMENT_MODE=non-saas`) and the **subscription platform** (`pipeshare.net` + tenant subdomains, `HP_DEPLOYMENT_MODE=saas`) run the **same repos**. Differences are env + host, not separate forks.
+
+### Single profile module
+
+`lib/deployment-profile.js` is the backend source of truth. It exposes:
+
+- `mode`: `saas` | `non-saas`
+- `features.*`: boolean gates (billing, tenant virtualbox, publish vs apply, dev PIN, …)
+- `storage.*`: bucket layout hints (`portal-users/8` on base, `tenant-{slug}/1` on SaaS)
+- Host-aware `tenantSlugFromHost` for `{Biz}.pipeshare.net`
+
+Browsers load the same profile via:
+
+1. `GET /public/deployment-bootstrap.js` (before login, sets `window.__HP_DEPLOYMENT_CONFIG__`)
+2. `/login` and `/session` → `deploymentProfile` (refreshed after auth)
+
+Frontend: `client-portal/scripts/services/deployment-profile.js` — use **`deploymentFeatureEnabled('…')`** instead of scattered `getDeploymentMode()` checks.
+
+### Rule: SaaS-first code, base exceptions
+
+| Concern | Default (SaaS) | Base exception |
+|---------|----------------|----------------|
+| Wasabi tenant prefix | `Tenants/{slug}/` in `SAAS_WASABI_BUCKET` | Legacy `WASABI_BUCKET` + `clients/portal-users/…` |
+| Portal scope | `tenant-{slug}/1` on tenant host | `portal-users/8` (platform admins never auto-bound to tenant scope) |
+| Code delivery | cPanel **Apply** platform release | Direct git/PM2 deploy + optional **Publish** |
+| Signup PIN | Email only | Dev PIN when SMTP missing |
+| Subscription gate | Active/trialing required on tenant hosts | Not required |
+
+**Never branch on hostname alone in app code** — use `deploymentProfile.features` or capabilities from `/session`.
+
+### Test on base → ship to SaaS workflow
+
+1. Develop on **base** (`pipeshare.live`, `non-saas` env) — full PipeShare + PipeSync, legacy bucket.
+2. Commit to `main` (both repos).
+3. Deploy base (PM2 reload or `github-deploy.sh`).
+4. **Publish** platform release artifact from base cPanel (writes to Wasabi `platform/releases/`).
+5. On SaaS host, **Apply** the same artifact — code updates without touching tenant data (Postgres rows, `Tenants/{slug}/` keys, Stripe, URLs stay per customer).
+
+Tenant **dynamic data** (URLs, branding, bucket prefix, auth snapshot) lives in Postgres + Wasabi under `saas_tenant_instances` — platform releases only swap **code/static**, not customer data.
+
+### Ops: two processes, never flip mode in production
+
+| PM2 name | Port | Env file | Mode | nginx hosts |
+|----------|------|----------|------|-------------|
+| `horizon-backend-base` | 3000 | `.env.base` | `non-saas` | `pipeshare.live` |
+| `horizon-backend-saas` | 3001 | `.env.saas` | `saas` | `pipeshare.net`, `*.pipeshare.net` |
+
+Templates: `deploy/ovh/ecosystem.dual.config.cjs`, `env.base.production.template`, `env.saas.production.template`.  
+Setup: `sudo bash deploy/ovh/setup-dual-backend.sh`
+
+Do not `sed` flip `HP_DEPLOYMENT_MODE` on a shared `.env` in production.
+
+### Integration testing tenant paths on base
+
+Set `SAAS_SKIP_HOST_BINDING=1` on a **staging** base host to relax tenant host↔slug binding when debugging SaaS Wasabi paths without wildcard DNS. Production SaaS keeps strict binding.

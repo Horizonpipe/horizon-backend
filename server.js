@@ -42,9 +42,15 @@ const {
   canAccessAdminPanel,
   canManagePortalExtras,
   isAdminUser,
-  looksLikeMike,
-  deploymentMode
+  looksLikeMike
 } = require('./capabilities');
+const {
+  resolveDeploymentProfile,
+  getPublicDeploymentConfig,
+  renderDeploymentBootstrapJs,
+  logDeploymentProfileAtStartup,
+  deploymentMode
+} = require('./lib/deployment-profile');
 const {
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,
@@ -66,6 +72,7 @@ const {
   assertKeyWithinTenantRoot
 } = require('./lib/tenant-storage-context');
 const { evaluateSaasCustomerLoginAccess } = require('./lib/saas-customer-access');
+const { parseSaasTenantSlugFromHost } = require('./lib/saas-tenant-access-urls');
 const { isSaasTenantOwner, applySaasTenantOwnerPrivileges } = require('./lib/saas-tenant-owner');
 const { upsertTenantDraft } = require('./tenant-provisioning.service');
 const { isSaasTenantCorsOrigin } = require('./lib/saas-cors');
@@ -840,7 +847,8 @@ function isPersistablePlanPdfStorageKey(key, rootPrefix = '') {
 }
 
 async function tenantWasabiRootForRequest(req) {
-  const ctx = await resolveTenantStorageContext(pool, req.user?.id);
+  const requestHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
+  const ctx = await resolveTenantStorageContext(pool, req.user?.id, { requestHost });
   return ctx?.wasabiRootPrefix || '';
 }
 
@@ -6322,6 +6330,20 @@ app.get('/health', async (req, res) => {
   }
 });
 
+/** Public bootstrap — same profile on base and SaaS; host-aware tenant slug detection. */
+app.get('/public/deployment-config.json', (req, res) => {
+  res.set('Cache-Control', 'public, max-age=60');
+  res.json(getPublicDeploymentConfig({ requestHost: req.headers['x-forwarded-host'] || req.headers.host }));
+});
+
+app.get('/public/deployment-bootstrap.js', (req, res) => {
+  res.type('application/javascript');
+  res.set('Cache-Control', 'public, max-age=60');
+  res.send(
+    renderDeploymentBootstrapJs({ requestHost: req.headers['x-forwarded-host'] || req.headers.host })
+  );
+});
+
 app.post('/admin/wasabi-state-snapshot', requireAuth, requireAdmin, async (req, res) => {
   try {
     await runWasabiStateSnapshot();
@@ -6798,15 +6820,31 @@ app.post('/login', async (req, res) => {
     }
 
     const loginContext = cleanString(req.body?.loginContext).toLowerCase();
-    if (loginContext === 'saas-customer') {
-      const access = await evaluateSaasCustomerLoginAccess(pool, row.id);
-      if (!access.allowed) {
-        const status = access.code === 'INVALID_LICENSE' ? 402 : 403;
-        return res.status(status).json({
-          success: false,
-          error: access.message || 'Access denied',
-          code: access.code || 'ACCESS_DENIED'
-        });
+    const requestHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
+    const loginProfile = getPublicDeploymentConfig({ requestHost });
+    const tenantSlugOnHost =
+      loginProfile.tenantSlugFromHost || parseSaasTenantSlugFromHost(requestHost);
+    const gateSaasCustomer =
+      loginContext === 'saas-customer' ||
+      (loginProfile.features?.saasCustomerLoginGate === true && !!tenantSlugOnHost);
+    if (gateSaasCustomer) {
+      const accountModel = deriveAccountModel({
+        accountType: row.account_type,
+        employeeRole: row.employee_role,
+        isAdmin: row.is_admin,
+        selfSignup: row.self_signup,
+        roles: row.roles
+      });
+      if (loginContext === 'saas-customer' || accountModel.accountType === ACCOUNT_TYPES.CUSTOMER) {
+        const access = await evaluateSaasCustomerLoginAccess(pool, row.id);
+        if (!access.allowed) {
+          const status = access.code === 'INVALID_LICENSE' ? 402 : 403;
+          return res.status(status).json({
+            success: false,
+            error: access.message || 'Access denied',
+            code: access.code || 'ACCESS_DENIED'
+          });
+        }
       }
     }
 
@@ -6839,7 +6877,10 @@ app.post('/login', async (req, res) => {
       user,
       token,
       capabilities: resolveCapabilities(user),
-      deploymentMode: deploymentMode()
+      deploymentMode: deploymentMode(),
+      deploymentProfile: getPublicDeploymentConfig({
+        requestHost: req.headers['x-forwarded-host'] || req.headers.host
+      })
     });
   } catch (error) {
     console.error('LOGIN ERROR:', error);
@@ -6852,7 +6893,10 @@ app.get('/session', requireAuth, async (req, res) => {
     success: true,
     user: req.user,
     capabilities: resolveCapabilities(req.user),
-    deploymentMode: deploymentMode()
+    deploymentMode: deploymentMode(),
+    deploymentProfile: getPublicDeploymentConfig({
+      requestHost: req.headers['x-forwarded-host'] || req.headers.host
+    })
   });
 });
 
@@ -11389,6 +11433,7 @@ ensureSchema()
     }
 
     app.listen(PORT, () => {
+      logDeploymentProfileAtStartup();
       console.log(`Horizon backend listening on port ${PORT}`);
     });
   })

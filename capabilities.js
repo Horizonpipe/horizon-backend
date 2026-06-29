@@ -192,6 +192,17 @@ function canManagePortalExtras(user) {
   return isAdminUser(user);
 }
 
+function canViewInspectionDiagnostics(user) {
+  if (!user) return false;
+  const { deploymentMode: modeFromProfile } = require('./lib/deployment-profile');
+  if (modeFromProfile() === 'non-saas') {
+    return looksLikeMike(user);
+  }
+  const model = deriveAccountModel(user);
+  if (model.accountType === ACCOUNT_TYPES.CUSTOMER) return false;
+  return model.accountType === ACCOUNT_TYPES.EMPLOYEE;
+}
+
 /**
  * @param {object|null} user - normalized user (camelCase) from `normalizeUser` + scopes
  * @returns {object} Stable shape for `/session` and clients
@@ -204,6 +215,7 @@ function resolveCapabilities(user) {
     superAdmin: isSuperAdmin(user),
     canAccessAdminPanel: canAccessAdminPanel(user),
     canManagePortalExtras: canManagePortalExtras(user),
+    canViewInspectionDiagnostics: canViewInspectionDiagnostics(user),
     accountType: model.accountType,
     employeeRole: model.employeeRole,
     psrPlanner: !!roles.psrPlanner,
@@ -225,10 +237,8 @@ function resolveCapabilities(user) {
 }
 
 function deploymentMode() {
-  const mode = String(process.env.HP_DEPLOYMENT_MODE || 'non-saas')
-    .trim()
-    .toLowerCase();
-  return mode === 'saas' ? 'saas' : 'non-saas';
+  const { deploymentMode: modeFromProfile } = require('./lib/deployment-profile');
+  return modeFromProfile();
 }
 
 module.exports = {
@@ -242,6 +252,7 @@ module.exports = {
   isSuperAdmin,
   canAccessAdminPanel,
   canManagePortalExtras,
+  canViewInspectionDiagnostics,
   isAdminUser,
   looksLikeMike,
   deploymentMode

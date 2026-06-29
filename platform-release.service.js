@@ -24,17 +24,14 @@ function cleanString(v) {
   return String(v ?? '').trim();
 }
 
-function deploymentMode() {
-  const mode = cleanString(process.env.HP_DEPLOYMENT_MODE || 'non-saas').toLowerCase();
-  return mode === 'saas' ? 'saas' : 'non-saas';
-}
-
-function isSaasDeployment() {
-  return deploymentMode() === 'saas';
-}
+const {
+  deploymentMode,
+  isSaasDeployment,
+  isPrivateBaseDeployment
+} = require('./lib/deployment-profile');
 
 function isNonSaasDeployment() {
-  return !isSaasDeployment();
+  return isPrivateBaseDeployment();
 }
 
 async function bodyToBuffer(body) {
