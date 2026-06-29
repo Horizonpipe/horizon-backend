@@ -1,12 +1,11 @@
 {
-  "title": "Remote assistance fix (PM2 cluster + frame poll storm)",
-  "description": "Remote support screen share was failing on production because PM2 runs multiple Node workers. WebRTC signals and HTTP frame relay data lived in each worker's memory only — the admin often polled a different worker than the customer, so video never connected and the admin hammered /frame ~30 times per second until the browser hit ERR_INSUFFICIENT_RESOURCES and nginx returned 502.\n\nSignals, frames, and control input are now stored in Postgres (shared across all workers). Admin frame polling only runs for dom-relay/http-control modes, uses one in-flight request at a time, and backs off on errors. WebRTC tab share no longer triggers pointless frame polling.\n\nWho is affected: anyone using Remote help / Remote assistance on pipeshare.live and pipeshare.net.",
+  "title": "Remote assistance input fix (clicks, keyboard, right-click)",
+  "description": "Remote control now maps admin clicks to the full shared tab viewport (not just portal-root), accounts for letterboxed video in the admin panel, and passes right-clicks and typed text through to the customer session.\n\nWho is affected: anyone using Remote help screen share on pipeshare.live / pipeshare.net.",
   "changeLog": [
-    "Postgres tables for remote WebRTC signals, viewport frames, and control input.",
-    "Remote signal/frame/input routes read and write Postgres instead of in-process memory.",
-    "Admin frame poll: single in-flight request, chained timing, error backoff.",
-    "Stop admin /frame polling during native WebRTC screen share.",
-    "Clear relay data from Postgres when remote session ends."
+    "Fix click coordinate mapping for tab screen share (letterbox + full viewport).",
+    "Right-click (context menu) forwarded from admin remote viewport.",
+    "Keyboard typing inserts text into focused inputs on customer side.",
+    "Pointer events dispatched alongside mouse events for better UI compatibility."
   ],
-  "updatedAt": "2026-06-28T18:00:00.000Z"
+  "updatedAt": "2026-06-29T02:00:00.000Z"
 }
