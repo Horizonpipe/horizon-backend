@@ -1,11 +1,11 @@
 {
-  "title": "Remote assistance input fix (clicks, keyboard, right-click)",
-  "description": "Remote control now maps admin clicks to the full shared tab viewport (not just portal-root), accounts for letterboxed video in the admin panel, and passes right-clicks and typed text through to the customer session.\n\nWho is affected: anyone using Remote help screen share on pipeshare.live / pipeshare.net.",
+  "title": "Remote assistance click reliability fix",
+  "description": "Remote control clicks now route through Postgres-backed HTTP input (not the WebRTC data channel), use elementsFromPoint hit testing, call .click() on actionable targets, and ignore the support chat widget overlay. One tap message per click instead of mousemove/mousedown/mouseup/click floods.\n\nWho is affected: remote help sessions on pipeshare.live / pipeshare.net.",
   "changeLog": [
-    "Fix click coordinate mapping for tab screen share (letterbox + full viewport).",
-    "Right-click (context menu) forwarded from admin remote viewport.",
-    "Keyboard typing inserts text into focused inputs on customer side.",
-    "Pointer events dispatched alongside mouse events for better UI compatibility."
+    "Admin clicks POST to /remote/.../input; customer polls every 40ms.",
+    "Single tap event per pointer-up; removed mousemove flood on data channel.",
+    "elementsFromPoint + .click() on buttons, rows, menu items.",
+    "Support widget pointer-events disabled during remote control on customer."
   ],
-  "updatedAt": "2026-06-29T02:00:00.000Z"
+  "updatedAt": "2026-06-29T03:00:00.000Z"
 }
