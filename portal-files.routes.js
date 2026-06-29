@@ -75,7 +75,13 @@ const DATA_AUTO_SYNC_EMPLOYEE_JOB_ID = String(process.env.DATA_AUTO_SYNC_EMPLOYE
 /** When no explicit jobId is provided, portal admins start on this folder. */
 const DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID =
   String(process.env.DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID || '8').trim() || '8';
-const PORTAL_FOLDER_COPY_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_COPY_CONCURRENCY', 8, 1, 32);
+/** Job ids under portal-users that are infra (system-state, sql-mirror) — hide from Folder view picker. */
+const PORTAL_NON_BROWSABLE_JOB_IDS = new Set(
+  String(process.env.PORTAL_NON_BROWSABLE_JOB_IDS || '3')
+    .split(/[,;\s]+/)
+    .map((x) => x.trim())
+    .filter(Boolean)
+);
 const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCURRENCY', 8, 1, 32);
 /** Max items per {@code POST /check-paths} (JSON body stays well under express 4mb). */
 const PORTAL_CHECK_PATHS_MAX = clampIntEnv('PORTAL_CHECK_PATHS_MAX', 800, 50, 2000);
@@ -2983,7 +2989,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         if (e.recordId) set.add(e.recordId);
         if (e.jobsite) set.add(e.jobsite);
       }
-      const jobs = [...set].sort((a, b) => {
+      const jobs = [...set]
+        .filter((id) => !PORTAL_NON_BROWSABLE_JOB_IDS.has(String(id)))
+        .sort((a, b) => {
         const an = Number(a);
         const bn = Number(b);
         if (Number.isFinite(an) && Number.isFinite(bn)) return an - bn;
