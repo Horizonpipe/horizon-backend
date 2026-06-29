@@ -12,6 +12,7 @@ const { buildTenantAccessUrls } = require('./lib/saas-tenant-access-urls');
 const { getSaasWasabiClient, saasWasabiBucket, saasVirtualboxConfigured } = require('./lib/saas-virtualbox-config');
 const { seedTenantAuthSnapshot, upsertTenantOwnerAuthSnapshot } = require('./lib/saas-tenant-auth-store');
 const { applySaasTenantOwnerPrivileges, isHorizonPlatformAdmin } = require('./lib/saas-tenant-owner');
+const { seedTenantAppDataSnapshot } = require('./lib/tenant-wasabi-state');
 
 function cleanString(v) {
   return String(v ?? '').trim();
@@ -240,6 +241,7 @@ async function provisionTenantInstance(pool, s3Client, bucket, ownerUserId) {
     const ownerUser = ownerRow.rows[0] || null;
     await seedTenantAuthSnapshot(slug, ownerUser);
     await upsertTenantOwnerAuthSnapshot(slug, ownerUser);
+    await seedTenantAppDataSnapshot(slug);
     await applySaasTenantOwnerPrivileges(pool, ownerUserId);
 
     await pool.query(

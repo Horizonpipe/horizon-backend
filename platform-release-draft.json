@@ -1,12 +1,13 @@
 {
-  "title": "Remote help works during tab screen share",
-  "description": "While a tab is shared via getDisplayMedia, Chrome blocks native UI like window.prompt and select dropdowns — so theme changes and workspace rename appeared broken until sharing ended. CaptureController keeps focus on the shared tab; rename uses a modal; theme cycles on click during capture. Admin remote control now sends full mouse sequences including double-click.\n\nWho is affected: remote help on pipeshare.live.",
+  "title": "SaaS tenant data isolation and plan uploads",
+  "description": "SaaS workspaces (e.g. techpipe.pipeshare.net) were reading the base PipeShare Wasabi snapshot, so Jobsite Contacts and other PSR data leaked across tenants. Tenant owners also had is_admin=true which bypassed all scope filters.\n\nEach SaaS tenant now gets its own empty app-data snapshot under Tenants/{slug}/…/system-state/latest.json. Plan view saves, workspace checkpoints, and PDF presign/hydrate use the tenant Wasabi bucket and prefix. Auth snapshots moved to Tenants/{slug}/auth/latest.json so they no longer collide with app data.\n\nWho is affected: SaaS customers on *.pipeshare.net and base pipeshare.live plan uploads.",
   "changeLog": [
-    "CaptureController keeps focus on the shared portal tab after getDisplayMedia.",
-    "Workspace tab rename uses in-app modal instead of window.prompt (blocked during capture).",
-    "Theme picker cycles profiles on click while tab share is active.",
-    "Admin remote sends mousedown/move/up/click/dblclick for drag and double-click actions.",
-    "Support chat header icons fixed; minimized chat shows Support tab pill."
+    "SaaS tenant owners no longer get global PSR admin bypass (is_admin=false).",
+    "Jobsite Contacts and plan view load from per-tenant Wasabi snapshots, not base tables.",
+    "Plan PDF upload/hydrate uses the same bucket as presign (fixes missing files after reload).",
+    "New tenants seed an empty isolated app-data snapshot at provision time.",
+    "Existing tenant owners re-seed on login; auth snapshot path separated from app-data.",
+    "nginx SaaS vhost expects pipeshare.net wildcard cert (see issue-pipeshare-net-wildcard-cert.sh)."
   ],
-  "updatedAt": "2026-06-29T18:00:00.000Z"
+  "updatedAt": "2026-06-28T22:00:00.000Z"
 }

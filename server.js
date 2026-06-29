@@ -79,6 +79,17 @@ const {
 const { evaluateSaasCustomerLoginAccess } = require('./lib/saas-customer-access');
 const { parseSaasTenantSlugFromHost } = require('./lib/saas-tenant-access-urls');
 const { isSaasTenantOwner, applySaasTenantOwnerPrivileges } = require('./lib/saas-tenant-owner');
+const {
+  userHasGlobalPsrBypass,
+  isTenantBoundUser,
+  resolveTenantWasabiStateScope,
+  loadTenantWasabiStateSnapshot,
+  putTenantWasabiStateSnapshot,
+  emptyTenantAppSnapshot,
+  seedTenantAppDataSnapshot
+} = require('./lib/tenant-wasabi-state');
+const { tenantSlugFromWasabiRoot } = require('./lib/saas-tenant-access-urls');
+const { upsertTenantOwnerAuthSnapshot } = require('./lib/saas-tenant-auth-store');
 const { upsertTenantDraft } = require('./tenant-provisioning.service');
 const { isSaasTenantCorsOrigin } = require('./lib/saas-cors');
 
@@ -711,16 +722,18 @@ async function hydrateJobsiteAssetsResponseRows(assets) {
   );
 }
 
-async function hydratePlanBoardPageRow(p) {
+async function hydratePlanBoardPageRow(p, planStorage) {
   if (!p || typeof p !== 'object') return p;
   const copy = { ...p };
   delete copy.viewUrl;
   const sk = String(copy.storageKey || '').trim();
-  if (sk && isPersistablePlanPdfStorageKey(sk)) {
+  const s3 = planStorage?.client || wasabiStateClient;
+  const bucket = String(planStorage?.bucket || WASABI_STATE_BUCKET || '').trim();
+  if (sk && isPersistablePlanPdfStorageKey(sk) && s3 && bucket) {
     try {
       const { url } = await presignAdminAttachmentGet(
-        wasabiStateClient,
-        WASABI_STATE_BUCKET,
+        s3,
+        bucket,
         sk,
         ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
       );
@@ -732,15 +745,17 @@ async function hydratePlanBoardPageRow(p) {
   return copy;
 }
 
-async function hydratePlanBoardLegacyPieceRow(p) {
+async function hydratePlanBoardLegacyPieceRow(p, planStorage) {
   if (!p || typeof p !== 'object') return p;
   const copy = { ...p };
   const sk = String(copy.storageKey || '').trim();
-  if (sk && isPersistablePlanPdfStorageKey(sk)) {
+  const s3 = planStorage?.client || wasabiStateClient;
+  const bucket = String(planStorage?.bucket || WASABI_STATE_BUCKET || '').trim();
+  if (sk && isPersistablePlanPdfStorageKey(sk) && s3 && bucket) {
     try {
       const { url } = await presignAdminAttachmentGet(
-        wasabiStateClient,
-        WASABI_STATE_BUCKET,
+        s3,
+        bucket,
         sk,
         ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
       );
@@ -752,15 +767,17 @@ async function hydratePlanBoardLegacyPieceRow(p) {
   return copy;
 }
 
-async function hydratePlanBoardLegacyPlanRow(d) {
+async function hydratePlanBoardLegacyPlanRow(d, planStorage) {
   if (!d || typeof d !== 'object') return d;
   const copy = { ...d };
   const sk = String(copy.storageKey || '').trim();
-  if (sk && isPersistablePlanPdfStorageKey(sk)) {
+  const s3 = planStorage?.client || wasabiStateClient;
+  const bucket = String(planStorage?.bucket || WASABI_STATE_BUCKET || '').trim();
+  if (sk && isPersistablePlanPdfStorageKey(sk) && s3 && bucket) {
     try {
       const { url } = await presignAdminAttachmentGet(
-        wasabiStateClient,
-        WASABI_STATE_BUCKET,
+        s3,
+        bucket,
         sk,
         ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
       );
@@ -773,14 +790,14 @@ async function hydratePlanBoardLegacyPlanRow(d) {
     const pieces = [];
     for (const p of copy.pieces) {
       if (!p || typeof p !== 'object') continue;
-      pieces.push(await hydratePlanBoardLegacyPieceRow(p));
+      pieces.push(await hydratePlanBoardLegacyPieceRow(p, planStorage));
     }
     copy.pieces = pieces;
   }
   return copy;
 }
 
-async function hydratePlanBoardWorkspacePages(workspaces) {
+async function hydratePlanBoardWorkspacePages(workspaces, planStorage) {
   if (!Array.isArray(workspaces)) return workspaces;
   const out = [];
   for (const w of workspaces) {
@@ -790,7 +807,7 @@ async function hydratePlanBoardWorkspacePages(workspaces) {
       const wp = [];
       for (const p of wCopy.pages) {
         if (!p || typeof p !== 'object') continue;
-        wp.push(await hydratePlanBoardPageRow(p));
+        wp.push(await hydratePlanBoardPageRow(p, planStorage));
       }
       wCopy.pages = wp;
     }
@@ -799,41 +816,42 @@ async function hydratePlanBoardWorkspacePages(workspaces) {
   return out;
 }
 
-async function hydratePlanBoardBranch(branch) {
+async function hydratePlanBoardBranch(branch, planStorage) {
   if (!branch || typeof branch !== 'object') return branch;
-  if (!adminAttachmentsWasabiConfigured()) return branch;
+  if (!adminAttachmentsWasabiConfigured() && !(planStorage?.client && planStorage?.bucket)) return branch;
   const next = { ...branch };
   if (Array.isArray(branch.pages)) {
     const pages = [];
     for (const p of branch.pages) {
-      pages.push(await hydratePlanBoardPageRow(p));
+      pages.push(await hydratePlanBoardPageRow(p, planStorage));
     }
     next.pages = pages;
   } else if (!Array.isArray(next.pages)) {
     next.pages = [];
   }
   if (Array.isArray(branch.mapWorkspaces)) {
-    next.mapWorkspaces = await hydratePlanBoardWorkspacePages(branch.mapWorkspaces);
+    next.mapWorkspaces = await hydratePlanBoardWorkspacePages(branch.mapWorkspaces, planStorage);
   }
   if (Array.isArray(branch.legacyPlans)) {
     const legacyPlans = [];
     for (const d of branch.legacyPlans) {
       if (!d || typeof d !== 'object') continue;
-      legacyPlans.push(await hydratePlanBoardLegacyPlanRow(d));
+      legacyPlans.push(await hydratePlanBoardLegacyPlanRow(d, planStorage));
     }
     next.legacyPlans = legacyPlans;
   }
   return next;
 }
 
-async function hydratePlanViewPayloadForResponse(payload) {
+async function hydratePlanViewPayloadForResponse(payload, req) {
   if (!payload || typeof payload !== 'object') return payload;
+  const planStorage = req ? await planViewWasabiForRequest(req) : null;
   if (payload.v === 2 && payload.imagePlan && payload.pdfMap) {
-    const imagePlan = await hydratePlanBoardBranch(payload.imagePlan);
-    const pdfMap = await hydratePlanBoardBranch(payload.pdfMap);
+    const imagePlan = await hydratePlanBoardBranch(payload.imagePlan, planStorage);
+    const pdfMap = await hydratePlanBoardBranch(payload.pdfMap, planStorage);
     return { ...payload, v: 2, imagePlan, pdfMap };
   }
-  return hydratePlanBoardBranch(payload);
+  return hydratePlanBoardBranch(payload, planStorage);
 }
 
 function isLegacyPlanPdfStorageKey(key) {
@@ -1063,6 +1081,82 @@ async function loadWasabiLatestStateSnapshot(force = false) {
   wasabiLatestStateCache = parsed;
   wasabiLatestStateCacheAt = now;
   return parsed;
+}
+
+async function loadWasabiStateForRequest(req, force = false) {
+  const tenantScope = await resolveTenantWasabiStateScope(pool, req);
+  if (tenantScope) {
+    const snapshot = await loadTenantWasabiStateSnapshot(tenantScope, force);
+    return { snapshot, tenantScope, isTenant: true };
+  }
+  if (isTenantBoundUser(req?.user)) {
+    return { snapshot: null, tenantScope: null, isTenant: true };
+  }
+  const snapshot = await loadWasabiLatestStateSnapshot(force);
+  return { snapshot, tenantScope: null, isTenant: false };
+}
+
+async function runWasabiStateWriteForRequest(req, reason, mutator) {
+  if (!WASABI_WRITES_PRIMARY_ENABLED) {
+    throw new Error('WASABI_WRITES_PRIMARY_ENABLED is off');
+  }
+  const tenantScope = await resolveTenantWasabiStateScope(pool, req);
+  if (tenantScope) {
+    const existing =
+      (await loadTenantWasabiStateSnapshot(tenantScope, true)) ||
+      emptyTenantAppSnapshot(tenantScope.tenantSlug);
+    const next = snapshotStateShape(existing);
+    await mutator(next.data);
+    next.generatedAt = nowIso();
+    next.reason = String(reason || 'mutation');
+    await putTenantWasabiStateSnapshot(tenantScope, next);
+    return next;
+  }
+  if (isTenantBoundUser(req?.user)) {
+    throw new Error('Tenant Wasabi state is not available for this account on this host.');
+  }
+  return runWasabiStateWrite(reason, mutator);
+}
+
+async function wasabiStateConfiguredForRequest(req) {
+  if (isTenantBoundUser(req?.user)) {
+    const scope = await resolveTenantWasabiStateScope(pool, req);
+    return !!(scope?.s3 && scope?.bucket);
+  }
+  return !!(wasabiStateClient && WASABI_STATE_BUCKET);
+}
+
+async function loadSnapshotTablesForRequest(req, force = false) {
+  const { snapshot, isTenant } = await loadWasabiStateForRequest(req, force);
+  if (isTenant && !snapshot) return {};
+  return readWasabiSnapshotDataTables(snapshot || {}, { strict: false });
+}
+
+async function ensureSaasTenantOwnerWorkspaceReady(pool, userId) {
+  const uid = String(userId || '').trim();
+  if (!uid) return;
+  const owner = await isSaasTenantOwner(pool, uid);
+  if (!owner) return;
+  await applySaasTenantOwnerPrivileges(pool, uid);
+  try {
+    const row = await pool.query(
+      `SELECT wasabi_root_prefix FROM saas_tenant_instances WHERE CAST(owner_user_id AS text) = $1 LIMIT 1`,
+      [uid]
+    );
+    const slug = tenantSlugFromWasabiRoot(row.rows[0]?.wasabi_root_prefix);
+    if (slug) {
+      const ownerRow = await pool.query(
+        `SELECT id, username, email, display_name FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
+        [uid]
+      );
+      if (ownerRow.rows[0]) {
+        await upsertTenantOwnerAuthSnapshot(slug, ownerRow.rows[0]);
+      }
+      await seedTenantAppDataSnapshot(slug);
+    }
+  } catch (error) {
+    console.warn('[saas] tenant app snapshot seed failed:', error?.message || error);
+  }
 }
 
 function nowIso() {
@@ -3381,8 +3475,12 @@ async function deleteJobsiteAssetsByClient(client) {
   return Number(result.rowCount || 0);
 }
 
-async function readJobsiteAssetsFromWasabiSnapshotForUser(user) {
-  const snapshot = await loadWasabiLatestStateSnapshot();
+async function readJobsiteAssetsFromWasabiSnapshotForUser(user, req) {
+  const tenantScope = req ? await resolveTenantWasabiStateScope(pool, req) : null;
+  if (isTenantBoundUser(user) && !tenantScope) return [];
+  const snapshot = tenantScope
+    ? await loadTenantWasabiStateSnapshot(tenantScope, false)
+    : await loadWasabiLatestStateSnapshot();
   if (
     !WASABI_APP_DATA_STORE_WASABI_ONLY &&
     !snapshotLooksFresh(snapshot, WASABI_ASSETS_PRIMARY_MAX_SNAPSHOT_AGE_MS)
@@ -4033,10 +4131,8 @@ async function readSessionFromWasabiSnapshot(token, snapshotOverride = null) {
 async function readFreshUserFromPostgresById(userId) {
   const id = String(userId || '').trim();
   if (!id) return null;
+  await ensureSaasTenantOwnerWorkspaceReady(pool, id);
   const saasTenantOwner = await isSaasTenantOwner(pool, id);
-  if (saasTenantOwner) {
-    await applySaasTenantOwnerPrivileges(pool, id);
-  }
   const result = await pool.query(
     `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id,
             portal_permissions_access, portal_files_access_granted, autosync_master_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
@@ -4115,9 +4211,9 @@ async function readSessionFromPostgres(token) {
   );
   return {
     user: await (async () => {
+      await ensureSaasTenantOwnerWorkspaceReady(pool, row.id);
       const saasTenantOwner = await isSaasTenantOwner(pool, row.id);
       if (saasTenantOwner) {
-        await applySaasTenantOwnerPrivileges(pool, row.id);
         const refreshed = await pool.query(
           `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id,
                   portal_permissions_access, portal_files_access_granted, autosync_master_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
@@ -4371,7 +4467,7 @@ const requireFootageAccess = requireAnyRole(
 );
 
 function userCanAccessPsrScope(user, scope) {
-  if (user?.isAdmin) return true;
+  if (userHasGlobalPsrBypass(user)) return true;
   const scopes = dedupePsrScopes(user?.psrScopes || []);
   if (!scopes.length) return false;
   const data =
@@ -4404,7 +4500,7 @@ function userCanAccessPsrScope(user, scope) {
 }
 
 function buildPsrScopeWhere(user, alias = '') {
-  if (user?.isAdmin) return { clause: 'TRUE', params: [] };
+  if (userHasGlobalPsrBypass(user)) return { clause: 'TRUE', params: [] };
   const scopes = dedupePsrScopes(user?.psrScopes || []);
   if (!scopes.length) return { clause: 'FALSE', params: [] };
   const prefix = alias ? `${alias}.` : '';
@@ -7996,17 +8092,19 @@ function planWorkspaceEntryIsNewer(candidate, incumbent) {
   return String(candidate.saved_at) > String(incumbent.saved_at);
 }
 
-async function putPipesyncPlanWorkspaceSaveBlob(storageKey, bodyObj) {
-  if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+async function putPipesyncPlanWorkspaceSaveBlob(storageKey, bodyObj, planStorage) {
+  const s3 = planStorage?.client || wasabiStateClient;
+  const bucket = String(planStorage?.bucket || WASABI_STATE_BUCKET || '').trim();
+  if (!s3 || !bucket) {
     throw new Error('Wasabi object storage is not configured.');
   }
   const json = JSON.stringify(bodyObj);
   if (json.length > PIPESYNC_PLAN_WORKSPACE_SAVE_MAX_BYTES) {
     throw new Error('Workspace save exceeds the maximum size.');
   }
-  await wasabiStateClient.send(
+  await s3.send(
     new PutObjectCommand({
-      Bucket: WASABI_STATE_BUCKET,
+      Bucket: bucket,
       Key: storageKey,
       Body: Buffer.from(json, 'utf8'),
       ContentType: 'application/json'
@@ -8014,16 +8112,18 @@ async function putPipesyncPlanWorkspaceSaveBlob(storageKey, bodyObj) {
   );
 }
 
-async function readPipesyncPlanWorkspaceSaveBlob(storageKey) {
-  if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+async function readPipesyncPlanWorkspaceSaveBlob(storageKey, planStorage) {
+  const s3 = planStorage?.client || wasabiStateClient;
+  const bucket = String(planStorage?.bucket || WASABI_STATE_BUCKET || '').trim();
+  if (!s3 || !bucket) {
     throw new Error('Wasabi object storage is not configured.');
   }
   if (!isValidPipesyncPlanWorkspaceSaveStorageKey(storageKey)) {
     throw new Error('Invalid workspace save storage key.');
   }
-  const out = await wasabiStateClient.send(
+  const out = await s3.send(
     new GetObjectCommand({
-      Bucket: WASABI_STATE_BUCKET,
+      Bucket: bucket,
       Key: storageKey
     })
   );
@@ -8035,13 +8135,13 @@ async function readPipesyncPlanWorkspaceSaveBlob(storageKey) {
   return parsed;
 }
 
-async function loadHydratedWorkspaceBoardFromEntry(entry) {
+async function loadHydratedWorkspaceBoardFromEntry(entry, planStorage) {
   if (!entry?.storage_key || !isValidPipesyncPlanWorkspaceSaveStorageKey(entry.storage_key)) return null;
   try {
-    const snap = await readPipesyncPlanWorkspaceSaveBlob(entry.storage_key);
+    const snap = await readPipesyncPlanWorkspaceSaveBlob(entry.storage_key, planStorage);
     const board = snap?.board && typeof snap.board === 'object' ? snap.board : null;
     if (!board) return null;
-    return hydratePlanBoardBranch(board);
+    return hydratePlanBoardBranch(board, planStorage);
   } catch (err) {
     console.warn('Workspace save hydrate failed:', entry?.id, err?.message || err);
     return null;
@@ -8076,15 +8176,14 @@ app.get('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, 
     if (!un) {
       return res.json({ success: true, payload: null, updated_at: null });
     }
-    if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+    if (!(await wasabiStateConfiguredForRequest(req))) {
       return res.json({ success: true, payload: null, updated_at: null, wasabi: false });
     }
-    const snap = await loadWasabiLatestStateSnapshot(false);
-    const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
+    const tables = await loadSnapshotTablesForRequest(req, false);
     const rows = Array.isArray(tables[PIPESYNC_PLAN_VIEW_TABLE]) ? tables[PIPESYNC_PLAN_VIEW_TABLE] : [];
     const row = rows.find((r) => String(r?.username || '').toLowerCase() === un);
     let payload = row && row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload) ? row.payload : null;
-    if (payload) payload = await hydratePlanViewPayloadForResponse(payload);
+    if (payload) payload = await hydratePlanViewPayloadForResponse(payload, req);
     return res.json({
       success: true,
       payload,
@@ -8101,7 +8200,7 @@ app.put('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, 
     if (!WASABI_WRITES_PRIMARY_ENABLED) {
       return res.status(503).json({ success: false, error: 'Wasabi primary writes are disabled on this server.' });
     }
-    if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+    if (!(await wasabiStateConfiguredForRequest(req))) {
       return res.status(503).json({ success: false, error: 'Wasabi state storage is not configured.' });
     }
     const un = pipesyncPlanViewUsernameKey(req.user);
@@ -8118,7 +8217,7 @@ app.put('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, 
       return res.status(413).json({ success: false, error: 'Plan view data exceeds the maximum save size.' });
     }
     const now = nowIso();
-    await runWasabiStateWrite(`pipesync-plan-view:${un}`, async (data) => {
+    await runWasabiStateWriteForRequest(req, `pipesync-plan-view:${un}`, async (data) => {
       const rows = ensureSnapshotTable(data, PIPESYNC_PLAN_VIEW_TABLE);
       const idx = rows.findIndex((r) => String(r?.username || '').toLowerCase() === un);
       const row = { username: un, payload: sanitized, updated_at: now };
@@ -8267,11 +8366,11 @@ app.get(
   async (req, res) => {
     try {
       const un = pipesyncPlanViewUsernameKey(req.user);
-      if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+      const planStorage = await planViewWasabiForRequest(req);
+      if (!(await wasabiStateConfiguredForRequest(req))) {
         return res.json({ success: true, planView: null, pdfMapView: null, wasabi: false });
       }
-      const snap = await loadWasabiLatestStateSnapshot(false);
-      const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
+      const tables = await loadSnapshotTablesForRequest(req, false);
       const rows = Array.isArray(tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE])
         ? tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE]
         : [];
@@ -8289,8 +8388,8 @@ app.get(
         if (!pdfMapViewEntry) pdfMapViewEntry = legacyActive.pdfMapView;
       }
       const [planViewBoard, pdfMapViewBoard] = await Promise.all([
-        loadHydratedWorkspaceBoardFromEntry(planViewEntry),
-        loadHydratedWorkspaceBoardFromEntry(pdfMapViewEntry)
+        loadHydratedWorkspaceBoardFromEntry(planViewEntry, planStorage),
+        loadHydratedWorkspaceBoardFromEntry(pdfMapViewEntry, planStorage)
       ]);
       return res.json({
         success: true,
@@ -8331,11 +8430,10 @@ app.get(
       if (!board) {
         return res.status(400).json({ success: false, error: 'Query board must be planView or pdfMapView.' });
       }
-      if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+      if (!(await wasabiStateConfiguredForRequest(req))) {
         return res.json({ success: true, saves: [], wasabi: false });
       }
-      const snap = await loadWasabiLatestStateSnapshot(false);
-      const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
+      const tables = await loadSnapshotTablesForRequest(req, false);
       const rows = Array.isArray(tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE])
         ? tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE]
         : [];
@@ -8370,11 +8468,11 @@ app.get(
       if (!board) {
         return res.status(400).json({ success: false, error: 'Query board must be planView or pdfMapView.' });
       }
-      if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+      const planStorage = await planViewWasabiForRequest(req);
+      if (!(await wasabiStateConfiguredForRequest(req))) {
         return res.json({ success: true, save: null, wasabi: false });
       }
-      const snap = await loadWasabiLatestStateSnapshot(false);
-      const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
+      const tables = await loadSnapshotTablesForRequest(req, false);
       const rows = Array.isArray(tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE])
         ? tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE]
         : [];
@@ -8382,7 +8480,7 @@ app.get(
         .filter((r) => r && String(r.username || '').toLowerCase() === un && r.board === board)
         .sort((a, b) => String(b.saved_at || '').localeCompare(String(a.saved_at || '')))[0];
       if (!entry) return res.json({ success: true, save: null });
-      const hydrated = await loadHydratedWorkspaceBoardFromEntry(entry);
+      const hydrated = await loadHydratedWorkspaceBoardFromEntry(entry, planStorage);
       return res.json({
         success: true,
         save: {
@@ -8411,11 +8509,11 @@ app.get(
       const saveId = String(req.params?.saveId || '').trim();
       if (!un) return res.status(401).json({ success: false, error: 'Not signed in.' });
       if (!saveId) return res.status(400).json({ success: false, error: 'saveId is required.' });
-      if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+      const planStorage = await planViewWasabiForRequest(req);
+      if (!(await wasabiStateConfiguredForRequest(req))) {
         return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured.' });
       }
-      const snap = await loadWasabiLatestStateSnapshot(false);
-      const tables = readWasabiSnapshotDataTables(snap || {}, { strict: false });
+      const tables = await loadSnapshotTablesForRequest(req, false);
       const rows = Array.isArray(tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE])
         ? tables[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE]
         : [];
@@ -8423,7 +8521,7 @@ app.get(
       if (!entry || String(entry.username || '').toLowerCase() !== un) {
         return res.status(404).json({ success: false, error: 'Workspace save not found.' });
       }
-      const hydrated = await loadHydratedWorkspaceBoardFromEntry(entry);
+      const hydrated = await loadHydratedWorkspaceBoardFromEntry(entry, planStorage);
       if (!hydrated) {
         return res.status(404).json({ success: false, error: 'Workspace save data is missing or invalid.' });
       }
@@ -8455,7 +8553,11 @@ app.post(
       if (!WASABI_WRITES_PRIMARY_ENABLED) {
         return res.status(503).json({ success: false, error: 'Wasabi primary writes are disabled on this server.' });
       }
-      if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
+      if (!(await wasabiStateConfiguredForRequest(req))) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured.' });
+      }
+      const planStorage = await planViewWasabiForRequest(req);
+      if (!planStorage.configured) {
         return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured.' });
       }
       const un = pipesyncPlanViewUsernameKey(req.user);
@@ -8484,7 +8586,7 @@ app.post(
         boardKey,
         username: un,
         board: sanitizedBoard
-      });
+      }, planStorage);
       const indexRow = {
         id: saveId,
         username: un,
@@ -8493,7 +8595,7 @@ app.post(
         storage_key: storageKey,
         bytes: blobJson.length
       };
-      await runWasabiStateWrite(`pipesync-plan-workspace-save:${un}:${boardKey}`, async (data) => {
+      await runWasabiStateWriteForRequest(req, `pipesync-plan-workspace-save:${un}:${boardKey}`, async (data) => {
         const rows = ensureSnapshotTable(data, PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE);
         rows.push(indexRow);
         data[PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE] = prunePlanWorkspaceSaveIndex(rows, un, boardKey);
@@ -9375,12 +9477,12 @@ app.delete('/daily-reports/:id', requireAuth, requireAdmin, async (req, res) => 
 app.get('/jobsite-assets', requireAuth, requireFootageAccess, async (req, res) => {
   try {
     if (WASABI_APP_DATA_STORE_WASABI_ONLY) {
-      const assets = (await readJobsiteAssetsFromWasabiSnapshotForUser(req.user)) || [];
+      const assets = (await readJobsiteAssetsFromWasabiSnapshotForUser(req.user, req)) || [];
       return res.json({ success: true, assets: await hydrateJobsiteAssetsResponseRows(assets) });
     }
     if (WASABI_ASSETS_PRIMARY_ENABLED) {
       try {
-        const snapshotAssets = await readJobsiteAssetsFromWasabiSnapshotForUser(req.user);
+        const snapshotAssets = await readJobsiteAssetsFromWasabiSnapshotForUser(req.user, req);
         if (snapshotAssets) {
           return res.json({ success: true, assets: await hydrateJobsiteAssetsResponseRows(snapshotAssets) });
         }
