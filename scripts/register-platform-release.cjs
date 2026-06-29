@@ -2,7 +2,11 @@
 
 require('dotenv').config();
 const fs = require('fs');
-const { S3Client } = require('@aws-sdk/client-s3');
+const {
+  createPlatformReleaseS3Client,
+  resolvePlatformReleaseBucket,
+  resolvePlatformReleaseS3Config
+} = require('../lib/platform-release-storage');
 const { publishPlatformRelease } = require('../platform-release.service');
 
 const version = process.argv[2] || '0.0.1';
@@ -14,16 +18,14 @@ if (process.env.HP_DEPLOYMENT_MODE !== 'non-saas') {
 }
 
 const draft = JSON.parse(fs.readFileSync('platform-release-draft.json', 'utf8'));
-const client = new S3Client({
-  region: process.env.WASABI_REGION,
-  endpoint: process.env.WASABI_ENDPOINT,
-  credentials: {
-    accessKeyId: process.env.WASABI_ACCESS_KEY_ID,
-    secretAccessKey: process.env.WASABI_SECRET_ACCESS_KEY
-  },
-  forcePathStyle: true
-});
-const bucket = process.env.WASABI_BUCKET;
+const client = createPlatformReleaseS3Client();
+const bucket = resolvePlatformReleaseBucket();
+const { region, endpoint } = resolvePlatformReleaseS3Config();
+if (!client || !bucket) {
+  console.error('Platform release Wasabi client/bucket not configured');
+  process.exit(1);
+}
+console.error(`[register] bucket=${bucket} region=${region} endpoint=${endpoint}`);
 
 publishPlatformRelease(client, bucket, {
   version,

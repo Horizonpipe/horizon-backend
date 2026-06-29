@@ -47,23 +47,37 @@ if [[ "${HP_DEPLOYMENT_MODE:-hybrid}" == "saas" ]]; then
   exit 1
 fi
 
-if [[ -z "${WASABI_BUCKET:-}" || -z "${WASABI_ACCESS_KEY_ID:-}" || -z "${WASABI_SECRET_ACCESS_KEY:-}" ]]; then
-  echo "[publish] WASABI_BUCKET and credentials required in .env" >&2
+if [[ -n "${HP_PLATFORM_RELEASE_BUCKET:-}" ]]; then
+  PUBLISH_BUCKET="${HP_PLATFORM_RELEASE_BUCKET}"
+elif [[ -n "${SAAS_WASABI_BUCKET:-}" ]]; then
+  PUBLISH_BUCKET="${SAAS_WASABI_BUCKET}"
+else
+  PUBLISH_BUCKET="${WASABI_BUCKET:-}"
+fi
+
+if [[ -z "${PUBLISH_BUCKET:-}" || -z "${WASABI_ACCESS_KEY_ID:-}" || -z "${WASABI_SECRET_ACCESS_KEY:-}" ]]; then
+  echo "[publish] release bucket and Wasabi credentials required in .env" >&2
   exit 1
+fi
+
+if [[ "${PUBLISH_BUCKET}" == "${SAAS_WASABI_BUCKET:-}" && -n "${SAAS_WASABI_ENDPOINT:-}" ]]; then
+  PUBLISH_ENDPOINT="${SAAS_WASABI_ENDPOINT}"
+  PUBLISH_REGION="${SAAS_WASABI_REGION:-us-east-2}"
+else
+  PUBLISH_ENDPOINT="${WASABI_ENDPOINT:-https://s3.us-east-1.wasabisys.com}"
+  PUBLISH_REGION="${WASABI_REGION:-us-east-1}"
 fi
 
 command -v aws >/dev/null 2>&1 || { echo "[publish] install aws CLI first (deploy/ovh/install-awscli.sh)" >&2; exit 1; }
 command -v tar >/dev/null 2>&1 || { echo "[publish] tar required" >&2; exit 1; }
 
-WASABI_ENDPOINT="${WASABI_ENDPOINT:-https://s3.us-east-1.wasabisys.com}"
-WASABI_REGION="${WASABI_REGION:-us-east-1}"
 API_BASE="${PUBLIC_ORIGIN:-${SAAS_CPANEL_BASE_URL:-http://127.0.0.1:3000}}"
 
 aws_cp() {
   AWS_ACCESS_KEY_ID="${WASABI_ACCESS_KEY_ID}" \
   AWS_SECRET_ACCESS_KEY="${WASABI_SECRET_ACCESS_KEY}" \
-  AWS_DEFAULT_REGION="${WASABI_REGION}" \
-    aws s3 cp "$1" "s3://${WASABI_BUCKET}/$2" --endpoint-url "$WASABI_ENDPOINT"
+  AWS_DEFAULT_REGION="${PUBLISH_REGION}" \
+    aws s3 cp "$1" "s3://${PUBLISH_BUCKET}/$2" --endpoint-url "$PUBLISH_ENDPOINT"
 }
 
 mkdir -p "$STAGING"
@@ -72,9 +86,9 @@ echo "[publish] reading current manifest from Wasabi…"
 MANIFEST_JSON="$STAGING/manifest.json"
 if AWS_ACCESS_KEY_ID="${WASABI_ACCESS_KEY_ID}" \
   AWS_SECRET_ACCESS_KEY="${WASABI_SECRET_ACCESS_KEY}" \
-  AWS_DEFAULT_REGION="${WASABI_REGION}" \
-    aws s3 cp "s3://${WASABI_BUCKET}/platform/releases/manifest.json" "$MANIFEST_JSON" \
-      --endpoint-url "$WASABI_ENDPOINT" 2>/dev/null; then
+  AWS_DEFAULT_REGION="${PUBLISH_REGION}" \
+    aws s3 cp "s3://${PUBLISH_BUCKET}/platform/releases/manifest.json" "$MANIFEST_JSON" \
+      --endpoint-url "$PUBLISH_ENDPOINT" 2>/dev/null; then
   LATEST="$(node -e "
     const fs = require('fs');
     const zlib = require('zlib');

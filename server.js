@@ -27,6 +27,10 @@ const { registerAccountRoutes } = require('./account.routes');
 const { registerSaasTenantRoutes } = require('./saas-tenant.routes');
 const { registerSaasBillingWebhook, registerSaasBillingRoutes } = require('./saas-billing.routes');
 const { registerPlatformReleaseRoutes } = require('./platform-release.routes');
+const {
+  createPlatformReleaseS3Client,
+  resolvePlatformReleaseBucket
+} = require('./lib/platform-release-storage');
 const { registerOvhOpsWebhook, registerOvhOpsRoutes } = require('./ovh-ops.routes');
 const { registerCustomerSupportRoutes } = require('./customer-support.routes');
 const { startMetricsCollector, isOvhOpsEnabled } = require('./ovh-ops.service');
@@ -11245,12 +11249,14 @@ registerSaasTenantRoutes(app, {
   wasabiBucket: WASABI_STATE_BUCKET
 });
 registerSaasBillingRoutes(app, { pool, requireAuth });
+const platformReleaseWasabiClient = createPlatformReleaseS3Client() || wasabiStateClient;
+const platformReleaseWasabiBucket = resolvePlatformReleaseBucket() || WASABI_STATE_BUCKET;
 registerPlatformReleaseRoutes(app, {
   pool,
   requireAuth,
   requireAdmin,
-  wasabiClient: wasabiStateClient,
-  wasabiBucket: WASABI_STATE_BUCKET
+  wasabiClient: platformReleaseWasabiClient,
+  wasabiBucket: platformReleaseWasabiBucket
 });
 registerOvhOpsRoutes(app, { requireAuth, requireAdmin });
 registerCustomerSupportRoutes(app, {
