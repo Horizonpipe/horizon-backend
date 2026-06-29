@@ -6,7 +6,8 @@
     "portal-files per-request Wasabi via AsyncLocalStorage + portalS3().",
     "Platform release Publish/Apply gated by request host on hybrid.",
     "nginx tenant + net hosts back to single :3000 upstream.",
-    "HP_DEPLOYMENT_MODE=hybrid default in env template."
+    "HP_DEPLOYMENT_MODE=hybrid default in env template.",
+    "Fix login handler duplicate requestHost (startup crash on hybrid)."
   ],
   "updatedAt": "2026-06-29T01:00:00.000Z"
 }
