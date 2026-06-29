@@ -6567,14 +6567,41 @@ async function ensureSchema() {
         account_type = 'employee',
         employee_role = 'superadmin',
         is_admin = true,
+        portal_files_client_id = CASE
+          WHEN portal_files_client_id IS NULL OR BTRIM(portal_files_client_id) = ''
+            OR LOWER(BTRIM(portal_files_client_id)) = 'portal-users'
+            THEN portal_files_client_id
+          WHEN LOWER(BTRIM(portal_files_client_id)) LIKE 'tenant-%'
+            THEN COALESCE(NULLIF(BTRIM($1::text), ''), 'portal-users')
+          ELSE portal_files_client_id
+        END,
+        portal_files_job_id = CASE
+          WHEN LOWER(BTRIM(COALESCE(portal_files_client_id, ''))) LIKE 'tenant-%'
+            THEN COALESCE(NULLIF(BTRIM($2::text), ''), portal_files_job_id)
+          ELSE portal_files_job_id
+        END,
+        portal_files_access_granted = true,
+        portal_permissions_access = true,
         updated_at = NOW()
     WHERE LOWER(TRIM(COALESCE(username, ''))) IN ('mik', 'mike strickland')
        OR LOWER(TRIM(COALESCE(display_name, ''))) = 'mike strickland'
        OR LOWER(TRIM(COALESCE(email, ''))) = 'mike@horizonpipe.com'
-  `);
+  `, [
+    String(process.env.PORTAL_SHARED_DEFAULT_CLIENT_ID || 'portal-users').trim(),
+    String(process.env.PORTAL_SHARED_DEFAULT_JOB_ID || '8').trim()
+  ]);
   await pool.query(`
     DELETE FROM saas_tenant_instances
     WHERE CAST(owner_user_id AS text) IN (
+      SELECT CAST(id AS text) FROM users
+      WHERE LOWER(TRIM(COALESCE(username, ''))) IN ('mik', 'mike strickland')
+         OR LOWER(TRIM(COALESCE(display_name, ''))) = 'mike strickland'
+         OR LOWER(TRIM(COALESCE(email, ''))) = 'mike@horizonpipe.com'
+    )
+  `);
+  await pool.query(`
+    DELETE FROM user_company_membership
+    WHERE CAST(user_id AS text) IN (
       SELECT CAST(id AS text) FROM users
       WHERE LOWER(TRIM(COALESCE(username, ''))) IN ('mik', 'mike strickland')
          OR LOWER(TRIM(COALESCE(display_name, ''))) = 'mike strickland'
