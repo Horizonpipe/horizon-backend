@@ -119,12 +119,10 @@ const HEARTBEAT_MIN_WRITE_MS = Math.max(
 const sseByTenant = new Map();
 /** @type {Map<string, number>} */
 const lastPresenceWriteMs = new Map();
-/** @type {Map<string, { id: number, at: number, fromUserId: string, type: string, payload: unknown }[]>} */
+/** Legacy in-process buffers (unused when Postgres relay tables are active). */
 const remoteSignalsBySession = new Map();
 const REMOTE_SIGNAL_BUFFER_MAX = 120;
-/** @type {Map<string, { seq: number, mimeType: string, dataBase64: string, w: number, h: number, at: number }>} */
 const remoteFramesBySession = new Map();
-/** @type {Map<string, { id: number, at: number, fromUserId: string, payload: unknown }[]>} */
 const remoteInputBySession = new Map();
 const REMOTE_INPUT_BUFFER_MAX = 240;
 const REMOTE_FRAME_MAX_B64 = 1_200_000;
@@ -164,28 +162,158 @@ function requireSupportAdmin(req, res, next) {
   return next();
 }
 
-function pushRemoteSignal(sessionId, fromUserId, type, payload) {
+async function insertRemoteSignalPg(pool, sessionId, fromUserId, type, payload) {
   const key = String(sessionId || '');
   if (!key) return null;
-  let list = remoteSignalsBySession.get(key);
-  if (!list) {
-    list = [];
-    remoteSignalsBySession.set(key, list);
-  }
-  const entry = {
-    id: (list[list.length - 1]?.id || 0) + 1,
-    at: Date.now(),
-    fromUserId: String(fromUserId || ''),
-    type: String(type || ''),
-    payload
+  const ins = await pool.query(
+    `INSERT INTO cp_support_remote_signals (session_id, from_user_id, signal_type, payload)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id, session_id, from_user_id, signal_type, payload, created_at`,
+    [key, String(fromUserId || ''), String(type || ''), payload != null ? JSON.stringify(payload) : null]
+  );
+  const row = ins.rows[0];
+  if (!row) return null;
+  await pool.query(
+    `DELETE FROM cp_support_remote_signals
+     WHERE session_id = $1
+       AND id NOT IN (
+         SELECT id FROM cp_support_remote_signals
+         WHERE session_id = $1
+         ORDER BY id DESC
+         LIMIT $2
+       )`,
+    [key, REMOTE_SIGNAL_BUFFER_MAX]
+  );
+  return {
+    id: Number(row.id) || 0,
+    at: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
+    fromUserId: String(row.from_user_id || ''),
+    type: String(row.signal_type || ''),
+    payload: row.payload
   };
-  list.push(entry);
-  while (list.length > REMOTE_SIGNAL_BUFFER_MAX) list.shift();
-  return entry;
+}
+
+async function fetchRemoteSignalsPg(pool, sessionId, afterId) {
+  const key = String(sessionId || '');
+  if (!key) return [];
+  const r = await pool.query(
+    `SELECT id, from_user_id, signal_type, payload, created_at
+     FROM cp_support_remote_signals
+     WHERE session_id = $1 AND id > $2
+     ORDER BY id ASC
+     LIMIT 64`,
+    [key, Math.max(0, Number(afterId) || 0)]
+  );
+  return r.rows.map((row) => ({
+    id: Number(row.id) || 0,
+    fromUserId: String(row.from_user_id || ''),
+    type: String(row.signal_type || ''),
+    payload: row.payload,
+    at: row.created_at ? new Date(row.created_at).getTime() : Date.now()
+  }));
 }
 
 function clearRemoteSignals(sessionId) {
   remoteSignalsBySession.delete(String(sessionId || ''));
+}
+
+async function upsertRemoteFramePg(pool, sessionId, payload) {
+  const key = String(sessionId || '');
+  if (!key) return null;
+  const dataBase64 = cleanString(payload?.dataBase64);
+  if (!dataBase64 || dataBase64.length > REMOTE_FRAME_MAX_B64) return null;
+  const seq = Math.max(1, Number(payload?.seq) || 0);
+  await pool.query(
+    `INSERT INTO cp_support_remote_frames (session_id, seq, mime_type, data_base64, w, h, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, NOW())
+     ON CONFLICT (session_id) DO UPDATE SET
+       seq = EXCLUDED.seq,
+       mime_type = EXCLUDED.mime_type,
+       data_base64 = EXCLUDED.data_base64,
+       w = EXCLUDED.w,
+       h = EXCLUDED.h,
+       updated_at = NOW()`,
+    [
+      key,
+      seq,
+      cleanString(payload?.mimeType || 'image/jpeg') || 'image/jpeg',
+      dataBase64,
+      Math.max(0, Number(payload?.w) || 0),
+      Math.max(0, Number(payload?.h) || 0)
+    ]
+  );
+  return { seq, mimeType: cleanString(payload?.mimeType || 'image/jpeg'), dataBase64, w: Math.max(0, Number(payload?.w) || 0), h: Math.max(0, Number(payload?.h) || 0), at: Date.now() };
+}
+
+async function fetchRemoteFramePg(pool, sessionId, afterSeq) {
+  const key = String(sessionId || '');
+  if (!key) return null;
+  const r = await pool.query(
+    `SELECT seq, mime_type, data_base64, w, h, updated_at
+     FROM cp_support_remote_frames
+     WHERE session_id = $1 AND seq > $2
+     LIMIT 1`,
+    [key, Math.max(0, Number(afterSeq) || 0)]
+  );
+  const row = r.rows[0];
+  if (!row) return null;
+  return {
+    seq: Number(row.seq) || 0,
+    mimeType: String(row.mime_type || 'image/jpeg'),
+    dataBase64: String(row.data_base64 || ''),
+    w: Number(row.w) || 0,
+    h: Number(row.h) || 0,
+    at: row.updated_at ? new Date(row.updated_at).getTime() : Date.now()
+  };
+}
+
+async function insertRemoteInputPg(pool, sessionId, fromUserId, payload) {
+  const key = String(sessionId || '');
+  if (!key || payload == null || typeof payload !== 'object') return null;
+  const ins = await pool.query(
+    `INSERT INTO cp_support_remote_inputs (session_id, from_user_id, payload)
+     VALUES ($1, $2, $3)
+     RETURNING id, from_user_id, payload, created_at`,
+    [key, String(fromUserId || ''), JSON.stringify(payload)]
+  );
+  const row = ins.rows[0];
+  if (!row) return null;
+  await pool.query(
+    `DELETE FROM cp_support_remote_inputs
+     WHERE session_id = $1
+       AND id NOT IN (
+         SELECT id FROM cp_support_remote_inputs
+         WHERE session_id = $1
+         ORDER BY id DESC
+         LIMIT $2
+       )`,
+    [key, REMOTE_INPUT_BUFFER_MAX]
+  );
+  return {
+    id: Number(row.id) || 0,
+    fromUserId: String(row.from_user_id || ''),
+    payload: row.payload,
+    at: row.created_at ? new Date(row.created_at).getTime() : Date.now()
+  };
+}
+
+async function fetchRemoteInputsPg(pool, sessionId, afterId) {
+  const key = String(sessionId || '');
+  if (!key) return [];
+  const r = await pool.query(
+    `SELECT id, from_user_id, payload, created_at
+     FROM cp_support_remote_inputs
+     WHERE session_id = $1 AND id > $2
+     ORDER BY id ASC
+     LIMIT 64`,
+    [key, Math.max(0, Number(afterId) || 0)]
+  );
+  return r.rows.map((row) => ({
+    id: Number(row.id) || 0,
+    fromUserId: String(row.from_user_id || ''),
+    payload: row.payload,
+    at: row.created_at ? new Date(row.created_at).getTime() : Date.now()
+  }));
 }
 
 function clearRemoteRelay(sessionId) {
@@ -194,41 +322,14 @@ function clearRemoteRelay(sessionId) {
   remoteInputBySession.delete(key);
 }
 
-function storeRemoteFrame(sessionId, payload) {
+async function clearRemoteRelayPg(pool, sessionId) {
   const key = String(sessionId || '');
-  if (!key) return null;
-  const dataBase64 = cleanString(payload?.dataBase64);
-  if (!dataBase64 || dataBase64.length > REMOTE_FRAME_MAX_B64) return null;
-  const seq = Math.max(1, Number(payload?.seq) || 0);
-  const entry = {
-    seq,
-    mimeType: cleanString(payload?.mimeType || 'image/jpeg') || 'image/jpeg',
-    dataBase64,
-    w: Math.max(0, Number(payload?.w) || 0),
-    h: Math.max(0, Number(payload?.h) || 0),
-    at: Date.now()
-  };
-  remoteFramesBySession.set(key, entry);
-  return entry;
-}
-
-function pushRemoteInput(sessionId, fromUserId, payload) {
-  const key = String(sessionId || '');
-  if (!key || payload == null || typeof payload !== 'object') return null;
-  let list = remoteInputBySession.get(key);
-  if (!list) {
-    list = [];
-    remoteInputBySession.set(key, list);
-  }
-  const entry = {
-    id: (list[list.length - 1]?.id || 0) + 1,
-    at: Date.now(),
-    fromUserId: String(fromUserId || ''),
-    payload
-  };
-  list.push(entry);
-  while (list.length > REMOTE_INPUT_BUFFER_MAX) list.shift();
-  return entry;
+  if (!key) return;
+  clearRemoteSignals(key);
+  clearRemoteRelay(key);
+  await pool.query(`DELETE FROM cp_support_remote_signals WHERE session_id = $1`, [key]);
+  await pool.query(`DELETE FROM cp_support_remote_frames WHERE session_id = $1`, [key]);
+  await pool.query(`DELETE FROM cp_support_remote_inputs WHERE session_id = $1`, [key]);
 }
 
 function broadcastTenant(tenantId, eventName, payload) {
@@ -286,7 +387,7 @@ async function endRemoteSessionsForCustomer(pool, tenantId, customerUserId, { ad
   return r.rows;
 }
 
-function broadcastEndedSessions(tenantId, chatRows, remoteRows, reason) {
+async function broadcastEndedSessions(pool, tenantId, chatRows, remoteRows, reason) {
   for (const row of chatRows) {
     broadcastSupportEvents(tenantId, 'chat-ended', {
       sessionId: row.id,
@@ -296,8 +397,7 @@ function broadcastEndedSessions(tenantId, chatRows, remoteRows, reason) {
     });
   }
   for (const row of remoteRows) {
-    clearRemoteSignals(row.id);
-    clearRemoteRelay(row.id);
+    await clearRemoteRelayPg(pool, row.id);
     broadcastSupportEvents(tenantId, 'remote-ended', {
       sessionId: row.id,
       customerUserId: row.customer_user_id,
@@ -310,7 +410,7 @@ function broadcastEndedSessions(tenantId, chatRows, remoteRows, reason) {
 async function terminateCustomerSessions(pool, tenantId, customerUserId, { adminUserId, reason } = {}) {
   const chatRows = await endChatSessionsForCustomer(pool, tenantId, customerUserId, { adminUserId });
   const remoteRows = await endRemoteSessionsForCustomer(pool, tenantId, customerUserId, { adminUserId });
-  broadcastEndedSessions(tenantId, chatRows, remoteRows, reason || 'terminated');
+  await broadcastEndedSessions(pool, tenantId, chatRows, remoteRows, reason || 'terminated');
   return { chatEnded: chatRows.length, remoteEnded: remoteRows.length };
 }
 
@@ -439,6 +539,45 @@ async function initCustomerSupportSchema(pool) {
   );
   await pool.query(
     `ALTER TABLE cp_support_remote_sessions ADD COLUMN IF NOT EXISTS chat_session_id UUID`
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cp_support_remote_signals (
+      id BIGSERIAL PRIMARY KEY,
+      session_id UUID NOT NULL REFERENCES cp_support_remote_sessions(id) ON DELETE CASCADE,
+      from_user_id TEXT NOT NULL,
+      signal_type TEXT NOT NULL,
+      payload JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_cp_support_remote_signals_session ON cp_support_remote_signals (session_id, id ASC)`
+  );
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cp_support_remote_frames (
+      session_id UUID PRIMARY KEY REFERENCES cp_support_remote_sessions(id) ON DELETE CASCADE,
+      seq INT NOT NULL,
+      mime_type TEXT NOT NULL DEFAULT 'image/jpeg',
+      data_base64 TEXT NOT NULL,
+      w INT NOT NULL DEFAULT 0,
+      h INT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cp_support_remote_inputs (
+      id BIGSERIAL PRIMARY KEY,
+      session_id UUID NOT NULL REFERENCES cp_support_remote_sessions(id) ON DELETE CASCADE,
+      from_user_id TEXT NOT NULL,
+      payload JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_cp_support_remote_inputs_session ON cp_support_remote_inputs (session_id, id ASC)`
   );
 }
 
@@ -1922,8 +2061,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         `UPDATE cp_support_remote_sessions SET status = 'ended', updated_at = NOW(), ended_at = NOW() WHERE id = $1`,
         [sessionId]
       );
-      clearRemoteSignals(sessionId);
-      clearRemoteRelay(sessionId);
+      await clearRemoteRelayPg(pool, sessionId);
       broadcastSupportEvents(row.tenant_id, 'remote-ended', {
         sessionId,
         customerUserId: row.customer_user_id,
@@ -1968,7 +2106,8 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const row = loaded.row;
       if (row.status !== 'active') return jsonError(res, 400, 'Remote session is not active');
 
-      const entry = pushRemoteSignal(sessionId, req.user.id, type, payload);
+      const entry = await insertRemoteSignalPg(pool, sessionId, req.user.id, type, payload);
+      if (!entry) return jsonError(res, 500, 'Failed to store signal');
       broadcastSupportEvents(row.tenant_id, 'remote-signal', {
         sessionId,
         signalId: entry?.id,
@@ -1996,8 +2135,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const row = loaded.row;
       if (row.status !== 'active') return jsonError(res, 400, 'Remote session is not active');
 
-      const list = remoteSignalsBySession.get(sessionId) || [];
-      const signals = list.filter((s) => s.id > afterId);
+      const signals = await fetchRemoteSignalsPg(pool, sessionId, afterId);
       return res.json({ success: true, signals });
     } catch (error) {
       console.error('[saas/support/remote/signals GET]', error);
@@ -2020,7 +2158,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         return jsonError(res, 403, 'Only the customer can upload viewport frames');
       }
 
-      const stored = storeRemoteFrame(sessionId, req.body || {});
+      const stored = await upsertRemoteFramePg(pool, sessionId, req.body || {});
       if (!stored) return jsonError(res, 400, 'Valid frame data is required');
       return res.json({ success: true, seq: stored.seq });
     } catch (error) {
@@ -2045,8 +2183,8 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         return jsonError(res, 403, 'Only the assigned admin can view viewport frames');
       }
 
-      const frame = remoteFramesBySession.get(sessionId) || null;
-      if (!frame || frame.seq <= afterSeq) {
+      const frame = await fetchRemoteFramePg(pool, sessionId, afterSeq);
+      if (!frame) {
         return res.json({ success: true, frame: null });
       }
       return res.json({
@@ -2093,7 +2231,8 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         return jsonError(res, 403, 'Only the admin can send control input');
       }
 
-      const entry = pushRemoteInput(sessionId, req.user.id, payload);
+      const entry = await insertRemoteInputPg(pool, sessionId, req.user.id, payload);
+      if (!entry) return jsonError(res, 500, 'Failed to store input');
       return res.json({ success: true, inputId: entry?.id });
     } catch (error) {
       console.error('[saas/support/remote/input POST]', error);
@@ -2117,8 +2256,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         return jsonError(res, 403, 'Only the customer can poll control input');
       }
 
-      const list = remoteInputBySession.get(sessionId) || [];
-      const messages = list.filter((s) => s.id > afterId);
+      const messages = await fetchRemoteInputsPg(pool, sessionId, afterId);
       return res.json({ success: true, messages });
     } catch (error) {
       console.error('[saas/support/remote/input GET]', error);

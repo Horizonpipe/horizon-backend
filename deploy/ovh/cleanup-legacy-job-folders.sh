@@ -67,6 +67,11 @@ const pg = require('pg');
      WHERE portal_files_client_id = 'portal-users' AND portal_files_job_id = '1'`
   );
   await p.query(`DELETE FROM portal_path_grants WHERE client_id = 'portal-users' AND job_id = '1'`);
+  await p.query(
+    `UPDATE users SET portal_files_job_id = '8', updated_at = NOW()
+     WHERE portal_files_client_id = 'portal-users' AND portal_files_job_id = '4'`
+  );
+  await p.query(`DELETE FROM portal_path_grants WHERE client_id = 'portal-users' AND job_id = '4'`);
   const u = await p.query(
     `SELECT id, username, portal_files_job_id FROM users WHERE portal_files_client_id = 'portal-users' ORDER BY id`
   );

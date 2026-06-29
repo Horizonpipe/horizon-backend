@@ -55,6 +55,7 @@ const {
   logDeploymentProfileAtStartup,
   deploymentMode
 } = require('./lib/deployment-profile');
+const { resolveStorageBackend } = require('./lib/portal-storage-backend');
 const {
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,
@@ -854,6 +855,16 @@ async function tenantWasabiRootForRequest(req) {
   const requestHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
   const ctx = await resolveTenantStorageContext(pool, req.user?.id, { requestHost });
   return ctx?.wasabiRootPrefix || '';
+}
+
+/** Plan-view PDF/image uploads: SaaS hosts use SAAS_WASABI_BUCKET; tenant users get Tenants/{slug}/ prefix. */
+async function planViewWasabiForRequest(req) {
+  const backend = resolveStorageBackend(req);
+  const tenantRoot = await tenantWasabiRootForRequest(req);
+  const rootPrefix = tenantRoot || backend.rootPrefix || '';
+  const client = backend.s3 || wasabiStateClient;
+  const bucket = String(backend.bucket || WASABI_STATE_BUCKET || '').trim();
+  return { client, bucket, rootPrefix, configured: !!(client && bucket) };
 }
 
 function sanitizePlanBoardBranch(branch) {
@@ -8128,10 +8139,11 @@ app.post(
   express.json({ limit: '64kb' }),
   async (req, res) => {
     try {
-      if (!adminAttachmentsWasabiConfigured()) {
+      const planStorage = await planViewWasabiForRequest(req);
+      if (!planStorage.configured) {
         return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
       }
-      const rootPrefix = await tenantWasabiRootForRequest(req);
+      const { client: planS3, bucket: planBucket, rootPrefix } = planStorage;
       const fileName = cleanString(req.body?.fileName);
       const contentType = cleanString(req.body?.contentType || 'application/octet-stream');
       const fileSize = Number(req.body?.fileSize);
@@ -8160,8 +8172,8 @@ app.post(
           ? reuseKey
           : buildPipesyncPlanPageStorageKey(fileName, rootPrefix);
       const signed = await presignAdminAttachmentPut(
-        wasabiStateClient,
-        WASABI_STATE_BUCKET,
+        planS3,
+        planBucket,
         storageKey,
         contentType,
         ADMIN_ATTACHMENT_UPLOAD_TTL_SECONDS
@@ -8169,8 +8181,8 @@ app.post(
       let viewUrl = null;
       try {
         const getSigned = await presignAdminAttachmentGet(
-          wasabiStateClient,
-          WASABI_STATE_BUCKET,
+          planS3,
+          planBucket,
           storageKey,
           ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
         );
@@ -8193,7 +8205,8 @@ app.post(
   express.json({ limit: '256kb' }),
   async (req, res) => {
     try {
-      if (!adminAttachmentsWasabiConfigured()) {
+      const planStorage = await planViewWasabiForRequest(req);
+      if (!planStorage.configured) {
         return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
       }
       const rawKeys = Array.isArray(req.body?.storageKeys) ? req.body.storageKeys : [];
@@ -8201,7 +8214,7 @@ app.post(
       if (!storageKeys.length) {
         return res.status(400).json({ success: false, error: 'storageKeys must include at least one valid plan page key.' });
       }
-      await deletePipesyncPlanPageKeys(wasabiStateClient, WASABI_STATE_BUCKET, storageKeys);
+      await deletePipesyncPlanPageKeys(planStorage.client, planStorage.bucket, storageKeys);
       return res.json({ success: true, deleted: storageKeys.length });
     } catch (error) {
       console.error('PIPESYNC PLAN VIEW DELETE FILES:', error);
@@ -8218,10 +8231,11 @@ app.post(
   express.json({ limit: '32kb' }),
   async (req, res) => {
     try {
-      if (!adminAttachmentsWasabiConfigured()) {
+      const planStorage = await planViewWasabiForRequest(req);
+      if (!planStorage.configured) {
         return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
       }
-      const rootPrefix = await tenantWasabiRootForRequest(req);
+      const { client: planS3, bucket: planBucket, rootPrefix } = planStorage;
       const storageKey = cleanString(req.body?.storageKey);
       if (!storageKey || !isPersistablePlanPdfStorageKey(storageKey, rootPrefix)) {
         return res.status(400).json({ success: false, error: 'A valid plan page storageKey is required.' });
@@ -8232,8 +8246,8 @@ app.post(
         return res.status(403).json({ success: false, error: 'Forbidden' });
       }
       const { url } = await presignAdminAttachmentGet(
-        wasabiStateClient,
-        WASABI_STATE_BUCKET,
+        planS3,
+        planBucket,
         storageKey,
         ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
       );

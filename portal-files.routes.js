@@ -77,7 +77,7 @@ const DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID =
   String(process.env.DATA_AUTO_SYNC_ADMIN_DEFAULT_JOB_ID || '8').trim() || '8';
 /** Job ids under portal-users that are infra (system-state, sql-mirror) — hide from Folder view picker. */
 const PORTAL_NON_BROWSABLE_JOB_IDS = new Set(
-  String(process.env.PORTAL_NON_BROWSABLE_JOB_IDS || '3')
+  String(process.env.PORTAL_NON_BROWSABLE_JOB_IDS || '3,1,4')
     .split(/[,;\s]+/)
     .map((x) => x.trim())
     .filter(Boolean)
