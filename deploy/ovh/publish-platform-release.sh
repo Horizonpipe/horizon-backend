@@ -75,7 +75,16 @@ if AWS_ACCESS_KEY_ID="${WASABI_ACCESS_KEY_ID}" \
   AWS_DEFAULT_REGION="${WASABI_REGION}" \
     aws s3 cp "s3://${WASABI_BUCKET}/platform/releases/manifest.json" "$MANIFEST_JSON" \
       --endpoint-url "$WASABI_ENDPOINT" 2>/dev/null; then
-  LATEST="$(node -e "const m=require(process.argv[1]); console.log(m.latestPublished||'');" "$MANIFEST_JSON")"
+  LATEST="$(node -e "
+    const fs = require('fs');
+    const zlib = require('zlib');
+    const raw = fs.readFileSync(process.argv[1]);
+    const text = raw.length >= 2 && raw[0] === 0x1f && raw[1] === 0x8b
+      ? zlib.gunzipSync(raw).toString('utf8')
+      : raw.toString('utf8');
+    const m = JSON.parse(text);
+    console.log(m.latestPublished || '');
+  " "$MANIFEST_JSON")"
 else
   LATEST=""
 fi
