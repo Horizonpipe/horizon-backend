@@ -1,12 +1,12 @@
 {
-  "title": "SaaS subscription gate on login; owner perms after purchase",
-  "description": "New pipeshare.net accounts no longer receive PipeShare/PipeSync tool permissions at sign-up. Workspace-owner roles, portal scopes, and tenant Wasabi seeds apply only after Stripe reports an active or trialing subscription on login.\n\nEvery business login syncs subscription status from Stripe (when a customer id exists), refreshes Postgres, then applies or revokes owner privileges. Purchasers without a subscription show subscription expired and Account holder in cPanel until they subscribe and sign in again.\n\nWho is affected: all SaaS cPanel sign-ups and returning purchasers on pipeshare.net.",
+  "title": "Fix SaaS billing API; Customer badge; welcome subscribe page",
+  "description": "Billing and Home failed with loadTenantByOwner is not a function due to a circular import between tenant-provisioning and saas-billing. Fixed by moving subscription constants to a shared module.\n\nSAAS_SKIP_SUBSCRIPTION_CHECK was enabled on OVH, which treated every purchaser as subscribed and showed Workspace owner immediately — disabled for real Stripe gating.\n\nPre-subscribe purchasers now show Customer in the sidebar. Home restores the Buy Subscription button and product bullet showcase when billing API hiccups. Script cache versions bumped on cPanel pages.\n\nWho is affected: pipeshare.net cPanel sign-ups (e.g. new tenant purchasers).",
   "changeLog": [
-    "Sign-up creates tenant draft only — no owner tool permissions until subscribed.",
-    "Login syncs Stripe subscription status every time for tenant purchasers.",
-    "Active/trialing subscription required before workspace-owner roles apply.",
-    "Expired/canceled subscription revokes owner roles on login.",
-    "New tenants default to subscription expired; cPanel shows Account holder pre-subscribe."
+    "Fix loadTenantByOwner circular import breaking /saas/billing/status.",
+    "Disable SAAS_SKIP_SUBSCRIPTION_CHECK on OVH so expired means expired.",
+    "Sidebar shows Customer until subscription activates on login.",
+    "Home welcome page: big Buy button + PipeShare/PipeSync bullet cards restored.",
+    "Bump cPanel script cache versions so nav and badges update after deploy."
   ],
-  "updatedAt": "2026-06-29T04:00:00.000Z"
+  "updatedAt": "2026-06-29T04:30:00.000Z"
 }

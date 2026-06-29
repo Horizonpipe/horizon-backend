@@ -1,6 +1,7 @@
 'use strict';
 
 const { loadTenantByOwner, upsertTenantDraft, serializeTenantRow } = require('./tenant-provisioning.service');
+const { SAAS_INITIAL_SUBSCRIPTION_STATUS } = require('./lib/saas-subscription-constants');
 
 function cleanString(v) {
   return String(v ?? '').trim();
@@ -53,9 +54,6 @@ function mapStripeSubscriptionStatus(stripeStatus) {
   if (s === 'canceled' || s === 'incomplete_expired') return 'canceled';
   return 'pending';
 }
-
-/** Default for new SaaS workspace owners who have never subscribed. */
-const SAAS_INITIAL_SUBSCRIPTION_STATUS = 'expired';
 
 function defaultBusinessNameFromUser(user) {
   const company = cleanString(user?.company);

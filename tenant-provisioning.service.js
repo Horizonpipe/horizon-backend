@@ -13,7 +13,7 @@ const { getSaasWasabiClient, saasWasabiBucket, saasVirtualboxConfigured } = requ
 const { seedTenantAuthSnapshot, upsertTenantOwnerAuthSnapshot } = require('./lib/saas-tenant-auth-store');
 const { applySaasTenantOwnerPrivileges, isHorizonPlatformAdmin } = require('./lib/saas-tenant-owner');
 const { seedTenantAppDataSnapshot } = require('./lib/tenant-wasabi-state');
-const { SAAS_INITIAL_SUBSCRIPTION_STATUS } = require('./saas-billing.service');
+const { SAAS_INITIAL_SUBSCRIPTION_STATUS } = require('./lib/saas-subscription-constants');
 
 function cleanString(v) {
   return String(v ?? '').trim();
