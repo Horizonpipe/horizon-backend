@@ -271,7 +271,7 @@ function createWasabiStateClient() {
   const accessKeyId = String(process.env.WASABI_ACCESS_KEY_ID || process.env.WASABI_ACCESS_KEY || '').trim();
   const secretAccessKey = String(process.env.WASABI_SECRET_ACCESS_KEY || process.env.WASABI_SECRET_KEY || '').trim();
   const region = String(process.env.WASABI_REGION || 'us-east-1').trim();
-  const endpoint = String(process.env.WASABI_ENDPOINT || '').trim();
+  const endpoint = String(process.env.WASABI_ENDPOINT || '').trim().replace(/^http:\/\//i, 'https://');
   if (!accessKeyId || !secretAccessKey) return null;
   return new S3Client({
     region,
@@ -3061,9 +3061,12 @@ async function readPlannerRecordsFromPostgresForUser(user) {
   return result.rows.map(normalizeRecordRow);
 }
 
-async function readRecordsFromWasabiSnapshotForUser(user) {
+async function readRecordsFromWasabiSnapshotForUser(user, req) {
   /** Force S3 read: each Node process caches latest.json; another dyno may have written — stale cache looks like "not saving". */
-  const snapshot = await loadWasabiLatestStateSnapshot(true);
+  const loaded = req
+    ? await loadWasabiStateForRequest(req, true)
+    : { snapshot: await loadWasabiLatestStateSnapshot(true), isTenant: false };
+  const snapshot = loaded.snapshot;
   // Same as record-by-id: do not drop the whole list when snapshot age exceeds threshold — merge with Postgres covers drift.
   if (!snapshot || !snapshot.data) return [];
   const rows = snapshotRows(snapshot, 'planner_records');
@@ -4354,7 +4357,7 @@ async function requireAuth(req, res, next) {
       );
       return res.status(401).json({ success: false, error: 'Authentication required' });
     }
-    req.user = user;
+    req.user = await enrichUserScopesForTenantRequest(user, req);
     req.sessionToken = token;
     return next();
   } catch (error) {
@@ -4526,6 +4529,43 @@ function buildPsrScopeWhere(user, alias = '') {
 
 function denyOutOfScope(res) {
   return res.status(403).json({ success: false, error: 'This account is not permitted for that PSR scope' });
+}
+
+/** SaaS tenant workspace users with planner/data-entry roles may create jobs in their tenant snapshot. */
+function userHasTenantPsrWorkspaceAccess(user) {
+  if (!isTenantBoundUser(user)) return false;
+  return ['psrDataEntry', 'psrPlanner', 'psrViewer'].some((k) => userRoleEnabled(user, k));
+}
+
+function userCanCreatePsrRecord(user, record) {
+  if (userHasGlobalPsrBypass(user)) return true;
+  if (userCanAccessPsrScope(user, record)) return true;
+  if (userHasTenantPsrWorkspaceAccess(user)) return true;
+  return false;
+}
+
+async function enrichUserScopesForTenantRequest(user, req) {
+  if (!user?.id || !req || !isTenantBoundUser(user)) return user;
+  try {
+    const { snapshot } = await loadWasabiStateForRequest({ user, headers: req.headers }, false);
+    if (!snapshot?.data) return user;
+    const uid = String(user.id || '');
+    const tenantScopes = snapshotRows(snapshot, 'user_psr_scopes')
+      .filter((row) => String(row.user_id || '') === uid)
+      .map((row) => ({
+        recordId: cleanString(row.psr_record_id || '') || null,
+        client: String(row.client || ''),
+        city: String(row.city || ''),
+        jobsite: String(row.jobsite || '')
+      }));
+    if (!tenantScopes.length) return user;
+    return {
+      ...user,
+      psrScopes: dedupePsrScopes([...(user.psrScopes || []), ...tenantScopes])
+    };
+  } catch {
+    return user;
+  }
 }
 
 function requireMike(req, res, next) {
@@ -8039,7 +8079,7 @@ app.get('/records', requireAuth, requirePsrViewerAccess, async (req, res) => {
     if (PLANNER_STORE_WASABI_ONLY) {
       let snapshotRecords = [];
       try {
-        snapshotRecords = await readRecordsFromWasabiSnapshotForUser(req.user);
+        snapshotRecords = await readRecordsFromWasabiSnapshotForUser(req.user, req);
       } catch (error) {
         if (WASABI_RECORDS_PRIMARY_STRICT) throw error;
       }
@@ -8056,7 +8096,7 @@ return res.json({ success: true, records: out });
 
     let snapshotRecords = [];
     try {
-      snapshotRecords = await readRecordsFromWasabiSnapshotForUser(req.user);
+      snapshotRecords = await readRecordsFromWasabiSnapshotForUser(req.user, req);
     } catch (error) {
       if (WASABI_RECORDS_PRIMARY_STRICT) throw error;
     }
@@ -8653,9 +8693,9 @@ app.post('/records', requireAuth, requirePsrDataEntryAccess, async (req, res) =>
       },
       systemBranches: { storm: showStorm, sanitary: showSanitary }
     };
-    if (!userCanAccessPsrScope(req.user, record)) return denyOutOfScope(res);
+    if (!userCanCreatePsrRecord(req.user, record)) return denyOutOfScope(res);
 
-    const saved = await createPlannerRecord(record);
+    const saved = await createPlannerRecord(record, req);
     res.status(201).json({ success: true, record: saved });
   } catch (error) {
     console.error('CREATE RECORD ERROR:', error);
@@ -8784,10 +8824,10 @@ async function persistRecord(record) {
   return normalizeRecordRow(ins.rows[0]);
 }
 
-async function createPlannerRecord(record) {
+async function createPlannerRecord(record, req) {
   const id = crypto.randomUUID();
   let createdRow = null;
-  const wasabiWrote = await tryWasabiStateWrite('create-planner-record', async (data) => {
+  const writeMutator = async (data) => {
     const rows = ensureSnapshotTable(data, 'planner_records');
     const now = nowIso();
     createdRow = {
@@ -8804,9 +8844,32 @@ async function createPlannerRecord(record) {
       updated_at: now
     };
     rows.push(createdRow);
-  });
+    const uid = String(req?.user?.id || '').trim();
+    if (uid && isTenantBoundUser(req?.user)) {
+      const scopes = ensureSnapshotTable(data, 'user_psr_scopes');
+      scopes.push({
+        user_id: uid,
+        client: createdRow.client,
+        city: createdRow.city,
+        jobsite: createdRow.jobsite,
+        psr_record_id: id,
+        created_at: now
+      });
+    }
+  };
+  const tenantScope = req ? await resolveTenantWasabiStateScope(pool, req) : null;
+  if (tenantScope || (req && isTenantBoundUser(req?.user))) {
+    await runWasabiStateWriteForRequest(req, 'create-planner-record', writeMutator);
+  } else {
+    const wasabiWrote = await tryWasabiStateWrite('create-planner-record', writeMutator);
+    if (PLANNER_STORE_WASABI_ONLY && !wasabiWrote) {
+      throw new Error(
+        'Planner data is stored only in Wasabi; create failed. Enable WASABI_WRITES_PRIMARY_ENABLED=1 and configure Wasabi bucket keys.'
+      );
+    }
+  }
   if (PLANNER_STORE_WASABI_ONLY) {
-    if (!wasabiWrote || !createdRow) {
+    if (!createdRow) {
       throw new Error(
         'Planner data is stored only in Wasabi; create failed. Enable WASABI_WRITES_PRIMARY_ENABLED=1 and configure Wasabi bucket keys.'
       );

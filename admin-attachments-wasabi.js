@@ -88,13 +88,15 @@ async function presignAdminAttachmentPut(client, bucket, key, contentType, expir
     Key: key,
     ContentType: ct
   });
-  const url = await getSignedUrl(client, cmd, { expiresIn });
+  const rawUrl = await getSignedUrl(client, cmd, { expiresIn });
+  const url = String(rawUrl || '').replace(/^http:\/\//i, 'https://');
   return { url, method: 'PUT', headers: { 'Content-Type': ct }, storageKey: key, expiresIn };
 }
 
 async function presignAdminAttachmentGet(client, bucket, key, expiresIn) {
   const cmd = new GetObjectCommand({ Bucket: bucket, Key: key });
-  const url = await getSignedUrl(client, cmd, { expiresIn });
+  const rawUrl = await getSignedUrl(client, cmd, { expiresIn });
+  const url = String(rawUrl || '').replace(/^http:\/\//i, 'https://');
   return { url, expiresIn };
 }
 

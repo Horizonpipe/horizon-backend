@@ -1,13 +1,12 @@
 {
-  "title": "SaaS tenant data isolation and plan uploads",
-  "description": "SaaS workspaces (e.g. techpipe.pipeshare.net) were reading the base PipeShare Wasabi snapshot, so Jobsite Contacts and other PSR data leaked across tenants. Tenant owners also had is_admin=true which bypassed all scope filters.\n\nEach SaaS tenant now gets its own empty app-data snapshot under Tenants/{slug}/…/system-state/latest.json. Plan view saves, workspace checkpoints, and PDF presign/hydrate use the tenant Wasabi bucket and prefix. Auth snapshots moved to Tenants/{slug}/auth/latest.json so they no longer collide with app data.\n\nWho is affected: SaaS customers on *.pipeshare.net and base pipeshare.live plan uploads.",
+  "title": "SaaS PSR create, HTTPS mixed-content fix, wildcard TLS tooling",
+  "description": "SaaS tenants on *.pipeshare.net could not add new PSR clients/jobsites because scope checks ran before the first record existed, and planner writes still hit the base Wasabi snapshot. Tenant-bound users with planner access can now create jobs in their isolated tenant snapshot; scopes are granted automatically on create.\n\nBrowsers showed \"Not secure\" despite a valid wildcard cert when Wasabi presigned URLs or subresources used http://. Presigned URLs and S3 endpoints are forced to HTTPS; SaaS nginx sends upgrade-insecure-requests.\n\nGoDaddy DNS-01 scripts issue and renew *.pipeshare.net certs for tenant subdomains.\n\nWho is affected: SaaS customers on techpipe.pipeshare.net and future *.pipeshare.net tenants.",
   "changeLog": [
-    "SaaS tenant owners no longer get global PSR admin bypass (is_admin=false).",
-    "Jobsite Contacts and plan view load from per-tenant Wasabi snapshots, not base tables.",
-    "Plan PDF upload/hydrate uses the same bucket as presign (fixes missing files after reload).",
-    "New tenants seed an empty isolated app-data snapshot at provision time.",
-    "Existing tenant owners re-seed on login; auth snapshot path separated from app-data.",
-    "nginx SaaS vhost expects pipeshare.net wildcard cert (see issue-pipeshare-net-wildcard-cert.sh)."
+    "SaaS PSR Add Client / Create jobsite works for tenant workspace owners.",
+    "Planner records and scopes write to per-tenant Wasabi snapshot, not base PipeShare.",
+    "Wasabi presigned GET/PUT URLs forced to HTTPS (fixes mixed-content warnings).",
+    "nginx SaaS vhost: upgrade-insecure-requests CSP header.",
+    "GoDaddy certbot hooks + apply-saas-tenant-nginx-ssl.sh for *.pipeshare.net TLS."
   ],
-  "updatedAt": "2026-06-28T22:00:00.000Z"
+  "updatedAt": "2026-06-29T02:30:00.000Z"
 }
