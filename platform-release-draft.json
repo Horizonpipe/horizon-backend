@@ -1,10 +1,11 @@
 {
-  "title": "Fix SaaS cPanel sign-up verification",
-  "description": "SaaS sign-up on pipeshare.net stored pending verification codes in the Wasabi snapshot. Concurrent snapshot writes from other API workers could overwrite the code before verify ran, producing \"No pending sign-up for this email\" even after a valid email was sent.\n\nPending PINs now live in Postgres (reliable, short-lived). Verify checks Postgres first, then creates the account in Wasabi for SaaS tenants.\n\nWho is affected: anyone signing up for a new pipeshare.net cPanel workspace.",
+  "title": "SaaS cPanel workspace owner vs Horizon admin",
+  "description": "New pipeshare.net sign-ups were labeled \"Horizon admin\" because tenant purchasers received superadmin employee_role, which granted global canAccessAdminPanel and isAdmin on the session.\n\nSaaS workspace owners are now a distinct class: saasTenantOwner/tenantAdmin capabilities, isAdmin false, canAccessAdminPanel false, sidebar shows \"Workspace owner\", and cPanel SaaS navigation (setup/billing/home) works for employee account_type owners.\n\nWho is affected: all new and existing SaaS cPanel accounts on pipeshare.net.",
   "changeLog": [
-    "SaaS sign-up verification codes stored in Postgres, not Wasabi snapshot.",
-    "Verify PIN against Postgres before creating tenant account in Wasabi.",
-    "SaaS owner privileges applied on Wasabi sign-up path (parity with Postgres path)."
+    "SaaS sign-ups show Workspace owner — not Horizon admin.",
+    "canAccessAdminPanel and global superAdmin false for saasTenantOwner.",
+    "cPanel SaaS customer nav works for tenant owners (employee account type).",
+    "Global PSR admin bypass blocked for workspace owners."
   ],
-  "updatedAt": "2026-06-29T03:00:00.000Z"
+  "updatedAt": "2026-06-29T03:30:00.000Z"
 }

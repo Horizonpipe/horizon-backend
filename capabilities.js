@@ -77,6 +77,11 @@ function looksLikeMike(userLike) {
   return MIKE_IDENTIFIERS.has(username) || MIKE_IDENTIFIERS.has(displayName) || MIKE_IDENTIFIERS.has(email);
 }
 
+/** SaaS workspace purchaser — super-admin inside their tenant, not global Horizon admin. */
+function isSaasWorkspaceOwner(user) {
+  return user?.saasTenantOwner === true || user?.isSaasTenantOwner === true;
+}
+
 function inferModelFromLegacy(userLike) {
   const roles = normalizeLegacyRoles(userLike?.roles);
   if (looksLikeMike(userLike)) {
@@ -169,14 +174,16 @@ function legacyRolesForAccountModel(model, legacyRolesInput = null) {
   return { ...out, ...legacy };
 }
 
-/** Global Horizon super-admin. */
+/** Global Horizon super-admin (platform operator — not a SaaS workspace purchaser). */
 function isSuperAdmin(user) {
+  if (isSaasWorkspaceOwner(user)) return false;
   const model = deriveAccountModel(user);
   return model.accountType === ACCOUNT_TYPES.EMPLOYEE && model.employeeRole === EMPLOYEE_ROLES.SUPERADMIN;
 }
 
-/** Horizon admin (includes superadmin). */
+/** Horizon admin (includes superadmin). Excludes SaaS workspace owners. */
 function isAdminUser(user) {
+  if (isSaasWorkspaceOwner(user)) return false;
   const model = deriveAccountModel(user);
   if (model.accountType !== ACCOUNT_TYPES.EMPLOYEE) return false;
   return model.employeeRole === EMPLOYEE_ROLES.ADMIN || model.employeeRole === EMPLOYEE_ROLES.SUPERADMIN;
@@ -189,6 +196,7 @@ function canAccessAdminPanel(user) {
 
 /** PipeShare ACL / path grants / share extras. */
 function canManagePortalExtras(user) {
+  if (isSaasWorkspaceOwner(user)) return true;
   return isAdminUser(user);
 }
 
@@ -210,9 +218,12 @@ function canViewInspectionDiagnostics(user) {
 function resolveCapabilities(user) {
   const model = deriveAccountModel(user || {});
   const roles = legacyRolesForAccountModel(model, user?.roles);
+  const saasOwner = isSaasWorkspaceOwner(user);
   return {
     version: 2,
     superAdmin: isSuperAdmin(user),
+    saasTenantOwner: saasOwner,
+    tenantAdmin: saasOwner,
     canAccessAdminPanel: canAccessAdminPanel(user),
     canManagePortalExtras: canManagePortalExtras(user),
     canViewInspectionDiagnostics: canViewInspectionDiagnostics(user),
@@ -254,6 +265,7 @@ module.exports = {
   canManagePortalExtras,
   canViewInspectionDiagnostics,
   isAdminUser,
+  isSaasWorkspaceOwner,
   looksLikeMike,
   deploymentMode
 };

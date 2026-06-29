@@ -2216,6 +2216,7 @@ function mergeUserPrefsPatch(current, patch) {
 }
 
 function normalizeUser(row, context = {}) {
+  const isSaasOwner = context.saasTenantOwner === true;
   const accountModel = deriveAccountModel({
     accountType: row?.account_type,
     employeeRole: row?.employee_role,
@@ -2226,11 +2227,12 @@ function normalizeUser(row, context = {}) {
     email: row?.email,
     self_signup: row?.self_signup,
     selfSignup: row?.self_signup === true,
-    saasTenantOwner: context.saasTenantOwner === true
+    saasTenantOwner: isSaasOwner
   });
   const legacyRoles = normalizeRoles(row?.roles);
   const canonicalRoles = legacyRolesForAccountModel(accountModel, legacyRoles);
   const canonicalIsAdmin =
+    !isSaasOwner &&
     accountModel.accountType === ACCOUNT_TYPES.EMPLOYEE &&
     (accountModel.employeeRole === EMPLOYEE_ROLES.ADMIN || accountModel.employeeRole === EMPLOYEE_ROLES.SUPERADMIN);
 
@@ -2296,9 +2298,12 @@ function normalizeUser(row, context = {}) {
     title: row.title || undefined,
     phone: row.phone || undefined,
     emailVerified: row.email_verified !== false,
+    saasTenantOwner: isSaasOwner,
     isAdmin: canonicalIsAdmin,
     isSuperAdmin:
-      accountModel.accountType === ACCOUNT_TYPES.EMPLOYEE && accountModel.employeeRole === EMPLOYEE_ROLES.SUPERADMIN,
+      !isSaasOwner &&
+      accountModel.accountType === ACCOUNT_TYPES.EMPLOYEE &&
+      accountModel.employeeRole === EMPLOYEE_ROLES.SUPERADMIN,
     accountType: accountModel.accountType,
     employeeRole: accountModel.employeeRole,
     roles: canonicalRoles,
