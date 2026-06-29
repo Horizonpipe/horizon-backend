@@ -107,7 +107,7 @@ const {
   tenantUserFilterParams,
   resolveActorTenantScope,
   assertUserIdInTenantScope,
-  assertLoginAllowedForTenantHost,
+  assertLoginEnvironmentAccess,
   assertUsernameAvailableForCreate,
   resolveLoginUserRow,
   loadTenantScopeByHost
@@ -7086,9 +7086,9 @@ app.post('/login', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Invalid email or password' });
     }
 
-    const tenantLogin = await assertLoginAllowedForTenantHost(pool, row, requestHost);
-    if (!tenantLogin.allowed) {
-      return res.status(403).json({ success: false, error: tenantLogin.error });
+    const envLogin = await assertLoginEnvironmentAccess(pool, row, requestHost);
+    if (!envLogin.allowed) {
+      return res.status(403).json({ success: false, error: envLogin.error });
     }
 
     const loginContext = cleanString(req.body?.loginContext).toLowerCase();

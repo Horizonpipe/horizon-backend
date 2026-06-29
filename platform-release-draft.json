@@ -1,11 +1,11 @@
 {
-  "title": "Per-tenant usernames — leon can exist in each workspace",
-  "description": "Create user was checking username globally while the Settings list only shows your tenant. A name like leon could exist on the platform or another SaaS box, blocking creation with Username already exists even though it was not visible.\n\nUsernames are now unique per tenant portal scope (tenant-{slug}), not platform-wide. Duplicate checks and login on company subdomains only look inside that virtualbox.\n\nWho is affected: SaaS workspace owners creating employees in Settings.",
+  "title": "Block cross-environment login (BASE vs SaaS tenants)",
+  "description": "Usernames and passwords now only work on their own environment. SaaS company accounts (for example LEON on REDPIPE) cannot sign in on the base PipeShare server (pipeshare.live). Base server accounts cannot sign in on SaaS tenant subdomains. Each SaaS company workspace remains isolated to its own subdomain.\n\nWho is affected: anyone who was accidentally using the wrong sign-in URL; BASE users and SaaS tenant users must use their correct site.",
   "changeLog": [
-    "Replace global username UNIQUE with per-tenant portal scope index.",
-    "Create user checks duplicates only within the signed-in workspace.",
-    "Tenant subdomain login matches users inside that box only.",
-    "Clearer error: Username already exists in your workspace."
+    "BASE login only matches portal-users and legacy base accounts — not tenant-* users.",
+    "Tenant subdomain login rejects base-only portal-users accounts.",
+    "Post-password environment check blocks Wasabi fallback cross-login.",
+    "SaaS cPanel root (pipeshare.net) rejects tenant-bound and base-only accounts."
   ],
-  "updatedAt": "2026-06-29T20:00:00.000Z"
+  "updatedAt": "2026-06-28T12:00:00.000Z"
 }
