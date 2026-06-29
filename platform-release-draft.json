@@ -1,12 +1,11 @@
 {
-  "title": "cPanel nav locked to platform super-admin only",
-  "description": "SaaS cPanel sidebar no longer shows Platform updates, Server, PipeShare, PipeSync, or Account to workspace purchasers or other sign-ins. Only Mike Strickland (PipeShare platform super-admin) sees the full operator menu.\n\nBackend adds platformCpanelSuperAdmin on session capabilities. Frontend filters nav to Home, Billing, and Setup for everyone else. Server and Platform updates pages redirect unauthorized users to Home.\n\nWho is affected: all pipeshare.net cPanel users except platform super-admin. Log out and back in after deploy to refresh session capabilities.",
+  "title": "Fix cPanel Home stuck on Loading your workspace",
+  "description": "Home never rendered the Buy Subscription button because cpanel-access.js threw a ReferenceError on load (SAAS_PIPESHARE_DOMAIN and related constants were exported but never defined). That prevented HPCpanelAccess from initializing, so home.js exited early and left the loading placeholder.\n\nDefined those constants from deployment config. Added a 12s loading timeout fallback on Home if billing API is slow.\n\nWho is affected: pipeshare.net cPanel purchasers (e.g. new sign-ups on expired subscription). Hard refresh after deploy.",
   "changeLog": [
-    "Add platformCpanelSuperAdmin capability for Mike-only cPanel operator nav.",
-    "Hide Platform updates, Server, PipeShare, PipeSync, and Account from SaaS purchasers.",
-    "Guard Server and Platform updates pages against direct URL access.",
-    "Fix role badge so purchasers never show Horizon admin.",
-    "Bump cPanel script cache to 20260629saas2."
+    "Fix cpanel-access.js ReferenceError that blocked Home from rendering.",
+    "Restore Buy Subscription button and PipeShare/PipeSync bullet showcase.",
+    "Home shows subscribe fallback if billing API does not respond in 12 seconds.",
+    "Bump cPanel cache to 20260629saas3."
   ],
-  "updatedAt": "2026-06-29T12:00:00.000Z"
+  "updatedAt": "2026-06-29T14:00:00.000Z"
 }
