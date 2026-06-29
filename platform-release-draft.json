@@ -1,11 +1,11 @@
 {
-  "title": "Remote support poll storm fix (502 / black video)",
-  "description": "Support chat and remote assistance were opening dozens of overlapping fetch requests (messages, active, presence) when the server slowed down, causing 502 errors and black video. All support polls now chain one-at-a-time with in-flight guards; GET requests are deduplicated; fetch times out after 12s. Non-critical polls pause or slow during active remote sessions.\n\nWho is affected: remote help and support chat on pipeshare.live.",
+  "title": "Remote support instant clicks + context menu fix",
+  "description": "Remote assistance clicks were routed only through HTTP polling (~2 second delay). Control input now uses the WebRTC data channel when open, with HTTP as fallback when the channel is down. Context menu items (e.g. Adjust workspace layout) were missed because menus live outside the portal root — targeting and pointer events are fixed.\n\nWho is affected: remote help on pipeshare.live.",
   "changeLog": [
-    "Chained support pollers — no overlapping poll ticks.",
-    "GET request coalescing + 12s fetch timeout in support-api.js.",
-    "Slower chat poll during active remote; skip redundant active-session polls.",
-    "Admin heartbeat no longer hammers /chat/active every 20s during remote."
+    "Admin clicks sent over WebRTC data channel when connected (HTTP fallback only when DC closed).",
+    "Customer applies control events immediately from data channel instead of waiting on poll.",
+    "Context menu items (.cp-ctx-menu__item) included in remote hit-testing.",
+    "Synthetic pointerdown + click sequence matches context menu handlers."
   ],
-  "updatedAt": "2026-06-29T05:00:00.000Z"
+  "updatedAt": "2026-06-29T12:00:00.000Z"
 }
