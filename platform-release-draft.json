@@ -1,12 +1,11 @@
 {
-  "title": "PipeShare DB3 pipe graph and saved workspace layouts",
-  "description": "Remote folder DB3 bindings now follow the same client/job scope as the file explorer, so the pipe graph and inspection data stay aligned when you browse cloud jobs. Changing the selected video or editing a folder DB3 binding reloads inspection instead of showing stale graph data.\n\nWorkspace settings now let you save named panel layouts (quick load dropdown, Save current as, delete) in addition to workspace tabs. Layouts sync to your account on BASE and SaaS PipeShare.\n\nWho is affected: PipeShare users on pipeshare.live (private BASE server) with remote/cloud jobs and custom workspace layouts.",
+  "title": "Plan View PDF highlight zoom alignment",
+  "description": "Highlights and auto-drawn lines on the Plan View PDF continuous viewer now stay in the right place when you zoom in or out. Page height scaling matches the visible PDF area, overlays refresh after the viewer adjusts slot height, and new auto-highlight lines store normalized coordinates plus the zoom level they were drawn at.\n\nWho is affected: PipeSync users on the private BASE server (pipeshare.live) who use Plan View with the PDF map and highlighting tools. SaaS tenants get this when the next platform version is applied in cPanel releases.",
   "changeLog": [
-    "DB3 folder bindings scoped to active remote tree client/job.",
-    "Inspection reloads when video selection or DB3 binding changes.",
-    "Saved layouts section in workspace settings with quick load.",
-    "Save current layout as named preset (up to 12).",
-    "Delete selected saved layout from settings modal."
+    "PDF continuous viewer uses base height for zoomed slot display height.",
+    "Highlight overlays refresh when a page slot height is corrected after render.",
+    "Auto-highlight lines save nrx/nry normalized coords and overlay zoom.",
+    "Reduces highlight drift when changing PDF map zoom in Plan View."
   ],
-  "updatedAt": "2026-06-29T18:00:00.000Z"
+  "updatedAt": "2026-06-29T20:00:00.000Z"
 }
