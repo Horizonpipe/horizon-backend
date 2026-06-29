@@ -6872,15 +6872,13 @@ app.post('/login', async (req, res) => {
     const keepRaw = req.body?.keepSession;
     const keepSession = keepRaw === true || keepRaw === 1 || String(keepRaw || '').trim().toLowerCase() === 'true';
     const token = await issueSession(row.id, { keepSession });
-    const requestHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
-    const deploymentProfile = getPublicDeploymentConfig({ requestHost });
     res.json({
       success: true,
       user,
       token,
       capabilities: resolveCapabilities(user),
-      deploymentMode: deploymentProfile.mode,
-      deploymentProfile
+      deploymentMode: loginProfile.mode,
+      deploymentProfile: loginProfile
     });
   } catch (error) {
     console.error('LOGIN ERROR:', error);
