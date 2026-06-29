@@ -107,7 +107,10 @@ const {
   tenantUserFilterParams,
   resolveActorTenantScope,
   assertUserIdInTenantScope,
-  assertLoginAllowedForTenantHost
+  assertLoginAllowedForTenantHost,
+  assertUsernameAvailableForCreate,
+  resolveLoginUserRow,
+  loadTenantScopeByHost
 } = require('./lib/saas-tenant-scope');
 const {
   mirrorUserToTenantLoginSchema,
@@ -5793,6 +5796,19 @@ async function ensureSchema() {
   ];
   for (const query of userAlters) await pool.query(query);
   await pool.query(`
+    DO $$ BEGIN
+      ALTER TABLE users DROP CONSTRAINT IF EXISTS users_username_key;
+    EXCEPTION WHEN undefined_object THEN NULL;
+    END $$;
+  `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_portal_scope
+    ON users (
+      LOWER(TRIM(username)),
+      COALESCE(NULLIF(BTRIM(portal_files_client_id), ''), '__global__')
+    )
+  `);
+  await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uq
     ON users (LOWER(TRIM(email)))
     WHERE email IS NOT NULL AND BTRIM(email) <> ''
@@ -7025,19 +7041,11 @@ app.post('/login', async (req, res) => {
     let row = null;
     let userRowFromWasabi = false;
     try {
-      const result = await pool.query(
-        `SELECT id, username, display_name, password, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-                email, email_verified, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup, product_tutorials_seen, user_prefs
-         FROM users u
-         WHERE LOWER(TRIM(u.username)) = LOWER(TRIM($1))
-            OR LOWER(TRIM(COALESCE(u.display_name, u.username))) = LOWER(TRIM($1))
-            OR (u.email IS NOT NULL AND BTRIM(u.email) <> '' AND LOWER(TRIM(u.email)) = LOWER(TRIM($1)))
-         LIMIT 1`,
-        [submittedUsername]
-      );
-      row = result.rows[0] || null;
+      row = await resolveLoginUserRow(pool, submittedUsername, requestHost);
     } catch (queryError) {
       if (!WASABI_LOGIN_FALLBACK_ENABLED) throw queryError;
+      const hostScope = await loadTenantScopeByHost(pool, requestHost);
+      if (hostScope.mode === 'tenant') throw queryError;
       row = await readLoginUserFromWasabiSnapshot(submittedUsername, true);
       userRowFromWasabi = !!row;
       if (!row) throw queryError;
@@ -7045,9 +7053,12 @@ app.post('/login', async (req, res) => {
     }
 
     if (!row && WASABI_LOGIN_FALLBACK_ENABLED) {
-      row = await readLoginUserFromWasabiSnapshot(submittedUsername, true);
-      userRowFromWasabi = !!row;
-      if (row) console.warn('[login] using Wasabi user lookup (self-signup user not mirrored in Postgres)');
+      const hostScope = await loadTenantScopeByHost(pool, requestHost);
+      if (hostScope.mode !== 'tenant') {
+        row = await readLoginUserFromWasabiSnapshot(submittedUsername, true);
+        userRowFromWasabi = !!row;
+        if (row) console.warn('[login] using Wasabi user lookup (self-signup user not mirrored in Postgres)');
+      }
     }
 
     if (!row) {
@@ -7580,15 +7591,12 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
   try {
     const hash = await bcrypt.hash(password, 10);
 
-    const dupPg = await pool.query(
-      `SELECT 1 FROM users WHERE LOWER(TRIM(username)) = LOWER(TRIM($1)) LIMIT 1`,
-      [username]
-    );
-    if (dupPg.rows.length) {
-      return res.status(409).json({ success: false, error: 'Username already exists' });
+    const usernameCheck = await assertUsernameAvailableForCreate(pool, username, req.tenantScope);
+    if (!usernameCheck.ok) {
+      return res.status(409).json({ success: false, error: usernameCheck.error });
     }
 
-    if (WASABI_WRITES_PRIMARY_ENABLED) {
+    if (WASABI_WRITES_PRIMARY_ENABLED && req.tenantScope?.mode !== 'tenant') {
       try {
         const snapshot = await loadWasabiLatestStateSnapshot(true);
         const usernameLower = String(username).trim().toLowerCase();
