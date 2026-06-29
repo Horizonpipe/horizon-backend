@@ -1,11 +1,12 @@
 {
-  "title": "Fix cPanel Home stuck on Loading your workspace",
-  "description": "Home never rendered the Buy Subscription button because cpanel-access.js threw a ReferenceError on load (SAAS_PIPESHARE_DOMAIN and related constants were exported but never defined). That prevented HPCpanelAccess from initializing, so home.js exited early and left the loading placeholder.\n\nDefined those constants from deployment config. Added a 12s loading timeout fallback on Home if billing API is slow.\n\nWho is affected: pipeshare.net cPanel purchasers (e.g. new sign-ups on expired subscription). Hard refresh after deploy.",
+  "title": "Fix Setup save; tighten SaaS cPanel nav to Home-only pre-subscribe",
+  "description": "Setup Save was reloading the page because setup-wizard.js had a syntax error (missing brandingState declaration) so the form submit handler never ran.\n\nSaaS purchaser nav is now staged correctly: Home only until subscription is active, then Home + Setup + Billing. Billing and Setup pages redirect to Home without an active license. Stale localStorage session no longer expands the sidebar to operator menus on Billing.\n\nWho is affected: pipeshare.net cPanel sign-ups. Hard refresh after deploy.",
   "changeLog": [
-    "Fix cpanel-access.js ReferenceError that blocked Home from rendering.",
-    "Restore Buy Subscription button and PipeShare/PipeSync bullet showcase.",
-    "Home shows subscribe fallback if billing API does not respond in 12 seconds.",
-    "Bump cPanel cache to 20260629saas3."
+    "Fix setup-wizard.js syntax error breaking Save setup.",
+    "Pre-subscribe sidebar: Home only (Buy Subscription stays on Home).",
+    "After active subscription: Home, Setup, and Billing only.",
+    "Block Billing/Setup URLs without active subscription.",
+    "Stop stale session cache from showing operator nav items."
   ],
-  "updatedAt": "2026-06-29T14:00:00.000Z"
+  "updatedAt": "2026-06-29T16:00:00.000Z"
 }
