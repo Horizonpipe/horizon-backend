@@ -1600,6 +1600,11 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
     poolOption && typeof poolOption.query === 'function'
       ? { query: (text, params) => poolOption.query(text, params) }
       : pool;
+  /** Tenant Wasabi scope reads users + saas_tenant_instances from live Postgres (not Wasabi portal-data adapter). */
+  const tenantContextPool =
+    poolOption && typeof poolOption.query === 'function'
+      ? { query: (text, params) => poolOption.query(text, params) }
+      : pool;
   const PORTAL_SHARE_LINK_TTL_DAYS = clampIntEnv('PORTAL_SHARE_LINK_TTL_DAYS', 7, 1, 90);
   const PORTAL_SHARE_META_MAX_BYTES = clampIntEnv('PORTAL_SHARE_META_MAX_BYTES', 512 * 1024, 8 * 1024, 2 * 1024 * 1024);
   /**
@@ -1769,7 +1774,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
   }
   const r = express.Router();
   r.use(requireAuth);
-  r.use(tenantStorageMiddleware(pool));
+  r.use(tenantStorageMiddleware(tenantContextPool));
   r.use(portalWasabiMiddleware);
   r.use((req, res, next) => {
     if (
@@ -2023,6 +2028,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     poolOption && typeof poolOption.query === 'function'
       ? { query: (text, params) => poolOption.query(text, params) }
       : pool;
+  /** Tenant Wasabi scope reads users + saas_tenant_instances from live Postgres (not Wasabi portal-data adapter). */
+  const tenantContextPool =
+    poolOption && typeof poolOption.query === 'function'
+      ? { query: (text, params) => poolOption.query(text, params) }
+      : pool;
   registerPortalShareLinkRoutes(app, { pool: poolOption, query: dbQuery, requireAuth, requireAdmin });
 
   const baseHost = process.env.HP_PRIVATE_BASE_DOMAIN || 'pipeshare.live';
@@ -2159,7 +2169,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
   const r = express.Router();
   r.use(requireAuth);
-  r.use(tenantStorageMiddleware(pool));
+  r.use(tenantStorageMiddleware(tenantContextPool));
   r.use(portalWasabiMiddleware);
 
   /**

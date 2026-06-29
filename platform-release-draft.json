@@ -7,7 +7,8 @@
     "Platform release Publish/Apply gated by request host on hybrid.",
     "nginx tenant + net hosts back to single :3000 upstream.",
     "HP_DEPLOYMENT_MODE=hybrid default in env template.",
-    "Fix login handler duplicate requestHost (startup crash on hybrid)."
+    "Fix login handler duplicate requestHost (startup crash on hybrid).",
+    "Fix tenant storage middleware using live Postgres (file explorer Wasabi adapter error)."
   ],
   "updatedAt": "2026-06-29T01:00:00.000Z"
 }
