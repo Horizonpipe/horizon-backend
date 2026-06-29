@@ -1,11 +1,12 @@
 {
-  "title": "Remote support instant clicks + context menu fix",
-  "description": "Remote assistance clicks were routed only through HTTP polling (~2 second delay). Control input now uses the WebRTC data channel when open, with HTTP as fallback when the channel is down. Context menu items (e.g. Adjust workspace layout) were missed because menus live outside the portal root — targeting and pointer events are fixed.\n\nWho is affected: remote help on pipeshare.live.",
+  "title": "Remote help works during tab screen share",
+  "description": "While a tab is shared via getDisplayMedia, Chrome blocks native UI like window.prompt and select dropdowns — so theme changes and workspace rename appeared broken until sharing ended. CaptureController keeps focus on the shared tab; rename uses a modal; theme cycles on click during capture. Admin remote control now sends full mouse sequences including double-click.\n\nWho is affected: remote help on pipeshare.live.",
   "changeLog": [
-    "Admin clicks sent over WebRTC data channel when connected (HTTP fallback only when DC closed).",
-    "Customer applies control events immediately from data channel instead of waiting on poll.",
-    "Context menu items (.cp-ctx-menu__item) included in remote hit-testing.",
-    "Synthetic pointerdown + click sequence matches context menu handlers."
+    "CaptureController keeps focus on the shared portal tab after getDisplayMedia.",
+    "Workspace tab rename uses in-app modal instead of window.prompt (blocked during capture).",
+    "Theme picker cycles profiles on click while tab share is active.",
+    "Admin remote sends mousedown/move/up/click/dblclick for drag and double-click actions.",
+    "Support chat header icons fixed; minimized chat shows Support tab pill."
   ],
-  "updatedAt": "2026-06-29T12:00:00.000Z"
+  "updatedAt": "2026-06-29T18:00:00.000Z"
 }
