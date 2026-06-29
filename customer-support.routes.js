@@ -135,17 +135,37 @@ function cleanString(v) {
   return String(v ?? '').trim();
 }
 
+function formatUserDisplayNameFromRow(row) {
+  if (!row || typeof row !== 'object') return 'User';
+  const displayName = cleanString(row.display_name ?? row.displayName);
+  if (displayName) return displayName;
+  const first = cleanString(row.first_name ?? row.firstName);
+  const last = cleanString(row.last_name ?? row.lastName);
+  if (first || last) return `${first} ${last}`.trim();
+  return cleanString(row.username) || cleanString(row.email) || 'User';
+}
+
+function formatUserDisplayNameFromUser(user) {
+  if (!user || typeof user !== 'object') return 'User';
+  const displayName = cleanString(user.displayName ?? user.display_name);
+  if (displayName) return displayName;
+  const first = cleanString(user.firstName ?? user.first_name);
+  const last = cleanString(user.lastName ?? user.last_name);
+  if (first || last) return `${first} ${last}`.trim();
+  return cleanString(user.username) || cleanString(user.email) || 'User';
+}
+
 async function lookupUserDisplayName(pool, userId) {
   const uid = cleanString(userId);
   if (!uid) return 'User';
   try {
     const r = await pool.query(
-      `SELECT display_name, username, email FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
+      `SELECT display_name, username, email, first_name, last_name FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
       [uid]
     );
     const row = r.rows[0];
     if (!row) return 'User';
-    return cleanString(row.display_name) || cleanString(row.username) || cleanString(row.email) || 'User';
+    return formatUserDisplayNameFromRow(row);
   } catch {
     return 'User';
   }
@@ -589,7 +609,7 @@ async function insertChatMessageRow(pool, { sessionId, senderUserId, body, messa
   return ins.rows[0];
 }
 
-function mapChatMessageRow(m) {
+function mapChatMessageRow(m, { senderDisplayName } = {}) {
   let attachment = m.attachment;
   if (typeof attachment === 'string') {
     try {
@@ -598,7 +618,7 @@ function mapChatMessageRow(m) {
       attachment = null;
     }
   }
-  return {
+  const mapped = {
     id: m.id,
     sessionId: m.session_id,
     senderUserId: m.sender_user_id,
@@ -607,6 +627,13 @@ function mapChatMessageRow(m) {
     attachment,
     createdAt: m.created_at
   };
+  if (senderDisplayName) mapped.senderDisplayName = senderDisplayName;
+  return mapped;
+}
+
+async function mapChatMessageRowWithSender(pool, m) {
+  const senderDisplayName = await lookupUserDisplayName(pool, m.sender_user_id);
+  return mapChatMessageRow(m, { senderDisplayName });
 }
 
 async function resolveTenantForUser(pool, user) {
@@ -750,8 +777,7 @@ async function upsertPresence(pool, user, tenantScope, body) {
   }
   lastPresenceWriteMs.set(writeKey, now);
 
-  const displayName =
-    cleanString(user.displayName) || cleanString(user.username) || cleanString(user.email) || 'User';
+  const displayName = formatUserDisplayNameFromUser(user);
 
   const deploymentModel = tenantScope?.deploymentModel === 'non-saas' ? 'non-saas' : 'saas';
 
@@ -1164,8 +1190,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         customerUserId,
         customerTabId,
         adminUserId: adminUserId,
-        adminDisplayName:
-          cleanString(req.user.displayName) || cleanString(req.user.username) || cleanString(req.user.email) || 'Support'
+        adminDisplayName: formatUserDisplayNameFromUser(req.user)
       });
       return res.json({ success: true, sessionId, status: 'pending' });
     } catch (error) {
@@ -1182,6 +1207,18 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         [sessionId, preferredTenantId]
       );
       row = r.rows[0];
+    }
+    if (!row) {
+      const uid = cleanString(user?.id ?? user?.userId);
+      if (uid) {
+        const r = await pool.query(
+          `SELECT * FROM cp_support_chat_sessions
+           WHERE id = $1 AND (customer_user_id = $2 OR admin_user_id = $2)
+           LIMIT 1`,
+          [sessionId, uid]
+        );
+        row = r.rows[0];
+      }
     }
     if (!row && canAccessAdminPanel(user)) {
       const r = await pool.query(`SELECT * FROM cp_support_chat_sessions WHERE id = $1 LIMIT 1`, [sessionId]);
@@ -1223,8 +1260,8 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         status,
         customerUserId: req.user.id,
         adminUserId: row.admin_user_id,
-        customerDisplayName:
-          cleanString(req.user.displayName) || cleanString(req.user.username) || cleanString(req.user.email) || 'Customer'
+        customerDisplayName: formatUserDisplayNameFromUser(req.user),
+        adminDisplayName: await lookupUserDisplayName(pool, row.admin_user_id)
       });
       return res.json({ success: true, sessionId, status });
     } catch (error) {
@@ -1250,6 +1287,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
          FROM cp_support_chat_messages WHERE session_id = $1 ORDER BY created_at ASC`,
         [sessionId]
       );
+      const messages = await Promise.all(msgs.rows.map((m) => mapChatMessageRowWithSender(pool, m)));
       return res.json({
         success: true,
         session: {
@@ -1260,7 +1298,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
           customerDisplayName,
           adminDisplayName
         },
-        messages: msgs.rows.map((m) => mapChatMessageRow(m))
+        messages
       });
     } catch (error) {
       console.error('[saas/support/chat/messages GET]', error);
@@ -1294,13 +1332,14 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         messageType,
         attachment
       });
+      const mapped = await mapChatMessageRowWithSender(pool, message);
       broadcastSupportEvents(row.tenant_id, 'chat-message', {
         sessionId: String(sessionId),
-        message: mapChatMessageRow(message)
+        message: mapped
       });
       return res.json({
         success: true,
-        message: mapChatMessageRow(message)
+        message: mapped
       });
     } catch (error) {
       console.error('[saas/support/chat/messages POST]', error);
@@ -1343,11 +1382,12 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         messageType,
         attachment
       });
+      const mapped = await mapChatMessageRowWithSender(pool, message);
       broadcastSupportEvents(row.tenant_id, 'chat-message', {
         sessionId: String(sessionId),
-        message: mapChatMessageRow(message)
+        message: mapped
       });
-      return res.json({ success: true, message: mapChatMessageRow(message) });
+      return res.json({ success: true, message: mapped });
     } catch (error) {
       console.error('[saas/support/chat/attachment POST]', error);
       return jsonError(res, 500, error.message || 'Server error');
@@ -2357,6 +2397,23 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
           LIMIT 1`;
         const r = await pool.query(sql, params);
         row = r.rows[0];
+      }
+
+      if (!row && uid) {
+        const params = [uid];
+        let sql = `
+          SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
+          FROM cp_support_chat_sessions
+          WHERE customer_user_id = $1 AND status IN ('pending', 'active')`;
+        if (sessionId) {
+          params.push(sessionId);
+          sql += ` AND id = $${params.length}`;
+        }
+        sql += `
+          ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, updated_at DESC
+          LIMIT 1`;
+        const participantHit = await pool.query(sql, params);
+        row = participantHit.rows[0];
       }
 
       if (!row) return res.json({ success: true, session: null });

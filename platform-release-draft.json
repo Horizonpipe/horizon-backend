@@ -1,12 +1,12 @@
 {
-  "title": "Support chat invite delivery fix",
-  "description": "When support staff clicked Start chat, the admin side showed \"Chat invite sent\" but the customer never got the accept popup. The invite was created in the database but the customer browser did not run the incoming-invite path — especially for admin-capable accounts and when the session tenant did not match the customer's presence tenant.\n\nThis update fixes invite delivery: the API returns pending invites to the customer participant first, sessions are stored under the correct tenant from the presence list, and all users poll for incoming chat invites (not only non-admin accounts).\n\nWho is affected: PipeShare support chat on the private OVH server (pipeshare.live). SaaS tenants receive this when the next platform version is applied in cPanel releases.",
+  "title": "Support chat names, stability, and screen share",
+  "description": "Follow-up to the chat invite delivery fix. Three issues were reported after that release: message bubbles showed \"User\" instead of real names, customer chats sometimes closed on their own, and screen sharing / remote help stopped appearing during an active chat.\n\nDisplay names now resolve first and last name from the users table (not just display_name/username). Each chat message includes senderDisplayName from the API. Active chat sync no longer drops the customer UI when the session tenant differs from the heartbeat tenant — it verifies the local session before clearing. Admin-initiated remote connection invites are shown even while a chat is open, and the Remote help toolbar button appears after the customer accepts a chat.\n\nWho is affected: PipeShare support chat and remote assistance on the private OVH server (pipeshare.live). SaaS when the next platform version is applied in cPanel releases.",
   "changeLog": [
-    "Customer browsers poll for pending support chat invites regardless of admin role.",
-    "Chat/active API prioritizes pending sessions where the user is the invited customer.",
-    "Chat start uses the customer's presence tenant so invites reach the right SSE channel.",
-    "Chat respond finds sessions by participant, not only strict tenant middleware scope.",
-    "Admin support UI no longer shows \"invite sent\" when the user is the invitee."
+    "Chat messages show sender first/last name instead of generic \"User\".",
+    "API enriches each message with senderDisplayName; lookup uses first_name and last_name.",
+    "Customer chat no longer auto-closes when session tenant differs from presence tenant.",
+    "Admin remote connection invites surface during an active support chat.",
+    "Remote help button appears after customer accepts a chat invite."
   ],
-  "updatedAt": "2026-06-29T22:00:00.000Z"
+  "updatedAt": "2026-06-29T23:30:00.000Z"
 }
