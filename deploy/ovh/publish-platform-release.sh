@@ -42,8 +42,8 @@ load_publish_env() {
 }
 load_publish_env
 
-if [[ "${HP_DEPLOYMENT_MODE:-non-saas}" != "non-saas" ]]; then
-  echo "[publish] HP_DEPLOYMENT_MODE must be non-saas on this host" >&2
+if [[ "${HP_DEPLOYMENT_MODE:-hybrid}" == "saas" ]]; then
+  echo "[publish] HP_DEPLOYMENT_MODE must be non-saas or hybrid on this host" >&2
   exit 1
 fi
 

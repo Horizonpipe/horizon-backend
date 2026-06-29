@@ -6872,15 +6872,15 @@ app.post('/login', async (req, res) => {
     const keepRaw = req.body?.keepSession;
     const keepSession = keepRaw === true || keepRaw === 1 || String(keepRaw || '').trim().toLowerCase() === 'true';
     const token = await issueSession(row.id, { keepSession });
+    const requestHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
+    const deploymentProfile = getPublicDeploymentConfig({ requestHost });
     res.json({
       success: true,
       user,
       token,
       capabilities: resolveCapabilities(user),
-      deploymentMode: deploymentMode(),
-      deploymentProfile: getPublicDeploymentConfig({
-        requestHost: req.headers['x-forwarded-host'] || req.headers.host
-      })
+      deploymentMode: deploymentProfile.mode,
+      deploymentProfile
     });
   } catch (error) {
     console.error('LOGIN ERROR:', error);
@@ -6889,14 +6889,14 @@ app.post('/login', async (req, res) => {
 });
 
 app.get('/session', requireAuth, async (req, res) => {
+  const requestHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
+  const deploymentProfile = getPublicDeploymentConfig({ requestHost });
   res.json({
     success: true,
     user: req.user,
     capabilities: resolveCapabilities(req.user),
-    deploymentMode: deploymentMode(),
-    deploymentProfile: getPublicDeploymentConfig({
-      requestHost: req.headers['x-forwarded-host'] || req.headers.host
-    })
+    deploymentMode: deploymentProfile.mode,
+    deploymentProfile
   });
 });
 

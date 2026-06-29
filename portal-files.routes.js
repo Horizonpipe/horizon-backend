@@ -12,7 +12,7 @@
  * Folder ZIP: use `GET /folders/zip-manifest` + `POST /presign-batch` + browser zip (bytes: Wasabi → browser only).
  */
 
-const fs = require('fs');
+const { AsyncLocalStorage } = require('async_hooks');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
@@ -593,13 +593,35 @@ function parseJobFromObjectKey(key) {
   return parseJobFromPrefixedObjectKey(key);
 }
 
+const portalWasabiAls = new AsyncLocalStorage();
+
+function requestHostFromReq(req) {
+  return String(req?.headers?.['x-forwarded-host'] || req?.headers?.host || '').trim();
+}
+
+function portalWasabiMiddleware(req, res, next) {
+  req.portalWasabi = resolveStorageBackend(req);
+  portalWasabiAls.run(req, () => next());
+}
+
+function portalWasabiCtx() {
+  const req = portalWasabiAls.getStore();
+  if (req?.portalWasabi) return req.portalWasabi;
+  return resolveStorageBackend(req || { headers: {} });
+}
+
+function portalS3() {
+  return portalWasabiCtx().s3;
+}
+
+function portalBucket() {
+  return portalWasabiCtx().bucket;
+}
+
 function storageRoot(req) {
   return resolveStorageBackend(req).rootPrefix;
 }
 
-function portalWasabi(req) {
-  return resolveStorageBackend(req);
-}
 
 function tenantStorageMiddleware(pool) {
   return async (req, res, next) => {
@@ -1748,6 +1770,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
   const r = express.Router();
   r.use(requireAuth);
   r.use(tenantStorageMiddleware(pool));
+  r.use(portalWasabiMiddleware);
   r.use((req, res, next) => {
     if (
       readPortalMode(req) === DATA_AUTO_SYNC_MODE &&
@@ -2002,11 +2025,14 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       : pool;
   registerPortalShareLinkRoutes(app, { pool: poolOption, query: dbQuery, requireAuth, requireAdmin });
 
-  const processStorage = resolveStorageBackendForProcess();
-  const s3 = processStorage.s3;
-  const bucket = processStorage.bucket;
+  const baseHost = process.env.HP_PRIVATE_BASE_DOMAIN || 'pipeshare.live';
+  const saasHost = process.env.SAAS_PIPESHARE_BASE_DOMAIN || 'pipeshare.net';
+  const baseStorage = resolveStorageBackend({ headers: { host: baseHost } });
+  const saasStorage = resolveStorageBackend({ headers: { host: saasHost } });
+  const storageReady =
+    (baseStorage.s3 && baseStorage.bucket) || (saasStorage.s3 && saasStorage.bucket);
 
-  if (!s3 || !bucket) {
+  if (!storageReady) {
     console.warn(
       '[portal-files] Wasabi not configured — set WASABI_ACCESS_KEY_ID, WASABI_SECRET_ACCESS_KEY, WASABI_BUCKET (and optional WASABI_REGION / WASABI_ENDPOINT)'
     );
@@ -2134,6 +2160,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   const r = express.Router();
   r.use(requireAuth);
   r.use(tenantStorageMiddleware(pool));
+  r.use(portalWasabiMiddleware);
 
   /**
    * Persist client-reported full-object SHA-256 (presigned uploads; trusted like resumable flow).
@@ -2291,15 +2318,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const endpoint = String(process.env.WASABI_ENDPOINT || '').trim() || null;
       const region = String(process.env.WASABI_REGION || '').trim() || 'us-east-1';
       const startedAt = Date.now();
-      const probe = await s3.send(
+      const probe = await portalS3().send(
         new ListObjectsV2Command({
-          Bucket: bucket,
+          Bucket: portalBucket(),
           MaxKeys: 1
         })
       );
       return res.json({
         provider: 'wasabi-s3-compatible',
-        bucket,
+        bucket: portalBucket(),
         endpoint,
         region,
         objectCountSample: Number(probe.KeyCount || 0),
@@ -2308,7 +2335,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      return res.status(500).json({ error: msg, provider: 'wasabi-s3-compatible', bucket });
+      return res.status(500).json({ error: msg, provider: 'wasabi-s3-compatible', bucket: portalBucket() });
     }
   });
 
@@ -2341,7 +2368,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const out = [];
       const maxListFlat =
         permEditorList ? PORTAL_TREE_MAX_OBJECTS : Math.min(PORTAL_TREE_MAX_OBJECTS, PORTAL_TREE_MAX_OBJECTS_ROOT);
-      const { keys: keysFlat, truncated: truncatedFlat } = await listAllKeysCapped(s3, bucket, prefix, maxListFlat);
+      const { keys: keysFlat, truncated: truncatedFlat } = await listAllKeysCapped(portalS3(), portalBucket(), prefix, maxListFlat);
       if (truncatedFlat) {
         return res.status(413).json({
           error: 'File catalog exceeds the configured maximum object count for this request',
@@ -2404,7 +2431,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         permEditorTree || hasPathScope
           ? PORTAL_TREE_MAX_OBJECTS
           : Math.min(PORTAL_TREE_MAX_OBJECTS, PORTAL_TREE_MAX_OBJECTS_ROOT);
-      const { keys, truncated: listingTruncated } = await listAllKeysCapped(s3, bucket, listPrefix, maxList);
+      const { keys, truncated: listingTruncated } = await listAllKeysCapped(portalS3(), portalBucket(), listPrefix, maxList);
       if (listingTruncated) {
         return res.status(413).json({
           error: 'File catalog for this folder exceeds the configured maximum object count',
@@ -2618,7 +2645,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         const canViewDb3 = await assertPortalPathRel(aclPool, req.user, storageClientId, storageJobId, relPath, 'view');
         if (!canViewDb3) return res.status(403).json({ error: 'Forbidden' });
         try {
-          await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+          await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: key }));
         } catch (he) {
           const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
           if (hn === 'NotFound' || hn === 'NoSuchKey' || he?.$metadata?.httpStatusCode === 404) {
@@ -2711,7 +2738,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
       const headOne = async (w) => {
         try {
-          const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: w.key }));
+          const head = await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: w.key }));
           const cl = Number(head.ContentLength ?? 0);
           if (Number.isFinite(w.expected) && w.expected >= 0 && cl !== w.expected) {
             return { kind: 'mismatch', pathRel: w.pathRel, expectedSize: w.expected, actualSize: cl };
@@ -2929,7 +2956,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const probePrefix = jobPrefix(clientId, '__hp_jobs_probe__', storageRoot(req));
       const prefix = probePrefix.replace(/__hp_jobs_probe__\/$/, '');
-      const set = await listJobIdsUnderClientJobsPrefix(s3, bucket, prefix);
+      const set = await listJobIdsUnderClientJobsPrefix(portalS3(), portalBucket(), prefix);
       const scoped = Array.isArray(req.user?.portalScopes) ? req.user.portalScopes : [];
       for (const s of scoped) {
         if (String(s?.clientId || '').trim() !== clientId) continue;
@@ -3100,7 +3127,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
         if (rel) listPrefix = `${prefix}${rel}/`;
       }
-      const keys = await listAllKeys(s3, bucket, listPrefix);
+      const keys = await listAllKeys(portalS3(), portalBucket(), listPrefix);
       const full = buildTreeFromKeys(prefix, keys);
       const filtered = filterTreeForSharePayload(full, payload);
       await mergeCompletedUploadSha256IntoTree(String(row.client_id), String(row.job_id), filtered);
@@ -3170,7 +3197,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const auth = await shareViewAuthObjectKey(req, req.params.token, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       try {
-        await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: auth.Key }));
+        await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: auth.Key }));
       } catch (he) {
         const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
         if (hn === 'NotFound' || hn === 'NoSuchKey' || he?.$metadata?.httpStatusCode === 404) {
@@ -3178,7 +3205,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
         throw he;
       }
-      const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: auth.Key }), {
+      const url = await getSignedUrl(portalS3(), new GetObjectCommand({ Bucket: portalBucket(), Key: auth.Key }), {
         expiresIn: PORTAL_PRESIGN_TTL_SECONDS
       });
       return res.json({ url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
@@ -3212,21 +3239,21 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const markerKey = rel ? `${pref}${rel}/${FOLDER_MARKER}` : `${pref}${FOLDER_MARKER}`;
 
       const probeP = `${pref}${rel}`;
-      const under = await listAllKeys(s3, bucket, `${probeP}/`);
+      const under = await listAllKeys(portalS3(), portalBucket(), `${probeP}/`);
       if (under.length > 0) {
         return res.status(409).json({ error: 'A file or folder already exists at this path' });
       }
       try {
-        await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: probeP }));
+        await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: probeP }));
         return res.status(409).json({ error: 'A file or folder already exists at this path' });
       } catch (he) {
         const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
         if (hn !== 'NotFound' && he?.$metadata?.httpStatusCode !== 404) throw he;
       }
 
-      await s3.send(
+      await portalS3().send(
         new PutObjectCommand({
-          Bucket: bucket,
+          Bucket: portalBucket(),
           Key: markerKey,
           Body: Buffer.from('', 'utf8'),
           ContentType: 'application/octet-stream'
@@ -3281,7 +3308,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           return res.status(403).json({ error: 'Forbidden' });
         }
         try {
-          await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: newKey }));
+          await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: newKey }));
           return res.status(409).json({ error: 'Destination already exists' });
         } catch (he) {
           const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
@@ -3289,15 +3316,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
             throw he;
           }
         }
-        await s3.send(
+        await portalS3().send(
           new CopyObjectCommand({
-            Bucket: bucket,
+            Bucket: portalBucket(),
             Key: newKey,
-            CopySource: copySourceHeader(bucket, oldKey),
+            CopySource: copySourceHeader(portalBucket(), oldKey),
             MetadataDirective: 'COPY'
           })
         );
-        await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: oldKey }));
+        await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: oldKey }));
         await remapPortalPathGrantPrefixes(aclPool, clientId, jobId, oldRel, newRel);
         return res.json({ id: keyToId(newKey), key: newKey, path: newRel, name: sanitized });
       }
@@ -3323,12 +3350,12 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
 
         const oldPrefix = `${pref}${oldFolderRel}/`;
         const listStartedAt = Date.now();
-        const keys = await listAllKeys(s3, bucket, oldPrefix);
+        const keys = await listAllKeys(portalS3(), portalBucket(), oldPrefix);
         if (keys.length === 0) {
           return res.status(404).json({ error: 'Folder not found' });
         }
 
-        const destProbe = await listAllKeys(s3, bucket, `${pref}${newRel}`);
+        const destProbe = await listAllKeys(portalS3(), portalBucket(), `${pref}${newRel}`);
         const destTaken = destProbe.some(
           (o) => o.Key === `${pref}${newRel}` || o.Key.startsWith(`${pref}${newRel}/`)
         );
@@ -3343,11 +3370,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }));
         const copyStartedAt = Date.now();
         const copyErrors = await runPoolCollectErrors(mapping, PORTAL_FOLDER_COPY_CONCURRENCY, async ({ from, to }) => {
-          await s3.send(
+          await portalS3().send(
             new CopyObjectCommand({
-              Bucket: bucket,
+              Bucket: portalBucket(),
               Key: to,
-              CopySource: copySourceHeader(bucket, from),
+              CopySource: copySourceHeader(portalBucket(), from),
               MetadataDirective: 'COPY'
             })
           );
@@ -3369,7 +3396,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           mapping,
           PORTAL_FOLDER_DELETE_CONCURRENCY,
           async ({ from }) => {
-            await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: from }));
+            await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: from }));
           }
         );
         if (deleteErrors.length > 0) {
@@ -3466,21 +3493,21 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           return res.json({ id: keyToId(newKey), key: newKey, path: newRel });
         }
         try {
-          await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: newKey }));
+          await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: newKey }));
           return res.status(409).json({ error: 'Destination already exists' });
         } catch (he) {
           const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
           if (hn !== 'NotFound' && he?.$metadata?.httpStatusCode !== 404) throw he;
         }
-        await s3.send(
+        await portalS3().send(
           new CopyObjectCommand({
-            Bucket: bucket,
+            Bucket: portalBucket(),
             Key: newKey,
-            CopySource: copySourceHeader(bucket, oldKey),
+            CopySource: copySourceHeader(portalBucket(), oldKey),
             MetadataDirective: 'COPY'
           })
         );
-        await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: oldKey }));
+        await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: oldKey }));
         if (crossScope) {
           await removePortalPathGrantPrefixes(aclPool, clientId, jobId, oldRel);
         } else {
@@ -3515,11 +3542,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
         const oldPrefix = `${pref}${oldFolderRel}/`;
         const listStartedAt = Date.now();
-        const keys = await listAllKeys(s3, bucket, oldPrefix);
+        const keys = await listAllKeys(portalS3(), portalBucket(), oldPrefix);
         if (keys.length === 0) {
           return res.status(404).json({ error: 'Folder not found' });
         }
-        const destProbe = await listAllKeys(s3, bucket, `${targetPref}${newRel}`);
+        const destProbe = await listAllKeys(portalS3(), portalBucket(), `${targetPref}${newRel}`);
         const destTaken = destProbe.some(
           (o) => o.Key === `${targetPref}${newRel}` || o.Key.startsWith(`${targetPref}${newRel}/`)
         );
@@ -3533,11 +3560,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }));
         const copyStartedAt = Date.now();
         const copyErrors = await runPoolCollectErrors(mapping, PORTAL_FOLDER_COPY_CONCURRENCY, async ({ from, to }) => {
-          await s3.send(
+          await portalS3().send(
             new CopyObjectCommand({
-              Bucket: bucket,
+              Bucket: portalBucket(),
               Key: to,
-              CopySource: copySourceHeader(bucket, from),
+              CopySource: copySourceHeader(portalBucket(), from),
               MetadataDirective: 'COPY'
             })
           );
@@ -3561,7 +3588,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           mapping,
           PORTAL_FOLDER_DELETE_CONCURRENCY,
           async ({ from }) => {
-            await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: from }));
+            await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: from }));
           }
         );
         if (deleteErrors.length > 0) {
@@ -3643,13 +3670,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       });
       const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const prefix = `${pref}${folderRel}/`;
-      const keys = await listAllKeys(s3, bucket, prefix);
+      const keys = await listAllKeys(portalS3(), portalBucket(), prefix);
       const markerKey = `${pref}${folderRel}/${FOLDER_MARKER}`;
       const toDelete = new Set(keys.map((k) => k.Key));
       toDelete.add(markerKey);
       for (const Key of toDelete) {
         try {
-          await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key }));
+          await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key }));
         } catch (err) {
           if (err && err.name !== 'NoSuchKey') throw err;
         }
@@ -3733,10 +3760,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         body.contentType != null && String(body.contentType).trim() !== ''
           ? String(body.contentType).trim().slice(0, 256)
           : 'application/octet-stream';
-      const url = await getSignedUrl(
-        s3,
+      const url = await getSignedUrl(portalS3(),
         new PutObjectCommand({
-          Bucket: bucket,
+          Bucket: portalBucket(),
           Key: built.key,
           ContentType: ct
         }),
@@ -3784,9 +3810,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           ? String(body.contentType).trim().slice(0, 256)
           : 'application/octet-stream';
       const { partSize, partCount } = multipartUploadLayoutHorizon(fileSize);
-      const created = await s3.send(
+      const created = await portalS3().send(
         new CreateMultipartUploadCommand({
-          Bucket: bucket,
+          Bucket: portalBucket(),
           Key: built.key,
           ContentType: ct
         })
@@ -3846,10 +3872,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (nums.length === 0) return res.status(400).json({ error: 'No valid part numbers' });
       const parts = [];
       for (const pn of nums) {
-        const url = await getSignedUrl(
-          s3,
+        const url = await getSignedUrl(portalS3(),
           new UploadPartCommand({
-            Bucket: bucket,
+            Bucket: portalBucket(),
             Key: key,
             UploadId: uid,
             PartNumber: pn
@@ -3895,16 +3920,16 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'Each part must include partNumber and etag' });
       }
       try {
-        await s3.send(
+        await portalS3().send(
           new CompleteMultipartUploadCommand({
-            Bucket: bucket,
+            Bucket: portalBucket(),
             Key: key,
             UploadId: uid,
             MultipartUpload: { Parts: s3Parts }
           })
         );
       } catch (completeErr) {
-        const headProbe = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key })).catch(() => null);
+        const headProbe = await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: key })).catch(() => null);
         const len = headProbe ? Number(headProbe.ContentLength || 0) : 0;
         if (!headProbe || !Number.isFinite(len) || len <= 0) {
           throw completeErr;
@@ -3928,7 +3953,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         size = clientSize;
       } else {
         try {
-          const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+          const head = await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: key }));
           size = Number(head.ContentLength || 0);
         } catch {
           /* ignore */
@@ -3994,7 +4019,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!parsed || !(await assertWritablePresignPath(req, parsed.clientId, parsed.jobId, key))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
-      await s3.send(new AbortMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uid }));
+      await portalS3().send(new AbortMultipartUploadCommand({ Bucket: portalBucket(), Key: key, UploadId: uid }));
       return res.status(204).end();
     } catch {
       return res.status(204).end();
@@ -4036,10 +4061,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (expBytes <= 0) {
         return res.status(400).json({ error: 'Invalid part number for this session' });
       }
-      const url = await getSignedUrl(
-        s3,
+      const url = await getSignedUrl(portalS3(),
         new UploadPartCommand({
-          Bucket: bucket,
+          Bucket: portalBucket(),
           Key: sessionRow.object_key,
           UploadId: sessionRow.multipart_upload_id,
           PartNumber: partNumber
@@ -4156,7 +4180,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         fs.unlink(f.path, () => {});
         return res.status(403).json({ error: 'Forbidden for this path' });
       }
-      await s3UploadFromTempPath(s3, bucket, Key, f.path, f.mimetype || 'application/octet-stream');
+      await s3UploadFromTempPath(portalS3(), portalBucket(), Key, f.path, f.mimetype || 'application/octet-stream');
       return res.status(201).json({
         id: keyToId(Key),
         key: Key,
@@ -4257,7 +4281,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           };
           return;
         }
-        await s3UploadFromTempPath(s3, bucket, Key, f.path, f.mimetype || 'application/octet-stream');
+        await s3UploadFromTempPath(portalS3(), portalBucket(), Key, f.path, f.mimetype || 'application/octet-stream');
         okSlot[idx] = {
           id: keyToId(Key),
           key: Key,
@@ -4409,9 +4433,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
 
       const effectiveChunkSize = resumableChunkSize(chunkSize);
-      const start = await s3.send(
+      const start = await portalS3().send(
         new CreateMultipartUploadCommand({
-          Bucket: bucket,
+          Bucket: portalBucket(),
           Key: key,
           ContentType: String(mimeType || '').trim() || 'application/octet-stream'
         })
@@ -4507,9 +4531,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(409).json({ error: 'Chunk hash mismatch', expected: chunkSha256, actual: actualChunkSha256 });
       }
 
-      const partResp = await s3.send(
+      const partResp = await portalS3().send(
         new UploadPartCommand({
-          Bucket: bucket,
+          Bucket: portalBucket(),
           Key: sessionRow.object_key,
           UploadId: sessionRow.multipart_upload_id,
           PartNumber: partNumber,
@@ -4596,9 +4620,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
         use.push({ ETag: String(p.etag), PartNumber: i });
       }
-      await s3.send(
+      await portalS3().send(
         new CompleteMultipartUploadCommand({
-          Bucket: bucket,
+          Bucket: portalBucket(),
           Key: sessionRow.object_key,
           UploadId: sessionRow.multipart_upload_id,
           MultipartUpload: { Parts: use }
@@ -4606,14 +4630,14 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       );
       let actualFileSha256 = expectedFileSha256;
       if (PORTAL_RESUMABLE_COMPLETE_STREAM_VERIFY) {
-        const finalObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+        const finalObj = await portalS3().send(new GetObjectCommand({ Bucket: portalBucket(), Key: sessionRow.object_key }));
         if (!finalObj.Body || typeof finalObj.Body.pipe !== 'function') {
           throw new Error('Missing completed object body for hash verification');
         }
         actualFileSha256 = normalizeSha256Hex(await sha256HexForReadable(finalObj.Body));
         if (actualFileSha256 !== expectedFileSha256) {
           try {
-            await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+            await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: sessionRow.object_key }));
           } catch (_) {
             /* ignore delete failure after hash mismatch */
           }
@@ -4635,11 +4659,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           throw new Error('Invalid session file_size for finalize');
         }
         if (!PORTAL_RESUMABLE_COMPLETE_SKIP_HEAD_VERIFY) {
-          const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+          const head = await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: sessionRow.object_key }));
           const contentLen = Number(head.ContentLength);
           if (!Number.isFinite(contentLen) || contentLen !== expectedSize) {
             try {
-              await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: sessionRow.object_key }));
+              await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: sessionRow.object_key }));
             } catch (_) {
               /* ignore */
             }
@@ -4692,9 +4716,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       if (isUploadSessionOpen(sessionRow)) {
         try {
-          await s3.send(
+          await portalS3().send(
             new AbortMultipartUploadCommand({
-              Bucket: bucket,
+              Bucket: portalBucket(),
               Key: sessionRow.object_key,
               UploadId: sessionRow.multipart_upload_id
             })
@@ -4784,7 +4808,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   }
 
   function invalidatePortalDlCachesForFile(fileId, objectKey) {
-    portalDlObjectMetaCache.delete(`${bucket}::${objectKey}`);
+    portalDlObjectMetaCache.delete(`${portalBucket()}::${objectKey}`);
     const suffix = `::${fileId}`;
     for (const key of portalDlAuthCache.keys()) {
       if (key.endsWith(suffix)) portalDlAuthCache.delete(key);
@@ -4792,11 +4816,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   }
 
   async function resolvePortalDownloadObjectMeta(objectKey) {
-    const mk = `${bucket}::${objectKey}`;
+    const mk = `${portalBucket()}::${objectKey}`;
     const now = Date.now();
     const hit = portalDlObjectMetaCache.get(mk);
     if (hit && hit.exp > now) return hit;
-    const meta = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: objectKey }));
+    const meta = await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: objectKey }));
     const total = Number(meta.ContentLength);
     if (!Number.isFinite(total) || total < 0) {
       throw new Error('Missing object size');
@@ -4892,9 +4916,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
               'Too many simultaneous video/download requests from this connection. Wait a second or avoid rapid scrubbing.'
           });
       }
-      const obj = await s3.send(
+      const obj = await portalS3().send(
         new GetObjectCommand({
-          Bucket: bucket,
+          Bucket: portalBucket(),
           Key,
           Range: `bytes=${pr.start}-${pr.end}`
         })
@@ -4922,7 +4946,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         });
     }
 
-    const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key }));
+    const obj = await portalS3().send(new GetObjectCommand({ Bucket: portalBucket(), Key }));
     if (obj.ContentLength != null) {
       res.setHeader('Content-Length', String(obj.ContentLength));
     }
@@ -5006,7 +5030,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     try {
       const auth = await portalAuthDownloadKey(req, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
-      const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: auth.Key }));
+      const head = await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: auth.Key }));
       res.set('Cache-Control', 'private, max-age=120');
       return res.json({
         size: Number(head.ContentLength || 0),
@@ -5032,7 +5056,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const auth = await portalAuthDownloadKey(req, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       try {
-        await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: auth.Key }));
+        await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: auth.Key }));
       } catch (he) {
         const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
         if (hn === 'NotFound' || hn === 'NoSuchKey' || he?.$metadata?.httpStatusCode === 404) {
@@ -5040,7 +5064,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
         throw he;
       }
-      const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: auth.Key }), {
+      const url = await getSignedUrl(portalS3(), new GetObjectCommand({ Bucket: portalBucket(), Key: auth.Key }), {
         expiresIn: PORTAL_PRESIGN_TTL_SECONDS
       });
       res.set('Cache-Control', 'private, max-age=300');
@@ -5098,9 +5122,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       let totalBytes = 0;
       let pageToken;
       do {
-        const resp = await s3.send(
+        const resp = await portalS3().send(
           new ListObjectsV2Command({
-            Bucket: bucket,
+            Bucket: portalBucket(),
             Prefix: prefix,
             ContinuationToken: pageToken,
             MaxKeys: 1000
@@ -5193,7 +5217,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
             });
             continue;
           }
-          const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: auth.Key }), {
+          const url = await getSignedUrl(portalS3(), new GetObjectCommand({ Bucket: portalBucket(), Key: auth.Key }), {
             expiresIn: PORTAL_PRESIGN_TTL_SECONDS
           });
           items.push({ id: fileId, url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
@@ -5256,7 +5280,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       await recordPortalTrashDelete(aclPool, req.user, parsed.clientId, parsed.jobId, 'file', relPathDel, req.params.id, {
         name: path.basename(Key)
       });
-      await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key }));
+      await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key }));
       invalidatePortalDlCachesForFile(req.params.id, Key);
       return res.status(204).send();
     } catch (e) {
@@ -5268,6 +5292,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   app.use('/api/files', r);
 
   const guest = express.Router();
+  guest.use(portalWasabiMiddleware);
 
   async function loadGuestShareRow(tkn) {
     const q = await aclPool.query(
@@ -5430,7 +5455,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const auth = await guestShareAuthObjectKey(req, req.params.token, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       try {
-        await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: auth.Key }));
+        await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: auth.Key }));
       } catch (he) {
         const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
         if (hn === 'NotFound' || hn === 'NoSuchKey' || he?.$metadata?.httpStatusCode === 404) {
@@ -5438,7 +5463,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
         throw he;
       }
-      const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: auth.Key }), {
+      const url = await getSignedUrl(portalS3(), new GetObjectCommand({ Bucket: portalBucket(), Key: auth.Key }), {
         expiresIn: PORTAL_PRESIGN_TTL_SECONDS
       });
       return res.json({ url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
@@ -5498,7 +5523,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
         if (rel) listPrefix = `${prefix}${rel}/`;
       }
-      const keys = await listAllKeys(s3, bucket, listPrefix);
+      const keys = await listAllKeys(portalS3(), portalBucket(), listPrefix);
       const full = buildTreeFromKeys(prefix, keys);
       const filtered = filterTreeForSharePayload(full, payload);
       await mergeCompletedUploadSha256IntoTree(String(row.client_id), String(row.job_id), filtered);
@@ -5559,7 +5584,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   });
 
   app.use('/api/guest', guest);
-  console.log('[portal-files] /api/files + /api/guest mounted (Wasabi bucket:', bucket + ')');
+  console.log(
+    '[portal-files] /api/files + /api/guest mounted (hybrid Wasabi: base + SaaS buckets via request host)'
+  );
 }
 
 module.exports = { registerPortalFilesRoutes };

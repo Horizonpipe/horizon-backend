@@ -1,12 +1,12 @@
 {
-  "title": "Base + SaaS dual deployment profile and storage abstraction",
-  "description": "PipeShare now runs from one codebase with a shared deploymentProfile (feature flags, storage layout, tenant host detection) on both Mike's private base and the subscription SaaS platform.\n\nAdded resolveStorageBackend for portal Wasabi access, migrated login/signup/inspection/cPanel branches off scattered hostname checks, auto subscription gate on tenant subdomain customer login, and OVH dual-PM2 templates (Base :3000, SaaS :3001).\n\nDeploy dual backend: copy env.base + env.saas templates, run deploy/ovh/setup-dual-backend.sh, reload nginx.\n\nWho is affected: OVH operators; SaaS tenants unchanged except customer login gate on unpaid subscriptions.",
+  "title": "Hybrid single backend — host picks Base vs SaaS mode",
+  "description": "One PM2 process on port 3000 now serves both pipeshare.live (Base) and pipeshare.net + tenant subdomains (SaaS). resolveDeploymentProfile derives mode from the Host header; portal-files uses per-request Wasabi bucket selection.\n\nSet HP_DEPLOYMENT_MODE=hybrid on OVH. nginx routes all hostnames to :3000. Publish from pipeshare.live cPanel; Apply from pipeshare.net cPanel.\n\nWho is affected: OVH operators; no tenant data migration required.",
   "changeLog": [
-    "lib/deployment-profile.js + /public/deployment-bootstrap.js for browsers.",
-    "lib/portal-storage-backend.js — unified Wasabi bucket/client selection.",
-    "Login subscription gate on tenant hosts for customer accounts.",
-    "Frontend: deployment-profile.js replaces scattered mode/host checks.",
-    "OVH: ecosystem.dual.config.cjs, nginx Base 3000 / SaaS 3001."
+    "Host-derived mode: pipeshare.live=non-saas, pipeshare.net=saas.",
+    "portal-files per-request Wasabi via AsyncLocalStorage + portalS3().",
+    "Platform release Publish/Apply gated by request host on hybrid.",
+    "nginx tenant + net hosts back to single :3000 upstream.",
+    "HP_DEPLOYMENT_MODE=hybrid default in env template."
   ],
-  "updatedAt": "2026-06-28T18:00:00.000Z"
+  "updatedAt": "2026-06-29T01:00:00.000Z"
 }

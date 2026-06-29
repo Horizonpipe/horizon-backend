@@ -1,15 +1,26 @@
 'use strict';
 
+const { resolveDeploymentProfile } = require('./lib/deployment-profile');
 const {
   getPlatformReleaseStatus,
   listPlatformReleases,
   registerNonSaasHeartbeat,
   publishPlatformRelease,
   applyPlatformRelease,
-  previewNextRelease,
-  isNonSaasDeployment,
-  isSaasDeployment
+  previewNextRelease
 } = require('./platform-release.service');
+
+function requestHostFromReq(req) {
+  return String(req?.headers?.['x-forwarded-host'] || req?.headers?.host || '').trim();
+}
+
+function isNonSaasRequest(req) {
+  return resolveDeploymentProfile({ requestHost: requestHostFromReq(req) }).isPrivateBase;
+}
+
+function isSaasRequest(req) {
+  return resolveDeploymentProfile({ requestHost: requestHostFromReq(req) }).isSaasPlatform;
+}
 
 function cleanString(v) {
   return String(v ?? '').trim();
@@ -55,8 +66,9 @@ function registerPlatformReleaseRoutes(app, { pool, requireAuth, requireAdmin, w
       return res.json({
         success: true,
         ...status,
-        canPublish: isNonSaasDeployment(),
-        canApply: isSaasDeployment()
+        canPublish: isNonSaasRequest(req),
+        canApply: isSaasRequest(req),
+        deploymentProfile: resolveDeploymentProfile({ requestHost: requestHostFromReq(req) })
       });
     } catch (error) {
       console.error('[saas/platform/releases/status]', error);
@@ -82,7 +94,7 @@ function registerPlatformReleaseRoutes(app, { pool, requireAuth, requireAdmin, w
   app.post('/saas/platform/releases/publish', requireAuth, requireAdmin, async (req, res) => {
     try {
       if (!wasabiReady(res)) return;
-      if (!isNonSaasDeployment()) {
+      if (!isNonSaasRequest(req)) {
         return jsonError(
           res,
           403,
@@ -132,7 +144,7 @@ function registerPlatformReleaseRoutes(app, { pool, requireAuth, requireAdmin, w
   app.post('/saas/platform/releases/apply', requireAuth, requireAdmin, async (req, res) => {
     try {
       if (!wasabiReady(res)) return;
-      if (!isSaasDeployment()) {
+      if (!isSaasRequest(req)) {
         return jsonError(
           res,
           403,

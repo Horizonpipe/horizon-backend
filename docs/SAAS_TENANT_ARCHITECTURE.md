@@ -215,15 +215,18 @@ Frontend: `client-portal/scripts/services/deployment-profile.js` — use **`depl
 
 Tenant **dynamic data** (URLs, branding, bucket prefix, auth snapshot) lives in Postgres + Wasabi under `saas_tenant_instances` — platform releases only swap **code/static**, not customer data.
 
-### Ops: two processes, never flip mode in production
+### Ops: single hybrid backend (recommended) or dual PM2 (optional)
 
-| PM2 name | Port | Env file | Mode | nginx hosts |
-|----------|------|----------|------|-------------|
-| `horizon-backend-base` | 3000 | `.env.base` | `non-saas` | `pipeshare.live` |
-| `horizon-backend-saas` | 3001 | `.env.saas` | `saas` | `pipeshare.net`, `*.pipeshare.net` |
+**Recommended:** one PM2 app on port **3000**, `HP_DEPLOYMENT_MODE=hybrid`. nginx sends **both** `pipeshare.live` and `pipeshare.net` (+ tenant subdomains) to the same upstream. Mode is derived per request from hostname:
 
-Templates: `deploy/ovh/ecosystem.dual.config.cjs`, `env.base.production.template`, `env.saas.production.template`.  
-Setup: `sudo bash deploy/ovh/setup-dual-backend.sh`
+| Host | Mode |
+|------|------|
+| `pipeshare.live` | `non-saas` (Base) |
+| `pipeshare.net`, `*.pipeshare.net` | `saas` |
+
+Publish from cPanel on **pipeshare.live**; Apply on **pipeshare.net** — same Node process, different host profile.
+
+**Optional:** two PM2 apps (`.env.base` / `.env.saas`, ports 3000/3001) — see `deploy/ovh/ecosystem.dual.config.cjs`.
 
 Do not `sed` flip `HP_DEPLOYMENT_MODE` on a shared `.env` in production.
 
