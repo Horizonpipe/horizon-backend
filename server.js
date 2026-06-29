@@ -46,7 +46,9 @@ const {
   canAccessAdminPanel,
   canManagePortalExtras,
   isAdminUser,
-  looksLikeMike
+  looksLikeMike,
+  resolveHostingTier,
+  HOSTING_TIERS
 } = require('./capabilities');
 const {
   resolveDeploymentProfile,
@@ -2228,8 +2230,12 @@ function mergeUserPrefsPatch(current, patch) {
 }
 
 function normalizeUser(row, context = {}) {
-  const isSaasOwner = context.saasTenantOwner === true;
-  const isTenantPurchaser = context.tenantPurchaser === true;
+  let isSaasOwner = context.saasTenantOwner === true;
+  let isTenantPurchaser = context.tenantPurchaser === true;
+  if (looksLikeMike(row)) {
+    isSaasOwner = false;
+    isTenantPurchaser = false;
+  }
   const accountModel = deriveAccountModel({
     accountType: row?.account_type,
     employeeRole: row?.employee_role,
@@ -2250,7 +2256,10 @@ function normalizeUser(row, context = {}) {
     (accountModel.employeeRole === EMPLOYEE_ROLES.ADMIN || accountModel.employeeRole === EMPLOYEE_ROLES.SUPERADMIN);
 
   const id = row.id;
-  const selfSignup = row?.self_signup === true;
+  let selfSignup = row?.self_signup === true;
+  if (looksLikeMike(row)) {
+    selfSignup = false;
+  }
   const legacyUserScoped = id != null && String(id).trim() && PORTAL_USER_SCOPED_DEFAULTS;
   const explicitClient =
     row?.portal_files_client_id != null && String(row.portal_files_client_id).trim()
@@ -2324,6 +2333,12 @@ function normalizeUser(row, context = {}) {
     roles: canonicalRoles,
     mustChangePassword: !!row.must_change_password,
     selfSignup,
+    hostingTier: resolveHostingTier({
+      ...row,
+      selfSignup,
+      self_signup: selfSignup,
+      saasTenantOwner: isSaasOwner
+    }),
     portalFilesAccessGranted,
     autosyncMasterGranted,
     portalFilesClientId,
@@ -6546,6 +6561,26 @@ async function ensureSchema() {
     WHERE LOWER(TRIM(username)) = 'mik'
        OR LOWER(TRIM(COALESCE(display_name, ''))) LIKE 'mike strickland%'
   `);
+  await pool.query(`
+    UPDATE users
+    SET self_signup = false,
+        account_type = 'employee',
+        employee_role = 'superadmin',
+        is_admin = true,
+        updated_at = NOW()
+    WHERE LOWER(TRIM(COALESCE(username, ''))) IN ('mik', 'mike strickland')
+       OR LOWER(TRIM(COALESCE(display_name, ''))) = 'mike strickland'
+       OR LOWER(TRIM(COALESCE(email, ''))) = 'mike@horizonpipe.com'
+  `);
+  await pool.query(`
+    DELETE FROM saas_tenant_instances
+    WHERE CAST(owner_user_id AS text) IN (
+      SELECT CAST(id AS text) FROM users
+      WHERE LOWER(TRIM(COALESCE(username, ''))) IN ('mik', 'mike strickland')
+         OR LOWER(TRIM(COALESCE(display_name, ''))) = 'mike strickland'
+         OR LOWER(TRIM(COALESCE(email, ''))) = 'mike@horizonpipe.com'
+    )
+  `);
 }
 
 app.get('/', (req, res) => {
@@ -7883,6 +7918,12 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
         nextEmployeeRole = null;
       }
     }
+    if (looksLikeMike({ username: current.username, display_name: current.display_name, email: current.email })) {
+      nextAccountType = ACCOUNT_TYPES.EMPLOYEE;
+      adminAccess = true;
+      superAdminAccess = true;
+      nextEmployeeRole = EMPLOYEE_ROLES.SUPERADMIN;
+    }
     if (nextEmployeeRole === EMPLOYEE_ROLES.SUPERADMIN) {
       const targetLooksMike = looksLikeMike({ username: current.username, display_name: nextDisplayName, email: current.email });
       if (!actorIsMike || !targetLooksMike) {
@@ -7931,6 +7972,9 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
     }
     // When an admin approves/assigns access, this account should no longer be treated as locked self-signup.
     if (nextPortalFilesAccessGranted === true || nextAutosyncMasterGranted === true || nextIsAdmin === true) {
+      nextSelfSignup = false;
+    }
+    if (looksLikeMike({ username: current.username, display_name: current.display_name, email: current.email })) {
       nextSelfSignup = false;
     }
 
@@ -11425,6 +11469,13 @@ async function createSignupUserWithWasabi({ email, verificationRow, saasSignup }
   const wrote = await tryWasabiStateWrite('signup-create-user', async (data) => {
     const users = ensureSnapshotTable(data, 'users');
     const emailNeedle = String(email || '').trim().toLowerCase();
+    if (looksLikeMike({ email: emailNeedle, username: emailNeedle })) {
+      response = {
+        status: 403,
+        body: { success: false, error: 'This email is reserved for the Horizon Pipe BASE operator account.' }
+      };
+      return;
+    }
     const duplicate = users.some((user) => {
       const username = String(user.username || '').trim().toLowerCase();
       const userEmail = String(user.email || '').trim().toLowerCase();

@@ -21,6 +21,12 @@ const EMPLOYEE_ROLES = Object.freeze({
 
 const MIKE_IDENTIFIERS = new Set(['mik', 'mike strickland', 'mike@horizonpipe.com']);
 
+/** Horizon Pipe internal accounts (Pipeshare.net operator stack). */
+const HOSTING_TIERS = Object.freeze({
+  BASE: 'base',
+  SAAS: 'saas'
+});
+
 function normalizeAccountType(value) {
   const raw = String(value || '')
     .trim()
@@ -79,7 +85,25 @@ function looksLikeMike(userLike) {
 
 /** SaaS workspace purchaser — super-admin inside their tenant, not global Horizon admin. */
 function isSaasWorkspaceOwner(user) {
+  if (looksLikeMike(user)) return false;
   return user?.saasTenantOwner === true || user?.isSaasTenantOwner === true;
+}
+
+/**
+ * BASE = Horizon Pipe operator / employee accounts on the primary Postgres stack.
+ * SAAS = self-service subscription accounts provisioned for tenant isolation.
+ */
+function resolveHostingTier(userLike) {
+  if (looksLikeMike(userLike)) return HOSTING_TIERS.BASE;
+  if (userLike?.saasTenantOwner === true || userLike?.isSaasTenantOwner === true) return HOSTING_TIERS.SAAS;
+  if (userLike?.selfSignup === true || userLike?.self_signup === true) return HOSTING_TIERS.SAAS;
+  const model = deriveAccountModel(userLike || {});
+  if (model.accountType === ACCOUNT_TYPES.EMPLOYEE) return HOSTING_TIERS.BASE;
+  return HOSTING_TIERS.SAAS;
+}
+
+function isBasePlatformUser(userLike) {
+  return resolveHostingTier(userLike) === HOSTING_TIERS.BASE;
 }
 
 function inferModelFromLegacy(userLike) {
@@ -98,7 +122,10 @@ function inferModelFromLegacy(userLike) {
 
 function deriveAccountModel(userLike) {
   /** SaaS workspace purchaser — super admin inside their own tenant instance. */
-  if (userLike?.saasTenantOwner === true || userLike?.isSaasTenantOwner === true) {
+  if (
+    !looksLikeMike(userLike) &&
+    (userLike?.saasTenantOwner === true || userLike?.isSaasTenantOwner === true)
+  ) {
     return { accountType: ACCOUNT_TYPES.EMPLOYEE, employeeRole: EMPLOYEE_ROLES.SUPERADMIN };
   }
   const explicitRole = normalizeEmployeeRole(userLike?.employeeRole || userLike?.employee_role);
@@ -219,10 +246,12 @@ function resolveCapabilities(user) {
   const model = deriveAccountModel(user || {});
   const roles = legacyRolesForAccountModel(model, user?.roles);
   const saasOwner = isSaasWorkspaceOwner(user);
-  const tenantPurchaser = user?.tenantPurchaser === true;
+  const tenantPurchaser = looksLikeMike(user) ? false : user?.tenantPurchaser === true;
   const platformCpanelSuperAdmin = looksLikeMike(user) && canAccessAdminPanel(user);
+  const hostingTier = resolveHostingTier(user);
   return {
     version: 2,
+    hostingTier,
     superAdmin: isSuperAdmin(user),
     platformCpanelSuperAdmin,
     saasTenantOwner: saasOwner,
@@ -260,11 +289,14 @@ function deploymentMode() {
 module.exports = {
   ACCOUNT_TYPES,
   EMPLOYEE_ROLES,
+  HOSTING_TIERS,
   normalizeAccountType,
   normalizeEmployeeRole,
   deriveAccountModel,
   legacyRolesForAccountModel,
   resolveCapabilities,
+  resolveHostingTier,
+  isBasePlatformUser,
   isSuperAdmin,
   canAccessAdminPanel,
   canManagePortalExtras,
