@@ -1,12 +1,11 @@
 {
-  "title": "Support chat, remote desktop, and explorer context menu",
-  "description": "Four regressions on pipeshare.live (BASE/SAAS): typed chat messages still did not sync, remote desktop was missing or broken on one side, remote support from chat failed cross-tenant, and right-click Create project structure did nothing.\n\nRoot cause for chat/remote sync: Express registered /chat/:sessionId and /remote/:sessionId routes before the static /chat/active, /chat/pending, and /remote/active handlers, so poll requests hit the wrong handler (sessionId literal \"active\"). Backend now registers static lookup routes first, adds participant fallback for remote sessions, and returns tenantId on session payloads. Frontend shows Remote desktop on both chat sides, passes chat tenantId into remote requests, and always passes employee explorer menu items to the dual context menu.\n\nWho is affected: PipeShare support chat, remote assistance, and file explorer on the private OVH server. SaaS when the next platform version is applied in cPanel releases.",
+  "title": "PipeShare BASE file explorer scope fix",
+  "description": "The file explorer on pipeshare.live could load an empty tree even though Wasabi has thousands of files under portal-users/job 8.\n\nRoot cause: stale ?clientId=tenant-* URL params and admin URL scope overriding the signed-in portal-users/8 assignment. The API returned HTTP 200 with zero files for tenant-mike-strickland/1 while portal-users/8 returns 4581 files. Empty trees were also cached in sessionStorage.\n\nFrontend now prefers session scope on private BASE, strips stale tenant URL params at boot, retries with assigned scope when the first tree is empty, and skips caching empty trees.\n\nWho is affected: PipeShare BASE on the private OVH server (pipeshare.live). SaaS when the next platform version is applied in cPanel releases.",
   "changeLog": [
-    "Fix Express route order so /chat/active and /remote/active poll endpoints work.",
-    "Remote session lookup uses participant fallback and stable auth user ids.",
-    "Remote desktop toolbar button visible on customer and support during active chat.",
-    "Chat toolbar remote desktop passes customer tenantId for cross-tenant admin.",
-    "Explorer context menu always includes employee actions (project structure)."
+    "Prefer session portal-users/job scope over stale tenant URL params on BASE.",
+    "Strip tenant ?clientId= from the URL when session is portal-users.",
+    "Retry file tree fetch with assigned scope when the first response is empty.",
+    "Do not cache empty file trees in sessionStorage (avoids 5-minute blank explorer)."
   ],
-  "updatedAt": "2026-06-30T18:00:00.000Z"
+  "updatedAt": "2026-06-30T17:15:00.000Z"
 }
