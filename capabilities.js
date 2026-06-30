@@ -101,8 +101,16 @@ function resolveHostingTier(userLike) {
   if (portalClientId.startsWith('tenant-')) return HOSTING_TIERS.SAAS;
   if (userLike?.saasTenantOwner === true || userLike?.isSaasTenantOwner === true) return HOSTING_TIERS.SAAS;
   if (userLike?.tenantPurchaser === true) return HOSTING_TIERS.SAAS;
-  if (userLike?.selfSignup === true || userLike?.self_signup === true) return HOSTING_TIERS.SAAS;
   const model = deriveAccountModel(userLike || {});
+  if ((userLike?.selfSignup === true || userLike?.self_signup === true) && model.accountType === ACCOUNT_TYPES.CUSTOMER) {
+    if (portalClientId.startsWith('tenant-') || userLike?.tenantPurchaser === true) {
+      return HOSTING_TIERS.SAAS;
+    }
+    if (portalClientId === 'portal-users' || !portalClientId) {
+      return HOSTING_TIERS.BASE;
+    }
+    return HOSTING_TIERS.SAAS;
+  }
   if (model.accountType === ACCOUNT_TYPES.EMPLOYEE) return HOSTING_TIERS.BASE;
   return HOSTING_TIERS.SAAS;
 }

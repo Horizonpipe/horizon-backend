@@ -1,11 +1,12 @@
 {
-  "title": "BASE vs SaaS login isolation hardening",
-  "description": "Full audit of provisioning and traffic control confirmed login walls on POST /login, but authenticated API calls did not re-check environment — a SaaS session token could still work on pipeshare.live until it expired.\n\nrequireAuth now enforces the same BASE vs SaaS rules on every request. Hosting tier labels treat tenant-bound portal scopes as SAAS (fixes employees mislabeled BASE). Sign-up on pipeshare.live rejects SaaS company provisioning. Login and portal session resume clear tokens on environment 403 with the server redirect message.\n\nWho is affected: everyone using PipeShare BASE (pipeshare.live / private server) and PipeShare SaaS (pipeshare.net / tenant subdomains). SaaS tenants receive this when the next platform version is applied in cPanel releases.",
+  "title": "Traffic control fixes — files, support, login",
+  "description": "After BASE vs SaaS session isolation shipped, legitimate users inside their own environment were getting HTTP 403 on every API call. Root causes: tenant SQL rejected membership users who still had legacy portal-users scope; BASE employees with any SaaS company link were treated as SaaS customers; Mike and Horizon admins were blocked on tenant subdomains needed for remote support.\n\nFixes keep the cross-environment wall (SaaS customers cannot use pipeshare.live, BASE portal-users cannot use tenant URLs) but allow: Mike and admin-panel users on any host; BASE employees on pipeshare.live; SaaS members with portal-users id on their company subdomain; correct BASE hosting tier for self-signup clients awaiting admin scope.\n\nWho is affected: PipeShare BASE (pipeshare.live / OVH) and SaaS tenants (pipeshare.net subdomains). SaaS receives this when the next platform version is applied in cPanel releases.",
   "changeLog": [
-    "Block session reuse across BASE and SaaS on every authenticated API call.",
-    "Classify tenant-* portal scopes as SAAS hosting tier (not BASE employees).",
-    "Reject SaaS company sign-up attempts on the base PipeShare server.",
-    "Clear stale sessions on environment mismatch during login resume and portal validation."
+    "Allow portal-users scope in tenant membership SQL (fixes file explorer 403).",
+    "Treat BASE employees as BASE on pipeshare.live even with SaaS membership rows.",
+    "Allow Mike and Horizon admin overlay on tenant subdomains (remote support).",
+    "Pass admin fields through session environment checks.",
+    "Classify BASE self-signup clients as BASE until tenant scope is assigned."
   ],
-  "updatedAt": "2026-06-30T20:00:00.000Z"
+  "updatedAt": "2026-06-30T22:30:00.000Z"
 }
