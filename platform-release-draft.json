@@ -1,11 +1,12 @@
 {
-  "title": "PipeShare file explorer reconnect fix",
-  "description": "After the DB3 binding scope work, switching client/job could leave a stale Wasabi `(clientId, jobId)` in memory. The explorer then called inspection-bindings with the wrong scope, the tree load failed, and the file list cleared even though objects still exist in Wasabi.\n\nFrontend now resets stale storage scope when portal job context changes, refetches when the session cache holds an empty tree, and treats DB3 binding load failures as non-fatal so the explorer still renders. Backend fixes a circular require that was crash-looping PM2 workers (`upsertTenantOwnerAuthSnapshot is not a function`).\n\nWho is affected: pipeshare.live (BASE / private OVH). SaaS picks this up on the next platform release apply.",
+  "title": "Support chat, remote desktop, and explorer context menu",
+  "description": "Four regressions on pipeshare.live (BASE/SAAS): typed chat messages still did not sync, remote desktop was missing or broken on one side, remote support from chat failed cross-tenant, and right-click Create project structure did nothing.\n\nRoot cause for chat/remote sync: Express registered /chat/:sessionId and /remote/:sessionId routes before the static /chat/active, /chat/pending, and /remote/active handlers, so poll requests hit the wrong handler (sessionId literal \"active\"). Backend now registers static lookup routes first, adds participant fallback for remote sessions, and returns tenantId on session payloads. Frontend shows Remote desktop on both chat sides, passes chat tenantId into remote requests, and always passes employee explorer menu items to the dual context menu.\n\nWho is affected: PipeShare support chat, remote assistance, and file explorer on the private OVH server. SaaS when the next platform version is applied in cPanel releases.",
   "changeLog": [
-    "Fix stale remote storage scope blocking PipeShare file tree loads.",
-    "Do not wipe the explorer when DB3 inspection bindings fail to load.",
-    "Refetch job tree when session cache is fresh but empty.",
-    "Break saas-tenant-auth-store ↔ saas-tenant-owner circular require (PM2 restarts)."
+    "Fix Express route order so /chat/active and /remote/active poll endpoints work.",
+    "Remote session lookup uses participant fallback and stable auth user ids.",
+    "Remote desktop toolbar button visible on customer and support during active chat.",
+    "Chat toolbar remote desktop passes customer tenantId for cross-tenant admin.",
+    "Explorer context menu always includes employee actions (project structure)."
   ],
-  "updatedAt": "2026-06-30T16:20:00.000Z"
+  "updatedAt": "2026-06-30T18:00:00.000Z"
 }

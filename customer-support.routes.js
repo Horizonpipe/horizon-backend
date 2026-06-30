@@ -145,6 +145,10 @@ function isChatParticipant(user, row) {
   return uid === String(row.customer_user_id) || uid === String(row.admin_user_id);
 }
 
+function isRemoteParticipant(user, row) {
+  return isChatParticipant(user, row);
+}
+
 function formatUserDisplayNameFromRow(row) {
   if (!row || typeof row !== 'object') return 'User';
   const displayName = cleanString(row.display_name ?? row.displayName);
@@ -1279,6 +1283,162 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
+  /** Static chat/remote lookup routes must register before /:sessionId/ param routes. */
+  app.get('/saas/support/chat/pending', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const r = await pool.query(
+        `SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
+         FROM cp_support_chat_sessions
+         WHERE tenant_id = $1 AND customer_user_id = $2 AND status = 'pending'
+         ORDER BY updated_at DESC LIMIT 1`,
+        [req.supportTenant.tenantId, authUserId(req.user)]
+      );
+      const row = r.rows[0];
+      if (!row) return res.json({ success: true, session: null });
+      return res.json({
+        success: true,
+        session: {
+          id: row.id,
+          tenantId: row.tenant_id,
+          status: row.status,
+          customerUserId: row.customer_user_id,
+          adminUserId: row.admin_user_id,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at
+        }
+      });
+    } catch (error) {
+      console.error('[saas/support/chat/pending]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.get('/saas/support/chat/active', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const uid = authUserId(req.user);
+      const sessionId = cleanString(req.query?.sessionId);
+      let row = null;
+
+      const customerParams = [req.supportTenant.tenantId, uid];
+      let customerSql = `
+          SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
+          FROM cp_support_chat_sessions
+          WHERE tenant_id = $1 AND customer_user_id = $2
+            AND status IN ('pending', 'active')`;
+      if (sessionId) {
+        customerParams.push(sessionId);
+        customerSql += ` AND id = $${customerParams.length}`;
+      }
+      customerSql += `
+          ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, updated_at DESC
+          LIMIT 1`;
+      const customerHit = await pool.query(customerSql, customerParams);
+      row = customerHit.rows[0];
+
+      if (!row && canAccessAdminPanel(req.user)) {
+        const params = [uid];
+        let sql = `
+          SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
+          FROM cp_support_chat_sessions
+          WHERE admin_user_id = $1 AND status IN ('pending', 'active')`;
+        if (sessionId) {
+          params.push(sessionId);
+          sql += ` AND id = $${params.length}`;
+        }
+        sql += `
+          ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, updated_at DESC
+          LIMIT 1`;
+        const r = await pool.query(sql, params);
+        row = r.rows[0];
+      }
+
+      if (!row && uid) {
+        const params = [uid];
+        let sql = `
+          SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
+          FROM cp_support_chat_sessions
+          WHERE (customer_user_id = $1 OR admin_user_id = $1) AND status IN ('pending', 'active')`;
+        if (sessionId) {
+          params.push(sessionId);
+          sql += ` AND id = $${params.length}`;
+        }
+        sql += `
+          ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, updated_at DESC
+          LIMIT 1`;
+        const participantHit = await pool.query(sql, params);
+        row = participantHit.rows[0];
+      }
+
+      if (!row) return res.json({ success: true, session: null });
+      const [customerDisplayName, adminDisplayName] = await Promise.all([
+        lookupUserDisplayName(pool, row.customer_user_id),
+        lookupUserDisplayName(pool, row.admin_user_id)
+      ]);
+      return res.json({
+        success: true,
+        session: {
+          id: row.id,
+          tenantId: row.tenant_id,
+          status: row.status,
+          customerUserId: row.customer_user_id,
+          adminUserId: row.admin_user_id,
+          customerDisplayName,
+          adminDisplayName,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at
+        }
+      });
+    } catch (error) {
+      console.error('[saas/support/chat/active]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
+  app.get('/saas/support/remote/active', requireAuth, tenantMiddleware, async (req, res) => {
+    try {
+      const uid = authUserId(req.user);
+      const r = await pool.query(
+        `SELECT id, tenant_id, customer_user_id, admin_user_id, status, persist_token, customer_tab_id, initiated_by, chat_session_id, created_at, updated_at
+         FROM cp_support_remote_sessions
+         WHERE ended_at IS NULL
+           AND (
+             (status = 'active' AND (customer_user_id = $1 OR admin_user_id = $1))
+             OR (status = 'pending' AND customer_user_id = $1 AND initiated_by = 'admin')
+             OR (status = 'pending' AND customer_user_id = $1 AND initiated_by = 'customer')
+             OR (status = 'pending' AND admin_user_id = $1 AND initiated_by = 'customer')
+           )
+         ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, updated_at DESC LIMIT 1`,
+        [uid]
+      );
+      const row = r.rows[0];
+      if (!row) return res.json({ success: true, session: null });
+      let customerDisplayName = '';
+      if (row.status === 'pending' && row.initiated_by === 'customer') {
+        customerDisplayName = await lookupUserDisplayName(pool, row.customer_user_id);
+      }
+      return res.json({
+        success: true,
+        session: {
+          id: row.id,
+          tenantId: row.tenant_id,
+          status: row.status,
+          customerUserId: row.customer_user_id,
+          adminUserId: row.admin_user_id,
+          persistToken: row.persist_token,
+          customerTabId: row.customer_tab_id,
+          initiatedBy: row.initiated_by || 'admin',
+          chatSessionId: row.chat_session_id || null,
+          customerDisplayName: customerDisplayName || undefined,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at
+        }
+      });
+    } catch (error) {
+      console.error('[saas/support/remote/active]', error);
+      return jsonError(res, 500, error.message || 'Server error');
+    }
+  });
+
   app.get('/saas/support/chat/:sessionId/messages', requireAuth, tenantMiddleware, async (req, res) => {
     try {
       const sessionId = cleanString(req.params.sessionId);
@@ -1301,6 +1461,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         success: true,
         session: {
           id: row.id,
+          tenantId: row.tenant_id,
           status: row.status,
           customerUserId: row.customer_user_id,
           adminUserId: row.admin_user_id,
@@ -1785,17 +1946,24 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       );
       row = r.rows[0];
     }
+    if (!row) {
+      const uid = authUserId(user);
+      if (uid) {
+        const r = await pool.query(
+          `SELECT * FROM cp_support_remote_sessions
+           WHERE id = $1 AND (customer_user_id = $2 OR admin_user_id = $2)
+           LIMIT 1`,
+          [sessionId, uid]
+        );
+        row = r.rows[0];
+      }
+    }
     if (!row && canAccessAdminPanel(user)) {
       const r = await pool.query(`SELECT * FROM cp_support_remote_sessions WHERE id = $1 LIMIT 1`, [sessionId]);
       row = r.rows[0];
     }
     if (!row) return { ok: false, status: 404, message: 'Remote session not found' };
-    const uid = String(user.id);
-    if (
-      uid !== String(row.customer_user_id) &&
-      uid !== String(row.admin_user_id) &&
-      !canAccessAdminPanel(user)
-    ) {
+    if (!isRemoteParticipant(user, row) && !canAccessAdminPanel(user)) {
       return { ok: false, status: 403, message: 'Not a participant in this remote session' };
     }
     return { ok: true, row };
@@ -1847,13 +2015,12 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const accept = req.body?.accept === true;
       if (!sessionId) return jsonError(res, 400, 'sessionId is required');
 
-      const r = await pool.query(
-        `SELECT * FROM cp_support_remote_sessions WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
-        [sessionId, req.supportTenant.tenantId]
-      );
-      const row = r.rows[0];
-      if (!row) return jsonError(res, 404, 'Remote session not found');
-      if (String(row.customer_user_id) !== String(req.user.id)) {
+      const loaded = await loadRemoteSessionForUser(pool, sessionId, req.user, {
+        preferredTenantId: req.supportTenant.tenantId
+      });
+      if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
+      const row = loaded.row;
+      if (String(row.customer_user_id) !== authUserId(req.user)) {
         return jsonError(res, 403, 'Only the customer can accept or decline remote control');
       }
       if (row.status !== 'pending') {
@@ -1868,10 +2035,10 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         `UPDATE cp_support_remote_sessions SET status = $2, updated_at = NOW(), ended_at = CASE WHEN $2 = 'declined' THEN NOW() ELSE NULL END WHERE id = $1`,
         [sessionId, status]
       );
-      broadcastSupportEvents(req.supportTenant.tenantId, 'remote-response', {
+      broadcastSupportEvents(row.tenant_id, 'remote-response', {
         sessionId,
         status,
-        customerUserId: req.user.id,
+        customerUserId: authUserId(req.user),
         persistToken: accept ? row.persist_token : null
       });
       return res.json({
@@ -2339,157 +2506,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     }
   });
 
-  app.get('/saas/support/chat/pending', requireAuth, tenantMiddleware, async (req, res) => {
-    try {
-      const r = await pool.query(
-        `SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
-         FROM cp_support_chat_sessions
-         WHERE tenant_id = $1 AND customer_user_id = $2 AND status = 'pending'
-         ORDER BY updated_at DESC LIMIT 1`,
-        [req.supportTenant.tenantId, req.user.id]
-      );
-      const row = r.rows[0];
-      if (!row) return res.json({ success: true, session: null });
-      return res.json({
-        success: true,
-        session: {
-          id: row.id,
-          status: row.status,
-          customerUserId: row.customer_user_id,
-          adminUserId: row.admin_user_id,
-          createdAt: row.created_at,
-          updatedAt: row.updated_at
-        }
-      });
-    } catch (error) {
-      console.error('[saas/support/chat/pending]', error);
-      return jsonError(res, 500, error.message || 'Server error');
-    }
-  });
 
-  app.get('/saas/support/chat/active', requireAuth, tenantMiddleware, async (req, res) => {
-    try {
-      const uid = cleanString(req.user?.id ?? req.user?.userId);
-      const sessionId = cleanString(req.query?.sessionId);
-      let row = null;
-
-      const customerParams = [req.supportTenant.tenantId, uid];
-      let customerSql = `
-          SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
-          FROM cp_support_chat_sessions
-          WHERE tenant_id = $1 AND customer_user_id = $2
-            AND status IN ('pending', 'active')`;
-      if (sessionId) {
-        customerParams.push(sessionId);
-        customerSql += ` AND id = $${customerParams.length}`;
-      }
-      customerSql += `
-          ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, updated_at DESC
-          LIMIT 1`;
-      const customerHit = await pool.query(customerSql, customerParams);
-      row = customerHit.rows[0];
-
-      if (!row && canAccessAdminPanel(req.user)) {
-        const params = [uid];
-        let sql = `
-          SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
-          FROM cp_support_chat_sessions
-          WHERE admin_user_id = $1 AND status IN ('pending', 'active')`;
-        if (sessionId) {
-          params.push(sessionId);
-          sql += ` AND id = $${params.length}`;
-        }
-        sql += `
-          ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, updated_at DESC
-          LIMIT 1`;
-        const r = await pool.query(sql, params);
-        row = r.rows[0];
-      }
-
-      if (!row && uid) {
-        const params = [uid];
-        let sql = `
-          SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
-          FROM cp_support_chat_sessions
-          WHERE (customer_user_id = $1 OR admin_user_id = $1) AND status IN ('pending', 'active')`;
-        if (sessionId) {
-          params.push(sessionId);
-          sql += ` AND id = $${params.length}`;
-        }
-        sql += `
-          ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, updated_at DESC
-          LIMIT 1`;
-        const participantHit = await pool.query(sql, params);
-        row = participantHit.rows[0];
-      }
-
-      if (!row) return res.json({ success: true, session: null });
-      const [customerDisplayName, adminDisplayName] = await Promise.all([
-        lookupUserDisplayName(pool, row.customer_user_id),
-        lookupUserDisplayName(pool, row.admin_user_id)
-      ]);
-      return res.json({
-        success: true,
-        session: {
-          id: row.id,
-          status: row.status,
-          customerUserId: row.customer_user_id,
-          adminUserId: row.admin_user_id,
-          customerDisplayName,
-          adminDisplayName,
-          createdAt: row.created_at,
-          updatedAt: row.updated_at
-        }
-      });
-    } catch (error) {
-      console.error('[saas/support/chat/active]', error);
-      return jsonError(res, 500, error.message || 'Server error');
-    }
-  });
-
-  app.get('/saas/support/remote/active', requireAuth, tenantMiddleware, async (req, res) => {
-    try {
-      const uid = String(req.user.id);
-      const r = await pool.query(
-        `SELECT id, tenant_id, customer_user_id, admin_user_id, status, persist_token, customer_tab_id, initiated_by, chat_session_id, created_at, updated_at
-         FROM cp_support_remote_sessions
-         WHERE ended_at IS NULL
-           AND (
-             (status = 'active' AND (customer_user_id = $1 OR admin_user_id = $1))
-             OR (status = 'pending' AND customer_user_id = $1 AND initiated_by = 'admin')
-             OR (status = 'pending' AND customer_user_id = $1 AND initiated_by = 'customer')
-             OR (status = 'pending' AND admin_user_id = $1 AND initiated_by = 'customer')
-           )
-         ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, updated_at DESC LIMIT 1`,
-        [uid]
-      );
-      const row = r.rows[0];
-      if (!row) return res.json({ success: true, session: null });
-      let customerDisplayName = '';
-      if (row.status === 'pending' && row.initiated_by === 'customer') {
-        customerDisplayName = await lookupUserDisplayName(pool, row.customer_user_id);
-      }
-      return res.json({
-        success: true,
-        session: {
-          id: row.id,
-          status: row.status,
-          customerUserId: row.customer_user_id,
-          adminUserId: row.admin_user_id,
-          persistToken: row.persist_token,
-          customerTabId: row.customer_tab_id,
-          initiatedBy: row.initiated_by || 'admin',
-          chatSessionId: row.chat_session_id || null,
-          customerDisplayName: customerDisplayName || undefined,
-          createdAt: row.created_at,
-          updatedAt: row.updated_at
-        }
-      });
-    } catch (error) {
-      console.error('[saas/support/remote/active]', error);
-      return jsonError(res, 500, error.message || 'Server error');
-    }
-  });
 }
 
 module.exports = { registerCustomerSupportRoutes, initCustomerSupportSchema };
