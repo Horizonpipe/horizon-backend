@@ -1,12 +1,12 @@
 {
-  "title": "Support chat accept + remote desktop in chat",
-  "description": "Two regressions after the tenant-routing chat fixes: when a customer accepted a chat invite, the admin stayed on \"Waiting for accept\" and never saw the live chat open. Also, the remote desktop / remote help controls were missing from the chat window toolbar.\n\nAdmin chat sync no longer wipes the waiting UI when /chat/active briefly returns empty — it re-checks the local session id via /chat/messages and keeps the accept poll running. chat-response SSE now uses stable user-id matching so the admin transition to active chat is reliable. Customers see the Remote help toolbar button again after accept; admins get a Remote desktop button in the chat header to start or reopen a remote session with the customer in chat.\n\nWho is affected: PipeShare support chat and remote assistance on the private OVH server (pipeshare.live). SaaS when the next platform version is applied in cPanel releases.",
+  "title": "Support chat text message delivery",
+  "description": "After the chat-connect fixes, support sessions could open but typed messages never appeared for the other party. POST /chat/messages could reject the sender when user ids were normalized differently than session participants, and /chat/active could return a stale pending session instead of the live active chat — which blocked the composer and message poll on reconnect.\n\nBackend now resolves auth user ids consistently for participant checks and prefers active sessions over orphaned pending rows. Frontend promotes admin chat to live send/poll mode when the server confirms active status, surfaces send errors instead of silently dropping text, and keeps polling while a session id is known.\n\nWho is affected: PipeShare support chat on the private OVH server (pipeshare.live). SaaS when the next platform version is applied in cPanel releases.",
   "changeLog": [
-    "Admin chat opens when customer accepts — SSE and poll no longer drop the session.",
-    "Admin chat sync keeps waiting UI until session is confirmed ended.",
-    "Customer Remote help button restored in chat toolbar after accept.",
-    "Admin Remote desktop button added to chat toolbar during active chat.",
-    "Stable user-id matching on chat-response and remote-help events."
+    "Fix support chat POST participant matching with stable auth user ids.",
+    "Prefer active over stale pending rows in /chat/active lookup.",
+    "Admin chat send/poll unlocks when server reports session active.",
+    "Show a warning when chat message POST fails instead of silent drop.",
+    "Participant fallback in /chat/active includes admin_user_id as well as customer."
   ],
-  "updatedAt": "2026-06-29T18:00:00.000Z"
+  "updatedAt": "2026-06-30T12:00:00.000Z"
 }

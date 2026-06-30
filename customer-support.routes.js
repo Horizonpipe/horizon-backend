@@ -135,6 +135,16 @@ function cleanString(v) {
   return String(v ?? '').trim();
 }
 
+function authUserId(user) {
+  return cleanString(user?.id ?? user?.userId);
+}
+
+function isChatParticipant(user, row) {
+  const uid = authUserId(user);
+  if (!uid || !row) return false;
+  return uid === String(row.customer_user_id) || uid === String(row.admin_user_id);
+}
+
 function formatUserDisplayNameFromRow(row) {
   if (!row || typeof row !== 'object') return 'User';
   const displayName = cleanString(row.display_name ?? row.displayName);
@@ -1225,8 +1235,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       row = r.rows[0];
     }
     if (!row) return { ok: false, status: 404, message: 'Chat session not found' };
-    const uid = String(user.id);
-    if (uid !== String(row.customer_user_id) && uid !== String(row.admin_user_id) && !canAccessAdminPanel(user)) {
+    if (!isChatParticipant(user, row) && !canAccessAdminPanel(user)) {
       return { ok: false, status: 403, message: 'Not a participant in this chat' };
     }
     return { ok: true, row };
@@ -1243,7 +1252,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       });
       if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
       const row = loaded.row;
-      if (String(row.customer_user_id) !== String(req.user.id)) {
+      if (String(row.customer_user_id) !== authUserId(req.user)) {
         return jsonError(res, 403, 'Only the invited customer can respond');
       }
       if (row.status !== 'pending') {
@@ -1258,7 +1267,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       broadcastSupportEvents(row.tenant_id, 'chat-response', {
         sessionId,
         status,
-        customerUserId: req.user.id,
+        customerUserId: authUserId(req.user),
         adminUserId: row.admin_user_id,
         customerDisplayName: formatUserDisplayNameFromUser(req.user),
         adminDisplayName: await lookupUserDisplayName(pool, row.admin_user_id)
@@ -1320,14 +1329,13 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
       const row = loaded.row;
       if (row.status !== 'active') return jsonError(res, 400, 'Chat is not active');
-      const uid = String(req.user.id);
-      if (uid !== String(row.customer_user_id) && uid !== String(row.admin_user_id)) {
+      if (!isChatParticipant(req.user, row) && !canAccessAdminPanel(req.user)) {
         return jsonError(res, 403, 'Not a participant in this chat');
       }
 
       const message = await insertChatMessageRow(pool, {
         sessionId,
-        senderUserId: req.user.id,
+        senderUserId: authUserId(req.user),
         body: body || (attachment?.name ? `Sent ${attachment.name}` : 'Attachment'),
         messageType,
         attachment
@@ -1364,8 +1372,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       if (!loaded.ok) return jsonError(res, loaded.status, loaded.message);
       const row = loaded.row;
       if (row.status !== 'active') return jsonError(res, 400, 'Chat is not active');
-      const uid = String(req.user.id);
-      if (uid !== String(row.customer_user_id) && uid !== String(row.admin_user_id)) {
+      if (!isChatParticipant(req.user, row) && !canAccessAdminPanel(req.user)) {
         return jsonError(res, 403, 'Not a participant in this chat');
       }
 
@@ -1377,7 +1384,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       };
       const message = await insertChatMessageRow(pool, {
         sessionId,
-        senderUserId: req.user.id,
+        senderUserId: authUserId(req.user),
         body: caption || (messageType === 'image' ? 'Screenshot' : `File: ${name}`),
         messageType,
         attachment
@@ -2377,7 +2384,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         customerSql += ` AND id = $${customerParams.length}`;
       }
       customerSql += `
-          ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, updated_at DESC
+          ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, updated_at DESC
           LIMIT 1`;
       const customerHit = await pool.query(customerSql, customerParams);
       row = customerHit.rows[0];
@@ -2393,7 +2400,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
           sql += ` AND id = $${params.length}`;
         }
         sql += `
-          ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, updated_at DESC
+          ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, updated_at DESC
           LIMIT 1`;
         const r = await pool.query(sql, params);
         row = r.rows[0];
@@ -2404,13 +2411,13 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         let sql = `
           SELECT id, tenant_id, customer_user_id, admin_user_id, status, created_at, updated_at
           FROM cp_support_chat_sessions
-          WHERE customer_user_id = $1 AND status IN ('pending', 'active')`;
+          WHERE (customer_user_id = $1 OR admin_user_id = $1) AND status IN ('pending', 'active')`;
         if (sessionId) {
           params.push(sessionId);
           sql += ` AND id = $${params.length}`;
         }
         sql += `
-          ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END, updated_at DESC
+          ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, updated_at DESC
           LIMIT 1`;
         const participantHit = await pool.query(sql, params);
         row = participantHit.rows[0];
