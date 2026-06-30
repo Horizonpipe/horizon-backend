@@ -1,12 +1,12 @@
 {
-  "title": "Traffic control fixes — files, support, login",
-  "description": "After BASE vs SaaS session isolation shipped, legitimate users inside their own environment were getting HTTP 403 on every API call. Root causes: tenant SQL rejected membership users who still had legacy portal-users scope; BASE employees with any SaaS company link were treated as SaaS customers; Mike and Horizon admins were blocked on tenant subdomains needed for remote support.\n\nFixes keep the cross-environment wall (SaaS customers cannot use pipeshare.live, BASE portal-users cannot use tenant URLs) but allow: Mike and admin-panel users on any host; BASE employees on pipeshare.live; SaaS members with portal-users id on their company subdomain; correct BASE hosting tier for self-signup clients awaiting admin scope.\n\nWho is affected: PipeShare BASE (pipeshare.live / OVH) and SaaS tenants (pipeshare.net subdomains). SaaS receives this when the next platform version is applied in cPanel releases.",
+  "title": "PipeShare BASE file explorer scope fix",
+  "description": "On pipeshare.live the file explorer could load an empty Wasabi prefix when stale SaaS tenant URL params (`?clientId=tenant-*`) or admin deep-link overrides pointed at tenant virtualbox storage instead of shared `portal-users/8` where all BASE files live.\n\nOVH verification: `GET /api/files/tree?clientId=portal-users&jobId=8` returns 4581 files; `tenant-mike-strickland/1` returns zero. The frontend now ignores tenant URL scope on BASE, strips those params at boot, resolves session/bootstrap defaults, and retries tree fetch when the first scope is empty.\n\nWho is affected: PipeShare on the private BASE server (pipeshare.live / OVH). SaaS tenants are unchanged.",
   "changeLog": [
-    "Allow portal-users scope in tenant membership SQL (fixes file explorer 403).",
-    "Treat BASE employees as BASE on pipeshare.live even with SaaS membership rows.",
-    "Allow Mike and Horizon admin overlay on tenant subdomains (remote support).",
-    "Pass admin fields through session environment checks.",
-    "Classify BASE self-signup clients as BASE until tenant scope is assigned."
+    "Ignore tenant-* URL clientId on pipeshare.live — use portal-users/{jobId}.",
+    "Strip stale tenant query params from BASE URLs at every boot.",
+    "Admins without explicit scope fall back to deployment bootstrap defaults (portal-users/8).",
+    "Skip hydrating empty cached trees; retry BASE scope when first tree fetch is empty.",
+    "Do not treat stale tenant clientId in local session as Wasabi scope on BASE."
   ],
-  "updatedAt": "2026-06-30T22:30:00.000Z"
+  "updatedAt": "2026-06-30T23:45:00.000Z"
 }
