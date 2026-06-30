@@ -1,12 +1,12 @@
 {
-  "title": "PipeShare BASE file explorer scope fix",
-  "description": "On pipeshare.live the file explorer could load an empty Wasabi prefix when stale SaaS tenant URL params (`?clientId=tenant-*`) or admin deep-link overrides pointed at tenant virtualbox storage instead of shared `portal-users/8` where all BASE files live.\n\nOVH verification: `GET /api/files/tree?clientId=portal-users&jobId=8` returns 4581 files; `tenant-mike-strickland/1` returns zero. The frontend now ignores tenant URL scope on BASE, strips those params at boot, resolves session/bootstrap defaults, and retries tree fetch when the first scope is empty.\n\nWho is affected: PipeShare on the private BASE server (pipeshare.live / OVH). SaaS tenants are unchanged.",
+  "title": "PipeShare BASE explorer: fix stale scope and tree cache",
+  "description": "Live debugging on OVH confirmed deploy `94e95b1` was present and `GET /api/files/tree?clientId=portal-users&jobId=8` returns 4581 files for Mike — the API was never broken. The frontend could still show an empty explorer when stale browser session data pointed at `tenant-*` or the first `portalScopes` row (`portal-users/2`, a 54MB tree) instead of shared `portal-users/8`, or when sessionStorage held an empty cached tree from a prior tenant load.\n\nThis release prefers BASE bootstrap defaults (`portal-users/8`) over tenant legacy and multi-scope drift, purges stale tenant/empty tree caches on boot, forces a fresh tree load on BASE, extends the tree fetch timeout to 120s, and skips writing oversized trees to sessionStorage.\n\nWho is affected: PipeShare on pipeshare.live (private BASE / OVH). SaaS tenant subdomains unchanged.",
   "changeLog": [
-    "Ignore tenant-* URL clientId on pipeshare.live — use portal-users/{jobId}.",
-    "Strip stale tenant query params from BASE URLs at every boot.",
-    "Admins without explicit scope fall back to deployment bootstrap defaults (portal-users/8).",
-    "Skip hydrating empty cached trees; retry BASE scope when first tree fetch is empty.",
-    "Do not treat stale tenant clientId in local session as Wasabi scope on BASE."
+    "Prefer portal-users/8 bootstrap defaults when session still has tenant legacy clientId.",
+    "Skip tenant-* rows in portalScopes when resolving BASE Wasabi scope.",
+    "Purge stale empty or tenant-* explorer tree caches from sessionStorage on boot.",
+    "Force fresh /api/files/tree load on BASE startup (bypass stale 5-minute cache).",
+    "120s tree fetch timeout and no sessionStorage cache for multi-MB job trees."
   ],
-  "updatedAt": "2026-06-30T23:45:00.000Z"
+  "updatedAt": "2026-06-30T20:30:00.000Z"
 }
