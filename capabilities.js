@@ -95,7 +95,12 @@ function isSaasWorkspaceOwner(user) {
  */
 function resolveHostingTier(userLike) {
   if (looksLikeMike(userLike)) return HOSTING_TIERS.BASE;
+  const portalClientId = String(userLike?.portalFilesClientId ?? userLike?.portal_files_client_id ?? '')
+    .trim()
+    .toLowerCase();
+  if (portalClientId.startsWith('tenant-')) return HOSTING_TIERS.SAAS;
   if (userLike?.saasTenantOwner === true || userLike?.isSaasTenantOwner === true) return HOSTING_TIERS.SAAS;
+  if (userLike?.tenantPurchaser === true) return HOSTING_TIERS.SAAS;
   if (userLike?.selfSignup === true || userLike?.self_signup === true) return HOSTING_TIERS.SAAS;
   const model = deriveAccountModel(userLike || {});
   if (model.accountType === ACCOUNT_TYPES.EMPLOYEE) return HOSTING_TIERS.BASE;

@@ -110,6 +110,7 @@ const {
   resolveActorTenantScope,
   assertUserIdInTenantScope,
   assertLoginEnvironmentAccess,
+  assertAuthenticatedEnvironmentAccess,
   assertUsernameAvailableForCreate,
   resolveLoginUserRow,
   loadTenantScopeByHost
@@ -4383,6 +4384,18 @@ async function requireAuth(req, res, next) {
         `[auth] reject ${req.method || 'GET'} ${req.originalUrl || req.url || ''}: no session for token=${tokenHint}`
       );
       return res.status(401).json({ success: false, error: 'Authentication required' });
+    }
+    const requestHost = requestHostFromReq(req);
+    const envAccess = await assertAuthenticatedEnvironmentAccess(pool, user, requestHost);
+    if (!envAccess.allowed) {
+      console.warn(
+        `[auth] environment reject ${req.method || 'GET'} ${req.originalUrl || req.url || ''}: user=${String(user.id || '')} host=${requestHost}`
+      );
+      return res.status(403).json({
+        success: false,
+        error: envAccess.error,
+        code: envAccess.code || 'ENVIRONMENT_ACCESS_DENIED'
+      });
     }
     req.user = await enrichUserScopesForTenantRequest(user, req);
     req.sessionToken = token;

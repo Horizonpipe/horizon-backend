@@ -1,11 +1,11 @@
 {
-  "title": "PipeShare BASE file explorer scope fix",
-  "description": "The file explorer on pipeshare.live could load an empty tree even though Wasabi has thousands of files under portal-users/job 8.\n\nRoot cause: stale ?clientId=tenant-* URL params and admin URL scope overriding the signed-in portal-users/8 assignment. The API returned HTTP 200 with zero files for tenant-mike-strickland/1 while portal-users/8 returns 4581 files. Empty trees were also cached in sessionStorage.\n\nFrontend now prefers session scope on private BASE, strips stale tenant URL params at boot, retries with assigned scope when the first tree is empty, and skips caching empty trees.\n\nWho is affected: PipeShare BASE on the private OVH server (pipeshare.live). SaaS when the next platform version is applied in cPanel releases.",
+  "title": "BASE vs SaaS login isolation hardening",
+  "description": "Full audit of provisioning and traffic control confirmed login walls on POST /login, but authenticated API calls did not re-check environment — a SaaS session token could still work on pipeshare.live until it expired.\n\nrequireAuth now enforces the same BASE vs SaaS rules on every request. Hosting tier labels treat tenant-bound portal scopes as SAAS (fixes employees mislabeled BASE). Sign-up on pipeshare.live rejects SaaS company provisioning. Login and portal session resume clear tokens on environment 403 with the server redirect message.\n\nWho is affected: everyone using PipeShare BASE (pipeshare.live / private server) and PipeShare SaaS (pipeshare.net / tenant subdomains). SaaS tenants receive this when the next platform version is applied in cPanel releases.",
   "changeLog": [
-    "Prefer session portal-users/job scope over stale tenant URL params on BASE.",
-    "Strip tenant ?clientId= from the URL when session is portal-users.",
-    "Retry file tree fetch with assigned scope when the first response is empty.",
-    "Do not cache empty file trees in sessionStorage (avoids 5-minute blank explorer)."
+    "Block session reuse across BASE and SaaS on every authenticated API call.",
+    "Classify tenant-* portal scopes as SAAS hosting tier (not BASE employees).",
+    "Reject SaaS company sign-up attempts on the base PipeShare server.",
+    "Clear stale sessions on environment mismatch during login resume and portal validation."
   ],
-  "updatedAt": "2026-06-30T17:15:00.000Z"
+  "updatedAt": "2026-06-30T20:00:00.000Z"
 }

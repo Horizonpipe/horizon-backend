@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const { isSaasSignupRequest } = require('./lib/saas-signup-context');
+const { resolveDeploymentProfile } = require('./lib/deployment-profile');
 const { upsertTenantDraft } = require('./tenant-provisioning.service');
 const { getSaasOwnerSessionContext } = require('./lib/saas-tenant-owner');
 const { loadTenantScopeByHost } = require('./lib/saas-tenant-scope');
@@ -138,6 +139,19 @@ async function sendApprovalRequestEmail(payload) {
   }
 }
 
+function signupEnvironmentGate(req, saasSignup) {
+  const requestHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
+  const profile = resolveDeploymentProfile({ requestHost });
+  if (saasSignup && profile.isPrivateBase) {
+    return {
+      ok: false,
+      status: 403,
+      error: 'SaaS company sign-up is only available on pipeshare.net, not the base PipeShare server.'
+    };
+  }
+  return { ok: true };
+}
+
 /**
  * @param {import('express').Express} app
  * @param {{ pool: import('pg').Pool, query?: (text: string, params?: unknown[]) => Promise<{rows: unknown[], rowCount?: number}>, createSignupUserWithWasabi?: (payload: {email: string, verificationRow: object, saasSignup?: boolean}) => Promise<{status: number, body: Record<string, unknown>} | null>, signupPrimaryStrict?: boolean, cleanString: (v: unknown) => string, normalizeRoles: (v: unknown) => object, normalizeUser: (row: object) => object, issueSession?: (userId: string|number, options?: {keepSession?: boolean}) => Promise<string>, attachScopesToUser?: (user: object) => Promise<object>, resolveCapabilities?: (user: object) => object }} deps
@@ -267,6 +281,12 @@ function registerSignupRoutes(app, deps) {
       });
     }
 
+    const saasSignup = isSaasSignupRequest(req);
+    const envGate = signupEnvironmentGate(req, saasSignup);
+    if (!envGate.ok) {
+      return res.status(envGate.status || 403).json({ success: false, error: envGate.error });
+    }
+
     try {
       const dup = await dbQuery(
         `SELECT id FROM users
@@ -317,7 +337,6 @@ function registerSignupRoutes(app, deps) {
       );
 
       const sendResult = await sendPinEmail(email, pin);
-      const saasSignup = isSaasSignupRequest(req);
       const devPinAllowed =
         !saasSignup && String(process.env.SIGNUP_DEV_RETURN_PIN || '').trim() === '1';
       const devPin = devPinAllowed ? pin : undefined;
@@ -362,6 +381,10 @@ function registerSignupRoutes(app, deps) {
     }
 
     const saasSignup = isSaasSignupRequest(req);
+    const envGate = signupEnvironmentGate(req, saasSignup);
+    if (!envGate.ok) {
+      return res.status(envGate.status || 403).json({ success: false, error: envGate.error });
+    }
 
     try {
       const v = await pool.query(
