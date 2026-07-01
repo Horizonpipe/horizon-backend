@@ -36,6 +36,7 @@ async function issueSession(pool, userId) {
   const user = session.user || {};
   console.log('SESSION', JSON.stringify({
     status: sessionRes.status,
+    capabilities: session.capabilities,
     portalFilesClientId: user.portalFilesClientId,
     portalFilesJobId: user.portalFilesJobId,
     portalFilesAccessGranted: user.portalFilesAccessGranted,

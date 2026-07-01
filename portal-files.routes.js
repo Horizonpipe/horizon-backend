@@ -39,7 +39,7 @@ const {
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { Upload } = require('@aws-sdk/lib-storage');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
-const { canManagePortalExtras } = require('./capabilities');
+const { canManagePortalExtras, looksLikeMike } = require('./capabilities');
 const {
   resolveStorageBackend,
   resolveStorageBackendForProcess
@@ -183,7 +183,10 @@ function userCanManagePortalExtras(user) {
 
 /** @param {import('express').Request['user']} user */
 function userIsPortalAdmin(user) {
-  return userCanManagePortalExtras(user);
+  if (userCanManagePortalExtras(user)) return true;
+  if (user?.capabilities?.canManagePortalExtras === true) return true;
+  if (user?.isAdmin === true && looksLikeMike(user)) return true;
+  return false;
 }
 
 /**
