@@ -1,12 +1,12 @@
 {
-  "title": "PipeShare BASE explorer: fix stale scope and tree cache",
-  "description": "Live debugging on OVH confirmed deploy `94e95b1` was present and `GET /api/files/tree?clientId=portal-users&jobId=8` returns 4581 files for Mike — the API was never broken. The frontend could still show an empty explorer when stale browser session data pointed at `tenant-*` or the first `portalScopes` row (`portal-users/2`, a 54MB tree) instead of shared `portal-users/8`, or when sessionStorage held an empty cached tree from a prior tenant load.\n\nThis release prefers BASE bootstrap defaults (`portal-users/8`) over tenant legacy and multi-scope drift, purges stale tenant/empty tree caches on boot, forces a fresh tree load on BASE, extends the tree fetch timeout to 120s, and skips writing oversized trees to sessionStorage.\n\nWho is affected: PipeShare on pipeshare.live (private BASE / OVH). SaaS tenant subdomains unchanged.",
+  "title": "BASE file explorer scope, SaaS support admin, folder create",
+  "description": "OVH runtime check confirmed Wasabi has 4581 files under portal-users/8 and Mike has portal admin access — the API was fine. The empty BASE explorer was caused by stale URL query params (?clientId= / ?jobId=) overriding the correct shared job (often portal-users/2 or tenant-* from earlier SaaS provisioning work). BASE now always uses resolvePrivateBasePortalScope (portal-users/8 defaults) and strips drifted URL scope on login unless scopeLock=1.\n\nSaaS remote support broke because requireSupportAdmin only allowed Horizon employee admins, not SaaS workspace owners. Tenant purchasers can again see presence for their own tenant only; Mike on BASE still sees all users via listAllPresenceRows.\n\nFolder creation on PipeShare now checks edit permission on the parent folder path (not view on the new child path), which fixes 403s for users with full grants on a parent but no grant row for the not-yet-created subfolder.\n\nDebug instrumentation is included for one verification pass (frontend + backend tree route). Remove after confirmed.\n\nWho is affected: pipeshare.live (BASE), SaaS tenant subdomains (support + folder create). Highlights zoom drift still under separate verification.",
   "changeLog": [
-    "Prefer portal-users/8 bootstrap defaults when session still has tenant legacy clientId.",
-    "Skip tenant-* rows in portalScopes when resolving BASE Wasabi scope.",
-    "Purge stale empty or tenant-* explorer tree caches from sessionStorage on boot.",
-    "Force fresh /api/files/tree load on BASE startup (bypass stale 5-minute cache).",
-    "120s tree fetch timeout and no sessionStorage cache for multi-MB job trees."
+    "BASE explorer ignores stale ?clientId/?jobId URL drift; uses portal-users/8 scope.",
+    "Strip tenant-* and wrong-job URL params on BASE login (scopeLock=1 to keep deep links).",
+    "loadRemoteTree uses live session so tree fetch is not skipped silently.",
+    "SaaS workspace owners can administer remote support within their tenant again.",
+    "Create-folder API checks parent-path edit grant instead of child-path view grant."
   ],
-  "updatedAt": "2026-06-30T20:30:00.000Z"
+  "updatedAt": "2026-07-01T17:30:00.000Z"
 }

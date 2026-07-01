@@ -122,18 +122,19 @@ function bypassPathGrantsForLenientPortalClient(user, userGrants) {
 // #region agent log
 const HP_DEBUG_LOG_PATH =
   process.env.HP_DEBUG_LOG_PATH ||
-  path.join('C:', 'HorizonDev', 'wincan_auto_import_exe_project', '.cursor', 'debug-2099e1.log');
+  path.join('C:', 'HorizonDev', 'wincan_auto_import_exe_project', 'debug-c52723.log');
 function hpAgentDebugLog(location, message, data, hypothesisId) {
   try {
     fs.appendFileSync(
       HP_DEBUG_LOG_PATH,
       `${JSON.stringify({
-        sessionId: '2099e1',
+        sessionId: 'c52723',
         location,
         message,
         data,
         hypothesisId,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        runId: 'pre-fix'
       })}\n`
     );
   } catch {
@@ -3250,7 +3251,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(403).json({ error: 'Forbidden' });
       }
       const rel = joinRel(parentPath || '', name);
-      if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, rel, 'view'))) {
+      const parentRel = parentRelPath(rel);
+      if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, parentRel, 'edit'))) {
         return res.status(403).json({ error: 'Forbidden for this path' });
       }
       const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));

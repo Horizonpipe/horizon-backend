@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
-const { canAccessAdminPanel, looksLikeMike, ACCOUNT_TYPES } = require('./capabilities');
+const { canAccessAdminPanel, isSaasWorkspaceOwner, looksLikeMike, ACCOUNT_TYPES } = require('./capabilities');
 const { loadUserCompanyMembership } = require('./company-permissions.service');
 const {
   MAX_CHAT_UPLOAD_BYTES,
@@ -190,10 +190,10 @@ function jsonError(res, status, message) {
 }
 
 function requireSupportAdmin(req, res, next) {
-  if (!canAccessAdminPanel(req.user)) {
-    return jsonError(res, 403, 'Admin access required');
+  if (canAccessAdminPanel(req.user) || isSaasWorkspaceOwner(req.user)) {
+    return next();
   }
-  return next();
+  return jsonError(res, 403, 'Admin access required');
 }
 
 async function insertRemoteSignalPg(pool, sessionId, fromUserId, type, payload) {
