@@ -1,11 +1,11 @@
 {
-  "title": "BASE explorer: remove debug CORS spam, clarify tree logging",
-  "description": "Production PipeShare was flooding the browser console with blocked localhost debug ingest requests (Private Network Access), which made the empty File Explorer hard to diagnose. OVH runtime checks confirm Mike's session is portal-users/8 and the tree API returns 4581 files — the API was never broken.\n\nThis release removes localhost-only debug ingest from pipeshare.live, adds plain console logs for portal scope and tree load results, bumps the portal runtime cache-bust version, and hardens portal admin detection for Mike on BASE file tree ACL bypass.\n\nWho is affected: pipeshare.live (BASE). SaaS unchanged unless you apply the next platform release bundle.",
+  "title": "Remote desktop no longer kills support chat",
+  "description": "Starting a Remote desktop session from an active support chat was ending the chat on the customer side (they fell back to Request support and lost the Remote desktop control). Remote desktop invites now keep the live chat open on both sides, show an in-chat accept prompt for the customer, and only replace prior remote sessions — not the chat.\n\nWho is affected: PipeShare support chat on BASE (pipeshare.live) and SaaS tenant portals.",
   "changeLog": [
-    "Stop localhost debug ingest calls on pipeshare.live (fixes CORS console spam).",
-    "Log BASE portal scope and tree load file/folder counts in the browser console.",
-    "Bump client-portal runtime version for cache bust (2026-07-01-base-explorer-fix2).",
-    "BASE Mike admin bypass for path-grant tree filtering on /api/files/tree."
+    "Admin Remote desktop request no longer terminates the active support chat.",
+    "Remote desktop button stays available in the chat toolbar on admin and customer.",
+    "Customer receives an in-chat accept/decline prompt for remote desktop invites.",
+    "Remote sessions link to the active chat session id when started from chat."
   ],
-  "updatedAt": "2026-07-01T18:00:00.000Z"
+  "updatedAt": "2026-07-04T02:00:00.000Z"
 }

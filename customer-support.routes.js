@@ -1973,29 +1973,41 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
     try {
       const customerUserId = cleanString(req.body?.customerUserId);
       const customerTabId = cleanString(req.body?.customerTabId) || 'default';
+      const chatSessionId = cleanString(req.body?.chatSessionId);
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
       const targetTenantId = await resolveTargetTenantId(pool, req, req.body?.tenantId, customerUserId);
       const adminUserId = cleanString(req.user?.id ?? req.user?.userId);
 
-      await terminateCustomerSessions(pool, targetTenantId, customerUserId, {
-        adminUserId,
-        reason: 'superseded'
+      // Only supersede prior remote sessions — never tear down the live support chat.
+      const priorRemote = await endRemoteSessionsForCustomer(pool, targetTenantId, customerUserId, {
+        adminUserId
       });
+      await broadcastEndedSessions(pool, targetTenantId, [], priorRemote, 'superseded');
 
       const persistToken = crypto.randomBytes(24).toString('base64url');
       const r = await pool.query(
         `INSERT INTO cp_support_remote_sessions (
-            tenant_id, customer_user_id, admin_user_id, status, persist_token, customer_tab_id
-          ) VALUES ($1,$2,$3,'pending',$4,$5)
+            tenant_id, customer_user_id, admin_user_id, status, persist_token, customer_tab_id,
+            initiated_by, chat_session_id
+          ) VALUES ($1,$2,$3,'pending',$4,$5,'admin',$6)
           RETURNING id, status, persist_token`,
-        [targetTenantId, customerUserId, adminUserId, persistToken, customerTabId]
+        [
+          targetTenantId,
+          customerUserId,
+          adminUserId,
+          persistToken,
+          customerTabId,
+          chatSessionId || null
+        ]
       );
       const session = r.rows[0];
       broadcastSupportEvents(targetTenantId, 'remote-request', {
         sessionId: session.id,
         customerUserId,
         customerTabId,
-        adminUserId: req.user.id
+        adminUserId,
+        initiatedBy: 'admin',
+        chatSessionId: chatSessionId || null
       });
       return res.json({
         success: true,
@@ -2039,6 +2051,9 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         sessionId,
         status,
         customerUserId: authUserId(req.user),
+        adminUserId: row.admin_user_id,
+        initiatedBy: row.initiated_by || 'admin',
+        chatSessionId: row.chat_session_id || null,
         persistToken: accept ? row.persist_token : null
       });
       return res.json({
