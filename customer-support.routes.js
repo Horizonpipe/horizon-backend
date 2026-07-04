@@ -2056,6 +2056,8 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
           messageType: 'remote-invite',
           attachment: {
             remoteSessionId: session.id,
+            customerUserId,
+            adminUserId,
             status: 'pending',
             initiatedBy: 'admin'
           }

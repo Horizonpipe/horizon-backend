@@ -1,10 +1,10 @@
 {
-  "title": "Remote desktop Accept/Decline buttons in chat",
-  "description": "Remote desktop invites now render Accept and Decline buttons directly inside the support chat message list on the customer side. The invite is always written into the active chat thread, and the buttons no longer depend on a separate prompt slot that could fail to show.\n\nWho is affected: PipeShare support chat between BASE admins and SaaS customers.",
+  "title": "SaaS customers can Accept remote desktop invites",
+  "description": "SaaS workspace owners (like CAT MEOW) were treated as support admins because they have portal permissions. That hid the Accept/Decline buttons on remote desktop invites and only showed the status text. Remote invites now use chat participant role (customer vs support admin), so SaaS customers always get Accept/Decline in the chat message list.\n\nWho is affected: SaaS tenant customers receiving remote desktop help from BASE support.",
   "changeLog": [
-    "Accept/Decline for remote desktop renders inside the chat message list.",
-    "Remote invite attachment parsing handles JSON strings from Postgres.",
-    "Remote invite always links to the active admin/customer chat when possible."
+    "SaaS portalPermissionsAccess no longer marks users as support admins.",
+    "Remote invite Accept/Decline shown to the chat customer/invitee.",
+    "Invite attachment includes customerUserId for reliable invitee detection."
   ],
-  "updatedAt": "2026-07-04T02:35:00.000Z"
+  "updatedAt": "2026-07-04T02:45:00.000Z"
 }
