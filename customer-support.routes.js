@@ -426,6 +426,38 @@ async function terminateCustomerSessions(pool, tenantId, customerUserId, { admin
   return { chatEnded: chatRows.length, remoteEnded: remoteRows.length };
 }
 
+/**
+ * Remove a customer from the support queue (all tabs, or one tab).
+ * Called when support answers (chat/remote) or when the engagement ends.
+ */
+async function clearSupportRequestForCustomer(pool, tenantId, customerUserId, { tabId } = {}) {
+  const tid = cleanString(tenantId);
+  const uid = cleanString(customerUserId);
+  if (!tid || !uid) return 0;
+  const params = [tid, uid];
+  let sql = `
+    UPDATE cp_support_presence
+    SET support_requested = false,
+        support_requested_at = NULL,
+        support_assigned_admin_user_id = NULL,
+        support_assigned_admin_name = NULL,
+        last_seen_at = NOW()
+    WHERE tenant_id = $1 AND user_id = $2 AND support_requested = true`;
+  if (tabId) {
+    params.push(cleanString(tabId) || 'default');
+    sql += ` AND tab_id = $3`;
+  }
+  sql += ` RETURNING tab_id`;
+  const r = await pool.query(sql, params);
+  for (const row of r.rows) {
+    broadcastSupportEvents(tid, 'support-clear', {
+      userId: uid,
+      tabId: row.tab_id || 'default'
+    });
+  }
+  return r.rows.length;
+}
+
 /** OVH legacy users use numeric ids in Postgres (TEXT), not UUID — migrate support tables to match. */
 async function migrateSupportUserIdColumnToText(pool, table, column) {
   const tbl = cleanString(table).replace(/[^a-z0-9_]/gi, '');
@@ -1199,6 +1231,10 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
           cleanString(req.user.email) ||
           'Support'
       );
+      // Admin answered the queue ticket by starting chat — remove from support queue.
+      await clearSupportRequestForCustomer(pool, targetTenantId, customerUserId, {
+        tabId: customerTabId
+      });
       broadcastSupportEvents(targetTenantId, 'chat-invite', {
         sessionId,
         customerUserId,
@@ -1268,6 +1304,9 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         `UPDATE cp_support_chat_sessions SET status = $2, updated_at = NOW() WHERE id = $1`,
         [sessionId, status]
       );
+      if (accept) {
+        await clearSupportRequestForCustomer(pool, row.tenant_id, row.customer_user_id);
+      }
       broadcastSupportEvents(row.tenant_id, 'chat-response', {
         sessionId,
         status,
@@ -1940,6 +1979,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         `UPDATE cp_support_chat_sessions SET status = 'closed', updated_at = NOW() WHERE id = $1`,
         [sessionId]
       );
+      await clearSupportRequestForCustomer(pool, row.tenant_id, row.customer_user_id);
       broadcastSupportEvents(row.tenant_id, 'chat-ended', {
         sessionId,
         customerUserId: row.customer_user_id,
@@ -2061,6 +2101,10 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         ]
       );
       const session = r.rows[0];
+      // Admin answered the queue ticket by starting remote — remove from support queue.
+      await clearSupportRequestForCustomer(pool, targetTenantId, customerUserId, {
+        tabId: customerTabId
+      });
       const invitePayload = {
         sessionId: session.id,
         customerUserId,
@@ -2132,6 +2176,9 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         `UPDATE cp_support_remote_sessions SET status = $2, updated_at = NOW(), ended_at = CASE WHEN $2 = 'declined' THEN NOW() ELSE NULL END WHERE id = $1`,
         [sessionId, status]
       );
+      if (accept) {
+        await clearSupportRequestForCustomer(pool, row.tenant_id, row.customer_user_id);
+      }
 
       // Turn the in-chat invite into plain status text on both sides.
       if (row.chat_session_id) {
@@ -2398,6 +2445,7 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         [sessionId]
       );
       await clearRemoteRelayPg(pool, sessionId);
+      await clearSupportRequestForCustomer(pool, row.tenant_id, row.customer_user_id);
       broadcastSupportEvents(row.tenant_id, 'remote-ended', {
         sessionId,
         customerUserId: row.customer_user_id,

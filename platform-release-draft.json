@@ -1,10 +1,11 @@
 {
-  "title": "Workspace name dialog centering and chat disconnect UX",
-  "description": "The workspace layout name editor is centered on screen instead of opening off in the corner. Ending a support chat posts “{User} disconnected” in the thread for the person still there, and their button changes from End chat to Close chat so they can dismiss the transcript.\n\nWho is affected: PipeShare workspace tabs and support chat on BASE and SaaS.",
+  "title": "Auto-clear support queue tickets and fix support push notifications",
+  "description": "When support answers a customer with chat or remote desktop, or when that engagement ends, the customer is removed from the Active Requests queue automatically. Support push notifications now use both an in-page toast and the browser notification API when permission is granted.\n\nWho is affected: PipeShare support queue on BASE (admin) and SaaS customers requesting help.",
   "changeLog": [
-    "Center the workspace name / save-layout prompt on screen.",
-    "End chat posts “User disconnected” for the remaining participant.",
-    "Remaining participant sees Close chat to dismiss the conversation."
+    "Clear support queue tickets when chat or remote support is answered.",
+    "Clear support queue tickets when chat or remote support ends.",
+    "Browser notifications for support requests when the toggle is on and permission is allowed.",
+    "In-page support request toast stays visible above other panels."
   ],
-  "updatedAt": "2026-07-04T04:20:00.000Z"
+  "updatedAt": "2026-07-04T04:50:00.000Z"
 }
