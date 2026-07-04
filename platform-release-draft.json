@@ -1,12 +1,10 @@
 {
-  "title": "SaaS remote desktop invite arrives in chat",
-  "description": "Remote desktop invites from BASE support to a SaaS customer (for example redpipe.pipeshare.net) now post into the live chat thread and use the chat session tenant, so the customer always receives an in-chat accept prompt. The Remote desktop control is shown in the chat header on both admin and customer while chat is live.\n\nWho is affected: PipeShare support chat between pipeshare.live admins and SaaS tenant customers.",
+  "title": "Remote desktop Accept/Decline buttons in chat",
+  "description": "Remote desktop invites now render Accept and Decline buttons directly inside the support chat message list on the customer side. The invite is always written into the active chat thread, and the buttons no longer depend on a separate prompt slot that could fail to show.\n\nWho is affected: PipeShare support chat between BASE admins and SaaS customers.",
   "changeLog": [
-    "Remote desktop invite is written into the active chat as a remote-invite message.",
-    "Remote session tenant is taken from the live chat (BASE admin → SaaS customer).",
-    "Customer chat shows an accept/decline prompt for remote desktop.",
-    "Remote desktop button appears on both sides of a live support chat.",
-    "Cache-bust portal support modules so SaaS clients load the fix."
+    "Accept/Decline for remote desktop renders inside the chat message list.",
+    "Remote invite attachment parsing handles JSON strings from Postgres.",
+    "Remote invite always links to the active admin/customer chat when possible."
   ],
-  "updatedAt": "2026-07-04T02:15:00.000Z"
+  "updatedAt": "2026-07-04T02:35:00.000Z"
 }

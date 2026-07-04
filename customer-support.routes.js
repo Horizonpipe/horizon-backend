@@ -1995,6 +1995,22 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
           return jsonError(res, 400, 'Customer does not match this chat');
         }
         targetTenantId = String(chatRow.tenant_id);
+      } else {
+        // Fall back to the active admin↔customer chat so the invite always lands in-thread.
+        const activeChat = await pool.query(
+          `SELECT id, tenant_id
+           FROM cp_support_chat_sessions
+           WHERE customer_user_id = $1
+             AND admin_user_id = $2
+             AND status = 'active'
+           ORDER BY updated_at DESC
+           LIMIT 1`,
+          [customerUserId, adminUserId]
+        );
+        if (activeChat.rows[0]) {
+          linkedChatSessionId = String(activeChat.rows[0].id);
+          targetTenantId = String(activeChat.rows[0].tenant_id);
+        }
       }
 
       // Only supersede prior remote sessions — never tear down the live support chat.
