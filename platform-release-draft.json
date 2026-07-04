@@ -1,11 +1,12 @@
 {
-  "title": "Remote desktop no longer kills support chat",
-  "description": "Starting a Remote desktop session from an active support chat was ending the chat on the customer side (they fell back to Request support and lost the Remote desktop control). Remote desktop invites now keep the live chat open on both sides, show an in-chat accept prompt for the customer, and only replace prior remote sessions — not the chat.\n\nWho is affected: PipeShare support chat on BASE (pipeshare.live) and SaaS tenant portals.",
+  "title": "SaaS remote desktop invite arrives in chat",
+  "description": "Remote desktop invites from BASE support to a SaaS customer (for example redpipe.pipeshare.net) now post into the live chat thread and use the chat session tenant, so the customer always receives an in-chat accept prompt. The Remote desktop control is shown in the chat header on both admin and customer while chat is live.\n\nWho is affected: PipeShare support chat between pipeshare.live admins and SaaS tenant customers.",
   "changeLog": [
-    "Admin Remote desktop request no longer terminates the active support chat.",
-    "Remote desktop button stays available in the chat toolbar on admin and customer.",
-    "Customer receives an in-chat accept/decline prompt for remote desktop invites.",
-    "Remote sessions link to the active chat session id when started from chat."
+    "Remote desktop invite is written into the active chat as a remote-invite message.",
+    "Remote session tenant is taken from the live chat (BASE admin → SaaS customer).",
+    "Customer chat shows an accept/decline prompt for remote desktop.",
+    "Remote desktop button appears on both sides of a live support chat.",
+    "Cache-bust portal support modules so SaaS clients load the fix."
   ],
-  "updatedAt": "2026-07-04T02:00:00.000Z"
+  "updatedAt": "2026-07-04T02:15:00.000Z"
 }

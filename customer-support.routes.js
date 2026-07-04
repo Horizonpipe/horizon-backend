@@ -1975,8 +1975,27 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
       const customerTabId = cleanString(req.body?.customerTabId) || 'default';
       const chatSessionId = cleanString(req.body?.chatSessionId);
       if (!customerUserId) return jsonError(res, 400, 'customerUserId is required');
-      const targetTenantId = await resolveTargetTenantId(pool, req, req.body?.tenantId, customerUserId);
       const adminUserId = cleanString(req.user?.id ?? req.user?.userId);
+
+      // Prefer the live chat's tenant — BASE admin + SaaS customer must land on the customer channel.
+      let targetTenantId = await resolveTargetTenantId(pool, req, req.body?.tenantId, customerUserId);
+      let linkedChatSessionId = chatSessionId || '';
+      if (linkedChatSessionId) {
+        const chatHit = await pool.query(
+          `SELECT id, tenant_id, customer_user_id, admin_user_id, status
+           FROM cp_support_chat_sessions
+           WHERE id = $1
+           LIMIT 1`,
+          [linkedChatSessionId]
+        );
+        const chatRow = chatHit.rows[0];
+        if (!chatRow) return jsonError(res, 404, 'Chat session not found');
+        if (String(chatRow.status) !== 'active') return jsonError(res, 400, 'Chat must be active');
+        if (String(chatRow.customer_user_id) !== customerUserId) {
+          return jsonError(res, 400, 'Customer does not match this chat');
+        }
+        targetTenantId = String(chatRow.tenant_id);
+      }
 
       // Only supersede prior remote sessions — never tear down the live support chat.
       const priorRemote = await endRemoteSessionsForCustomer(pool, targetTenantId, customerUserId, {
@@ -1997,18 +2016,41 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
           adminUserId,
           persistToken,
           customerTabId,
-          chatSessionId || null
+          linkedChatSessionId || null
         ]
       );
       const session = r.rows[0];
-      broadcastSupportEvents(targetTenantId, 'remote-request', {
+      const invitePayload = {
         sessionId: session.id,
         customerUserId,
         customerTabId,
         adminUserId,
         initiatedBy: 'admin',
-        chatSessionId: chatSessionId || null
-      });
+        chatSessionId: linkedChatSessionId || null
+      };
+      broadcastSupportEvents(targetTenantId, 'remote-request', invitePayload);
+
+      // Also post into the live chat so SaaS customers receive the invite via message poll
+      // even when SSE is on a different tenant channel than the admin.
+      if (linkedChatSessionId) {
+        const message = await insertChatMessageRow(pool, {
+          sessionId: linkedChatSessionId,
+          senderUserId: adminUserId,
+          body: 'Remote desktop request — accept to share your screen with support.',
+          messageType: 'remote-invite',
+          attachment: {
+            remoteSessionId: session.id,
+            status: 'pending',
+            initiatedBy: 'admin'
+          }
+        });
+        const mapped = await mapChatMessageRowWithSender(pool, message);
+        broadcastSupportEvents(targetTenantId, 'chat-message', {
+          sessionId: String(linkedChatSessionId),
+          message: mapped
+        });
+      }
+
       return res.json({
         success: true,
         sessionId: session.id,
