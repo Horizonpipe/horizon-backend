@@ -187,11 +187,22 @@ function legacyRolesForAccountModel(model, legacyRolesInput = null) {
     portalDelete: false
   };
 
-  if (model.accountType === ACCOUNT_TYPES.CUSTOMER) return out;
+  if (model.accountType === ACCOUNT_TYPES.CUSTOMER) {
+    // SaaS purchasers / portal clients may carry explicit portal* flags in roles JSON.
+    // Do not wipe those — otherwise PipeShare delete/upload/edit always 403.
+    return {
+      ...out,
+      portalUpload: legacy.portalUpload === true,
+      portalDownload: legacy.portalDownload === true,
+      portalEdit: legacy.portalEdit === true,
+      portalDelete: legacy.portalDelete === true
+    };
+  }
   const role = normalizeEmployeeRole(model.employeeRole);
   if (role === EMPLOYEE_ROLES.SUPERADMIN || role === EMPLOYEE_ROLES.ADMIN) {
     for (const key of Object.keys(out)) out[key] = true;
-    return out;
+    // Keep any explicit legacy portal flags (already all true for admin).
+    return { ...out, ...legacy, portalUpload: true, portalDownload: true, portalEdit: true, portalDelete: true };
   }
   if (role === EMPLOYEE_ROLES.CAMERA_OPERATOR) {
     out.camera = true;

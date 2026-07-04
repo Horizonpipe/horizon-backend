@@ -1,11 +1,11 @@
 {
-  "title": "Auto-clear support queue tickets and fix support push notifications",
-  "description": "When support answers a customer with chat or remote desktop, or when that engagement ends, the customer is removed from the Active Requests queue automatically. Support push notifications now use both an in-page toast and the browser notification API when permission is granted.\n\nWho is affected: PipeShare support queue on BASE (admin) and SaaS customers requesting help.",
+  "title": "Screen capture via tab share and SaaS file delete fix",
+  "description": "Support screen capture now uses the browser’s tab share API first (then crops your selection), so portal color-mix CSS no longer blocks screenshots. SaaS tenant owners and portal-permission accounts can delete files again — customer account types were incorrectly wiping portalDelete and related roles.\n\nWho is affected: support chat screen capture on all hosts; SaaS PipeShare file delete.",
   "changeLog": [
-    "Clear support queue tickets when chat or remote support is answered.",
-    "Clear support queue tickets when chat or remote support ends.",
-    "Browser notifications for support requests when the toggle is on and permission is allowed.",
-    "In-page support request toast stays visible above other panels."
+    "Screen capture prefers native tab share, then crops the selected region.",
+    "html2canvas fallback inlines resolved colors and drops color-mix stylesheets.",
+    "SaaS owners / portal-permission users keep portal delete (and upload/edit) capabilities.",
+    "Customer account types no longer zero out explicit portal* role flags."
   ],
-  "updatedAt": "2026-07-04T04:50:00.000Z"
+  "updatedAt": "2026-07-04T05:10:00.000Z"
 }

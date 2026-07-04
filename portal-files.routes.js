@@ -185,6 +185,8 @@ function userCanManagePortalExtras(user) {
 function userIsPortalAdmin(user) {
   if (userCanManagePortalExtras(user)) return true;
   if (user?.capabilities?.canManagePortalExtras === true) return true;
+  if (user?.capabilities?.saasTenantOwner === true || user?.saasTenantOwner === true) return true;
+  if (user?.portalPermissionsAccess === true || user?.portal_permissions_access === true) return true;
   if (user?.isAdmin === true && looksLikeMike(user)) return true;
   return false;
 }
@@ -202,6 +204,13 @@ function userCanPortalCapability(user, capability) {
   if (capability === 'download') return roles.portalDownload === true;
   if (capability === 'edit') return roles.portalEdit === true;
   if (capability === 'delete') return roles.portalDelete === true;
+  // SaaS tenant virtualbox owners always manage their own files.
+  const pci = String(user?.portalFilesClientId || user?.portal_files_client_id || '')
+    .trim()
+    .toLowerCase();
+  if (pci.startsWith('tenant-') && user?.portalFilesAccessGranted === true) {
+    return true;
+  }
   return false;
 }
 
