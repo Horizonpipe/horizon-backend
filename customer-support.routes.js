@@ -2107,6 +2107,38 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         `UPDATE cp_support_remote_sessions SET status = $2, updated_at = NOW(), ended_at = CASE WHEN $2 = 'declined' THEN NOW() ELSE NULL END WHERE id = $1`,
         [sessionId, status]
       );
+
+      // Turn the in-chat invite into plain status text on both sides.
+      if (row.chat_session_id) {
+        const finalBody = accept
+          ? 'Remote desktop request accepted.'
+          : 'Remote desktop request declined.';
+        const inviteStatus = accept ? 'accepted' : 'declined';
+        const updated = await pool.query(
+          `UPDATE cp_support_chat_messages
+           SET body = $2,
+               message_type = 'system',
+               attachment = COALESCE(attachment, '{}'::jsonb) || $3::jsonb
+           WHERE session_id = $1
+             AND message_type = 'remote-invite'
+             AND (attachment->>'remoteSessionId') = $4
+           RETURNING id, session_id, sender_user_id, body, message_type, attachment, created_at`,
+          [
+            row.chat_session_id,
+            finalBody,
+            JSON.stringify({ status: inviteStatus, remoteSessionId: sessionId }),
+            sessionId
+          ]
+        );
+        for (const msg of updated.rows) {
+          const mapped = await mapChatMessageRowWithSender(pool, msg);
+          broadcastSupportEvents(row.tenant_id, 'chat-message', {
+            sessionId: String(row.chat_session_id),
+            message: mapped
+          });
+        }
+      }
+
       broadcastSupportEvents(row.tenant_id, 'remote-response', {
         sessionId,
         status,
@@ -2114,7 +2146,9 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         adminUserId: row.admin_user_id,
         initiatedBy: row.initiated_by || 'admin',
         chatSessionId: row.chat_session_id || null,
-        persistToken: accept ? row.persist_token : null
+        persistToken: accept ? row.persist_token : null,
+        notice:
+          accept ? 'Remote desktop request accepted.' : 'Remote desktop request declined.'
       });
       return res.json({
         success: true,

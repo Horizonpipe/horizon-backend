@@ -1,10 +1,10 @@
 {
-  "title": "SaaS customers can Accept remote desktop invites",
-  "description": "SaaS workspace owners (like CAT MEOW) were treated as support admins because they have portal permissions. That hid the Accept/Decline buttons on remote desktop invites and only showed the status text. Remote invites now use chat participant role (customer vs support admin), so SaaS customers always get Accept/Decline in the chat message list.\n\nWho is affected: SaaS tenant customers receiving remote desktop help from BASE support.",
+  "title": "Remote desktop fullscreen, invite status text, and scroll wheel",
+  "description": "Remote assistance now supports a true full-screen video feed, turns Accept/Decline invites into plain chat status text after the customer responds, and scrolls the customer page when the admin uses the mouse wheel over the remote viewport.\n\nWho is affected: PipeShare support remote desktop on BASE and SaaS.",
   "changeLog": [
-    "SaaS portalPermissionsAccess no longer marks users as support admins.",
-    "Remote invite Accept/Decline shown to the chat customer/invitee.",
-    "Invite attachment includes customerUserId for reliable invitee detection."
+    "Full screen control for the remote video feed panel.",
+    "Accepted/declined remote invites become normal chat status text.",
+    "Mouse wheel over remote viewport scrolls the customer session."
   ],
-  "updatedAt": "2026-07-04T02:45:00.000Z"
+  "updatedAt": "2026-07-04T03:05:00.000Z"
 }
