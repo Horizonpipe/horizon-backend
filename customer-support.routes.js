@@ -1920,6 +1920,22 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         return res.json({ success: true, sessionId, status: row.status });
       }
 
+      const endedByUserId = authUserId(req.user);
+      const endedByDisplayName = formatUserDisplayNameFromUser(req.user) || 'User';
+      const disconnectBody = `${endedByDisplayName} disconnected`;
+      const disconnectMsg = await insertChatMessageRow(pool, {
+        sessionId,
+        senderUserId: endedByUserId,
+        body: disconnectBody,
+        messageType: 'system',
+        attachment: { variant: 'info', kind: 'disconnect', endedByUserId }
+      });
+      const mappedDisconnect = await mapChatMessageRowWithSender(pool, disconnectMsg);
+      broadcastSupportEvents(row.tenant_id, 'chat-message', {
+        sessionId: String(sessionId),
+        message: mappedDisconnect
+      });
+
       await pool.query(
         `UPDATE cp_support_chat_sessions SET status = 'closed', updated_at = NOW() WHERE id = $1`,
         [sessionId]
@@ -1928,9 +1944,18 @@ function registerCustomerSupportRoutes(app, { pool, requireAuth, readSession, cu
         sessionId,
         customerUserId: row.customer_user_id,
         adminUserId: row.admin_user_id,
+        endedByUserId,
+        endedByDisplayName,
+        notice: disconnectBody,
         reason: 'ended'
       });
-      return res.json({ success: true, sessionId, status: 'closed' });
+      return res.json({
+        success: true,
+        sessionId,
+        status: 'closed',
+        notice: disconnectBody,
+        message: mappedDisconnect
+      });
     } catch (error) {
       console.error('[saas/support/chat/end]', error);
       return jsonError(res, 500, error.message || 'Server error');

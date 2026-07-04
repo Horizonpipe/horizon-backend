@@ -1,10 +1,10 @@
 {
-  "title": "Remote desktop fullscreen, invite status text, and scroll wheel",
-  "description": "Remote assistance now supports a true full-screen video feed, turns Accept/Decline invites into plain chat status text after the customer responds, and scrolls the customer page when the admin uses the mouse wheel over the remote viewport.\n\nWho is affected: PipeShare support remote desktop on BASE and SaaS.",
+  "title": "Workspace name dialog centering and chat disconnect UX",
+  "description": "The workspace layout name editor is centered on screen instead of opening off in the corner. Ending a support chat posts “{User} disconnected” in the thread for the person still there, and their button changes from End chat to Close chat so they can dismiss the transcript.\n\nWho is affected: PipeShare workspace tabs and support chat on BASE and SaaS.",
   "changeLog": [
-    "Full screen control for the remote video feed panel.",
-    "Accepted/declined remote invites become normal chat status text.",
-    "Mouse wheel over remote viewport scrolls the customer session."
+    "Center the workspace name / save-layout prompt on screen.",
+    "End chat posts “User disconnected” for the remaining participant.",
+    "Remaining participant sees Close chat to dismiss the conversation."
   ],
-  "updatedAt": "2026-07-04T03:05:00.000Z"
+  "updatedAt": "2026-07-04T04:20:00.000Z"
 }
