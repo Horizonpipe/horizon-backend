@@ -1,12 +1,12 @@
 {
-  "title": "Plan Sync saved groups — right-click edit and delete",
-  "description": "Plan Sync saved groups now open a custom context menu on right-click (Edit group / Delete group) instead of the browser menu. Edit loads the group into the builder; delete removes it from your account. Also includes prior fixes: Plan Sync button wiring, overlay-only download progress, marketing mobile PIPESHARE/PIPESYNC chips.\n\nWho is affected: PipeSync users using Plan Sync on pipeshare.live.",
+  "title": "Plan Sync saved groups — select, edit, and delete",
+  "description": "Saved Plan Sync groups now use click-to-select with a clear green highlight. Edit and Delete buttons sit in the top-right of the Saved groups panel — faded and disabled until you pick a group. Edit loads the group into the builder so you can rename it, add or remove PSR jobsites and PDF plans, then Save changes. Right-click still offers Edit and Delete as a shortcut.\n\nWho is affected: PipeSync users using Plan Sync on pipeshare.live.",
   "changeLog": [
-    "Right-click saved Plan Sync groups — Edit or Delete from context menu.",
-    "Suppress Windows/browser menu on group rows; wire menu on modal open.",
-    "Edit loads group into builder; delete confirms and syncs to account.",
-    "Plan Sync button fix (buildPlanViewDataActionCtx).",
-    "Plan download uses top popup HUD only (no duplicate inline bar)."
+    "Click a saved group to select it — green highlight shows your choice.",
+    "Edit and Delete buttons in Saved groups header — enabled only after selection.",
+    "Edit mode: rename group, add/remove jobsites and PDFs, Save changes or Cancel.",
+    "Status line and tooltips guide each step; right-click menu still works.",
+    "Prior fixes: Plan Sync button, download HUD overlay, marketing mobile chips."
   ],
-  "updatedAt": "2026-07-05T18:08:00.000Z"
+  "updatedAt": "2026-07-05T22:20:00.000Z"
 }
