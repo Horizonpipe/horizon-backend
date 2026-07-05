@@ -1,13 +1,11 @@
 {
-  "title": "Plan download progress HUD and smooth transfer spinner",
-  "description": "Plan PDF downloads and uploads now show a reliable progress HUD: top-center bubble, inline bar above the explorer, and a strip in fullscreen PDF workspaces. The spinner no longer restarts on every sheet — it loops smoothly until the job finishes.\n\nDownloads are faster with batch read-url presign and parallel sheet fetch/burn. Who is affected: PipeSync Plan view on pipeshare.live and private OVH. Hard refresh after deploy (cache hl46).",
+  "title": "Marketing mobile PipeShare and PipeSync entry buttons",
+  "description": "The Horizon Pipe marketing site now shows PipeShare and PipeSync on mobile: a sticky pill bar under the header plus matching buttons in the hamburger menu. Desktop header links are unchanged.\n\nWho is affected: visitors on horizonpipe.com / pipeshare.live marketing pages on phones and small tablets.",
   "changeLog": [
-    "Plan download progress visible in overlay, Plan view panel, and fullscreen workspace.",
-    "Upload/download spinner runs continuously without resetting each sheet.",
-    "Stable progress DOM — text and bar patch in place, no spinner rebuild per tick.",
-    "Batch read-url prefetch and parallel sheet processing for faster exports.",
-    "Portal/support spinner CSS aligned with PipeSync progress spin animation.",
-    "Cache bust hl46."
+    "Mobile sticky PipeShare (green) and PipeSync (orange) pill bar under site header.",
+    "Same product buttons added inside the mobile navigation menu.",
+    "Shared hp-product-links.css/js on index, about, and services pages.",
+    "Desktop PIPE SHARE / PIPE SYNC header links preserved."
   ],
-  "updatedAt": "2026-07-05T17:10:00.000Z"
+  "updatedAt": "2026-07-05T17:25:00.000Z"
 }
