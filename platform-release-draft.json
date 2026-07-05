@@ -1,13 +1,12 @@
 {
-  "title": "Outlook Email — split workspace + portrait/landscape reading",
-  "description": "Further polished the PipeSync Outlook Email page into a cleaner split workspace (list pane + reading pane). Folder tabs and header buttons are slimmer with no pill glow. Unread messages use a dot indicator instead of loud badges.\n\nThe reading pane now auto-detects email layout: narrow portrait newsletters are centered in a readable column; wide landscape tables (e.g. security digests) expand with horizontal scroll. A short hint appears when sideways scroll or centering applies. Preview header uses grouped actions on desktop.\n\nPresentation only — no email API changes. Cache bust hl57.\n\nWho is affected: PipeSync users on pipeshare.live who use Outlook Email.",
+  "title": "Email fix — portrait messages scroll to the bottom",
+  "description": "Fixed a bug where tall portrait emails (e.g. Disney+ payment notices) were cut off with no way to scroll. The reading pane viewport was using flex layout in portrait mode, which made it grow past the panel and get clipped by overflow:hidden.\n\nThe body viewport now stays height-bounded and scrolls vertically. Portrait emails stay centered with margin auto. Scrollbars are slightly more visible on the reading pane.\n\nWho is affected: PipeSync users reading long HTML emails on pipeshare.live. Cache bust hl58.",
   "changeLog": [
-    "Email: unified split workspace with full-height list and reading panes.",
-    "Email: auto portrait/landscape layout for HTML message bodies.",
-    "Email: unread dot indicators; slimmer tabs and action toolbar.",
-    "Email: wide-table horizontal scroll with layout hint.",
-    "Production Ready V1: refined email grid and canvas polish.",
-    "Cache bust hl57."
+    "Fix: portrait emails no longer clipped — body viewport scrolls vertically.",
+    "Fix: removed flex layout on scroll container that blocked overflow.",
+    "Email grid height chain corrected (min-height: 0 through flex parents).",
+    "Slightly more visible scrollbars on email reading pane.",
+    "Cache bust hl58."
   ],
-  "updatedAt": "2026-07-05T23:42:00.000Z"
+  "updatedAt": "2026-07-05T23:45:00.000Z"
 }
