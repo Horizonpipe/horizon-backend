@@ -1,13 +1,13 @@
 {
-  "title": "Outlook Email — professional reading-pane reskin",
-  "description": "Redesigned the PipeSync Outlook Email page for a cleaner, more professional mail-client feel. Folder tabs are now a subtle segmented control instead of loud orange glow pills. The message list uses left accent bars, tighter typography, and muted unread chips. The reading pane has a structured header (From/To/Date labels), compact action toolbar, and a soft paper-style frame for HTML email bodies so third-party messages no longer sit in a harsh white box on dark chrome.\n\nProduction Ready V1 theme adds green selection accents and refined panel shadows on email. Presentation only — no email API or handler changes.\n\nWho is affected: PipeSync users on pipeshare.live who use Outlook Email.",
+  "title": "Outlook Email — split workspace + portrait/landscape reading",
+  "description": "Further polished the PipeSync Outlook Email page into a cleaner split workspace (list pane + reading pane). Folder tabs and header buttons are slimmer with no pill glow. Unread messages use a dot indicator instead of loud badges.\n\nThe reading pane now auto-detects email layout: narrow portrait newsletters are centered in a readable column; wide landscape tables (e.g. security digests) expand with horizontal scroll. A short hint appears when sideways scroll or centering applies. Preview header uses grouped actions on desktop.\n\nPresentation only — no email API changes. Cache bust hl57.\n\nWho is affected: PipeSync users on pipeshare.live who use Outlook Email.",
   "changeLog": [
-    "Email: segmented folder tabs replace orange gradient pill glow.",
-    "Email: reading pane with labeled metadata header and compact actions.",
-    "Email: paper-style body frame for HTML messages (softer contrast).",
-    "Email: list rows with accent bars and subtle unread/attachment chips.",
-    "Production Ready V1: green email selection accents and panel polish.",
-    "Cache bust hl56."
+    "Email: unified split workspace with full-height list and reading panes.",
+    "Email: auto portrait/landscape layout for HTML message bodies.",
+    "Email: unread dot indicators; slimmer tabs and action toolbar.",
+    "Email: wide-table horizontal scroll with layout hint.",
+    "Production Ready V1: refined email grid and canvas polish.",
+    "Cache bust hl57."
   ],
-  "updatedAt": "2026-07-05T23:30:00.000Z"
+  "updatedAt": "2026-07-05T23:42:00.000Z"
 }
