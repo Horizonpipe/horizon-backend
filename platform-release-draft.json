@@ -1,11 +1,11 @@
 {
-  "title": "Marketing mobile product links — seamless header integration",
-  "description": "PipeShare and PipeSync on the Horizon Pipe marketing site now sit inline in the mobile header (compact Share / Sync chips before the menu icon) and as normal rows in the slide-out menu. The separate sticky bar under the header was removed so the layout feels native to the site.\n\nWho is affected: mobile visitors on marketing/horizonpipe pages on pipeshare.live and horizonpipe.com.",
+  "title": "Plan Sync fix, download overlay cleanup, marketing mobile buttons",
+  "description": "PipeSync Plan Sync button works again (missing action context wiring). Plan download/upload shows only the top popup progress HUD — the duplicate inline bar under Plan view was removed. Marketing site mobile header shows centered PIPESHARE / PIPESYNC chips.\n\nWho is affected: PipeSync users on pipeshare.live (Plan Sync, plan downloads); marketing visitors on mobile.",
   "changeLog": [
-    "Removed separate mobile sticky product bar below header.",
-    "Share and Sync chips integrated into mobile header row before hamburger.",
-    "PipeShare and PipeSync menu rows match Home / About / Services styling.",
-    "Desktop PIPE SHARE / PIPE SYNC header links unchanged."
+    "Fix Plan Sync button — wire buildPlanViewDataActionCtx for plan-view data actions.",
+    "Remove duplicate inline plan transfer progress bar; keep top popup HUD only.",
+    "Marketing mobile: centered PIPESHARE / PIPESYNC header chips (hp3).",
+    "Cache bust hl48 for PipeSync assets."
   ],
-  "updatedAt": "2026-07-05T17:32:00.000Z"
+  "updatedAt": "2026-07-05T17:55:00.000Z"
 }
