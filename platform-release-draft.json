@@ -1,10 +1,11 @@
 {
-  "title": "Remove WinCan DB3 placeholder from Segment Planner",
-  "description": "Removed the empty WinCan project (DB3) placeholder card from the top of the Segment Planner tree. The planner now starts directly with your Client / City / Jobsite groups. No behavior change to imports, DB3 linking, or segment data.\n\nWho is affected: PipeSync users on the Segment Planner tab.",
+  "title": "Production Ready V1 reskin + planner banner cleanup",
+  "description": "Removed the DB3-backed pipe view info banner from Segment Planner. Expanded Production Ready V1 theme polish across all PipeSync modules — planner tree, Plan View workspace, footage, reports, contacts, email, modals, and overlays — plus more tooltips and modal guides. Core behavior unchanged; select Production Ready V1 from the site menu Theme dropdown.\n\nWho is affected: PipeSync users on pipeshare.live.",
   "changeLog": [
-    "Removed WinCan project (DB3) beta placeholder branch from planner tree.",
-    "Cleaned related placeholder styles and context-menu handling.",
-    "Prior release: Production Ready V1 theme, Plan Sync saved groups UX."
+    "Removed DB3-backed pipe view banner from Segment Planner.",
+    "Production Ready V1: reskin for planner, Plan View, footage, reports, contacts, email.",
+    "More theme tooltips and modal guides (import, map builder, download plans).",
+    "Prior: WinCan placeholder removed, Plan Sync saved groups UX."
   ],
-  "updatedAt": "2026-07-05T23:18:00.000Z"
+  "updatedAt": "2026-07-05T23:22:00.000Z"
 }
