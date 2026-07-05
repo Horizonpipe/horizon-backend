@@ -1,12 +1,10 @@
 {
-  "title": "Plan Sync saved groups — select, edit, and delete",
-  "description": "Saved Plan Sync groups now use click-to-select with a clear green highlight. Edit and Delete buttons sit in the top-right of the Saved groups panel — faded and disabled until you pick a group. Edit loads the group into the builder so you can rename it, add or remove PSR jobsites and PDF plans, then Save changes. Right-click still offers Edit and Delete as a shortcut.\n\nWho is affected: PipeSync users using Plan Sync on pipeshare.live.",
+  "title": "Plan Sync saved groups — cleaner edit flow",
+  "description": "Removed the blue editing banner from Plan Sync when you edit a saved group. The builder header already shows edit mode; Cancel edit remains next to Save changes. Saved group selection stays green without extra blue highlights.\n\nWho is affected: PipeSync users using Plan Sync on pipeshare.live.",
   "changeLog": [
-    "Click a saved group to select it — green highlight shows your choice.",
-    "Edit and Delete buttons in Saved groups header — enabled only after selection.",
-    "Edit mode: rename group, add/remove jobsites and PDFs, Save changes or Cancel.",
-    "Status line and tooltips guide each step; right-click menu still works.",
-    "Prior fixes: Plan Sync button, download HUD overlay, marketing mobile chips."
+    "Removed blue edit banner and duplicate Cancel button from Plan Sync builder.",
+    "Saved group rows stay green when selected or editing — no blue overlay.",
+    "Prior: click-to-select, Edit/Delete header buttons, green highlight (hl51)."
   ],
-  "updatedAt": "2026-07-05T22:20:00.000Z"
+  "updatedAt": "2026-07-05T22:55:00.000Z"
 }
