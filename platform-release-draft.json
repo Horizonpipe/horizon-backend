@@ -1,11 +1,12 @@
 {
-  "title": "Plan Sync fix, download overlay cleanup, marketing mobile buttons",
-  "description": "PipeSync Plan Sync button works again (missing action context wiring). Plan download/upload shows only the top popup progress HUD — the duplicate inline bar under Plan view was removed. Marketing site mobile header shows centered PIPESHARE / PIPESYNC chips.\n\nWho is affected: PipeSync users on pipeshare.live (Plan Sync, plan downloads); marketing visitors on mobile.",
+  "title": "Plan Sync saved groups — right-click edit and delete",
+  "description": "Plan Sync saved groups now open a custom context menu on right-click (Edit group / Delete group) instead of the browser menu. Edit loads the group into the builder; delete removes it from your account. Also includes prior fixes: Plan Sync button wiring, overlay-only download progress, marketing mobile PIPESHARE/PIPESYNC chips.\n\nWho is affected: PipeSync users using Plan Sync on pipeshare.live.",
   "changeLog": [
-    "Fix Plan Sync button — wire buildPlanViewDataActionCtx for plan-view data actions.",
-    "Remove duplicate inline plan transfer progress bar; keep top popup HUD only.",
-    "Marketing mobile: centered PIPESHARE / PIPESYNC header chips (hp3).",
-    "Cache bust hl48 for PipeSync assets."
+    "Right-click saved Plan Sync groups — Edit or Delete from context menu.",
+    "Suppress Windows/browser menu on group rows; wire menu on modal open.",
+    "Edit loads group into builder; delete confirms and syncs to account.",
+    "Plan Sync button fix (buildPlanViewDataActionCtx).",
+    "Plan download uses top popup HUD only (no duplicate inline bar)."
   ],
-  "updatedAt": "2026-07-05T17:55:00.000Z"
+  "updatedAt": "2026-07-05T18:08:00.000Z"
 }
