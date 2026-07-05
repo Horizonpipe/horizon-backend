@@ -82,6 +82,7 @@ const PORTAL_NON_BROWSABLE_JOB_IDS = new Set(
     .map((x) => x.trim())
     .filter(Boolean)
 );
+const PORTAL_FOLDER_COPY_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_COPY_CONCURRENCY', 8, 1, 32);
 const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCURRENCY', 8, 1, 32);
 /** Max items per {@code POST /check-paths} (JSON body stays well under express 4mb). */
 const PORTAL_CHECK_PATHS_MAX = clampIntEnv('PORTAL_CHECK_PATHS_MAX', 800, 50, 2000);
@@ -199,18 +200,15 @@ function userIsPortalAdmin(user) {
 function userCanPortalCapability(user, capability) {
   if (!user) return false;
   if (userIsPortalAdmin(user)) return true;
+  // SaaS tenant virtualbox owners always manage their own files.
+  if (user?.saasTenantOwner === true || user?.capabilities?.saasTenantOwner === true) {
+    return true;
+  }
   const roles = user.roles && typeof user.roles === 'object' ? user.roles : {};
   if (capability === 'upload') return roles.portalUpload === true;
   if (capability === 'download') return roles.portalDownload === true;
   if (capability === 'edit') return roles.portalEdit === true;
   if (capability === 'delete') return roles.portalDelete === true;
-  // SaaS tenant virtualbox owners always manage their own files.
-  const pci = String(user?.portalFilesClientId || user?.portal_files_client_id || '')
-    .trim()
-    .toLowerCase();
-  if (pci.startsWith('tenant-') && user?.portalFilesAccessGranted === true) {
-    return true;
-  }
   return false;
 }
 
@@ -2052,6 +2050,82 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     poolOption && typeof poolOption.query === 'function'
       ? { query: (text, params) => poolOption.query(text, params) }
       : pool;
+
+  /**
+   * Job object-key prefix — always prefer resolveStorageRootForJob so list/create/delete
+   * share the same SaaS tenant root (storageRoot alone can be empty when host binding lags).
+   */
+  async function resolveJobPrefix(req, clientId, jobId) {
+    const jobRoot = await resolveStorageRootForJob(aclPool, clientId, jobId, req);
+    return jobPrefix(String(clientId), String(jobId), jobRoot || storageRoot(req));
+  }
+
+  /**
+   * All prefixes a job may have used historically (tenant root missing, glued root, etc.).
+   * Delete must clear every candidate or folders reappear from the surviving prefix.
+   */
+  async function candidateJobPrefixes(req, clientId, jobId) {
+    const cid = String(clientId);
+    const jid = String(jobId);
+    const seen = new Set();
+    /** @type {string[]} */
+    const out = [];
+    const add = (p) => {
+      const s = String(p || '');
+      if (!s || seen.has(s)) return;
+      seen.add(s);
+      out.push(s);
+    };
+    const jobRoot = await resolveStorageRootForJob(aclPool, cid, jid, req);
+    const reqRoot = storageRoot(req);
+    add(jobPrefix(cid, jid, jobRoot || reqRoot));
+    add(jobPrefix(cid, jid, jobRoot));
+    add(jobPrefix(cid, jid, reqRoot));
+    add(jobPrefix(cid, jid, ''));
+    // Pre-normalize bug: `Tenants/foo` + `clients/...` → `Tenants/fooclients/...`
+    for (const raw of [jobRoot, reqRoot]) {
+      const r = String(raw || '')
+        .trim()
+        .replace(/\\/g, '/')
+        .replace(/\/+$/, '');
+      if (r) add(`${r}clients/${cid}/jobs/${jid}/`);
+    }
+    return out;
+  }
+
+  /**
+   * @param {string} folderRel
+   * @param {string[]} prefixes
+   * @returns {Promise<number>}
+   */
+  async function deleteFolderKeysUnderPrefixes(folderRel, prefixes) {
+    let deleted = 0;
+    for (const pref of prefixes) {
+      const prefix = `${pref}${folderRel}/`;
+      const keys = await listAllKeys(portalS3(), portalBucket(), prefix);
+      const toDelete = new Set();
+      for (const row of keys) {
+        if (row?.Key) toDelete.add(row.Key);
+      }
+      toDelete.add(`${pref}${folderRel}/${FOLDER_MARKER}`);
+      for (const Key of toDelete) {
+        try {
+          await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key }));
+          deleted += 1;
+        } catch (err) {
+          const name = err && typeof err === 'object' && 'name' in err ? String(err.name) : '';
+          const status =
+            err && typeof err === 'object' && err.$metadata && typeof err.$metadata === 'object'
+              ? Number(err.$metadata.httpStatusCode)
+              : 0;
+          if (name === 'NoSuchKey' || name === 'NotFound' || status === 404) continue;
+          throw err;
+        }
+      }
+    }
+    return deleted;
+  }
+
   registerPortalShareLinkRoutes(app, { pool: poolOption, query: dbQuery, requireAuth, requireAdmin });
 
   const baseHost = process.env.HP_PRIVATE_BASE_DOMAIN || 'pipeshare.live';
@@ -2379,7 +2453,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         const detail = await explainPortalJobAccessDenial(aclPool, req.user, clientId, jobId);
         return res.status(403).json(detail);
       }
-      const prefix = jobPrefix(String(clientId), String(jobId), storageRoot(req));
+      const prefix = await resolveJobPrefix(req, clientId, jobId);
       const jobHasPathGrants = await portalOrCompanyJobHasPathGrants(aclPool, req.user, clientId, jobId);
       const permEditorList =
         readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
@@ -2440,7 +2514,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         const detail = await explainPortalJobAccessDenial(aclPool, req.user, clientId, jobId);
         return res.status(403).json(detail);
       }
-      const prefix = jobPrefix(String(clientId), String(jobId), storageRoot(req));
+      const prefix = await resolveJobPrefix(req, clientId, jobId);
       let listPrefix = prefix;
       const subtreeRaw = String(req.query.pathPrefix ?? req.query.prefix ?? '').trim();
       if (subtreeRaw) {
@@ -3262,12 +3336,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
         return res.status(403).json({ error: 'Forbidden' });
       }
+      if (!userCanPortalCapability(req.user, 'edit')) {
+        return res.status(403).json({ error: 'Portal edit is not enabled for this account' });
+      }
       const rel = joinRel(parentPath || '', name);
       const parentRel = parentRelPath(rel);
       if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, parentRel, 'edit'))) {
         return res.status(403).json({ error: 'Forbidden for this path' });
       }
-      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
+      const pref = await resolveJobPrefix(req, clientId, jobId);
       const markerKey = rel ? `${pref}${rel}/${FOLDER_MARKER}` : `${pref}${FOLDER_MARKER}`;
 
       const probeP = `${pref}${rel}`;
@@ -3318,7 +3395,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!userCanPortalCapability(req.user, 'edit')) {
         return res.status(403).json({ error: 'Portal edit is not enabled for this account' });
       }
-      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
+      const jobRoot = await resolveStorageRootForJob(aclPool, clientId, jobId, req);
+      const pref = jobPrefix(String(clientId), String(jobId), jobRoot || storageRoot(req));
 
       if (body.fileId) {
         const oldKey = idToKey(String(body.fileId));
@@ -3502,8 +3580,14 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       ) {
         return res.status(403).json({ error: 'Forbidden destination scope' });
       }
-      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
-      const targetPref = jobPrefix(String(targetClientId), String(targetJobId), storageRoot(req));
+      const jobRoot = await resolveStorageRootForJob(aclPool, clientId, jobId, req);
+      const targetJobRoot = await resolveStorageRootForJob(aclPool, targetClientId, targetJobId, req);
+      const pref = jobPrefix(String(clientId), String(jobId), jobRoot || storageRoot(req));
+      const targetPref = jobPrefix(
+        String(targetClientId),
+        String(targetJobId),
+        targetJobRoot || storageRoot(req)
+      );
       const destParent = normalizeRelPath(toParentPath);
 
       if (fileId) {
@@ -3700,20 +3784,26 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       await recordPortalTrashDelete(aclPool, req.user, clientId, jobId, 'folder', folderRel, null, {
         name: path.basename(folderRel) || folderRel
       });
-      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
-      const prefix = `${pref}${folderRel}/`;
-      const keys = await listAllKeys(portalS3(), portalBucket(), prefix);
-      const markerKey = `${pref}${folderRel}/${FOLDER_MARKER}`;
-      const toDelete = new Set(keys.map((k) => k.Key));
-      toDelete.add(markerKey);
-      for (const Key of toDelete) {
-        try {
-          await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key }));
-        } catch (err) {
-          if (err && err.name !== 'NoSuchKey') throw err;
-        }
+      // Clear every historical prefix (tenant root / bare / glued) so SaaS folders
+      // created during earlier path bugs cannot survive a single-prefix delete.
+      const prefixes = await candidateJobPrefixes(req, clientId, jobId);
+      const deleted = await deleteFolderKeysUnderPrefixes(folderRel, prefixes);
+      if (deleted === 0) {
+        console.warn('[portal-files] folder delete found no objects', {
+          clientId: String(clientId),
+          jobId: String(jobId),
+          folderRel,
+          prefixes
+        });
       }
-      await removePortalPathGrantPrefixes(aclPool, clientId, jobId, folderRel);
+      try {
+        await removePortalPathGrantPrefixes(aclPool, clientId, jobId, folderRel);
+      } catch (grantErr) {
+        console.warn(
+          '[portal-files] removePortalPathGrantPrefixes failed:',
+          grantErr instanceof Error ? grantErr.message : grantErr
+        );
+      }
       return res.status(204).send();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -5299,13 +5389,14 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(403).json({ error: 'Forbidden' });
       }
       const jobRoot = await resolveStorageRootForJob(aclPool, parsed.clientId, parsed.jobId, req);
+      const rootDel = jobRoot || storageRoot(req);
       try {
-        assertKeyWithinTenantRoot(Key, jobRoot || storageRoot(req));
+        assertKeyWithinTenantRoot(Key, rootDel);
       } catch {
         return res.status(403).json({ error: 'Forbidden' });
       }
-      const prefDel = jobPrefix(parsed.clientId, parsed.jobId, jobRoot);
-      const relPathDel = Key.slice(prefDel.length);
+      const prefDel = jobPrefix(parsed.clientId, parsed.jobId, rootDel);
+      const relPathDel = Key.startsWith(prefDel) ? Key.slice(prefDel.length) : Key;
       if (!(await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDel, 'full'))) {
         return res.status(403).json({ error: 'Forbidden' });
       }

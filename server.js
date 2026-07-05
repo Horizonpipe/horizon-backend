@@ -749,6 +749,24 @@ async function hydrateJobsiteAssetsResponseRows(assets) {
   );
 }
 
+/** Run async mapper over items with a concurrency cap. */
+async function pmap(items, concurrency, fn) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return [];
+  const limit = Math.max(1, Math.min(Number(concurrency) || 8, list.length));
+  const results = new Array(list.length);
+  let next = 0;
+  const workers = Array.from({ length: limit }, async () => {
+    while (next < list.length) {
+      const i = next;
+      next += 1;
+      results[i] = await fn(list[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 async function hydratePlanBoardPageRow(p, planStorage) {
   if (!p || typeof p !== 'object') return p;
   const copy = { ...p };
@@ -814,71 +832,58 @@ async function hydratePlanBoardLegacyPlanRow(d, planStorage) {
     }
   }
   if (Array.isArray(copy.pieces)) {
-    const pieces = [];
-    for (const p of copy.pieces) {
-      if (!p || typeof p !== 'object') continue;
-      pieces.push(await hydratePlanBoardLegacyPieceRow(p, planStorage));
-    }
-    copy.pieces = pieces;
+    const pieceRows = copy.pieces.filter((p) => p && typeof p === 'object');
+    copy.pieces = await pmap(pieceRows, 16, (p) => hydratePlanBoardLegacyPieceRow(p, planStorage));
   }
   return copy;
 }
 
 async function hydratePlanBoardWorkspacePages(workspaces, planStorage) {
   if (!Array.isArray(workspaces)) return workspaces;
-  const out = [];
-  for (const w of workspaces) {
-    if (!w || typeof w !== 'object') continue;
+  const rows = workspaces.filter((w) => w && typeof w === 'object');
+  return pmap(rows, 6, async (w) => {
     const wCopy = { ...w };
     if (Array.isArray(wCopy.pages)) {
-      const wp = [];
-      for (const p of wCopy.pages) {
-        if (!p || typeof p !== 'object') continue;
-        wp.push(await hydratePlanBoardPageRow(p, planStorage));
-      }
-      wCopy.pages = wp;
+      const pageRows = wCopy.pages.filter((p) => p && typeof p === 'object');
+      wCopy.pages = await pmap(pageRows, 12, (p) => hydratePlanBoardPageRow(p, planStorage));
     }
-    out.push(wCopy);
-  }
-  return out;
+    return wCopy;
+  });
 }
 
-async function hydratePlanBoardBranch(branch, planStorage) {
+async function hydratePlanBoardBranch(branch, planStorage, opts = {}) {
   if (!branch || typeof branch !== 'object') return branch;
   if (!adminAttachmentsWasabiConfigured() && !(planStorage?.client && planStorage?.bucket)) return branch;
+  const skipLegacyPlans = opts.skipLegacyPlans === true;
   const next = { ...branch };
   if (Array.isArray(branch.pages)) {
-    const pages = [];
-    for (const p of branch.pages) {
-      pages.push(await hydratePlanBoardPageRow(p, planStorage));
-    }
-    next.pages = pages;
+    const pageRows = branch.pages.filter((p) => p && typeof p === 'object');
+    next.pages = await pmap(pageRows, 12, (p) => hydratePlanBoardPageRow(p, planStorage));
   } else if (!Array.isArray(next.pages)) {
     next.pages = [];
   }
   if (Array.isArray(branch.mapWorkspaces)) {
     next.mapWorkspaces = await hydratePlanBoardWorkspacePages(branch.mapWorkspaces, planStorage);
   }
-  if (Array.isArray(branch.legacyPlans)) {
-    const legacyPlans = [];
-    for (const d of branch.legacyPlans) {
-      if (!d || typeof d !== 'object') continue;
-      legacyPlans.push(await hydratePlanBoardLegacyPlanRow(d, planStorage));
-    }
-    next.legacyPlans = legacyPlans;
+  if (!skipLegacyPlans && Array.isArray(branch.legacyPlans)) {
+    const legacyRows = branch.legacyPlans.filter((d) => d && typeof d === 'object');
+    next.legacyPlans = await pmap(legacyRows, 4, (d) => hydratePlanBoardLegacyPlanRow(d, planStorage));
   }
   return next;
 }
 
-async function hydratePlanViewPayloadForResponse(payload, req) {
+async function hydratePlanViewPayloadForResponse(payload, req, opts = {}) {
   if (!payload || typeof payload !== 'object') return payload;
   const planStorage = req ? await planViewWasabiForRequest(req) : null;
+  const hydrateOpts = { skipLegacyPlans: opts.skipLegacyPlans !== false };
   if (payload.v === 2 && payload.imagePlan && payload.pdfMap) {
-    const imagePlan = await hydratePlanBoardBranch(payload.imagePlan, planStorage);
-    const pdfMap = await hydratePlanBoardBranch(payload.pdfMap, planStorage);
+    const [imagePlan, pdfMap] = await Promise.all([
+      hydratePlanBoardBranch(payload.imagePlan, planStorage, hydrateOpts),
+      hydratePlanBoardBranch(payload.pdfMap, planStorage, hydrateOpts)
+    ]);
     return { ...payload, v: 2, imagePlan, pdfMap };
   }
-  return hydratePlanBoardBranch(payload, planStorage);
+  return hydratePlanBoardBranch(payload, planStorage, hydrateOpts);
 }
 
 function isLegacyPlanPdfStorageKey(key) {
@@ -1014,6 +1019,60 @@ function sanitizePlanBoardBranch(branch) {
   return clone;
 }
 
+function sanitizePlanSyncRow(row) {
+  if (!row || typeof row !== 'object') return null;
+  const key = String(row.key || '').trim().slice(0, 240);
+  if (!key) return null;
+  const out = {
+    key,
+    label: String(row.label || key).slice(0, 260)
+  };
+  const ref = String(row.reference || '').trim().slice(0, 120);
+  if (ref) out.reference = ref;
+  const jobKey = String(row.jobKey || '').trim().slice(0, 240);
+  if (jobKey) out.jobKey = jobKey;
+  return out;
+}
+
+function sanitizePlanSyncState(planSync) {
+  if (!planSync || typeof planSync !== 'object') return null;
+  const subtypeOk = (raw) => {
+    const s = String(raw || '').toLowerCase();
+    return s === 'storm' || s === 'sanitary' || s === 'both' ? s : 'both';
+  };
+  const groups = Array.isArray(planSync.groups) ? planSync.groups : [];
+  const cleanedGroups = groups
+    .filter((g) => g && typeof g === 'object' && String(g.name || '').trim())
+    .slice(0, 200)
+    .map((g) => ({
+      id: String(g.id || '').trim().slice(0, 80),
+      name: String(g.name || '').trim().slice(0, 120),
+      psrSubtype: subtypeOk(g.psrSubtype),
+      psr: (Array.isArray(g.psr) ? g.psr : []).map(sanitizePlanSyncRow).filter(Boolean).slice(0, 500),
+      pdf: (Array.isArray(g.pdf) ? g.pdf : []).map(sanitizePlanSyncRow).filter(Boolean).slice(0, 200),
+      db3: [],
+      nodes: (Array.isArray(g.nodes) ? g.nodes : []).map(sanitizePlanSyncRow).filter(Boolean).slice(0, 2000),
+      updatedAt: String(g.updatedAt || '').slice(0, 40)
+    }))
+    .filter((g) => g.id && g.name);
+  const builder = planSync.builder && typeof planSync.builder === 'object' ? planSync.builder : {};
+  return {
+    groups: cleanedGroups,
+    builder: {
+      name: String(builder.name || '').slice(0, 120),
+      psrSubtype: subtypeOk(builder.psrSubtype),
+      psr: (Array.isArray(builder.psr) ? builder.psr : []).map(sanitizePlanSyncRow).filter(Boolean).slice(0, 500),
+      pdf: (Array.isArray(builder.pdf) ? builder.pdf : []).map(sanitizePlanSyncRow).filter(Boolean).slice(0, 200),
+      db3: [],
+      nodes: (Array.isArray(builder.nodes) ? builder.nodes : []).map(sanitizePlanSyncRow).filter(Boolean).slice(0, 2000)
+    },
+    searchQuery: String(planSync.searchQuery || '').slice(0, 120),
+    selectedGroupId: String(planSync.selectedGroupId || '').slice(0, 80),
+    activeGroupId: String(planSync.activeGroupId || '').slice(0, 80),
+    pendingUpdateAutoHighlight: !!planSync.pendingUpdateAutoHighlight
+  };
+}
+
 function sanitizePlanViewPayloadForPersist(payload) {
   if (!payload || typeof payload !== 'object') return payload;
   let clone;
@@ -1023,11 +1082,14 @@ function sanitizePlanViewPayloadForPersist(payload) {
     return payload;
   }
   if (clone.v === 2 && clone.imagePlan && clone.pdfMap) {
-    return {
+    const out = {
       v: 2,
       imagePlan: sanitizePlanBoardBranch(clone.imagePlan),
       pdfMap: sanitizePlanBoardBranch(clone.pdfMap)
     };
+    const planSync = sanitizePlanSyncState(clone.planSync);
+    if (planSync) out.planSync = planSync;
+    return out;
   }
   return sanitizePlanBoardBranch(clone);
 }
@@ -1480,6 +1542,9 @@ const PIPESYNC_PLAN_VIEW_TABLE = 'pipesync_plan_views';
 const PIPESYNC_PLAN_VIEW_MAX_BYTES = 14 * 1024 * 1024;
 const PIPESYNC_PRICING_STATE_TABLE = 'pipesync_pricing_state';
 const PIPESYNC_PRICING_STATE_MAX_BYTES = 768 * 1024;
+const PIPESYNC_INSPECTOR_ROSTER_TABLE = 'pipesync_inspector_roster';
+const PIPESYNC_INSPECTOR_ROSTER_MAX_NAMES = 64;
+const OVH_DEFAULT_INSPECTOR_ROSTER = Object.freeze(['A. Beck', 'M. Strickland', 'M. Thomas']);
 const PIPESYNC_PRICING_SNAPSHOTS_MAX = 48;
 const PIPESYNC_PLAN_WORKSPACE_SAVE_TABLE = 'pipesync_plan_workspace_saves';
 const PIPESYNC_PLAN_WORKSPACE_SAVE_MAX_BYTES = 14 * 1024 * 1024;
@@ -1489,6 +1554,37 @@ const PIPESYNC_PLAN_WORKSPACE_BOARDS = new Set(['planView', 'pdfMapView']);
 function pipesyncPlanViewUsernameKey(user) {
   const u = cleanString(user?.username || user?.displayName || '').toLowerCase();
   return u ? u.slice(0, 200) : '';
+}
+
+function sanitizeInspectorRosterNames(raw) {
+  const names = Array.isArray(raw) ? raw : [];
+  const seen = new Set();
+  const out = [];
+  for (const n of names) {
+    const s = cleanString(n).slice(0, 120);
+    if (!s || db3ValueLooksLikeInspectorGarbage(s)) continue;
+    const key = s.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+    if (out.length >= PIPESYNC_INSPECTOR_ROSTER_MAX_NAMES) break;
+  }
+  out.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  return out;
+}
+
+async function inspectorRosterScopeKey(req) {
+  const tenantScope = await resolveTenantWasabiStateScope(pool, req);
+  if (tenantScope?.tenantSlug) return `tenant:${tenantScope.tenantSlug}`;
+  const requestHost = String(req?.headers?.['x-forwarded-host'] || req?.headers?.host || '').trim();
+  const profile = getPublicDeploymentConfig({ requestHost });
+  return profile.mode === 'saas' ? 'tenant:unknown' : 'platform';
+}
+
+function defaultInspectorRosterForRequest(req) {
+  const requestHost = String(req?.headers?.['x-forwarded-host'] || req?.headers?.host || '').trim();
+  const profile = getPublicDeploymentConfig({ requestHost });
+  return profile.mode === 'saas' ? [] : [...OVH_DEFAULT_INSPECTOR_ROSTER];
 }
 
 function sanitizePricingHourlyForPersist(raw) {
@@ -4835,14 +4931,16 @@ const DB3_INSPECTOR_HINT_KEYS = new Set(
 );
 
 const DB3_INSPECTOR_ALIAS_MAP = new Map([
-  ['thomas', 'Mike Thomas'],
-  ['m thomas', 'Mike Thomas'],
-  ['mike thomas', 'Mike Thomas'],
-  ['mike s', 'Mike Strickland'],
-  ['m strickland', 'Mike Strickland'],
-  ['strickland', 'Mike Strickland'],
-  ['mike strickland', 'Mike Strickland'],
-  ['alec beck', 'Alec Beck']
+  ['a beck', 'A. Beck'],
+  ['beck', 'A. Beck'],
+  ['alec beck', 'A. Beck'],
+  ['m strickland', 'M. Strickland'],
+  ['strickland', 'M. Strickland'],
+  ['mike strickland', 'M. Strickland'],
+  ['mike s', 'M. Strickland'],
+  ['m thomas', 'M. Thomas'],
+  ['thomas', 'M. Thomas'],
+  ['mike thomas', 'M. Thomas']
 ]);
 
 /** Guard against extremely wide SECINSP schemas generating huge OR predicates in sql.js. */
@@ -4861,6 +4959,16 @@ function db3InspectorAliasKey(value) {
     .trim();
 }
 
+function db3ValueLooksLikeInspectorGarbage(value) {
+  const s = cleanString(value);
+  if (!s) return true;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s)) return true;
+  const hexOnly = s.replace(/[^0-9a-f]/gi, '');
+  if (hexOnly.length >= 16 && hexOnly.length === s.replace(/[^0-9a-f-]/gi, '').length && !/\s/.test(s)) return true;
+  if (/^[0-9._-]+$/.test(s)) return true;
+  return false;
+}
+
 function db3InspectorDisplay(value) {
   return String(value == null ? '' : value)
     .trim()
@@ -4871,6 +4979,7 @@ function db3InspectorDisplay(value) {
 function db3ValueLooksLikeOperatorDisplayName(value) {
   const s = cleanString(value);
   if (!s) return false;
+  if (db3ValueLooksLikeInspectorGarbage(s)) return false;
   if (/^\d+$/.test(s)) return false;
   return /[A-Za-z]/.test(s);
 }
@@ -4965,14 +5074,27 @@ function db3InspectorIdentityFromImported(imported) {
     const v = imp[k];
     return typeof v === 'number' && Number.isFinite(v) ? String(v) : cleanString(v);
   };
-  let raw = read('HP_INSPECTOR_RAW') || read('HP_EDIT_INSPECTED_BY') || read('HP_INSPECTOR_DISPLAY') || read('OPERATOR_NAME');
+  const manual = read('HP_EDIT_INSPECTED_BY');
+  if (manual && !db3ValueLooksLikeInspectorGarbage(manual)) {
+    const alias = db3InspectorAliasKey(manual);
+    const canonical = db3InspectorDisplay(DB3_INSPECTOR_ALIAS_MAP.get(alias) || manual);
+    return { raw: manual, canonical, key: db3InspectorAliasKey(canonical) || alias };
+  }
+  let raw = '';
+  for (const k of ['HP_INSPECTOR_DISPLAY', 'OPERATOR_NAME', 'HP_INSPECTOR_RAW']) {
+    const v = read(k);
+    if (v && !db3ValueLooksLikeInspectorGarbage(v)) {
+      raw = v;
+      break;
+    }
+  }
   if (!raw) {
     for (const [k, v] of Object.entries(imp)) {
       const ku = String(k || '').toUpperCase();
       const vv = typeof v === 'number' && Number.isFinite(v) ? String(v) : cleanString(v);
-      if (!vv) continue;
+      if (!vv || db3ValueLooksLikeInspectorGarbage(vv)) continue;
       if (DB3_INSPECTOR_HINT_KEYS.has(ku)) {
-        if ((ku === 'INS_OPERATOR_REF' || ku === 'INS_Operator_REF'.toUpperCase() || ku === 'OP_KEY') && !db3ValueLooksLikeOperatorDisplayName(vv)) {
+        if ((ku === 'INS_OPERATOR_REF' || ku === 'OP_KEY') && !db3ValueLooksLikeOperatorDisplayName(vv)) {
           continue;
         }
         raw = vv;
@@ -4984,7 +5106,7 @@ function db3InspectorIdentityFromImported(imported) {
     for (const [k, v] of Object.entries(imp)) {
       const ku = String(k || '').toUpperCase();
       const vv = typeof v === 'number' && Number.isFinite(v) ? String(v) : cleanString(v);
-      if (!vv) continue;
+      if (!vv || db3ValueLooksLikeInspectorGarbage(vv)) continue;
       if (/^INS_(PK|ID)$/.test(ku)) continue;
       if (/INSPECT|SURVEY|OPERATOR|TECHNICIAN|CREW|FIELD.?LEAD|COMPLETEDBY/.test(ku)) {
         raw = vv;
@@ -4993,11 +5115,28 @@ function db3InspectorIdentityFromImported(imported) {
     }
   }
   raw = db3InspectorDisplay(raw);
-  if (!raw) return null;
+  if (!raw || db3ValueLooksLikeInspectorGarbage(raw)) return null;
   const alias = db3InspectorAliasKey(raw);
   const canonical = db3InspectorDisplay(DB3_INSPECTOR_ALIAS_MAP.get(alias) || raw);
   const key = db3InspectorAliasKey(canonical) || alias;
   return { raw, canonical, key };
+}
+
+function applyDb3ManualInspectorFields(imported, manualName) {
+  const out = imported && typeof imported === 'object' && !Array.isArray(imported) ? { ...imported } : {};
+  const manual = cleanString(manualName).slice(0, 4000);
+  if (!manual || db3ValueLooksLikeInspectorGarbage(manual)) {
+    delete out.HP_EDIT_INSPECTED_BY;
+    return out;
+  }
+  const alias = db3InspectorAliasKey(manual);
+  const display = db3InspectorDisplay(DB3_INSPECTOR_ALIAS_MAP.get(alias) || manual);
+  out.HP_EDIT_INSPECTED_BY = manual;
+  out.HP_INSPECTOR_RAW = display;
+  out.HP_INSPECTOR_DISPLAY = display;
+  out.HP_INSPECTOR_KEY = db3InspectorAliasKey(display) || alias;
+  out.OPERATOR_NAME = display.slice(0, 4000);
+  return out;
 }
 
 /**
@@ -8475,7 +8614,8 @@ app.get('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, 
     const rows = Array.isArray(tables[PIPESYNC_PLAN_VIEW_TABLE]) ? tables[PIPESYNC_PLAN_VIEW_TABLE] : [];
     const row = rows.find((r) => String(r?.username || '').toLowerCase() === un);
     let payload = row && row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload) ? row.payload : null;
-    if (payload) payload = await hydratePlanViewPayloadForResponse(payload, req);
+    const hydrateFull = String(req.query?.hydrate || '').trim().toLowerCase() === 'full';
+    if (payload) payload = await hydratePlanViewPayloadForResponse(payload, req, { skipLegacyPlans: !hydrateFull });
     return res.json({
       success: true,
       payload,
@@ -8519,6 +8659,61 @@ app.put('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, 
     return res.json({ success: true, updated_at: now });
   } catch (error) {
     console.error('PUT PIPESYNC PLAN VIEW:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/pipesync/inspector-roster', requireAuth, requirePsrViewerAccess, async (req, res) => {
+  try {
+    if (!(await wasabiStateConfiguredForRequest(req))) {
+      return res.json({ success: true, names: defaultInspectorRosterForRequest(req), wasabi: false });
+    }
+    const scopeKey = await inspectorRosterScopeKey(req);
+    const tables = await loadSnapshotTablesForRequest(req, false);
+    const rows = Array.isArray(tables[PIPESYNC_INSPECTOR_ROSTER_TABLE]) ? tables[PIPESYNC_INSPECTOR_ROSTER_TABLE] : [];
+    const row = rows.find((r) => String(r?.scope_key || '') === scopeKey);
+    let names = sanitizeInspectorRosterNames(row?.names);
+    if (!names.length) names = defaultInspectorRosterForRequest(req);
+    return res.json({ success: true, names, scope_key: scopeKey, updated_at: row?.updated_at || null });
+  } catch (error) {
+    console.error('GET PIPESYNC INSPECTOR ROSTER:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/pipesync/inspector-roster', requireAuth, requirePsrDataEntryAccess, async (req, res) => {
+  try {
+    if (!WASABI_WRITES_PRIMARY_ENABLED) {
+      return res.status(503).json({ success: false, error: 'Wasabi primary writes are disabled on this server.' });
+    }
+    if (!(await wasabiStateConfiguredForRequest(req))) {
+      return res.status(503).json({ success: false, error: 'Wasabi state storage is not configured.' });
+    }
+    const scopeKey = await inspectorRosterScopeKey(req);
+    const addName = cleanString(req.body?.addName).slice(0, 120);
+    const replaceNames = Array.isArray(req.body?.names) ? sanitizeInspectorRosterNames(req.body.names) : null;
+    if (!addName && !replaceNames) {
+      return res.status(400).json({ success: false, error: 'Provide addName or names[] in the request body.' });
+    }
+    const now = nowIso();
+    let resolvedNames = [];
+    await runWasabiStateWriteForRequest(req, `pipesync-inspector-roster:${scopeKey}`, async (data) => {
+      const rows = ensureSnapshotTable(data, PIPESYNC_INSPECTOR_ROSTER_TABLE);
+      const idx = rows.findIndex((r) => String(r?.scope_key || '') === scopeKey);
+      const existing = idx >= 0 ? sanitizeInspectorRosterNames(rows[idx]?.names) : defaultInspectorRosterForRequest(req);
+      const merged = replaceNames
+        ? [...replaceNames]
+        : addName
+          ? [...existing.filter((n) => n.toLowerCase() !== addName.toLowerCase()), addName]
+          : [...existing];
+      resolvedNames = sanitizeInspectorRosterNames(merged);
+      const row = { scope_key: scopeKey, names: resolvedNames, updated_at: now };
+      if (idx >= 0) rows[idx] = row;
+      else rows.push(row);
+    });
+    return res.json({ success: true, names: resolvedNames, scope_key: scopeKey, updated_at: now });
+  } catch (error) {
+    console.error('PUT PIPESYNC INSPECTOR ROSTER:', error);
     return res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -8600,8 +8795,11 @@ app.post(
       if (!planStorage.configured) {
         return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
       }
+      const { rootPrefix } = planStorage;
       const rawKeys = Array.isArray(req.body?.storageKeys) ? req.body.storageKeys : [];
-      const storageKeys = [...new Set(rawKeys.map((k) => cleanString(k)).filter((k) => isValidPipesyncPlanPageStorageKey(k)))];
+      const storageKeys = [
+        ...new Set(rawKeys.map((k) => cleanString(k)).filter((k) => isValidPipesyncPlanPageStorageKey(k, rootPrefix)))
+      ];
       if (!storageKeys.length) {
         return res.status(400).json({ success: false, error: 'storageKeys must include at least one valid plan page key.' });
       }
@@ -8645,6 +8843,48 @@ app.post(
       return res.json({ success: true, url: typeof url === 'string' ? url : '' });
     } catch (error) {
       console.error('PIPESYNC PLAN VIEW READ URL:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+/** Batch presign GET for plan-board storage keys (parallel, capped). */
+app.post(
+  '/pipesync/plan-view/read-urls',
+  requireAuth,
+  requirePsrViewerAccess,
+  express.json({ limit: '512kb' }),
+  async (req, res) => {
+    try {
+      const planStorage = await planViewWasabiForRequest(req);
+      if (!planStorage.configured) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
+      }
+      const { client: planS3, bucket: planBucket, rootPrefix } = planStorage;
+      const rawKeys = Array.isArray(req.body?.storageKeys) ? req.body.storageKeys : [];
+      const keys = [
+        ...new Set(rawKeys.map((k) => cleanString(k)).filter((k) => isPersistablePlanPdfStorageKey(k, rootPrefix)))
+      ].slice(0, 120);
+      if (!keys.length) {
+        return res.status(400).json({ success: false, error: 'storageKeys must include at least one valid plan page key.' });
+      }
+      const urls = await pmap(keys, 16, async (storageKey) => {
+        try {
+          assertKeyWithinTenantRoot(storageKey, rootPrefix);
+          const { url } = await presignAdminAttachmentGet(
+            planS3,
+            planBucket,
+            storageKey,
+            ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+          );
+          return { storageKey, url: typeof url === 'string' ? url : '' };
+        } catch {
+          return { storageKey, url: '' };
+        }
+      });
+      return res.json({ success: true, urls });
+    } catch (error) {
+      console.error('PIPESYNC PLAN VIEW READ URLS:', error);
       return res.status(500).json({ success: false, error: error.message });
     }
   }
@@ -9408,6 +9648,9 @@ app.put('/records/:id/segments/:segmentId', requireAuth, requirePsrDataEntryAcce
             : String(v == null ? '' : v).trim();
         if (!str) delete cur[ku];
         else cur[ku] = str.slice(0, 4000);
+      }
+      if (cur.HP_EDIT_INSPECTED_BY) {
+        Object.assign(cur, applyDb3ManualInspectorFields(cur, cur.HP_EDIT_INSPECTED_BY));
       }
       found.db3Imported = sanitizeDb3ImportedObject(cur);
     }

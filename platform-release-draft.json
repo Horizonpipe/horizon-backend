@@ -1,11 +1,10 @@
-{
-  "title": "Screen capture via tab share and SaaS file delete fix",
-  "description": "Support screen capture now uses the browser’s tab share API first (then crops your selection), so portal color-mix CSS no longer blocks screenshots. SaaS tenant owners and portal-permission accounts can delete files again — customer account types were incorrectly wiping portalDelete and related roles.\n\nWho is affected: support chat screen capture on all hosts; SaaS PipeShare file delete.",
-  "changeLog": [
-    "Screen capture prefers native tab share, then crops the selected region.",
-    "html2canvas fallback inlines resolved colors and drops color-mix stylesheets.",
-    "SaaS owners / portal-permission users keep portal delete (and upload/edit) capabilities.",
-    "Customer account types no longer zero out explicit portal* role flags."
-  ],
-  "updatedAt": "2026-07-04T05:10:00.000Z"
-}
+{
+  "title": "Plan export — fix arrow and surveyed-by positioning",
+  "description": "Inspection direction arrows and Surveyed By labels on structure-node plan downloads looked correct but were offset from the highlight lines. The decor PNG overlay was built in display-pixel space and stretched into PDF coordinates using a single page model, while highlight lines were mapped per-line through the full FitH letterbox transform.\n\nDecor is now rasterized in PDF user space using the same per-line coordinate mapping as line burn, so arrows and labels land on the lines they belong to.\n\nWho is affected: PipeSync users exporting Highlights with Structure Nodes on pipeshare.live and private OVH.",
+  "changeLog": [
+    "Export decor overlay uses per-line page model (same as highlight line burn).",
+    "Arrows and surveyed-by labels rasterized in PDF coordinate space, not display stretch.",
+    "Full-page PNG embed at 1:1 PDF dimensions — no letterbox rect skew."
+  ],
+  "updatedAt": "2026-07-05T19:00:00.000Z"
+}

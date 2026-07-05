@@ -63,6 +63,16 @@ if [[ ! -s "$BACKEND/.env" ]] || ! grep -q '^DATABASE_URL=' "$BACKEND/.env" 2>/d
 fi
 
 echo "[github-deploy] pm2 reload"
-run_as_deploy_user bash -lc "cd '$BACKEND' && pm2 reload deploy/ovh/ecosystem.config.cjs --update-env && pm2 save"
+if sudo pm2 describe horizon-backend &>/dev/null; then
+  echo "[github-deploy] using root PM2 (production listener on :3000)"
+  sudo bash -lc "cd '$BACKEND' && pm2 reload deploy/ovh/ecosystem.config.cjs --update-env && pm2 save"
+  if run_as_deploy_user pm2 describe horizon-backend &>/dev/null; then
+    echo "[github-deploy] stopping duplicate ${PM2_USER} PM2 horizon-backend"
+    run_as_deploy_user pm2 stop horizon-backend || true
+    run_as_deploy_user pm2 save || true
+  fi
+else
+  run_as_deploy_user bash -lc "cd '$BACKEND' && pm2 reload deploy/ovh/ecosystem.config.cjs --update-env && pm2 save"
+fi
 
 echo "[github-deploy] done $(date -u +%Y-%m-%dT%H:%M:%SZ)"

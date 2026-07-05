@@ -242,12 +242,16 @@ function isAdminUser(user) {
 
 /** User Manager / Admin Panel access. */
 function canAccessAdminPanel(user) {
+  // SaaS workspace owners are super-admin inside their tenant (same PipeShare admin UI as BASE).
+  // They are still excluded from global isAdminUser / isSuperAdmin (platform-only).
+  if (isSaasWorkspaceOwner(user)) return true;
   return isAdminUser(user);
 }
 
 /** PipeShare ACL / path grants / share extras. */
 function canManagePortalExtras(user) {
   if (isSaasWorkspaceOwner(user)) return true;
+  if (user?.portalPermissionsAccess === true || user?.portal_permissions_access === true) return true;
   return isAdminUser(user);
 }
 

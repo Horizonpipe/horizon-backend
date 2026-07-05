@@ -21,9 +21,9 @@ function resolveAppDataPrefix(relativePrefix, rootPrefix = '') {
   return root ? `${root}${relativePrefix}` : relativePrefix;
 }
 
-/** Strip optional `tenants/{slug}/` for validation of stored keys. */
+/** Strip optional `Tenants/{slug}/` (any case) for validation of stored keys. */
 function stripOptionalTenantRoot(key) {
-  const m = /^tenants\/[^/]+\/(.*)$/.exec(String(key || ''));
+  const m = /^tenants\/[^/]+\/(.*)$/i.exec(String(key || ''));
   return m ? m[1] : String(key || '');
 }
 
