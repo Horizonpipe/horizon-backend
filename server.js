@@ -833,7 +833,7 @@ async function hydratePlanBoardLegacyPlanRow(d, planStorage) {
   }
   if (Array.isArray(copy.pieces)) {
     const pieceRows = copy.pieces.filter((p) => p && typeof p === 'object');
-    copy.pieces = await pmap(pieceRows, 16, (p) => hydratePlanBoardLegacyPieceRow(p, planStorage));
+    copy.pieces = await pmap(pieceRows, 24, (p) => hydratePlanBoardLegacyPieceRow(p, planStorage));
   }
   return copy;
 }
@@ -867,7 +867,7 @@ async function hydratePlanBoardBranch(branch, planStorage, opts = {}) {
   }
   if (!skipLegacyPlans && Array.isArray(branch.legacyPlans)) {
     const legacyRows = branch.legacyPlans.filter((d) => d && typeof d === 'object');
-    next.legacyPlans = await pmap(legacyRows, 4, (d) => hydratePlanBoardLegacyPlanRow(d, planStorage));
+    next.legacyPlans = await pmap(legacyRows, 8, (d) => hydratePlanBoardLegacyPlanRow(d, planStorage));
   }
   return next;
 }
@@ -8864,11 +8864,11 @@ app.post(
       const rawKeys = Array.isArray(req.body?.storageKeys) ? req.body.storageKeys : [];
       const keys = [
         ...new Set(rawKeys.map((k) => cleanString(k)).filter((k) => isPersistablePlanPdfStorageKey(k, rootPrefix)))
-      ].slice(0, 120);
+      ].slice(0, 200);
       if (!keys.length) {
         return res.status(400).json({ success: false, error: 'storageKeys must include at least one valid plan page key.' });
       }
-      const urls = await pmap(keys, 16, async (storageKey) => {
+      const urls = await pmap(keys, 24, async (storageKey) => {
         try {
           assertKeyWithinTenantRoot(storageKey, rootPrefix);
           const { url } = await presignAdminAttachmentGet(

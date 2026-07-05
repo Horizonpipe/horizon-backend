@@ -1,10 +1,13 @@
-{
-  "title": "Plan export — fix arrow and surveyed-by positioning",
-  "description": "Inspection direction arrows and Surveyed By labels on structure-node plan downloads looked correct but were offset from the highlight lines. The decor PNG overlay was built in display-pixel space and stretched into PDF coordinates using a single page model, while highlight lines were mapped per-line through the full FitH letterbox transform.\n\nDecor is now rasterized in PDF user space using the same per-line coordinate mapping as line burn, so arrows and labels land on the lines they belong to.\n\nWho is affected: PipeSync users exporting Highlights with Structure Nodes on pipeshare.live and private OVH.",
-  "changeLog": [
-    "Export decor overlay uses per-line page model (same as highlight line burn).",
-    "Arrows and surveyed-by labels rasterized in PDF coordinate space, not display stretch.",
-    "Full-page PNG embed at 1:1 PDF dimensions — no letterbox rect skew."
-  ],
-  "updatedAt": "2026-07-05T19:00:00.000Z"
-}
+{
+  "title": "Plan download progress HUD and smooth transfer spinner",
+  "description": "Plan PDF downloads and uploads now show a reliable progress HUD: top-center bubble, inline bar above the explorer, and a strip in fullscreen PDF workspaces. The spinner no longer restarts on every sheet — it loops smoothly until the job finishes.\n\nDownloads are faster with batch read-url presign and parallel sheet fetch/burn. Who is affected: PipeSync Plan view on pipeshare.live and private OVH. Hard refresh after deploy (cache hl46).",
+  "changeLog": [
+    "Plan download progress visible in overlay, Plan view panel, and fullscreen workspace.",
+    "Upload/download spinner runs continuously without resetting each sheet.",
+    "Stable progress DOM — text and bar patch in place, no spinner rebuild per tick.",
+    "Batch read-url prefetch and parallel sheet processing for faster exports.",
+    "Portal/support spinner CSS aligned with PipeSync progress spin animation.",
+    "Cache bust hl46."
+  ],
+  "updatedAt": "2026-07-05T17:10:00.000Z"
+}
