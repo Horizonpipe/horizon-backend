@@ -1,11 +1,11 @@
 {
-  "title": "Marketing mobile PipeShare and PipeSync entry buttons",
-  "description": "The Horizon Pipe marketing site now shows PipeShare and PipeSync on mobile: a sticky pill bar under the header plus matching buttons in the hamburger menu. Desktop header links are unchanged.\n\nWho is affected: visitors on horizonpipe.com / pipeshare.live marketing pages on phones and small tablets.",
+  "title": "Marketing mobile product links — seamless header integration",
+  "description": "PipeShare and PipeSync on the Horizon Pipe marketing site now sit inline in the mobile header (compact Share / Sync chips before the menu icon) and as normal rows in the slide-out menu. The separate sticky bar under the header was removed so the layout feels native to the site.\n\nWho is affected: mobile visitors on marketing/horizonpipe pages on pipeshare.live and horizonpipe.com.",
   "changeLog": [
-    "Mobile sticky PipeShare (green) and PipeSync (orange) pill bar under site header.",
-    "Same product buttons added inside the mobile navigation menu.",
-    "Shared hp-product-links.css/js on index, about, and services pages.",
-    "Desktop PIPE SHARE / PIPE SYNC header links preserved."
+    "Removed separate mobile sticky product bar below header.",
+    "Share and Sync chips integrated into mobile header row before hamburger.",
+    "PipeShare and PipeSync menu rows match Home / About / Services styling.",
+    "Desktop PIPE SHARE / PIPE SYNC header links unchanged."
   ],
-  "updatedAt": "2026-07-05T17:25:00.000Z"
+  "updatedAt": "2026-07-05T17:32:00.000Z"
 }
