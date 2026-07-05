@@ -1,10 +1,12 @@
 {
-  "title": "Plan Sync saved groups — cleaner edit flow",
-  "description": "Removed the blue editing banner from Plan Sync when you edit a saved group. The builder header already shows edit mode; Cancel edit remains next to Save changes. Saved group selection stays green without extra blue highlights.\n\nWho is affected: PipeSync users using Plan Sync on pipeshare.live.",
+  "title": "Production Ready V1 theme for PipeSync",
+  "description": "New selectable theme in the site menu: Production Ready V1. It polishes PipeSync appearance (typography, panels, tabs, Plan Sync, Plan View, modals) and adds first-time-friendly page guides and tooltips — without changing any core behavior. Switch themes anytime from the dropdown; other themes are unaffected.\n\nAlso includes prior fixes: Plan Sync saved groups (select, Edit/Delete header), removed blue edit banner, download HUD overlay.\n\nWho is affected: PipeSync users on pipeshare.live.",
   "changeLog": [
-    "Removed blue edit banner and duplicate Cancel button from Plan Sync builder.",
-    "Saved group rows stay green when selected or editing — no blue overlay.",
-    "Prior: click-to-select, Edit/Delete header buttons, green highlight (hl51)."
+    "Production Ready V1 theme — polished UI + guided hints in site menu Theme dropdown.",
+    "Page guides on planner, Plan View, footage, reports, contacts, email, import queue.",
+    "Tooltips and field hints on key buttons and forms when theme is active.",
+    "Plan Sync saved groups: click-to-select, Edit/Delete header, green highlight.",
+    "Removed redundant blue Plan Sync edit banner."
   ],
-  "updatedAt": "2026-07-05T22:55:00.000Z"
+  "updatedAt": "2026-07-05T23:10:00.000Z"
 }
