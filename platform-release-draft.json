@@ -1,11 +1,13 @@
 {
-  "title": "Production Ready V1 reskin + planner banner cleanup",
-  "description": "Removed the DB3-backed pipe view info banner from Segment Planner. Expanded Production Ready V1 theme polish across all PipeSync modules — planner tree, Plan View workspace, footage, reports, contacts, email, modals, and overlays — plus more tooltips and modal guides. Core behavior unchanged; select Production Ready V1 from the site menu Theme dropdown.\n\nWho is affected: PipeSync users on pipeshare.live.",
+  "title": "Outlook Email — professional reading-pane reskin",
+  "description": "Redesigned the PipeSync Outlook Email page for a cleaner, more professional mail-client feel. Folder tabs are now a subtle segmented control instead of loud orange glow pills. The message list uses left accent bars, tighter typography, and muted unread chips. The reading pane has a structured header (From/To/Date labels), compact action toolbar, and a soft paper-style frame for HTML email bodies so third-party messages no longer sit in a harsh white box on dark chrome.\n\nProduction Ready V1 theme adds green selection accents and refined panel shadows on email. Presentation only — no email API or handler changes.\n\nWho is affected: PipeSync users on pipeshare.live who use Outlook Email.",
   "changeLog": [
-    "Removed DB3-backed pipe view banner from Segment Planner.",
-    "Production Ready V1: reskin for planner, Plan View, footage, reports, contacts, email.",
-    "More theme tooltips and modal guides (import, map builder, download plans).",
-    "Prior: WinCan placeholder removed, Plan Sync saved groups UX."
+    "Email: segmented folder tabs replace orange gradient pill glow.",
+    "Email: reading pane with labeled metadata header and compact actions.",
+    "Email: paper-style body frame for HTML messages (softer contrast).",
+    "Email: list rows with accent bars and subtle unread/attachment chips.",
+    "Production Ready V1: green email selection accents and panel polish.",
+    "Cache bust hl56."
   ],
-  "updatedAt": "2026-07-05T23:22:00.000Z"
+  "updatedAt": "2026-07-05T23:30:00.000Z"
 }
