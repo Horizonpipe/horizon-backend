@@ -30,7 +30,7 @@ load_publish_env() {
   local line key val
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-    [[ "$line" =~ ^(WASABI_|HP_|PUBLIC_ORIGIN|SAAS_CPANEL_BASE_URL) ]] || continue
+    [[ "$line" =~ ^(WASABI_|HP_|SAAS_|PUBLIC_ORIGIN|SAAS_CPANEL_BASE_URL) ]] || continue
     key="${line%%=*}"
     val="${line#*=}"
     val="${val%\"}"

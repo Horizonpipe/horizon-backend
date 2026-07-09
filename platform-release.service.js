@@ -13,6 +13,7 @@ const {
   buildSaasRuntimeKey,
   PLATFORM_RELEASES_ROOT
 } = require('./lib/platform-release-paths');
+const { listPlatformReleaseBucketCandidates } = require('./lib/platform-release-storage');
 const {
   loadPlatformReleaseDraft,
   clearPlatformReleaseDraft
@@ -420,6 +421,19 @@ async function artifactExists(client, bucket, key) {
   }
 }
 
+/** Find which configured Wasabi bucket holds release artifacts (publish may use WASABI_BUCKET while catalog reads SAAS_WASABI_BUCKET). */
+async function findReleaseArtifactBucket(client, frontendKey, backendKey) {
+  const keys = [frontendKey, backendKey].filter(Boolean);
+  for (const bucket of listPlatformReleaseBucketCandidates()) {
+    for (const key of keys) {
+      if (await artifactExists(client, bucket, key)) {
+        return bucket;
+      }
+    }
+  }
+  return '';
+}
+
 async function applyPlatformRelease(
   client,
   bucket,
@@ -439,8 +453,9 @@ async function applyPlatformRelease(
   const frontendKey = cleanString(entry.artifactKeys?.frontend) || buildReleaseArtifactKey(v, 'frontend.tar.gz');
   const backendKey = cleanString(entry.artifactKeys?.backend) || buildReleaseArtifactKey(v, 'backend.tar.gz');
 
-  const hasFrontend = await artifactExists(client, bucket, frontendKey);
-  const hasBackend = await artifactExists(client, bucket, backendKey);
+  const artifactBucket = (await findReleaseArtifactBucket(client, frontendKey, backendKey)) || bucket;
+  const hasFrontend = await artifactExists(client, artifactBucket, frontendKey);
+  const hasBackend = await artifactExists(client, artifactBucket, backendKey);
   if (!hasFrontend && !hasBackend) {
     throw new Error(`Version ${v} has no uploaded artifacts yet. Publish from non-SaaS first.`);
   }
@@ -457,7 +472,8 @@ async function applyPlatformRelease(
         ...process.env,
         HP_RELEASE_VERSION: v,
         HP_RELEASE_FRONTEND_KEY: frontendKey,
-        HP_RELEASE_BACKEND_KEY: backendKey
+        HP_RELEASE_BACKEND_KEY: backendKey,
+        HP_RELEASE_ARTIFACT_BUCKET: artifactBucket
       },
       stdio: ['ignore', 'pipe', 'pipe']
     });

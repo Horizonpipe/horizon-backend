@@ -35,7 +35,9 @@ if [[ "$MODE" != "saas" && "$MODE" != "hybrid" ]]; then
 fi
 
 # Hybrid BASE+SaaS on one box: artifacts live in the SaaS virtualbox bucket when configured.
-if [[ -n "${SAAS_WASABI_BUCKET:-}" ]]; then
+if [[ -n "${HP_RELEASE_ARTIFACT_BUCKET:-}" ]]; then
+  WASABI_BUCKET="${HP_RELEASE_ARTIFACT_BUCKET}"
+elif [[ -n "${SAAS_WASABI_BUCKET:-}" ]]; then
   WASABI_BUCKET="${SAAS_WASABI_BUCKET}"
   if [[ -n "${SAAS_WASABI_ENDPOINT:-}" ]]; then
     WASABI_ENDPOINT="${SAAS_WASABI_ENDPOINT}"
