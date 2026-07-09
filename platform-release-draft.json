@@ -1,11 +1,11 @@
 {
-  "title": "Pipe chart: full structure names + pro UI",
-  "description": "Pipe chart structure labels like SSMH-A5 to SSMH-A4 were getting cut down to incomplete names (for example showing SSMH alone). Parsing now keeps the full compound structure IDs from WinCan OBJ_Key, and the chart prefers the fuller name when NODE and OBJ_Key both exist.\n\nThe Pipe chart panel also got a cleaner production layout: clear From → To header, length/direction chips, a short how-to line, and a simple legend so anyone can read the run without guessing.\n\nWho is affected: PipeShare WinCan pipe chart on BASE (and SaaS after Push).",
+  "title": "File explorer: delete no longer blanks the folder",
+  "description": "Deleting a file or folder in PipeShare could blank the explorer until you left and re-entered the folder, and the deleted item often still appeared afterward.\n\nThat happened because delete refreshed only the job root listing while you stayed inside a subfolder, and cached tree data could bring deleted rows back. Delete now removes the item immediately, then reloads the folder you are in with a fresh (non-cached) listing.\n\nWho is affected: PipeShare file explorer on BASE (and SaaS after Push).",
   "changeLog": [
-    "Fix structure names like SSMH-A5 / SSMH-A4 so they are never truncated on the pipe chart.",
-    "Prefer fuller structure labels when NODE and OBJ_Key disagree in length.",
-    "Redesign pipe chart header: From → To, length, direction, observation count.",
-    "Add legend and short how-to (click mark / drag pipe) for clearer use."
+    "Fix delete leaving the explorer blank inside nested folders.",
+    "Cold-refresh the open folder after delete so removed items stay gone.",
+    "Same refresh path for rename, new folder, move, and paste.",
+    "Bypass browser/tree cache on post-delete listings."
   ],
-  "updatedAt": "2026-07-09T16:50:00.000Z"
+  "updatedAt": "2026-07-09T17:00:00.000Z"
 }
