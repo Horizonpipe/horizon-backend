@@ -49,6 +49,25 @@ preserve_backend_env() {
     echo "[github-deploy] restored stashed .env after git reset"
   fi
   run_as_deploy_user bash -lc "cd '$BACKEND' && npm install --omit=dev"
+  ensure_hybrid_manifest_only_env "$env_file"
+}
+
+ensure_hybrid_manifest_only_env() {
+  local env_file="$1"
+  if [[ ! -f "$env_file" ]]; then
+    return 0
+  fi
+  if ! grep -q '^HP_PLATFORM_APPLY_PEER_URLS=' "$env_file" 2>/dev/null; then
+    return 0
+  fi
+  if grep -q '^HP_PLATFORM_APPLY_MANIFEST_ONLY=' "$env_file" 2>/dev/null; then
+    sed -i 's/^HP_PLATFORM_APPLY_MANIFEST_ONLY=.*/HP_PLATFORM_APPLY_MANIFEST_ONLY=1/' "$env_file"
+  else
+    echo 'HP_PLATFORM_APPLY_MANIFEST_ONLY=1' >> "$env_file"
+  fi
+  chmod 600 "$env_file"
+  chown "${PM2_USER}:${PM2_USER}" "$env_file" 2>/dev/null || true
+  echo "[github-deploy] ensured HP_PLATFORM_APPLY_MANIFEST_ONLY=1 (hybrid BASE→SaaS push)"
 }
 
 preserve_backend_env
