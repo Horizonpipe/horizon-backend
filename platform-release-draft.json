@@ -1,11 +1,10 @@
 {
-  "title": "File explorer: delete no longer blanks the folder",
-  "description": "Deleting a file or folder in PipeShare could blank the explorer until you left and re-entered the folder, and the deleted item often still appeared afterward.\n\nThat happened because delete refreshed only the job root listing while you stayed inside a subfolder, and cached tree data could bring deleted rows back. Delete now removes the item immediately, then reloads the folder you are in with a fresh (non-cached) listing.\n\nWho is affected: PipeShare file explorer on BASE (and SaaS after Push).",
+  "title": "Sleek delete confirmation for file explorer",
+  "description": "Deleting files or folders in PipeShare no longer uses the plain browser popup. You now get a clean in-app confirmation that shows what will be removed, warns that cloud delete is permanent, and matches the rest of the PipeShare UI.\n\nWho is affected: PipeShare file explorer on BASE (and SaaS after Push).",
   "changeLog": [
-    "Fix delete leaving the explorer blank inside nested folders.",
-    "Cold-refresh the open folder after delete so removed items stay gone.",
-    "Same refresh path for rename, new folder, move, and paste.",
-    "Bypass browser/tree cache on post-delete listings."
+    "Replace browser delete confirm with a professional in-app modal.",
+    "Show selected file/folder names before permanent cloud delete.",
+    "Clear Cancel / Delete actions with keyboard Escape and Enter support."
   ],
-  "updatedAt": "2026-07-09T17:00:00.000Z"
+  "updatedAt": "2026-07-09T17:15:00.000Z"
 }
