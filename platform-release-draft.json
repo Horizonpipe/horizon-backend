@@ -1,11 +1,10 @@
 {
-  "title": "Instant Employee ↔ Customer folder switch",
-  "description": "Switching Folder System between Employee and Customer no longer blanks the file list and waits on a cold tree fetch.\n\nPipeShare now keeps each job’s shallow listing in an in-tab stash, paints it immediately on switch, refreshes quietly in the background, and prefetches the partner tree after boot so the first flip is already warm. On private BASE, admin Folder System jobId deep links are honored (they were previously ignored).\n\nWho is affected: PipeShare Folder System on BASE (and SaaS after Push).",
+  "title": "Billable package auto-detect without folder clicking",
+  "description": "Create billable package no longer depends on you opening every Videos/Reports/Images folder first.\n\nWhen you start the wizard, PipeShare recursively scans the selected package folder (full subtree listing) so PDFs, videos, images, ovality, and DB3 files are auto-detected immediately — even with shallow explorer browsing.\n\nWho is affected: PipeShare billable package on BASE (and SaaS after Push).",
   "changeLog": [
-    "Stash Employee and Customer trees in-tab for instant Folder System switches.",
-    "Paint cached/stashed listing immediately; background refresh instead of blank loading.",
-    "Prefetch partner job tree after boot so the first switch is already warm.",
-    "Honor Folder System ?jobId= on private BASE for admins (Employee ↔ Customer)."
+    "Billable package wizard scans the full package subtree before auto-detect.",
+    "No need to click through Videos/Reports/Images folders first.",
+    "Keeps prior Employee ↔ Customer instant switch and explorer speed fixes."
   ],
-  "updatedAt": "2026-07-09T15:40:00.000Z"
+  "updatedAt": "2026-07-09T15:45:00.000Z"
 }
