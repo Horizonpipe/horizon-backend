@@ -882,6 +882,94 @@ async function listAllKeys(s3, bucket, prefix) {
 }
 
 /**
+ * Fast one-level listing (ShareFile-style Children): Delimiter '/' so Wasabi returns
+ * immediate child folders + files only — not the whole subtree.
+ * @returns {Promise<{ folders: Array<Record<string, unknown>>, files: Array<Record<string, unknown>> }>}
+ */
+async function listShallowTreeUnderPrefix(s3, bucket, jobPref, listPrefix) {
+  const jobP = String(jobPref || '');
+  const listP = String(listPrefix || jobP);
+  /** @type {Map<string, { path: string, parentPath: string, name: string, lastModified: string | null }>} */
+  const folderByPath = new Map();
+  /** @type {Map<string, Record<string, unknown>>} */
+  const fileById = new Map();
+  let pageToken;
+  do {
+    const resp = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: listP,
+        Delimiter: '/',
+        ContinuationToken: pageToken
+      })
+    );
+    for (const cp of resp.CommonPrefixes || []) {
+      const full = String(cp.Prefix || '');
+      if (!full.startsWith(jobP)) continue;
+      let rel = full.slice(jobP.length).replace(/\/+$/, '');
+      if (!rel) continue;
+      const parentPath = parentRelPath(rel);
+      folderByPath.set(rel, {
+        path: rel,
+        parentPath,
+        name: basenameRel(rel),
+        lastModified: null
+      });
+    }
+    for (const obj of resp.Contents || []) {
+      const key = String(obj.Key || '');
+      if (!key.startsWith(jobP)) continue;
+      const r = key.slice(jobP.length);
+      if (!r || isFolderMarkerKey(r)) {
+        if (r && isFolderMarkerKey(r)) {
+          const folderRel = markerRelToFolderRel(r);
+          if (folderRel) {
+            const iso = obj.LastModified ? obj.LastModified.toISOString() : null;
+            const prev = folderByPath.get(folderRel);
+            if (!prev) {
+              folderByPath.set(folderRel, {
+                path: folderRel,
+                parentPath: parentRelPath(folderRel),
+                name: basenameRel(folderRel),
+                lastModified: iso
+              });
+            } else if (iso && (!prev.lastModified || iso > prev.lastModified)) {
+              prev.lastModified = iso;
+            }
+          }
+        }
+        continue;
+      }
+      // Only direct children (Delimiter already excludes nested keys from Contents).
+      const slash = r.lastIndexOf('/');
+      const parentPath = slash === -1 ? '' : r.slice(0, slash);
+      const name = slash === -1 ? r : r.slice(slash + 1);
+      const rawEtag = obj.ETag != null ? String(obj.ETag).replace(/^"+|"+$/g, '') : '';
+      const id = keyToId(key);
+      fileById.set(id, {
+        id,
+        key,
+        path: r,
+        parentPath,
+        name,
+        size: obj.Size ?? 0,
+        lastModified: obj.LastModified ? obj.LastModified.toISOString() : null,
+        ...(rawEtag ? { etag: rawEtag } : {})
+      });
+    }
+    pageToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+  } while (pageToken);
+
+  const folders = [...folderByPath.values()].sort((a, b) =>
+    String(a.path).localeCompare(String(b.path), undefined, { sensitivity: 'base' })
+  );
+  const files = [...fileById.values()].sort((a, b) =>
+    String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' })
+  );
+  return { folders, files };
+}
+
+/**
  * Distinct job ids that have at least one object under {@code clients/{clientId}/jobs/{jobId}/}.
  * Uses {@code Delimiter: '/'} so Wasabi returns one common prefix per job folder (fast), not every object key.
  * @param {import('@aws-sdk/client-s3').S3Client} s3
@@ -2513,25 +2601,38 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         if (rel) listPrefix = `${prefix}${rel}/`;
       }
       const hasPathScope = Boolean(subtreeRaw);
+      const shallowRaw = String(req.query.shallow ?? '').trim().toLowerCase();
+      const shallow =
+        shallowRaw === '1' || shallowRaw === 'true' || shallowRaw === 'yes' || shallowRaw === 'on';
       const permEditorTree =
         readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
-      const maxList =
-        permEditorTree || hasPathScope
-          ? PORTAL_TREE_MAX_OBJECTS
-          : Math.min(PORTAL_TREE_MAX_OBJECTS, PORTAL_TREE_MAX_OBJECTS_ROOT);
-      const { keys, truncated: listingTruncated } = await listAllKeysCapped(portalS3(), portalBucket(), listPrefix, maxList);
-      if (listingTruncated) {
-        return res.status(413).json({
-          error: 'File catalog for this folder exceeds the configured maximum object count',
-          code: 'TREE_LISTING_TOO_LARGE',
-          maxObjects: maxList,
-          pathPrefix: hasPathScope ? String(subtreeRaw || '') : '',
-          hint: hasPathScope
-            ? `Raise PORTAL_TREE_MAX_OBJECTS (scoped cap is ${maxList}), split the folder in storage, or narrow pathPrefix.`
-            : 'Add ?pathPrefix=<portal-relative-folder> to list one subtree (Horizon File Explorer sends this when you open a folder), or raise PORTAL_TREE_MAX_OBJECTS_ROOT / PORTAL_TREE_MAX_OBJECTS.'
-        });
+      /** @type {{ folders: unknown[], files: unknown[] }} */
+      let tree;
+      /** @type {unknown[]} */
+      let keys = [];
+      if (shallow && !permEditorTree) {
+        tree = await listShallowTreeUnderPrefix(portalS3(), portalBucket(), prefix, listPrefix);
+        keys = Array.isArray(tree.files) ? tree.files : [];
+      } else {
+        const maxList =
+          permEditorTree || hasPathScope
+            ? PORTAL_TREE_MAX_OBJECTS
+            : Math.min(PORTAL_TREE_MAX_OBJECTS, PORTAL_TREE_MAX_OBJECTS_ROOT);
+        const listed = await listAllKeysCapped(portalS3(), portalBucket(), listPrefix, maxList);
+        keys = listed.keys;
+        if (listed.truncated) {
+          return res.status(413).json({
+            error: 'File catalog for this folder exceeds the configured maximum object count',
+            code: 'TREE_LISTING_TOO_LARGE',
+            maxObjects: maxList,
+            pathPrefix: hasPathScope ? String(subtreeRaw || '') : '',
+            hint: hasPathScope
+              ? `Raise PORTAL_TREE_MAX_OBJECTS (scoped cap is ${maxList}), split the folder in storage, or narrow pathPrefix.`
+              : 'Add ?pathPrefix=<portal-relative-folder> to list one subtree (Horizon File Explorer sends this when you open a folder), or raise PORTAL_TREE_MAX_OBJECTS_ROOT / PORTAL_TREE_MAX_OBJECTS.'
+          });
+        }
+        tree = buildTreeFromKeys(prefix, listed.keys);
       }
-      let tree = buildTreeFromKeys(prefix, keys);
       const treeBeforeFilter = {
         folders: Array.isArray(tree?.folders) ? tree.folders.length : 0,
         files: Array.isArray(tree?.files) ? tree.files.length : 0
@@ -5173,15 +5274,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const auth = await portalAuthDownloadKey(req, req.params.id);
       if (!auth.ok) return res.status(auth.status).json(auth.body);
-      try {
-        await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: auth.Key }));
-      } catch (he) {
-        const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
-        if (hn === 'NotFound' || hn === 'NoSuchKey' || he?.$metadata?.httpStatusCode === 404) {
-          return res.status(404).json({ error: 'Not found' });
-        }
-        throw he;
-      }
+      // Skip HeadObject — auth already validated the key; browser 404s if missing.
+      // Saves one Wasabi RTT on every video open / scrub-presign refresh.
       const url = await getSignedUrl(portalS3(), new GetObjectCommand({ Bucket: portalBucket(), Key: auth.Key }), {
         expiresIn: PORTAL_PRESIGN_TTL_SECONDS
       });

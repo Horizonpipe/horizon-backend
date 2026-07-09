@@ -1,12 +1,12 @@
 {
-  "title": "Smooth billable package open + faster copies",
-  "description": "After Create billable package, PipeShare no longer hard-refreshes the whole page. It soft-switches to the Customer folder, patches in the new package tree immediately, and keeps the view stable without Ctrl+Shift+R.\n\nCopies are faster: more parallel Wasabi CopyObject workers, skip existence HeadObject on clone-only copies, and the transfer queue no longer forces an extra full tree reload that blanked the package view.\n\nWho is affected: PipeShare billable packaging and Employee↔Customer folder switching on BASE (and SaaS after Push).",
+  "title": "Lightning explorer + LAN-feel video scrub",
+  "description": "PipeShare folder browsing and video scrubbing are much faster and more dependable.\n\nExplorer: job boot and folder opens use shallow one-level listings (Wasabi Delimiter), like ShareFile Children — not giant recursive trees. Opening a folder hydrates its children immediately.\n\nVideo: scrubbing updates the time label while you drag and seeks once on release (object storage cannot do true LAN scrub without HLS). Presigns are cached until near expiry and skip an extra Wasabi HeadObject on every open.\n\nWho is affected: PipeShare on BASE (and SaaS after Push).",
   "changeLog": [
-    "Open billable package with soft job switch — no full page reload.",
-    "Show Customer package folder immediately via shallow tree patch.",
-    "Skip transfer-queue full-tree reload after billable copy (prevents blank/flicker).",
-    "Raise Wasabi folder copy concurrency; skip HeadObject on copyOnly clones.",
-    "Soft-switch Folder System Employee/Customer picker without hard refresh."
+    "Shallow tree API (shallow=1) for fast one-level folder listings.",
+    "Boot explorer with shallow root; hydrate children when a folder opens.",
+    "Seek-on-release video scrubbing to cut Wasabi Range spam while dragging.",
+    "Longer TTL-aware video presign cache; faster /presign without HeadObject.",
+    "preload=metadata for remote video to reduce aborted Range requests."
   ],
-  "updatedAt": "2026-07-09T15:00:00.000Z"
+  "updatedAt": "2026-07-09T15:15:00.000Z"
 }
