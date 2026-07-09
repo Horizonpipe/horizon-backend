@@ -2844,7 +2844,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         if (!/\.db3$/i.test(path.basename(relPath))) {
           return res.status(400).json({ error: 'db3FileId must reference a .db3 file' });
         }
-        const canViewDb3 = await assertPortalPathRel(aclPool, req.user, storageClientId, storageJobId, relPath, 'view');
+        const crossJobDb3Link =
+          String(storageClientId) === String(bindingClientId) &&
+          String(storageJobId) !== String(bindingJobId);
+        // Cross-job billable link: admin already passed resolveDb3FileScopeForBinding; do not
+        // require view on the Employee DB3 path (Customer users never have that grant).
+        const canViewDb3 = crossJobDb3Link
+          ? userIsPortalAdmin(req.user) ||
+            (await assertPortalPathRel(aclPool, req.user, bindingClientId, bindingJobId, folderPath || '', 'view'))
+          : await assertPortalPathRel(aclPool, req.user, storageClientId, storageJobId, relPath, 'view');
         if (!canViewDb3) return res.status(403).json({ error: 'Forbidden' });
         try {
           await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: key }));
@@ -5211,29 +5219,29 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     const prefDl = jobPrefix(parsed.clientId, parsed.jobId, jobRoot);
     const relPathDl = Key.slice(prefDl.length);
     let pathOk = false;
-    {
-      const now = Date.now();
-      const authK = portalDlAuthCacheKey(req.user, fileId);
-      const authHit = portalDlAuthCache.get(authK);
-      if (authHit && authHit.exp > now) {
-        pathOk = authHit.allowed;
-      } else {
-        pathOk = await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
-        portalDlAuthCache.set(authK, {
-          allowed: pathOk,
-          exp: now + (pathOk ? PORTAL_DL_AUTH_TTL_MS : PORTAL_DL_AUTH_DENY_TTL_MS)
-        });
-        trimPortalDlMap(portalDlAuthCache);
+    const now = Date.now();
+    const authK = portalDlAuthCacheKey(req.user, fileId);
+    const authHit = portalDlAuthCache.get(authK);
+    if (authHit && authHit.exp > now) {
+      pathOk = authHit.allowed;
+    } else {
+      pathOk = await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
+      // Customer package → Employee DB3: path grants on the file job fail; binding is the grant.
+      if (!pathOk) {
+        pathOk = await userCanDownloadDb3ViaInspectionBinding(
+          req,
+          fileId,
+          parsed.clientId,
+          parsed.jobId,
+          relPathDl
+        );
       }
-    }
-    if (!pathOk) {
-      pathOk = await userCanDownloadDb3ViaInspectionBinding(
-        req,
-        fileId,
-        parsed.clientId,
-        parsed.jobId,
-        relPathDl
-      );
+      // Cache the FINAL decision (including binding fallback) so deny is not sticky across retries.
+      portalDlAuthCache.set(authK, {
+        allowed: pathOk,
+        exp: now + (pathOk ? PORTAL_DL_AUTH_TTL_MS : PORTAL_DL_AUTH_DENY_TTL_MS)
+      });
+      trimPortalDlMap(portalDlAuthCache);
     }
     if (!pathOk) {
       return { ok: false, status: 403, body: { error: 'Forbidden' } };

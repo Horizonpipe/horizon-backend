@@ -1,11 +1,11 @@
 {
-  "title": "DB3 pipe chart, no auto-jump, SaaS plan PDF upload",
-  "description": "Three fixes for PipeShare / PipeSync reliability.\n\nDB3 / pipe chart: folder DB3 links now load under the portal job you are viewing (Customer or Employee), not a Wasabi tree-inferred job that could wipe Customer bindings after soft-switch. Admins get all inspection bindings for the job; empty server responses no longer erase a just-saved local link.\n\nBillable package: after a successful copy you stay on the Employee (source) folder — no auto-switch to Customer and no sticky reopen of that package path.\n\nSaaS Plan View: tenant host binding accepts hyphen-insensitive subdomain vs storage slug (techpipe vs tech-pipe), PDF content-type is inferred when the browser sends octet-stream, and failed plan saves show an error instead of failing silently.\n\nWho is affected: PipeShare on BASE; PipeSync Plan View on SaaS (after Push).",
+  "title": "Customer DB3 pipe chart after hard refresh",
+  "description": "Customer-side pipe charts were failing after Ctrl+Shift+R because the chart resolved before folder DB3 bindings finished loading from the server, and failed downloads could cache a deny before the binding fallback ran.\n\nPipeShare now waits for Customer/Employee inspection bindings before loading the pipe chart, does not show demo data when a remote link is missing, caches download auth only after the binding check, and keeps cross-job Employee DB3 links usable from Customer packages.\n\nWho is affected: PipeShare Customer (and Employee) WinCan pipe chart on BASE.",
   "changeLog": [
-    "Load DB3 bindings from portal UI job so Customer pipe chart keeps its links.",
-    "Stop auto-switching to Customer folder after billable package copy.",
-    "SaaS tenant host binding matches compact subdomain to hyphenated storage slug.",
-    "Plan View PDF upload: infer application/pdf; surface persist failures."
+    "Await folder DB3 bindings before resolving remote pipe chart.",
+    "Stop masking missing Customer DB3 links with demo observations.",
+    "Cache download auth after inspection-binding fallback (not before).",
+    "Cross-job billable DB3 bind no longer requires Employee path view grant."
   ],
-  "updatedAt": "2026-07-09T16:10:00.000Z"
+  "updatedAt": "2026-07-09T16:25:00.000Z"
 }
