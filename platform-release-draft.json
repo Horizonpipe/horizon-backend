@@ -1,11 +1,11 @@
 {
-  "title": "Billable package folder DB3 linking",
-  "description": "You can dependably link a WinCan .db3 to a customer / project folder when building a billable package in PipeShare.\n\nWhat changed: the Folder DB3 strip is visible again in the cloud file explorer (it was implemented but not shown). After Create new project structure, PipeShare opens the new folder and offers to link a .db3 immediately. Manual folder DB3 assignments also stick when you switch videos (Wasabi vs UI scope fix from earlier today).\n\nWho is affected: PipeShare on BASE and SaaS when packaging customer jobs with videos + one shared WinCan database.",
+  "title": "Restore Create billable package menu",
+  "description": "Right-click a folder in PipeShare again shows Create billable package… and opens the full billable package wizard (copy videos/reports/images to the customer folder and link the WinCan .db3).\n\nThe temporary Folder DB3 strip that was mounted in the explorer is removed. Folder DB3 can still be set from the right-click DB3 menu when needed. Create new project structure no longer pops a DB3 prompt.\n\nWho is affected: PipeShare on BASE (and SaaS after Push) for employees/admins packaging customer jobs.",
   "changeLog": [
-    "Show Billable package · folder DB3 strip in the cloud explorer for customer folders.",
-    "After Create new project structure, open the folder and offer to link a WinCan .db3.",
-    "Local project structure marks the new folder as a jobsite so the Jobsite DB3 strip appears.",
-    "Keep folder DB3 assignments across video switches (Wasabi/UI scope merge)."
+    "Restore right-click Create billable package… on folders (customer and employee menus).",
+    "Re-wire the billable package wizard, cloud copy queue, and post-copy DB3 binding.",
+    "Remove the explorer Folder DB3 strip UI.",
+    "Stop prompting for DB3 after Create new project structure."
   ],
-  "updatedAt": "2026-07-09T13:45:00.000Z"
+  "updatedAt": "2026-07-09T14:00:00.000Z"
 }
