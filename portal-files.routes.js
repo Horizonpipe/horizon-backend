@@ -1133,6 +1133,12 @@ async function resolveDb3FileScopeForBinding(pool, user, reqClientId, reqJobId, 
     }
   }
 
+  // Billable package: link an Employee-folder .db3 onto a Customer package folder.
+  // Same client, different job — admins with access to both may bind across jobs.
+  if (fileClient === reqClient && fileJob !== reqJob && userIsPortalAdmin(user)) {
+    return { ok: true, clientId: fileClient, jobId: fileJob };
+  }
+
   return { ok: false, error: 'db3FileId must belong to the same client/job scope' };
 }
 
@@ -2303,6 +2309,54 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     return Array.isArray(r.rows) ? r.rows : [];
   }
 
+  /**
+   * True when this .db3 object is linked from a folder the user can view
+   * (billable package: Customer folder → Employee DB3).
+   */
+  async function userCanDownloadDb3ViaInspectionBinding(req, fileId, fileClientId, fileJobId, fileRelPath) {
+    if (!/\.db3$/i.test(path.basename(String(fileRelPath || '')))) return false;
+    await ensurePortalInspectionBindingsSchema(uploadMetaPool);
+    const r = await uploadMetaPool.query(
+      `SELECT client_id, job_id, folder_path
+       FROM portal_inspection_bindings
+       WHERE db3_file_id = $1
+       LIMIT 40`,
+      [String(fileId)]
+    );
+    const rows = Array.isArray(r.rows) ? r.rows : [];
+    for (const row of rows) {
+      const bindClient = String(row.client_id || '').trim();
+      const bindJob = String(row.job_id || '').trim();
+      const folderPath = String(row.folder_path || '').trim();
+      if (!bindClient || !bindJob) continue;
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, bindClient, bindJob))) continue;
+      if (folderPath) {
+        const canViewFolder = await assertPortalPathRel(
+          aclPool,
+          req.user,
+          bindClient,
+          bindJob,
+          folderPath,
+          'view'
+        );
+        if (!canViewFolder) continue;
+      } else if (!(await assertPortalJobAccess(aclPool, req.user, bindClient, bindJob))) {
+        continue;
+      }
+      // Still require the user can view the DB3 object itself when it lives in the same job,
+      // or that they already passed folder access on a linked package (cross-job link).
+      if (bindClient === String(fileClientId) && bindJob === String(fileJobId)) {
+        if (await assertPortalPathRel(aclPool, req.user, fileClientId, fileJobId, fileRelPath, 'download')) {
+          return true;
+        }
+      } else {
+        // Cross-job link (Customer package → Employee DB3): package folder access is enough.
+        return true;
+      }
+    }
+    return false;
+  }
+
   async function savePortalInspectionBinding(
     dbPool,
     clientId,
@@ -2616,8 +2670,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const db3FileIdRaw = body.db3FileId ?? body.value ?? null;
       const db3FileId = db3FileIdRaw == null ? '' : String(db3FileIdRaw).trim();
-      let pathScopeClient = String(clientId);
-      let pathScopeJob = String(jobId);
+      /** Folder binding is always stored under the requested destination job (e.g. Customer package). */
+      const bindingClientId = String(clientId);
+      const bindingJobId = String(jobId);
+      /** @type {{ clientId: string, jobId: string } | null} */
+      let db3StorageScope = null;
       if (db3FileId) {
         const key = idToKey(db3FileId);
         if (!isPortalClientsObjectKey(key)) return res.status(400).json({ error: 'Invalid db3FileId' });
@@ -2637,41 +2694,33 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         if (!scopeResolved.ok) {
           return res.status(400).json({ error: scopeResolved.error });
         }
-        pathScopeClient = scopeResolved.clientId;
-        pathScopeJob = scopeResolved.jobId;
+        db3StorageScope = { clientId: scopeResolved.clientId, jobId: scopeResolved.jobId };
       }
       if (folderPath) {
         const treePortalMode = readPortalMode(req, body);
-        const visible =
-          (await assertRelPathMatchesPortalTreeVisibility(
-            aclPool,
-            req,
-            pathScopeClient,
-            pathScopeJob,
-            treePortalMode,
-            folderPath
-          )) ||
-          (pathScopeClient !== String(clientId) || pathScopeJob !== String(jobId)
-            ? await assertRelPathMatchesPortalTreeVisibility(
-                aclPool,
-                req,
-                clientId,
-                jobId,
-                treePortalMode,
-                folderPath
-              )
-            : false);
+        const visible = await assertRelPathMatchesPortalTreeVisibility(
+          aclPool,
+          req,
+          bindingClientId,
+          bindingJobId,
+          treePortalMode,
+          folderPath
+        );
         if (!visible) return res.status(403).json({ error: 'Forbidden' });
-        const canEditPath =
-          (await assertPortalPathRel(aclPool, req.user, pathScopeClient, pathScopeJob, folderPath, 'full')) ||
-          ((pathScopeClient !== String(clientId) || pathScopeJob !== String(jobId)) &&
-            (await assertPortalPathRel(aclPool, req.user, clientId, jobId, folderPath, 'full')));
+        const canEditPath = await assertPortalPathRel(
+          aclPool,
+          req.user,
+          bindingClientId,
+          bindingJobId,
+          folderPath,
+          'full'
+        );
         if (!canEditPath) return res.status(403).json({ error: 'Forbidden' });
       }
       if (db3FileId) {
         const key = idToKey(db3FileId);
-        const storageClientId = pathScopeClient;
-        const storageJobId = pathScopeJob;
+        const storageClientId = db3StorageScope?.clientId || bindingClientId;
+        const storageJobId = db3StorageScope?.jobId || bindingJobId;
         const pref = jobPrefix(String(storageClientId), String(storageJobId), storageRoot(req));
         const relPath = key.slice(pref.length);
         if (!/\.db3$/i.test(path.basename(relPath))) {
@@ -2688,10 +2737,12 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           }
           throw he;
         }
+        // Persist under the package/destination job so Customer pipe chart loads the link.
+        // db3FileId may still point at an Employee-folder object (link, not a second copy).
         await savePortalInspectionBinding(
           uploadMetaPool,
-          storageClientId,
-          storageJobId,
+          bindingClientId,
+          bindingJobId,
           folderPath,
           bindingType,
           db3FileId,
@@ -2702,8 +2753,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           folderPath,
           bindingType,
           db3FileId: db3FileId || null,
-          clientId: storageClientId,
-          jobId: storageJobId
+          clientId: bindingClientId,
+          jobId: bindingJobId
         });
       }
       await savePortalInspectionBinding(
@@ -3481,6 +3532,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const body = req.body || {};
       const scope = resolvePortalScope(req, body);
       const { fileId, folderPath, toParentPath, toClientId: toClientIdRaw, toJobId: toJobIdRaw } = body;
+      const copyOnly = body.copyOnly === true || body.copyOnly === 'true' || body.copyOnly === 1;
       if (scope.error || toParentPath === undefined) {
         return res.status(400).json({ error: 'clientId, jobId, and toParentPath are required' });
       }
@@ -3546,11 +3598,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
             MetadataDirective: 'COPY'
           })
         );
-        await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: oldKey }));
-        if (crossScope) {
-          await removePortalPathGrantPrefixes(aclPool, clientId, jobId, oldRel);
-        } else {
-          await remapPortalPathGrantPrefixes(aclPool, clientId, jobId, oldRel, newRel);
+        if (!copyOnly) {
+          await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: oldKey }));
+          if (crossScope) {
+            await removePortalPathGrantPrefixes(aclPool, clientId, jobId, oldRel);
+          } else {
+            await remapPortalPathGrantPrefixes(aclPool, clientId, jobId, oldRel, newRel);
+          }
         }
         return res.json({
           id: keyToId(newKey),
@@ -3558,7 +3612,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           path: newRel,
           name,
           clientId: targetClientId,
-          jobId: targetJobId
+          jobId: targetJobId,
+          copied: copyOnly
         });
       }
 
@@ -3618,37 +3673,42 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
             oldFolderRel,
             newRel,
             itemCount: mapping.length,
+            copyOnly,
             summary
           });
           return res.status(502).json({ error: summary || 'Folder copy failed' });
         }
         const deleteStartedAt = Date.now();
-        const deleteErrors = await runPoolCollectErrors(
-          mapping,
-          PORTAL_FOLDER_DELETE_CONCURRENCY,
-          async ({ from }) => {
-            await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: from }));
+        if (!copyOnly) {
+          const deleteErrors = await runPoolCollectErrors(
+            mapping,
+            PORTAL_FOLDER_DELETE_CONCURRENCY,
+            async ({ from }) => {
+              await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: from }));
+            }
+          );
+          if (deleteErrors.length > 0) {
+            const summary = summarizePoolErrors('delete', deleteErrors, mapping);
+            console.warn('[portal-files] folder move delete error', {
+              clientId: String(clientId),
+              jobId: String(jobId),
+              targetClientId: String(targetClientId),
+              targetJobId: String(targetJobId),
+              oldFolderRel,
+              newRel,
+              itemCount: mapping.length,
+              summary
+            });
+            return res.status(502).json({ error: summary || 'Folder delete failed after copy' });
           }
-        );
-        if (deleteErrors.length > 0) {
-          const summary = summarizePoolErrors('delete', deleteErrors, mapping);
-          console.warn('[portal-files] folder move delete error', {
-            clientId: String(clientId),
-            jobId: String(jobId),
-            targetClientId: String(targetClientId),
-            targetJobId: String(targetJobId),
-            oldFolderRel,
-            newRel,
-            itemCount: mapping.length,
-            summary
-          });
-          return res.status(502).json({ error: summary || 'Folder delete failed after copy' });
         }
         const grantsStartedAt = Date.now();
-        if (crossScope) {
-          await removePortalPathGrantPrefixes(aclPool, clientId, jobId, oldFolderRel);
-        } else {
-          await remapPortalPathGrantPrefixes(aclPool, clientId, jobId, oldFolderRel, newRel);
+        if (!copyOnly) {
+          if (crossScope) {
+            await removePortalPathGrantPrefixes(aclPool, clientId, jobId, oldFolderRel);
+          } else {
+            await remapPortalPathGrantPrefixes(aclPool, clientId, jobId, oldFolderRel, newRel);
+          }
         }
         console.info('[portal-files] folder-move stats', {
           clientId: String(clientId),
@@ -5045,6 +5105,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
     } else {
       pathOk = await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
+    }
+    if (!pathOk) {
+      pathOk = await userCanDownloadDb3ViaInspectionBinding(
+        req,
+        fileId,
+        parsed.clientId,
+        parsed.jobId,
+        relPathDl
+      );
     }
     if (!pathOk) {
       return { ok: false, status: 403, body: { error: 'Forbidden' } };

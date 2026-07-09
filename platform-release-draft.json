@@ -1,11 +1,12 @@
 {
-  "title": "Restore Create billable package menu",
-  "description": "Right-click a folder in PipeShare again shows Create billable package… and opens the full billable package wizard (copy videos/reports/images to the customer folder and link the WinCan .db3).\n\nThe temporary Folder DB3 strip that was mounted in the explorer is removed. Folder DB3 can still be set from the right-click DB3 menu when needed. Create new project structure no longer pops a DB3 prompt.\n\nWho is affected: PipeShare on BASE (and SaaS after Push) for employees/admins packaging customer jobs.",
+  "title": "Billable package DB3 links to customer pipe chart",
+  "description": "Create billable package now keeps the WinCan .db3 link on the customer package folder so pipe chart / PACP load when you open a copied video.\n\nWhat was wrong: the package files copied to Customer, but the DB3 assignment was saved under the Employee job (or rejected as cross-job). Customer explorer never loaded that link, so the pipe chart stayed empty.\n\nAlso fixed: cloud copy with copyOnly no longer deletes the Employee source files. Linked Employee .db3 files can be downloaded for inspection when the customer package folder is bound to them.\n\nWho is affected: PipeShare billable packaging on BASE (and SaaS after Push).",
   "changeLog": [
-    "Restore right-click Create billable package… on folders (customer and employee menus).",
-    "Re-wire the billable package wizard, cloud copy queue, and post-copy DB3 binding.",
-    "Remove the explorer Folder DB3 strip UI.",
-    "Stop prompting for DB3 after Create new project structure."
+    "Save folder DB3 bindings under the Customer package job, even when the .db3 file stays on Employee.",
+    "Allow admin same-client Employee→Customer DB3 links for billable packages.",
+    "Honor copyOnly on cloud move so billable package clones do not delete source files.",
+    "Allow downloading a linked Employee .db3 when viewing a Customer package video.",
+    "Persist DB3 on package root and Videos/Reports/Images/Ovality subfolders after build."
   ],
-  "updatedAt": "2026-07-09T14:00:00.000Z"
+  "updatedAt": "2026-07-09T14:30:00.000Z"
 }
