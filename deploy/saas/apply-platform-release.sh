@@ -37,6 +37,14 @@ fi
 # Hybrid BASE+SaaS on one box: artifacts live in the SaaS virtualbox bucket when configured.
 if [[ -n "${HP_RELEASE_ARTIFACT_BUCKET:-}" ]]; then
   WASABI_BUCKET="${HP_RELEASE_ARTIFACT_BUCKET}"
+  if [[ -n "${SAAS_WASABI_BUCKET:-}" && "${HP_RELEASE_ARTIFACT_BUCKET}" == "${SAAS_WASABI_BUCKET}" ]]; then
+    if [[ -n "${SAAS_WASABI_ENDPOINT:-}" ]]; then
+      WASABI_ENDPOINT="${SAAS_WASABI_ENDPOINT}"
+    fi
+    if [[ -n "${SAAS_WASABI_REGION:-}" ]]; then
+      WASABI_REGION="${SAAS_WASABI_REGION}"
+    fi
+  fi
 elif [[ -n "${SAAS_WASABI_BUCKET:-}" ]]; then
   WASABI_BUCKET="${SAAS_WASABI_BUCKET}"
   if [[ -n "${SAAS_WASABI_ENDPOINT:-}" ]]; then

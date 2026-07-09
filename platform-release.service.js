@@ -13,7 +13,7 @@ const {
   buildSaasRuntimeKey,
   PLATFORM_RELEASES_ROOT
 } = require('./lib/platform-release-paths');
-const { listPlatformReleaseBucketCandidates } = require('./lib/platform-release-storage');
+const { listPlatformReleaseBucketCandidates, createS3ClientForBucket } = require('./lib/platform-release-storage');
 const {
   loadPlatformReleaseDraft,
   clearPlatformReleaseDraft
@@ -422,11 +422,13 @@ async function artifactExists(client, bucket, key) {
 }
 
 /** Find which configured Wasabi bucket holds release artifacts (publish may use WASABI_BUCKET while catalog reads SAAS_WASABI_BUCKET). */
-async function findReleaseArtifactBucket(client, frontendKey, backendKey) {
+async function findReleaseArtifactBucket(_client, frontendKey, backendKey) {
   const keys = [frontendKey, backendKey].filter(Boolean);
   for (const bucket of listPlatformReleaseBucketCandidates()) {
+    const bucketClient = createS3ClientForBucket(bucket);
+    if (!bucketClient) continue;
     for (const key of keys) {
-      if (await artifactExists(client, bucket, key)) {
+      if (await artifactExists(bucketClient, bucket, key)) {
         return bucket;
       }
     }
