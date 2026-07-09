@@ -1,11 +1,12 @@
 {
-  "title": "Push SaaS releases from BASE (pipeshare.live)",
-  "description": "Platform updates cPanel on pipeshare.live can now push a published release to SaaS tenants without switching to pipeshare.net. BASE calls each URL in HP_PLATFORM_APPLY_PEER_URLS (server-to-server) which runs apply on the SaaS platform host.\n\nWho is affected: Mike's BASE workflow on pipeshare.live. SaaS tenants receive updates when you Push from Releases after publish.",
+  "title": "DB3 folder link sticks across videos",
+  "description": "Manually linking a WinCan .db3 to a PipeShare folder (billable package / job folder) no longer disappears after you leave the first video.\n\nWhat was wrong: the portal sometimes treated Wasabi’s storage client/job labels as a “different job” from the UI labels, wiped the folder DB3 binding scope, then reloaded bindings under the wrong key. The first video could still look fine via filename auto-match; the next video had no match and looked unassigned.\n\nWho is affected: PipeShare cloud jobs on BASE and SaaS when you assign Folder DB3 (or Link selected .db3) and review multiple videos in the same folder.",
   "changeLog": [
-    "Push to SaaS from pipeshare.live Releases (HP_PLATFORM_APPLY_PEER_URLS fan-out).",
-    "Internal POST /internal/platform/releases/apply on SaaS peers with shared secret.",
-    "canApply true on BASE when peer URLs + secret are configured.",
-    "Hybrid apply script accepts HP_DEPLOYMENT_MODE=hybrid and SAAS_WASABI_BUCKET artifacts."
+    "Keep Wasabi storage scope for folder DB3 bindings when UI client/job labels differ.",
+    "Load inspection bindings from both Wasabi and UI scopes and merge them.",
+    "Do not wipe a local folder DB3 assignment when the server returns an empty binding map.",
+    "Keep video selection (and DB3 context) when switching videos outside the current explorer folder.",
+    "Resolve admin-linked DB3 even if the .db3 row is briefly missing from a stale tree cache."
   ],
-  "updatedAt": "2026-07-09T12:00:00.000Z"
+  "updatedAt": "2026-07-09T13:30:00.000Z"
 }
