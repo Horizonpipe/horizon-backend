@@ -30,7 +30,6 @@ STRIPE_CANCEL_URL=${PUBLIC}/horizonpipe-cpanel/billing.html?billing=canceled
 STRIPE_PORTAL_RETURN_URL=${PUBLIC}/horizonpipe-cpanel/billing.html
 EOF
 chmod 600 /opt/horizon/horizon-backend/.env
-pm2 delete horizon-backend 2>/dev/null || true
-pm2 start server.js --name horizon-backend -i 4 --max-memory-restart 1500M
-pm2 save
+chown ubuntu:ubuntu /opt/horizon/horizon-backend/.env
+sudo -u ubuntu bash -lc 'cd /opt/horizon/horizon-backend && pm2 delete horizon-backend 2>/dev/null || true && pm2 start deploy/ovh/ecosystem.config.cjs --update-env && pm2 save'
 echo APP_OK

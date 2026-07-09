@@ -81,11 +81,15 @@ if [[ ! -s "$BACKEND/.env" ]] || ! grep -q '^DATABASE_URL=' "$BACKEND/.env" 2>/d
   exit 1
 fi
 
-# Orphan root node workers (manual starts) bind :3000 and serve stale code while PM2 crash-loops.
-for pid in $(ps -eo user=,pid=,args= | awk '$1=="root" && /node.*horizon-backend\/server.js/ {print $2}'); do
-  echo "[github-deploy] stopping orphan root node pid=$pid"
-  sudo kill "$pid" 2>/dev/null || true
-done
+# Orphan root PM2 god (/root/.pm2) steals :3000 from ubuntu PM2 — remove before restart.
+if [[ -x "$BACKEND/deploy/ovh/deduplicate-pm2.sh" ]]; then
+  bash "$BACKEND/deploy/ovh/deduplicate-pm2.sh"
+else
+  for pid in $(ps -eo user=,pid=,args= | awk '$1=="root" && /node.*horizon-backend\/server.js/ {print $2}'); do
+    echo "[github-deploy] stopping orphan root node pid=$pid"
+    sudo kill "$pid" 2>/dev/null || true
+  done
+fi
 
 echo "[github-deploy] pm2 restart"
 run_as_deploy_user bash -lc "cd '$BACKEND' && pm2 restart deploy/ovh/ecosystem.config.cjs --update-env && pm2 save"

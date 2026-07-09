@@ -338,10 +338,17 @@ sudo certbot --nginx -d app.yourdomain.com
 
 ## Step 6 — Start the app
 
+**Run PM2 as the deploy user only** (`ubuntu` on OVH). Never `sudo pm2 start` — that creates a second PM2 god under `/root/.pm2` that steals port 3000 and serves stale code while the real app crash-loops.
+
 ```bash
-pm2 start deploy/ovh/ecosystem.config.cjs
-pm2 save
-sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u horizon --hp /opt/horizon
+sudo -u ubuntu bash -lc 'cd /opt/horizon/horizon-backend && pm2 start deploy/ovh/ecosystem.config.cjs && pm2 save'
+sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u ubuntu --hp /home/ubuntu
+```
+
+If you ever see duplicate workers or Push/Apply serving old routes, run:
+
+```bash
+sudo bash /opt/horizon/horizon-backend/deploy/ovh/deduplicate-pm2.sh
 ```
 
 Smoke test:

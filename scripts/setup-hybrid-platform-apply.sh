@@ -18,12 +18,16 @@ fi
 chmod 600 "$ENV_FILE"
 echo "[setup] HP_PLATFORM_APPLY_MANIFEST_ONLY=1 in $ENV_FILE"
 
-for pid in $(ps -eo user=,pid=,args= | awk '$1=="root" && /node.*horizon-backend\/server.js/ {print $2}'); do
-  echo "[setup] stopping orphan root node pid=$pid"
-  kill "$pid" 2>/dev/null || true
-done
-
-cd "$BACKEND"
-sudo -u ubuntu pm2 restart deploy/ovh/ecosystem.config.cjs --update-env
-sudo -u ubuntu pm2 save
-echo "[setup] pm2 restarted"
+DEDUPE="$BACKEND/deploy/ovh/deduplicate-pm2.sh"
+if [[ -x "$DEDUPE" ]]; then
+  bash "$DEDUPE"
+else
+  for pid in $(ps -eo user=,pid=,args= | awk '$1=="root" && /node.*horizon-backend\/server.js/ {print $2}'); do
+    echo "[setup] stopping orphan root node pid=$pid"
+    kill "$pid" 2>/dev/null || true
+  done
+  cd "$BACKEND"
+  sudo -u ubuntu pm2 restart deploy/ovh/ecosystem.config.cjs --update-env
+  sudo -u ubuntu pm2 save
+  echo "[setup] pm2 restarted"
+fi
