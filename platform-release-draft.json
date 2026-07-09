@@ -1,11 +1,11 @@
 {
-  "title": "Customer pipe chart: fix real load path + binding memory",
-  "description": "Customer DB3 pipe charts were still broken because the main selection path (syncWincanInspectionState) loaded the chart before folder bindings and fell back to demo data. Stale user-prefs could also wipe freshly loaded Customer links.\n\nPipeShare now waits for inspection bindings on that main path, keeps an in-memory overlay of folder DB3 links so prefs hydrate cannot erase them, and downloads Employee-linked DB3s via presign even when meta/HeadObject fails.\n\nWho is affected: PipeShare Customer (and Employee) WinCan pipe chart on BASE.",
+  "title": "Pipe chart: full structure names + pro UI",
+  "description": "Pipe chart structure labels like SSMH-A5 to SSMH-A4 were getting cut down to incomplete names (for example showing SSMH alone). Parsing now keeps the full compound structure IDs from WinCan OBJ_Key, and the chart prefers the fuller name when NODE and OBJ_Key both exist.\n\nThe Pipe chart panel also got a cleaner production layout: clear From → To header, length/direction chips, a short how-to line, and a simple legend so anyone can read the run without guessing.\n\nWho is affected: PipeShare WinCan pipe chart on BASE (and SaaS after Push).",
   "changeLog": [
-    "Fix syncWincanInspectionState to await Customer folder DB3 bindings (was the live path).",
-    "In-memory folder DB3 overlay so user-prefs cannot wipe Customer links.",
-    "DB3 download: presign-only fallback when /meta HeadObject fails.",
-    "No demo observations for remote videos when a link is missing."
+    "Fix structure names like SSMH-A5 / SSMH-A4 so they are never truncated on the pipe chart.",
+    "Prefer fuller structure labels when NODE and OBJ_Key disagree in length.",
+    "Redesign pipe chart header: From → To, length, direction, observation count.",
+    "Add legend and short how-to (click mark / drag pipe) for clearer use."
   ],
-  "updatedAt": "2026-07-09T16:40:00.000Z"
+  "updatedAt": "2026-07-09T16:50:00.000Z"
 }
