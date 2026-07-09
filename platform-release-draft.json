@@ -1,12 +1,11 @@
 {
-  "title": "SaaS tenants: hide scaffold folders, clean job root uploads",
-  "description": "New and existing SaaS PipeShare tenants no longer see the pre-made DB3, PDF, Photos, and Video folders when they open File Explorer. Those paths were legacy routing buckets from early provisioning — not folders clients should manage. Infra folders like system-state stay in storage for PipeSync but are hidden from the explorer.\n\nSaaS root uploads (no target folder selected) now land at the job root so tenants can build their own folder tree. BASE (pipeshare.live / portal-users) keeps the existing category-bucket behavior.\n\nWho is affected: SaaS tenants on pipeshare.net (and other SaaS hosts) after you apply this platform release. BASE gets the backend immediately on OVH deploy; SaaS applies via cPanel Releases.",
+  "title": "Push SaaS releases from BASE (pipeshare.live)",
+  "description": "Platform updates cPanel on pipeshare.live can now push a published release to SaaS tenants without switching to pipeshare.net. BASE calls each URL in HP_PLATFORM_APPLY_PEER_URLS (server-to-server) which runs apply on the SaaS platform host.\n\nWho is affected: Mike's BASE workflow on pipeshare.live. SaaS tenants receive updates when you Push from Releases after publish.",
   "changeLog": [
-    "Stop creating empty videos/db3/pdf/photos folders for newly provisioned SaaS tenants.",
-    "Hide videos, db3, pdf, photos, and system-state from SaaS tenant file explorer trees.",
-    "SaaS uploads without a folder path go to job root instead of type buckets.",
-    "Share and guest file trees respect the same hidden-folder rules for tenant jobs.",
-    "BASE portal-users explorer and upload routing unchanged."
+    "Push to SaaS from pipeshare.live Releases (HP_PLATFORM_APPLY_PEER_URLS fan-out).",
+    "Internal POST /internal/platform/releases/apply on SaaS peers with shared secret.",
+    "canApply true on BASE when peer URLs + secret are configured.",
+    "Hybrid apply script accepts HP_DEPLOYMENT_MODE=hybrid and SAAS_WASABI_BUCKET artifacts."
   ],
-  "updatedAt": "2026-07-09T11:45:00.000Z"
+  "updatedAt": "2026-07-09T12:00:00.000Z"
 }

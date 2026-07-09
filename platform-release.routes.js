@@ -9,6 +9,13 @@ const {
   applyPlatformRelease,
   previewNextRelease
 } = require('./platform-release.service');
+const {
+  isPlatformApplyPeerConfigured,
+  pushPlatformReleaseToPeers,
+  requirePlatformApplyPeerSecret,
+  platformApplyLocalEnabled,
+  defaultSaasPlatformRequestHost
+} = require('./lib/platform-release-peers');
 
 function requestHostFromReq(req) {
   return String(req?.headers?.['x-forwarded-host'] || req?.headers?.host || '').trim();
@@ -63,11 +70,13 @@ function registerPlatformReleaseRoutes(app, { pool, requireAuth, requireAdmin, w
     try {
       if (!wasabiReady(res)) return;
       const status = await getPlatformReleaseStatus(wasabiClient, wasabiBucket);
+      const peersReady = isPlatformApplyPeerConfigured();
       return res.json({
         success: true,
         ...status,
         canPublish: isNonSaasRequest(req),
-        canApply: isSaasRequest(req),
+        canApply: isSaasRequest(req) || (isNonSaasRequest(req) && peersReady),
+        canPushFromBase: isNonSaasRequest(req) && peersReady,
         deploymentProfile: resolveDeploymentProfile({ requestHost: requestHostFromReq(req) })
       });
     } catch (error) {
@@ -144,29 +153,69 @@ function registerPlatformReleaseRoutes(app, { pool, requireAuth, requireAdmin, w
   app.post('/saas/platform/releases/apply', requireAuth, requireAdmin, async (req, res) => {
     try {
       if (!wasabiReady(res)) return;
-      if (!isSaasRequest(req)) {
-        return jsonError(
-          res,
-          403,
-          'Apply runs on the SaaS platform host (HP_DEPLOYMENT_MODE=saas). Use Publish on your non-SaaS server.'
-        );
-      }
       const version = cleanString(req.body?.version);
       if (!version) return jsonError(res, 400, 'version is required');
+      const actor = cleanString(req.user?.username || req.user?.displayName);
+
+      if (isSaasRequest(req)) {
+        const result = await applyPlatformRelease(
+          wasabiClient,
+          wasabiBucket,
+          { version, actor, requestHost: requestHostFromReq(req) },
+          { pool }
+        );
+        return res.json({ success: true, ...result });
+      }
+
+      if (isNonSaasRequest(req) && isPlatformApplyPeerConfigured()) {
+        const peers = await pushPlatformReleaseToPeers(version, { actor });
+        let local = null;
+        if (platformApplyLocalEnabled()) {
+          local = await applyPlatformRelease(
+            wasabiClient,
+            wasabiBucket,
+            { version, actor, requestHost: defaultSaasPlatformRequestHost() },
+            { pool }
+          );
+        }
+        if (pool) {
+          await pool.query(
+            `INSERT INTO platform_release_events (version, event_type, actor_user_id, deployment_mode, notes)
+             VALUES ($1, 'applied', $2, 'non-saas', $3)`,
+            [version, cleanString(req.user?.id), `Pushed to SaaS peers from BASE (${peers.length})`]
+          );
+        }
+        return res.json({ success: true, version, pushedFromBase: true, peers, local });
+      }
+
+      return jsonError(
+        res,
+        403,
+        'Configure HP_PLATFORM_APPLY_PEER_URLS and HP_PLATFORM_APPLY_PEER_SECRET on BASE to push from pipeshare.live.'
+      );
+    } catch (error) {
+      console.error('[saas/platform/releases/apply]', error);
+      return jsonError(res, 400, error.message || 'Apply failed');
+    }
+  });
+
+  /** Server-to-server apply invoked by BASE (pipeshare.live) when pushing to SaaS platform hosts. */
+  app.post('/internal/platform/releases/apply', requirePlatformApplyPeerSecret, async (req, res) => {
+    try {
+      if (!wasabiReady(res)) return;
+      const version = cleanString(req.body?.version);
+      if (!version) return jsonError(res, 400, 'version is required');
+      const actor = cleanString(req.body?.actor) || 'BASE peer push';
       const result = await applyPlatformRelease(
         wasabiClient,
         wasabiBucket,
-        {
-          version,
-          actor: cleanString(req.user?.username || req.user?.displayName),
-          requestHost: requestHostFromReq(req)
-        },
+        { version, actor, requestHost: defaultSaasPlatformRequestHost() },
         { pool }
       );
       return res.json({ success: true, ...result });
     } catch (error) {
-      console.error('[saas/platform/releases/apply]', error);
-      return jsonError(res, 400, error.message || 'Apply failed');
+      console.error('[internal/platform/releases/apply]', error);
+      return jsonError(res, 400, error.message || 'Peer apply failed');
     }
   });
 
