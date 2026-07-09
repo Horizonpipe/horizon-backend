@@ -1,12 +1,11 @@
 {
-  "title": "Faster folder opens and file preview",
-  "description": "PipeShare file loading was still slow because every folder click bypassed cache and paid full backend work again. This batch fixes that so browsing feels snappy.\n\nExplorer: shallow folder listings now reuse memory/session cache (correct shallow cache keys), BASE boot no longer wipes a good cache or force-refetches every time, and the server skips full-job hash merging on shallow tree calls.\n\nFiles: video/PDF open with presign only (no extra HeadObject meta trip); PDF preview streams from Wasabi in the iframe instead of downloading the whole file first; download auth is cached for all users for 60s.\n\nWho is affected: PipeShare on BASE (and SaaS after Push).",
+  "title": "Instant Employee ↔ Customer folder switch",
+  "description": "Switching Folder System between Employee and Customer no longer blanks the file list and waits on a cold tree fetch.\n\nPipeShare now keeps each job’s shallow listing in an in-tab stash, paints it immediately on switch, refreshes quietly in the background, and prefetches the partner tree after boot so the first flip is already warm. On private BASE, admin Folder System jobId deep links are honored (they were previously ignored).\n\nWho is affected: PipeShare Folder System on BASE (and SaaS after Push).",
   "changeLog": [
-    "Reuse shallow tree cache on folder open (no bypassCache on every click).",
-    "Match shallow cache keys on boot/hydrate so revisits are instant.",
-    "Skip full-job SHA merge on shallow /tree listings.",
-    "Video/PDF preview: presign-only path; PDF iframe loads Wasabi directly.",
-    "Cache path-download auth for all users (60s) to speed repeated opens."
+    "Stash Employee and Customer trees in-tab for instant Folder System switches.",
+    "Paint cached/stashed listing immediately; background refresh instead of blank loading.",
+    "Prefetch partner job tree after boot so the first switch is already warm.",
+    "Honor Folder System ?jobId= on private BASE for admins (Employee ↔ Customer)."
   ],
-  "updatedAt": "2026-07-09T15:25:00.000Z"
+  "updatedAt": "2026-07-09T15:40:00.000Z"
 }
