@@ -1,12 +1,12 @@
 {
-  "title": "Billable package DB3 links to customer pipe chart",
-  "description": "Create billable package now keeps the WinCan .db3 link on the customer package folder so pipe chart / PACP load when you open a copied video.\n\nWhat was wrong: the package files copied to Customer, but the DB3 assignment was saved under the Employee job (or rejected as cross-job). Customer explorer never loaded that link, so the pipe chart stayed empty.\n\nAlso fixed: cloud copy with copyOnly no longer deletes the Employee source files. Linked Employee .db3 files can be downloaded for inspection when the customer package folder is bound to them.\n\nWho is affected: PipeShare billable packaging on BASE (and SaaS after Push).",
+  "title": "Pre launch Beta 2.0.0a",
+  "description": "Backup snapshot of BASE (pipeshare.live) before launch — Pre launch Beta 2.0.0a.\n\nIncludes the working Create billable package flow with Customer-folder WinCan DB3 linking for pipe chart / PACP, cloud copyOnly (source files stay on Employee), hybrid Push/apply fixes, and related PipeShare explorer work from this cycle.\n\nWho is affected: This is a numbered platform backup you can re-apply or Push to SaaS from cPanel Releases. It does not change SaaS until you apply/push it.",
   "changeLog": [
-    "Save folder DB3 bindings under the Customer package job, even when the .db3 file stays on Employee.",
-    "Allow admin same-client Employee→Customer DB3 links for billable packages.",
-    "Honor copyOnly on cloud move so billable package clones do not delete source files.",
-    "Allow downloading a linked Employee .db3 when viewing a Customer package video.",
-    "Persist DB3 on package root and Videos/Reports/Images/Ovality subfolders after build."
+    "Named backup: Pre launch Beta 2.0.0a.",
+    "Create billable package copies to Customer and links DB3 for pipe chart.",
+    "Folder DB3 bindings save under Customer package job (Employee DB3 may stay linked).",
+    "Cloud copyOnly no longer deletes Employee source files.",
+    "Hybrid BASE→SaaS Push / PM2 / manifest-only apply path included."
   ],
-  "updatedAt": "2026-07-09T14:30:00.000Z"
+  "updatedAt": "2026-07-09T14:35:00.000Z"
 }
