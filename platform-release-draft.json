@@ -1,10 +1,10 @@
 {
-  "title": "Billable package auto-detect without folder clicking",
-  "description": "Create billable package no longer depends on you opening every Videos/Reports/Images folder first.\n\nWhen you start the wizard, PipeShare recursively scans the selected package folder (full subtree listing) so PDFs, videos, images, ovality, and DB3 files are auto-detected immediately — even with shallow explorer browsing.\n\nWho is affected: PipeShare billable package on BASE (and SaaS after Push).",
+  "title": "Billable package: DB3 pick jumps to customer folder",
+  "description": "After you pick a DB3 in the billable package wizard, PipeShare immediately opens the customer destination step so you can choose where the package should live (e.g. AJJ).\n\nAlso keeps the full-subtree scan so videos/PDFs auto-detect without clicking through folders first.\n\nWho is affected: PipeShare billable package on BASE (and SaaS after Push).",
   "changeLog": [
-    "Billable package wizard scans the full package subtree before auto-detect.",
-    "No need to click through Videos/Reports/Images folders first.",
-    "Keeps prior Employee ↔ Customer instant switch and explorer speed fixes."
+    "Selecting a DB3 advances straight to the customer save-location step.",
+    "Skip DB3 still uses Next to reach the destination picker.",
+    "Billable wizard still scans the full package subtree for auto-detect."
   ],
-  "updatedAt": "2026-07-09T15:45:00.000Z"
+  "updatedAt": "2026-07-09T15:50:00.000Z"
 }
