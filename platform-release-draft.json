@@ -1,12 +1,12 @@
 {
-  "title": "Pre launch Beta 2.0.0a",
-  "description": "Backup snapshot of BASE (pipeshare.live) before launch — Pre launch Beta 2.0.0a.\n\nIncludes the working Create billable package flow with Customer-folder WinCan DB3 linking for pipe chart / PACP, cloud copyOnly (source files stay on Employee), hybrid Push/apply fixes, and related PipeShare explorer work from this cycle.\n\nWho is affected: This is a numbered platform backup you can re-apply or Push to SaaS from cPanel Releases. It does not change SaaS until you apply/push it.",
+  "title": "Smooth billable package open + faster copies",
+  "description": "After Create billable package, PipeShare no longer hard-refreshes the whole page. It soft-switches to the Customer folder, patches in the new package tree immediately, and keeps the view stable without Ctrl+Shift+R.\n\nCopies are faster: more parallel Wasabi CopyObject workers, skip existence HeadObject on clone-only copies, and the transfer queue no longer forces an extra full tree reload that blanked the package view.\n\nWho is affected: PipeShare billable packaging and Employee↔Customer folder switching on BASE (and SaaS after Push).",
   "changeLog": [
-    "Named backup: Pre launch Beta 2.0.0a.",
-    "Create billable package copies to Customer and links DB3 for pipe chart.",
-    "Folder DB3 bindings save under Customer package job (Employee DB3 may stay linked).",
-    "Cloud copyOnly no longer deletes Employee source files.",
-    "Hybrid BASE→SaaS Push / PM2 / manifest-only apply path included."
+    "Open billable package with soft job switch — no full page reload.",
+    "Show Customer package folder immediately via shallow tree patch.",
+    "Skip transfer-queue full-tree reload after billable copy (prevents blank/flicker).",
+    "Raise Wasabi folder copy concurrency; skip HeadObject on copyOnly clones.",
+    "Soft-switch Folder System Employee/Customer picker without hard refresh."
   ],
-  "updatedAt": "2026-07-09T14:35:00.000Z"
+  "updatedAt": "2026-07-09T15:00:00.000Z"
 }

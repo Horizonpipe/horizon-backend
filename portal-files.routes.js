@@ -88,6 +88,8 @@ const PORTAL_NON_BROWSABLE_JOB_IDS = new Set(
     .filter(Boolean)
 );
 const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCURRENCY', 8, 1, 32);
+/** Parallel Wasabi CopyObject calls for folder clone/move (billable package / bridge). */
+const PORTAL_FOLDER_COPY_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_COPY_CONCURRENCY', 16, 1, 48);
 /** Max items per {@code POST /check-paths} (JSON body stays well under express 4mb). */
 const PORTAL_CHECK_PATHS_MAX = clampIntEnv('PORTAL_CHECK_PATHS_MAX', 800, 50, 2000);
 /** Parallel S3 HeadObject calls per check-paths request (Wasabi handles many concurrent small reads). */
@@ -3583,12 +3585,16 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         if (oldKey === newKey) {
           return res.json({ id: keyToId(newKey), key: newKey, path: newRel });
         }
-        try {
-          await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: newKey }));
-          return res.status(409).json({ error: 'Destination already exists' });
-        } catch (he) {
-          const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
-          if (hn !== 'NotFound' && he?.$metadata?.httpStatusCode !== 404) throw he;
+        // copyOnly (billable package / clone): skip HeadObject — one less Wasabi RTT per file.
+        // Move still checks so we do not silently overwrite.
+        if (!copyOnly) {
+          try {
+            await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: newKey }));
+            return res.status(409).json({ error: 'Destination already exists' });
+          } catch (he) {
+            const hn = he && typeof he === 'object' && 'name' in he ? he.name : '';
+            if (hn !== 'NotFound' && he?.$metadata?.httpStatusCode !== 404) throw he;
+          }
         }
         await portalS3().send(
           new CopyObjectCommand({
