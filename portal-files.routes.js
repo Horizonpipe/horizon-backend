@@ -2703,8 +2703,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       );
       // #endregion
       const forceHashes = String(req.query.includeHashes ?? '').trim() === '1';
+      // Shallow folder browsing does not need full-job SHA merge (2 PG queries) — skip unless asked.
       const skipHashMerge =
-        !forceHashes && PORTAL_TREE_MERGE_HASH_MAX_FILES > 0 && keys.length > PORTAL_TREE_MERGE_HASH_MAX_FILES;
+        (shallow && !forceHashes && !permEditorTree) ||
+        (!forceHashes && PORTAL_TREE_MERGE_HASH_MAX_FILES > 0 && keys.length > PORTAL_TREE_MERGE_HASH_MAX_FILES);
       if (!skipHashMerge) {
         await mergeCompletedUploadSha256IntoTree(clientId, jobId, tree);
       }
@@ -5196,7 +5198,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     const prefDl = jobPrefix(parsed.clientId, parsed.jobId, jobRoot);
     const relPathDl = Key.slice(prefDl.length);
     let pathOk = false;
-    if (userIsPortalAdmin(req.user)) {
+    {
       const now = Date.now();
       const authK = portalDlAuthCacheKey(req.user, fileId);
       const authHit = portalDlAuthCache.get(authK);
@@ -5210,8 +5212,6 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         });
         trimPortalDlMap(portalDlAuthCache);
       }
-    } else {
-      pathOk = await assertPortalPathRel(aclPool, req.user, parsed.clientId, parsed.jobId, relPathDl, 'download');
     }
     if (!pathOk) {
       pathOk = await userCanDownloadDb3ViaInspectionBinding(

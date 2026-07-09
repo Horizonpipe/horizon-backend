@@ -1,12 +1,12 @@
 {
-  "title": "Lightning explorer + LAN-feel video scrub",
-  "description": "PipeShare folder browsing and video scrubbing are much faster and more dependable.\n\nExplorer: job boot and folder opens use shallow one-level listings (Wasabi Delimiter), like ShareFile Children — not giant recursive trees. Opening a folder hydrates its children immediately.\n\nVideo: scrubbing updates the time label while you drag and seeks once on release (object storage cannot do true LAN scrub without HLS). Presigns are cached until near expiry and skip an extra Wasabi HeadObject on every open.\n\nWho is affected: PipeShare on BASE (and SaaS after Push).",
+  "title": "Faster folder opens and file preview",
+  "description": "PipeShare file loading was still slow because every folder click bypassed cache and paid full backend work again. This batch fixes that so browsing feels snappy.\n\nExplorer: shallow folder listings now reuse memory/session cache (correct shallow cache keys), BASE boot no longer wipes a good cache or force-refetches every time, and the server skips full-job hash merging on shallow tree calls.\n\nFiles: video/PDF open with presign only (no extra HeadObject meta trip); PDF preview streams from Wasabi in the iframe instead of downloading the whole file first; download auth is cached for all users for 60s.\n\nWho is affected: PipeShare on BASE (and SaaS after Push).",
   "changeLog": [
-    "Shallow tree API (shallow=1) for fast one-level folder listings.",
-    "Boot explorer with shallow root; hydrate children when a folder opens.",
-    "Seek-on-release video scrubbing to cut Wasabi Range spam while dragging.",
-    "Longer TTL-aware video presign cache; faster /presign without HeadObject.",
-    "preload=metadata for remote video to reduce aborted Range requests."
+    "Reuse shallow tree cache on folder open (no bypassCache on every click).",
+    "Match shallow cache keys on boot/hydrate so revisits are instant.",
+    "Skip full-job SHA merge on shallow /tree listings.",
+    "Video/PDF preview: presign-only path; PDF iframe loads Wasabi directly.",
+    "Cache path-download auth for all users (60s) to speed repeated opens."
   ],
-  "updatedAt": "2026-07-09T15:15:00.000Z"
+  "updatedAt": "2026-07-09T15:25:00.000Z"
 }
