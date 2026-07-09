@@ -28,9 +28,21 @@ fi
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
-if [[ "${HP_DEPLOYMENT_MODE:-}" != "saas" ]]; then
-  echo "[apply] HP_DEPLOYMENT_MODE must be saas on this host" >&2
+MODE="${HP_DEPLOYMENT_MODE:-}"
+if [[ "$MODE" != "saas" && "$MODE" != "hybrid" ]]; then
+  echo "[apply] HP_DEPLOYMENT_MODE must be saas or hybrid on this host" >&2
   exit 1
+fi
+
+# Hybrid BASE+SaaS on one box: artifacts live in the SaaS virtualbox bucket when configured.
+if [[ -n "${SAAS_WASABI_BUCKET:-}" ]]; then
+  WASABI_BUCKET="${SAAS_WASABI_BUCKET}"
+  if [[ -n "${SAAS_WASABI_ENDPOINT:-}" ]]; then
+    WASABI_ENDPOINT="${SAAS_WASABI_ENDPOINT}"
+  fi
+  if [[ -n "${SAAS_WASABI_REGION:-}" ]]; then
+    WASABI_REGION="${SAAS_WASABI_REGION}"
+  fi
 fi
 
 FE_KEY="${HP_RELEASE_FRONTEND_KEY:-platform/releases/${VERSION}/artifacts/frontend.tar.gz}"

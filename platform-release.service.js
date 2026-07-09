@@ -420,8 +420,13 @@ async function artifactExists(client, bucket, key) {
   }
 }
 
-async function applyPlatformRelease(client, bucket, { version, actor = '' } = {}, { pool } = {}) {
-  if (!isSaasDeployment()) {
+async function applyPlatformRelease(
+  client,
+  bucket,
+  { version, actor = '', requestHost = '' } = {},
+  { pool } = {}
+) {
+  if (!isSaasDeployment({ requestHost: requestHost || undefined })) {
     throw new Error('Apply is only allowed on HP_DEPLOYMENT_MODE=saas hosts');
   }
   const v = cleanString(version);

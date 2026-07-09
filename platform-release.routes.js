@@ -156,7 +156,11 @@ function registerPlatformReleaseRoutes(app, { pool, requireAuth, requireAdmin, w
       const result = await applyPlatformRelease(
         wasabiClient,
         wasabiBucket,
-        { version, actor: cleanString(req.user?.username || req.user?.displayName) },
+        {
+          version,
+          actor: cleanString(req.user?.username || req.user?.displayName),
+          requestHost: requestHostFromReq(req)
+        },
         { pool }
       );
       return res.json({ success: true, ...result });
