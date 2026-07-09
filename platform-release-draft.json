@@ -1,11 +1,11 @@
 {
-  "title": "Customer DB3 pipe chart after hard refresh",
-  "description": "Customer-side pipe charts were failing after Ctrl+Shift+R because the chart resolved before folder DB3 bindings finished loading from the server, and failed downloads could cache a deny before the binding fallback ran.\n\nPipeShare now waits for Customer/Employee inspection bindings before loading the pipe chart, does not show demo data when a remote link is missing, caches download auth only after the binding check, and keeps cross-job Employee DB3 links usable from Customer packages.\n\nWho is affected: PipeShare Customer (and Employee) WinCan pipe chart on BASE.",
+  "title": "Customer pipe chart: fix real load path + binding memory",
+  "description": "Customer DB3 pipe charts were still broken because the main selection path (syncWincanInspectionState) loaded the chart before folder bindings and fell back to demo data. Stale user-prefs could also wipe freshly loaded Customer links.\n\nPipeShare now waits for inspection bindings on that main path, keeps an in-memory overlay of folder DB3 links so prefs hydrate cannot erase them, and downloads Employee-linked DB3s via presign even when meta/HeadObject fails.\n\nWho is affected: PipeShare Customer (and Employee) WinCan pipe chart on BASE.",
   "changeLog": [
-    "Await folder DB3 bindings before resolving remote pipe chart.",
-    "Stop masking missing Customer DB3 links with demo observations.",
-    "Cache download auth after inspection-binding fallback (not before).",
-    "Cross-job billable DB3 bind no longer requires Employee path view grant."
+    "Fix syncWincanInspectionState to await Customer folder DB3 bindings (was the live path).",
+    "In-memory folder DB3 overlay so user-prefs cannot wipe Customer links.",
+    "DB3 download: presign-only fallback when /meta HeadObject fails.",
+    "No demo observations for remote videos when a link is missing."
   ],
-  "updatedAt": "2026-07-09T16:25:00.000Z"
+  "updatedAt": "2026-07-09T16:40:00.000Z"
 }
