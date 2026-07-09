@@ -14,6 +14,7 @@ const {
   PLATFORM_RELEASES_ROOT
 } = require('./lib/platform-release-paths');
 const { listPlatformReleaseBucketCandidates, createS3ClientForBucket } = require('./lib/platform-release-storage');
+const { platformApplyManifestOnly } = require('./lib/platform-release-peers');
 const {
   loadPlatformReleaseDraft,
   clearPlatformReleaseDraft
@@ -226,9 +227,20 @@ function gitBranchName() {
 }
 
 async function loadManifest(client, bucket) {
-  const manifest = (await getJsonObject(client, bucket, buildManifestKey())) || emptyManifest();
-  manifest.versions = Array.isArray(manifest.versions) ? manifest.versions : [];
-  return manifest;
+  const manifestKey = buildManifestKey();
+  const primary = (await getJsonObject(client, bucket, manifestKey)) || emptyManifest();
+  primary.versions = Array.isArray(primary.versions) ? primary.versions : [];
+  if (primary.versions.length) return primary;
+
+  for (const candidateBucket of listPlatformReleaseBucketCandidates()) {
+    if (candidateBucket === bucket) continue;
+    const candidateClient = createS3ClientForBucket(candidateBucket);
+    if (!candidateClient) continue;
+    const alt = (await getJsonObject(candidateClient, candidateBucket, manifestKey)) || emptyManifest();
+    alt.versions = Array.isArray(alt.versions) ? alt.versions : [];
+    if (alt.versions.length) return alt;
+  }
+  return primary;
 }
 
 async function saveManifest(client, bucket, manifest) {
@@ -456,38 +468,54 @@ async function applyPlatformRelease(
   const backendKey = cleanString(entry.artifactKeys?.backend) || buildReleaseArtifactKey(v, 'backend.tar.gz');
 
   const artifactBucket = (await findReleaseArtifactBucket(client, frontendKey, backendKey)) || bucket;
-  const hasFrontend = await artifactExists(client, artifactBucket, frontendKey);
-  const hasBackend = await artifactExists(client, artifactBucket, backendKey);
+  const artifactClient = createS3ClientForBucket(artifactBucket) || client;
+  const hasFrontend = await artifactExists(artifactClient, artifactBucket, frontendKey);
+  const hasBackend = await artifactExists(artifactClient, artifactBucket, backendKey);
   if (!hasFrontend && !hasBackend) {
     throw new Error(`Version ${v} has no uploaded artifacts yet. Publish from non-SaaS first.`);
   }
 
-  const applyScript = cleanString(process.env.HP_PLATFORM_APPLY_SCRIPT);
-  if (!applyScript || !fs.existsSync(applyScript)) {
-    throw new Error('HP_PLATFORM_APPLY_SCRIPT is not configured on this SaaS host');
-  }
+  const manifestOnly = platformApplyManifestOnly();
+  if (!manifestOnly) {
+    const applyScript = cleanString(process.env.HP_PLATFORM_APPLY_SCRIPT);
+    if (!applyScript || !fs.existsSync(applyScript)) {
+      throw new Error('HP_PLATFORM_APPLY_SCRIPT is not configured on this SaaS host');
+    }
 
-  const childProcess = require('child_process');
-  await new Promise((resolve, reject) => {
-    const proc = childProcess.spawn('bash', [applyScript, v], {
-      env: {
-        ...process.env,
-        HP_RELEASE_VERSION: v,
-        HP_RELEASE_FRONTEND_KEY: frontendKey,
-        HP_RELEASE_BACKEND_KEY: backendKey,
-        HP_RELEASE_ARTIFACT_BUCKET: artifactBucket
-      },
-      stdio: ['ignore', 'pipe', 'pipe']
+    const childProcess = require('child_process');
+    await new Promise((resolve, reject) => {
+      const proc = childProcess.spawn('bash', [applyScript, v], {
+        env: {
+          ...process.env,
+          HP_RELEASE_VERSION: v,
+          HP_RELEASE_FRONTEND_KEY: frontendKey,
+          HP_RELEASE_BACKEND_KEY: backendKey,
+          HP_RELEASE_ARTIFACT_BUCKET: artifactBucket
+        },
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', (chunk) => {
+        stdout += String(chunk || '');
+      });
+      proc.stderr.on('data', (chunk) => {
+        stderr += String(chunk || '');
+      });
+      proc.on('close', (code) => {
+        if (code === 0) resolve();
+        else {
+          reject(
+            new Error(
+              String(stderr || stdout || `Apply script exited with code ${code}`)
+                .trim()
+                .slice(0, 2000)
+            )
+          );
+        }
+      });
     });
-    let stderr = '';
-    proc.stderr.on('data', (chunk) => {
-      stderr += String(chunk || '');
-    });
-    proc.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(stderr.trim() || `Apply script exited with code ${code}`));
-    });
-  });
+  }
 
   manifest.saasDeployedVersion = v;
   await saveManifest(client, bucket, manifest);

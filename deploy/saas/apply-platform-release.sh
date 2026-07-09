@@ -30,8 +30,13 @@ source "$ENV_FILE"
 
 MODE="${HP_DEPLOYMENT_MODE:-}"
 if [[ "$MODE" != "saas" && "$MODE" != "hybrid" ]]; then
-  echo "[apply] HP_DEPLOYMENT_MODE must be saas or hybrid on this host" >&2
-  exit 1
+  # Same OVH box serves pipeshare.live (BASE) and pipeshare.net (SaaS); peer apply passes artifact bucket.
+  if [[ "$MODE" == "non-saas" && -n "${HP_RELEASE_ARTIFACT_BUCKET:-}" && -n "${HP_PLATFORM_APPLY_PEER_URLS:-}" ]]; then
+    :
+  else
+    echo "[apply] HP_DEPLOYMENT_MODE must be saas or hybrid on this host (or non-saas hybrid with peer apply configured)" >&2
+    exit 1
+  fi
 fi
 
 # Hybrid BASE+SaaS on one box: artifacts live in the SaaS virtualbox bucket when configured.
