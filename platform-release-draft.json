@@ -1,12 +1,11 @@
 {
-  "title": "DB3 folder link sticks across videos",
-  "description": "Manually linking a WinCan .db3 to a PipeShare folder (billable package / job folder) no longer disappears after you leave the first video.\n\nWhat was wrong: the portal sometimes treated Wasabi’s storage client/job labels as a “different job” from the UI labels, wiped the folder DB3 binding scope, then reloaded bindings under the wrong key. The first video could still look fine via filename auto-match; the next video had no match and looked unassigned.\n\nWho is affected: PipeShare cloud jobs on BASE and SaaS when you assign Folder DB3 (or Link selected .db3) and review multiple videos in the same folder.",
+  "title": "Billable package folder DB3 linking",
+  "description": "You can dependably link a WinCan .db3 to a customer / project folder when building a billable package in PipeShare.\n\nWhat changed: the Folder DB3 strip is visible again in the cloud file explorer (it was implemented but not shown). After Create new project structure, PipeShare opens the new folder and offers to link a .db3 immediately. Manual folder DB3 assignments also stick when you switch videos (Wasabi vs UI scope fix from earlier today).\n\nWho is affected: PipeShare on BASE and SaaS when packaging customer jobs with videos + one shared WinCan database.",
   "changeLog": [
-    "Keep Wasabi storage scope for folder DB3 bindings when UI client/job labels differ.",
-    "Load inspection bindings from both Wasabi and UI scopes and merge them.",
-    "Do not wipe a local folder DB3 assignment when the server returns an empty binding map.",
-    "Keep video selection (and DB3 context) when switching videos outside the current explorer folder.",
-    "Resolve admin-linked DB3 even if the .db3 row is briefly missing from a stale tree cache."
+    "Show Billable package · folder DB3 strip in the cloud explorer for customer folders.",
+    "After Create new project structure, open the folder and offer to link a WinCan .db3.",
+    "Local project structure marks the new folder as a jobsite so the Jobsite DB3 strip appears.",
+    "Keep folder DB3 assignments across video switches (Wasabi/UI scope merge)."
   ],
-  "updatedAt": "2026-07-09T13:30:00.000Z"
+  "updatedAt": "2026-07-09T13:45:00.000Z"
 }
