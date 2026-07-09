@@ -56,6 +56,11 @@ const {
   resolveStorageRootForJob
 } = require('./lib/tenant-storage-context');
 const {
+  isTenantPortalClientId,
+  isHiddenPortalTreeRelPath,
+  filterHiddenPortalTreeForTenantClient
+} = require('./lib/portal-hidden-tree-paths');
+const {
   loadEffectivePathGrantsForUser,
   jobHasAnyEffectivePathGrants,
   migrateLegacyScopeAuthorityForUserJob,
@@ -355,8 +360,14 @@ async function s3UploadFromTempPath(s3Client, bucketName, Key, tempPath, content
 
 function portalUploadKey(clientId, jobId, folderPathRel, originalName, explicitCategory, root = '') {
   const fp = normalizeRelPath(folderPathRel || '');
+  const pref = jobPrefix(String(clientId), String(jobId), root);
+  const safeName = sanitizeFilename(originalName);
   if (fp) {
-    return `${jobPrefix(String(clientId), String(jobId), root)}${fp}/${sanitizeFilename(originalName)}`;
+    return `${pref}${fp}/${safeName}`;
+  }
+  /** SaaS tenants build their own folder tree — root uploads land at job root, not type buckets. */
+  if (isTenantPortalClientId(clientId)) {
+    return `${pref}${safeName}`;
   }
   const cat = explicitCategory || inferCategoryFromFilename(originalName);
   return objectKey(String(clientId), String(jobId), String(cat), originalName, root);
@@ -2401,6 +2412,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       for (const obj of keysFlat) {
         const rel = obj.Key.slice(prefix.length);
         if (!rel || isFolderMarkerKey(rel)) continue;
+        if (isTenantPortalClientId(clientId) && !permEditorList && isHiddenPortalTreeRelPath(rel)) continue;
         if (userGrants) {
           const best = bestPathGrantForRelPath(userGrants, rel);
           if (!best || normalizeGrantAccessMode(best.access_mode) === 'off') continue;
@@ -2538,6 +2550,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         !forceHashes && PORTAL_TREE_MERGE_HASH_MAX_FILES > 0 && keys.length > PORTAL_TREE_MERGE_HASH_MAX_FILES;
       if (!skipHashMerge) {
         await mergeCompletedUploadSha256IntoTree(clientId, jobId, tree);
+      }
+      if (!permEditorTree) {
+        tree = filterHiddenPortalTreeForTenantClient(tree, clientId);
       }
       res.set('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
       return res.json(tree);
@@ -3151,7 +3166,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const keys = await listAllKeys(portalS3(), portalBucket(), listPrefix);
       const full = buildTreeFromKeys(prefix, keys);
-      const filtered = filterTreeForSharePayload(full, payload);
+      let filtered = filterTreeForSharePayload(full, payload);
+      filtered = filterHiddenPortalTreeForTenantClient(filtered, String(row.client_id));
       await mergeCompletedUploadSha256IntoTree(String(row.client_id), String(row.job_id), filtered);
       return res.json({
         ...filtered,
@@ -3735,6 +3751,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     const root = storageRoot(req);
     if (folderPath) {
       const key = portalUploadKey(clientId, jobId, folderPath, fileName, null, root);
+      return { key };
+    }
+    if (isTenantPortalClientId(clientId)) {
+      const key = portalUploadKey(clientId, jobId, '', fileName, null, root);
       return { key };
     }
     if (!categoryRaw || !CATEGORIES.has(categoryRaw)) {
@@ -5548,7 +5568,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const keys = await listAllKeys(portalS3(), portalBucket(), listPrefix);
       const full = buildTreeFromKeys(prefix, keys);
-      const filtered = filterTreeForSharePayload(full, payload);
+      let filtered = filterTreeForSharePayload(full, payload);
+      filtered = filterHiddenPortalTreeForTenantClient(filtered, String(row.client_id));
       await mergeCompletedUploadSha256IntoTree(String(row.client_id), String(row.job_id), filtered);
       return res.json({
         ...filtered,

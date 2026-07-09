@@ -1,11 +1,12 @@
 {
-  "title": "BASE explorer: remove debug CORS spam, clarify tree logging",
-  "description": "Production PipeShare was flooding the browser console with blocked localhost debug ingest requests (Private Network Access), which made the empty File Explorer hard to diagnose. OVH runtime checks confirm Mike's session is portal-users/8 and the tree API returns 4581 files — the API was never broken.\n\nThis release removes localhost-only debug ingest from pipeshare.live, adds plain console logs for portal scope and tree load results, bumps the portal runtime cache-bust version, and hardens portal admin detection for Mike on BASE file tree ACL bypass.\n\nWho is affected: pipeshare.live (BASE). SaaS unchanged unless you apply the next platform release bundle.",
+  "title": "SaaS tenants: hide scaffold folders, clean job root uploads",
+  "description": "New and existing SaaS PipeShare tenants no longer see the pre-made DB3, PDF, Photos, and Video folders when they open File Explorer. Those paths were legacy routing buckets from early provisioning — not folders clients should manage. Infra folders like system-state stay in storage for PipeSync but are hidden from the explorer.\n\nSaaS root uploads (no target folder selected) now land at the job root so tenants can build their own folder tree. BASE (pipeshare.live / portal-users) keeps the existing category-bucket behavior.\n\nWho is affected: SaaS tenants on pipeshare.net (and other SaaS hosts) after you apply this platform release. BASE gets the backend immediately on OVH deploy; SaaS applies via cPanel Releases.",
   "changeLog": [
-    "Stop localhost debug ingest calls on pipeshare.live (fixes CORS console spam).",
-    "Log BASE portal scope and tree load file/folder counts in the browser console.",
-    "Bump client-portal runtime version for cache bust (2026-07-01-base-explorer-fix2).",
-    "BASE Mike admin bypass for path-grant tree filtering on /api/files/tree."
+    "Stop creating empty videos/db3/pdf/photos folders for newly provisioned SaaS tenants.",
+    "Hide videos, db3, pdf, photos, and system-state from SaaS tenant file explorer trees.",
+    "SaaS uploads without a folder path go to job root instead of type buckets.",
+    "Share and guest file trees respect the same hidden-folder rules for tenant jobs.",
+    "BASE portal-users explorer and upload routing unchanged."
   ],
-  "updatedAt": "2026-07-01T18:00:00.000Z"
+  "updatedAt": "2026-07-09T11:45:00.000Z"
 }
