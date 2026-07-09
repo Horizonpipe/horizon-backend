@@ -8536,7 +8536,14 @@ app.post(
       }
       const { client: planS3, bucket: planBucket, rootPrefix } = planStorage;
       const fileName = cleanString(req.body?.fileName);
-      const contentType = cleanString(req.body?.contentType || 'application/octet-stream');
+      let contentType = cleanString(req.body?.contentType || 'application/octet-stream');
+      // Browsers often send application/octet-stream for PDFs — infer from filename.
+      if (!contentType || contentType === 'application/octet-stream') {
+        if (/\.pdf$/i.test(fileName)) contentType = 'application/pdf';
+        else if (/\.png$/i.test(fileName)) contentType = 'image/png';
+        else if (/\.jpe?g$/i.test(fileName)) contentType = 'image/jpeg';
+        else if (/\.webp$/i.test(fileName)) contentType = 'image/webp';
+      }
       const fileSize = Number(req.body?.fileSize);
       const reuseKey = cleanString(req.body?.storageKey);
       if (reuseKey && isValidPipesyncPlanPageStorageKey(reuseKey, rootPrefix)) {

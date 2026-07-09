@@ -2734,9 +2734,22 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const rows = await listPortalInspectionBindings(uploadMetaPool, clientId, jobId);
       const primary = {};
       const override = {};
+      const adminBindings = userIsPortalAdmin(req.user);
       for (const row of rows) {
         const folderPath = String(row.folder_path || '').trim();
-        if (folderPath && !pathGate.check(folderPath)) continue;
+        // Admins see all job bindings (billable Customer packages). Others: folder or any ancestor.
+        if (folderPath && !adminBindings) {
+          let visible = pathGate.check(folderPath);
+          if (!visible) {
+            let p = folderPath;
+            while (p && !visible) {
+              const i = p.lastIndexOf('/');
+              p = i === -1 ? '' : p.slice(0, i);
+              if (p && pathGate.check(p)) visible = true;
+            }
+          }
+          if (!visible) continue;
+        }
         const type = normalizeInspectionBindingType(row.binding_type);
         const db3FileId = String(row.db3_file_id || '').trim();
         if (!type || !db3FileId) continue;
