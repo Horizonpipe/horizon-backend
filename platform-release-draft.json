@@ -1,10 +1,11 @@
 {
-  "title": "Sleek delete confirmation for file explorer",
-  "description": "Deleting files or folders in PipeShare no longer uses the plain browser popup. You now get a clean in-app confirmation that shows what will be removed, warns that cloud delete is permanent, and matches the rest of the PipeShare UI.\n\nWho is affected: PipeShare file explorer on BASE (and SaaS after Push).",
+  "title": "Instant folder create — no clunky list refresh",
+  "description": "Creating folders in PipeShare felt slow: the browser name box, then a full list refresh with a “Refreshing file list…” banner before the folder showed up.\n\nNew folder now uses a clean in-app name dialog, paints the folder in the list as soon as the server creates it, and syncs quietly in the background — no refresh banner.\n\nWho is affected: PipeShare file explorer on BASE (and SaaS after Push).",
   "changeLog": [
-    "Replace browser delete confirm with a professional in-app modal.",
-    "Show selected file/folder names before permanent cloud delete.",
-    "Clear Cancel / Delete actions with keyboard Escape and Enter support."
+    "New folder appears immediately after create (no waiting on full list reload).",
+    "Remove the “Refreshing file list…” banner during mutations.",
+    "In-app New folder name dialog instead of the browser prompt.",
+    "Project structure folders paint as each subfolder is created."
   ],
-  "updatedAt": "2026-07-09T17:15:00.000Z"
+  "updatedAt": "2026-07-09T17:25:00.000Z"
 }
