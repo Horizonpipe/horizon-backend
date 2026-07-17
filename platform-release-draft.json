@@ -1,9 +1,9 @@
 {
-  "title": "Pipe chart shaft meets both end spheres — no dead gap",
-  "description": "The pipe shaft stopped short of the To sphere because track height was a fixed pixel value while the layout row still grew. The shaft now fills the space between the From and To nodes so the graph is continuous.\n\nWho is affected: PipeShare Pipe chart on BASE after deploy; SaaS after Push.",
+  "title": "Pipe chart direction label cleanup",
+  "description": "Removed the vertical CAMERA caption beside the pipe. The Direction chip now reads Inspection Direction : Upstream or Downstream from the WinCan inspection direction.\n\nWho is affected: PipeShare Pipe chart on BASE after deploy; SaaS after Push.",
   "changeLog": [
-    "Pipe shaft fills the grid row between From and To spheres (no gap above To).",
-    "Fit logic no longer forces a shorter fixed track height inside the panel."
+    "Remove CAMERA caption beside the pipe flow arrow.",
+    "Chip label is Inspection Direction : Upstream|Downstream."
   ],
-  "updatedAt": "2026-07-17T02:30:00.000Z"
+  "updatedAt": "2026-07-17T02:35:00.000Z"
 }
