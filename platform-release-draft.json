@@ -1,10 +1,11 @@
 {
-  "title": "Pipe chart shows full run — no clipped end sphere",
-  "description": "The Pipe chart was still cutting off the bottom (To) manhole because shaft height used the full panel and ignored the From/To end spheres. Track height now reserves space for both end nodes so the full pipe (From → shaft → To) fits in the panel without a scrollbar.\n\nWho is affected: PipeShare Pipe chart on BASE after deploy; SaaS after Push.",
+  "title": "Pipe chart truly fits the panel — no cutoff or scrollbar",
+  "description": "Pipe chart sizing now uses the float panel’s fixed height (not a content-grown body), reserves space for From/To spheres and chart chrome, and forces overflow hidden. The howto line is hidden in the panel to free vertical space. CSS is cache-busted so browsers pick up the fix.\n\nWho is affected: PipeShare Pipe chart on BASE after deploy; SaaS after Push.",
   "changeLog": [
-    "Pipe chart track height subtracts From/To node heights so the end sphere is not clipped.",
-    "Refine track size after layout and shrink if content still overflows.",
-    "Prefer CSS zoom over transform:scale so fit does not clip the bottom."
+    "Pipe chart fit uses panel height so the shaft shrinks instead of clipping the To end.",
+    "Force overflow:hidden on pipe panel containers — no inner scrollbar.",
+    "Compact chart chrome in the float panel; hide howto to free space.",
+    "Cache-bust file-host.css so the fit styles load."
   ],
-  "updatedAt": "2026-07-17T02:15:00.000Z"
+  "updatedAt": "2026-07-17T02:20:00.000Z"
 }
