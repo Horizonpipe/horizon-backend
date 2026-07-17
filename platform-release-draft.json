@@ -1,11 +1,11 @@
 {
-  "title": "Instant folder create — no clunky list refresh",
-  "description": "Creating folders in PipeShare felt slow: the browser name box, then a full list refresh with a “Refreshing file list…” banner before the folder showed up.\n\nNew folder now uses a clean in-app name dialog, paints the folder in the list as soon as the server creates it, and syncs quietly in the background — no refresh banner.\n\nWho is affected: PipeShare file explorer on BASE (and SaaS after Push).",
+  "title": "Pipe chart fits the window and ends sit on the pipe end",
+  "description": "The Pipe chart no longer needs a scrollbar: it scales to the panel height so the full run (From → To, marks, labels) stays visible at any window size. Chainage stays proportional along the shaft.\n\nEnd-of-run marks and the playhead now sit on the true pipe end (0–100% along the shaft) instead of stopping slightly short of the bottom/top. Video near the start or end snaps the playhead to the structure end.\n\nWho is affected: PipeShare Pipe chart on BASE after deploy; SaaS after Push from releases.",
   "changeLog": [
-    "New folder appears immediately after create (no waiting on full list reload).",
-    "Remove the “Refreshing file list…” banner during mutations.",
-    "In-app New folder name dialog instead of the browser prompt.",
-    "Project structure folders paint as each subfolder is created."
+    "Pipe chart fills the panel height — no inner scrollbar.",
+    "Track height follows available window space; proportions stay by chainage %.",
+    "End marks and labels use full 0–100% shaft (no 1.5–98.5 inset).",
+    "Playhead snaps to pipe ends near video start/end."
   ],
-  "updatedAt": "2026-07-09T17:25:00.000Z"
+  "updatedAt": "2026-07-17T02:00:00.000Z"
 }
