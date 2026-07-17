@@ -1,11 +1,10 @@
 {
-  "title": "Pipe chart fits the window and ends sit on the pipe end",
-  "description": "The Pipe chart no longer needs a scrollbar: it scales to the panel height so the full run (From → To, marks, labels) stays visible at any window size. Chainage stays proportional along the shaft.\n\nEnd-of-run marks and the playhead now sit on the true pipe end (0–100% along the shaft) instead of stopping slightly short of the bottom/top. Video near the start or end snaps the playhead to the structure end.\n\nWho is affected: PipeShare Pipe chart on BASE after deploy; SaaS after Push from releases.",
+  "title": "Pipe chart shows full run — no clipped end sphere",
+  "description": "The Pipe chart was still cutting off the bottom (To) manhole because shaft height used the full panel and ignored the From/To end spheres. Track height now reserves space for both end nodes so the full pipe (From → shaft → To) fits in the panel without a scrollbar.\n\nWho is affected: PipeShare Pipe chart on BASE after deploy; SaaS after Push.",
   "changeLog": [
-    "Pipe chart fills the panel height — no inner scrollbar.",
-    "Track height follows available window space; proportions stay by chainage %.",
-    "End marks and labels use full 0–100% shaft (no 1.5–98.5 inset).",
-    "Playhead snaps to pipe ends near video start/end."
+    "Pipe chart track height subtracts From/To node heights so the end sphere is not clipped.",
+    "Refine track size after layout and shrink if content still overflows.",
+    "Prefer CSS zoom over transform:scale so fit does not clip the bottom."
   ],
-  "updatedAt": "2026-07-17T02:00:00.000Z"
+  "updatedAt": "2026-07-17T02:15:00.000Z"
 }
