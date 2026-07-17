@@ -1,9 +1,12 @@
 {
-  "title": "Pipe chart direction label cleanup",
-  "description": "Removed the vertical CAMERA caption beside the pipe. The Direction chip now reads Inspection Direction : Upstream or Downstream from the WinCan inspection direction.\n\nWho is affected: PipeShare Pipe chart on BASE after deploy; SaaS after Push.",
+  "title": "Pipe chart From/To follow inspection direction",
+  "description": "Pipe chart From/To now follow camera travel from WinCan inspection direction, not only the hydraulic SECTION From/To ends.\n\nDownstream inspections always show From = Upstream MH → To = Downstream MH. Upstream inspections always show From = Downstream MH → To = Upstream MH (example: start at CB-5 going to CB-6).\n\nWho is affected: PipeShare Pipe chart on BASE after deploy; SaaS after Push. Reload the inspection (or clear observation cache) once so DB3 re-parses with the new travel labels.",
   "changeLog": [
-    "Remove CAMERA caption beside the pipe flow arrow.",
-    "Chip label is Inspection Direction : Upstream|Downstream."
+    "Derive travel From/To from INS_InspectionDir plus Upstream/Downstream MH.",
+    "Upstream travel: From = Downstream MH, To = Upstream MH.",
+    "Downstream travel: From = Upstream MH, To = Downstream MH.",
+    "Sphere From/To roles match travel start/end on the shaft.",
+    "Bump inspection pipeline cache to v23 so old parses refresh."
   ],
-  "updatedAt": "2026-07-17T02:35:00.000Z"
+  "updatedAt": "2026-07-17T03:00:00.000Z"
 }
