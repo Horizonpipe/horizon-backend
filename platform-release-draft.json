@@ -1,10 +1,9 @@
 {
-  "title": "Pipe chart code tags no longer clipped",
-  "description": "Observation code tags (distance + code pills) near the top or bottom of the Pipe chart were cut off. Label pills now sit slightly inset from the shaft ends while pipe marks and leader wires still use true chainage. The label column allows visible overflow so pills are not cropped.\n\nWho is affected: PipeShare Pipe chart on BASE after deploy; SaaS after Push.",
+  "title": "Pipe chart shaft meets both end spheres — no dead gap",
+  "description": "The pipe shaft stopped short of the To sphere because track height was a fixed pixel value while the layout row still grew. The shaft now fills the space between the From and To nodes so the graph is continuous.\n\nWho is affected: PipeShare Pipe chart on BASE after deploy; SaaS after Push.",
   "changeLog": [
-    "Inset observation label pills (5–95%) so they are not clipped at shaft ends.",
-    "Keep pipe marks and wire anchors on true 0–100% chainage.",
-    "Allow visible overflow on the pipe chart label column."
+    "Pipe shaft fills the grid row between From and To spheres (no gap above To).",
+    "Fit logic no longer forces a shorter fixed track height inside the panel."
   ],
-  "updatedAt": "2026-07-17T02:25:00.000Z"
+  "updatedAt": "2026-07-17T02:30:00.000Z"
 }
