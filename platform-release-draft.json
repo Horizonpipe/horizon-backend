@@ -1,16 +1,10 @@
 {
-  "title": "Every workspace can have its own Mike",
-  "description": "Each SaaS workspace now owns its user list outright. Forty different companies can each create a user named Mike (or any other name) and those accounts stay completely separate — separate passwords, separate permissions, separate file spaces. A login only works on the workspace it belongs to, so a Mike created by one company cannot sign in on another company's site or on the base server.\n\nThe reserved Horizon operator identity is now decided by which stack the account lives on, not by the name on it. Previously an account whose name matched the operator's was treated as the platform operator anywhere it appeared, which meant a workspace could create a user that inherited base-server access. Workspace accounts are now always workspace accounts, no matter what they are called, and the operator account is still protected from being re-created through public signup.\n\nWorkspace owners can now create their own admins. The Create User form shows an 'Admin access (this workspace)' option for workspace owners and workspace admins, and those admins only ever see and manage users in their own workspace. This also closes a scoping bug where any admin account was treated as a platform admin when managing users, which would have let a workspace admin reach other workspaces.\n\nThis release also fixes a real cause of the false 'account already exists' message: the user id counter in the database had fallen behind after accounts were restored from cloud snapshots, so new accounts collided on the id instead of the name and the error blamed the username. The counter is now repaired at startup and after every snapshot restore, and an id collision no longer reports itself as a duplicate name.\n\nWho is affected: everyone creating users, on the private server and on SaaS after Push.",
+  "title": "Fix Approve failing with 'User not found'",
+  "description": "Approving (or editing) a waiting account could fail with a 'User not found' error even though the account clearly existed in the list. This happened when an account was present in the database but missing from the cloud snapshot — a drift that could occur if a snapshot write had failed earlier or the snapshot was rebuilt before the newest accounts were added.\n\nWhen cloud storage is the primary write target, saving a user update writes to the snapshot first. If the account was not already in the snapshot, the save stopped with an error before the change was applied. Now the save adds the missing account to the snapshot (seeded from the database record) and applies the change, so Approve and user edits succeed and the snapshot is healed automatically.\n\nWho is affected: anyone approving or editing accounts, on the private server and on SaaS after Push.",
   "changeLog": [
-    "Each workspace can create its own Mike (or any repeated name) with fully independent accounts.",
-    "Workspace accounts can never inherit platform operator access from a matching name.",
-    "A workspace user named like the operator can no longer sign in on the base server.",
-    "The operator name and email are still reserved on public signup and password reset.",
-    "Workspace owners and workspace admins can now create admin users inside their own workspace.",
-    "Fix user management scope so a workspace admin can never act across workspaces.",
-    "Repair the user id counter at startup and after cloud snapshot restores.",
-    "An id collision during user creation no longer reports 'username already exists'.",
-    "SuperAdmin can no longer be assigned inside a workspace."
+    "Approving a waiting account no longer fails with 'User not found'.",
+    "Editing a user that was missing from the cloud snapshot now succeeds.",
+    "User saves heal snapshot drift by re-adding the missing account instead of erroring."
   ],
-  "updatedAt": "2026-07-25T15:40:00.000Z"
+  "updatedAt": "2026-07-25T21:30:00.000Z"
 }
