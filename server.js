@@ -7864,6 +7864,9 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
 
 app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, async (req, res) => {
   const id = cleanString(req.params.id);
+  console.log(
+    `[DBG put-user] id=${JSON.stringify(id)} scope=${req.tenantScope?.mode} actor=${JSON.stringify(req.user?.username)} actorId=${req.user?.id} host=${requestHostFromReq(req)}`
+  );
   if (!id) {
     return res.status(400).json({ success: false, error: 'User id is required' });
   }
@@ -7943,6 +7946,9 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
       }
     }
     if (!current) {
+      console.log(
+        `[DBG put-user] NOT FOUND id=${JSON.stringify(id)} pgRows=${currentResult.rows.length} usersPrimary=${WASABI_USERS_PRIMARY_ENABLED} strict=${WASABI_USERS_PRIMARY_STRICT}`
+      );
       return res.status(404).json({ success: false, error: 'User not found' });
     }
     const legacyScopeWarnings = [];
