@@ -1,10 +1,9 @@
 {
-  "title": "Slimmer file/folder right-click menus",
-  "description": "Right-clicking a file or folder now shows only File Actions (download, rename, cut, copy, move, delete, etc.). Share, Workspace, Admin tools extras, DB3, and Folder system stay on empty-space right-click so the row menus stay uncluttered.\n\nWho is affected: PipeShare BASE after deploy; SaaS after Push.",
+  "title": "Workspace Scope label (no vendor names in UI)",
+  "description": "Folder system and right-click menus now say Workspace Scope instead of Wasabi scope. User-facing copy across PipeShare, PipeSync, cPanel, and marketing no longer names internal cloud vendors.\n\nWho is affected: BASE after deploy; SaaS after Push.",
   "changeLog": [
-    "File/folder right-click: File Actions only.",
-    "Empty-space right-click keeps Share, Workspace, Create, support, DB3, Folder system.",
-    "Folder system switch no longer appears on row menus."
+    "Rename Wasabi scope → Workspace Scope in Folder system UI.",
+    "Remove vendor service names from user-facing toasts, errors, and site copy."
   ],
-  "updatedAt": "2026-07-25T14:40:00.000Z"
+  "updatedAt": "2026-07-25T14:50:00.000Z"
 }
