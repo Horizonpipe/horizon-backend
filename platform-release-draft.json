@@ -1,10 +1,10 @@
 {
-  "title": "Fix Approve failing with 'User not found'",
-  "description": "Approving (or editing) a waiting account could fail with a 'User not found' error even though the account clearly existed in the list. This happened when an account was present in the database but missing from the cloud snapshot — a drift that could occur if a snapshot write had failed earlier or the snapshot was rebuilt before the newest accounts were added.\n\nWhen cloud storage is the primary write target, saving a user update writes to the snapshot first. If the account was not already in the snapshot, the save stopped with an error before the change was applied. Now the save adds the missing account to the snapshot (seeded from the database record) and applies the change, so Approve and user edits succeed and the snapshot is healed automatically.\n\nWho is affected: anyone approving or editing accounts, on the private server and on SaaS after Push.",
+  "title": "Animated PIPESHARE logo on login and splash",
+  "description": "PipeShare now uses the branded animated login loop on the sign-in screen and again as the short splash that plays right after you log in. The login card loops the animation quietly while you enter credentials, and the post-login splash plays it once before fading into the file explorer.\n\nIf the browser blocks video or the user prefers reduced motion, the previous static logo (login) or CSS wordmark (splash) still shows so nothing breaks.\n\nWho is affected: everyone signing into PipeShare on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Approving a waiting account no longer fails with 'User not found'.",
-    "Editing a user that was missing from the cloud snapshot now succeeds.",
-    "User saves heal snapshot drift by re-adding the missing account instead of erroring."
+    "Login screen shows the animated PIPESHARE brand loop.",
+    "Post-login splash plays the same brand animation once, then fades out.",
+    "Static logo / CSS wordmark remain as fallbacks for reduced motion or video errors."
   ],
-  "updatedAt": "2026-07-25T21:30:00.000Z"
+  "updatedAt": "2026-07-25T22:10:00.000Z"
 }
