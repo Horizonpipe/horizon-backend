@@ -1,9 +1,9 @@
 {
-  "title": "Workspace Scope label (no vendor names in UI)",
-  "description": "Folder system and right-click menus now say Workspace Scope instead of Wasabi scope. User-facing copy across PipeShare, PipeSync, cPanel, and marketing no longer names internal cloud vendors.\n\nWho is affected: BASE after deploy; SaaS after Push.",
+  "title": "Fix Create User in Admin tools menu",
+  "description": "Create User in the Admin tools right-click menu is now a direct action that opens Settings with Create user expanded. The old flyout submenu was easy to miss beside the Folder system panel.\n\nWho is affected: PipeShare BASE after deploy; SaaS after Push.",
   "changeLog": [
-    "Rename Wasabi scope → Workspace Scope in Folder system UI.",
-    "Remove vendor service names from user-facing toasts, errors, and site copy."
+    "Create User opens the admin create-user form in one click.",
+    "Module access settings stays as its own Admin tools item."
   ],
-  "updatedAt": "2026-07-25T14:50:00.000Z"
+  "updatedAt": "2026-07-25T14:55:00.000Z"
 }
