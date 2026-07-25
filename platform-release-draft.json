@@ -1,10 +1,10 @@
 {
-  "title": "Right-click Folder system switch",
-  "description": "PipeShare right-click now shows a third Folder system menu beside Quick actions and Admin tools. Admins who can use the Folder system bar can switch Customer ↔ Employee Wasabi scopes in one click without leaving the explorer.\n\nWho is affected: PipeShare BASE after deploy; SaaS after Push. Same permission gate as the Folder system dropdown (not line-only DAS employees).",
+  "title": "Slimmer file/folder right-click menus",
+  "description": "Right-clicking a file or folder now shows only File Actions (download, rename, cut, copy, move, delete, etc.). Share, Workspace, Admin tools extras, DB3, and Folder system stay on empty-space right-click so the row menus stay uncluttered.\n\nWho is affected: PipeShare BASE after deploy; SaaS after Push.",
   "changeLog": [
-    "Add third right-click panel: Folder system.",
-    "One-click Switch to Customer / Switch to Employee file spaces.",
-    "Current scope is marked and disabled so you always see where you are."
+    "File/folder right-click: File Actions only.",
+    "Empty-space right-click keeps Share, Workspace, Create, support, DB3, Folder system.",
+    "Folder system switch no longer appears on row menus."
   ],
-  "updatedAt": "2026-07-25T14:20:00.000Z"
+  "updatedAt": "2026-07-25T14:40:00.000Z"
 }
