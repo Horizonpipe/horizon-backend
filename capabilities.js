@@ -70,7 +70,8 @@ function normalizeLegacyRoles(value) {
   return out;
 }
 
-function looksLikeMike(userLike) {
+/** Name/email match only — use for reserving the identity on public signup, never for granting power. */
+function matchesPlatformOperatorIdentity(userLike) {
   const username = String(userLike?.username || '')
     .trim()
     .toLowerCase();
@@ -81,6 +82,27 @@ function looksLikeMike(userLike) {
     .trim()
     .toLowerCase();
   return MIKE_IDENTIFIERS.has(username) || MIKE_IDENTIFIERS.has(displayName) || MIKE_IDENTIFIERS.has(email);
+}
+
+/** Account lives inside a SaaS tenant virtualbox (tenant-<slug> portal scope). */
+function isTenantScopedAccount(userLike) {
+  const portalClientId = String(userLike?.portalFilesClientId ?? userLike?.portal_files_client_id ?? '')
+    .trim()
+    .toLowerCase();
+  return portalClientId.startsWith('tenant-');
+}
+
+/**
+ * Horizon platform operator (Mike on the BASE stack).
+ *
+ * Every SaaS tenant may create its own "Mike" — including the literal reserved name — so a
+ * workspace-bound account must never inherit platform powers from its name alone. Callers that
+ * pass rows without `portal_files_client_id` get name-only matching, so always select that column
+ * when the answer decides authorization.
+ */
+function looksLikeMike(userLike) {
+  if (!matchesPlatformOperatorIdentity(userLike)) return false;
+  return !isTenantScopedAccount(userLike);
 }
 
 /** SaaS workspace purchaser — super-admin inside their tenant, not global Horizon admin. */
@@ -317,5 +339,7 @@ module.exports = {
   isAdminUser,
   isSaasWorkspaceOwner,
   looksLikeMike,
+  matchesPlatformOperatorIdentity,
+  isTenantScopedAccount,
   deploymentMode
 };

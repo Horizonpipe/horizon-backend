@@ -9,7 +9,7 @@ const { upsertTenantDraft } = require('./tenant-provisioning.service');
 const { getSaasOwnerSessionContext } = require('./lib/saas-tenant-owner');
 const { loadTenantScopeByHost } = require('./lib/saas-tenant-scope');
 const { upsertTenantAuthUserFromRow } = require('./lib/saas-tenant-auth-store');
-const { looksLikeMike } = require('./capabilities');
+const { matchesPlatformOperatorIdentity } = require('./capabilities');
 
 const SIGNUP_PIN_TTL_MIN = Number(process.env.SIGNUP_PIN_TTL_MIN || 30);
 const RESEND_COOLDOWN_SEC = Math.max(30, Number(process.env.SIGNUP_RESEND_COOLDOWN_SEC || 60));
@@ -274,7 +274,7 @@ function registerSignupRoutes(app, deps) {
         error: `Password must be at least ${PASSWORD_MIN_LEN} characters`
       });
     }
-    if (looksLikeMike({ email, username: email, displayName: `${firstName} ${lastName}`.trim() })) {
+    if (matchesPlatformOperatorIdentity({ email, username: email, displayName: `${firstName} ${lastName}`.trim() })) {
       return res.status(403).json({
         success: false,
         error: 'This email is reserved for the Horizon Pipe BASE operator account. Sign in with your existing credentials or contact support.'
@@ -373,7 +373,7 @@ function registerSignupRoutes(app, deps) {
     if (pin.length !== 6) {
       return res.status(400).json({ success: false, error: 'Enter the 6-digit code from your email' });
     }
-    if (looksLikeMike({ email, username: email })) {
+    if (matchesPlatformOperatorIdentity({ email, username: email })) {
       return res.status(403).json({
         success: false,
         error: 'This email is reserved for the Horizon Pipe BASE operator account.'

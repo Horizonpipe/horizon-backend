@@ -47,6 +47,7 @@ const {
   canManagePortalExtras,
   isAdminUser,
   looksLikeMike,
+  matchesPlatformOperatorIdentity,
   resolveHostingTier,
   HOSTING_TIERS
 } = require('./capabilities');
@@ -112,6 +113,7 @@ const {
   assertLoginEnvironmentAccess,
   assertAuthenticatedEnvironmentAccess,
   assertUsernameAvailableForCreate,
+  findSnapshotUsernameConflict,
   resolveLoginUserRow,
   loadTenantScopeByHost
 } = require('./lib/saas-tenant-scope');
@@ -2835,6 +2837,26 @@ async function readLoginUserFromWasabiSnapshot(submittedUsername, force = false)
   return users.find((row) => snapshotUserMatchesLogin(row, submittedUsername)) || null;
 }
 
+/**
+ * Snapshot mirrors insert users with an explicit id, which leaves `users_id_seq` behind MAX(id).
+ * The next admin-created user then collides on the primary key, so keep the sequence caught up.
+ */
+async function syncUsersIdSequence() {
+  try {
+    await pool.query(
+      `SELECT setval(
+         pg_get_serial_sequence('users', 'id'),
+         GREATEST((SELECT COALESCE(MAX(id), 0) FROM users), 1)
+       )
+       WHERE pg_get_serial_sequence('users', 'id') IS NOT NULL`
+    );
+    return true;
+  } catch (error) {
+    console.warn(`[users] Could not sync users_id_seq: ${error?.message || error}`);
+    return false;
+  }
+}
+
 /** Persist Wasabi self-signup users in Postgres so login survives snapshot merges/refreshes. */
 async function mirrorSelfSignupUserToPostgres(userRow) {
   if (!userRow || userRow.self_signup !== true) return;
@@ -2879,6 +2901,7 @@ async function mirrorSelfSignupUserToPostgres(userRow) {
       userRow.phone == null ? null : String(userRow.phone)
     ]
   );
+  await syncUsersIdSequence();
 }
 
 function sortPlannerRecordsForList(records) {
@@ -4452,15 +4475,23 @@ async function requireAdminPanelOrTenantUserManagement(req, res, next) {
     if (!req.user) {
       return res.status(401).json({ success: false, error: 'Authentication required' });
     }
+    /**
+     * Resolve the actor's box first. A workspace admin also passes `canAccessAdminPanel`, so
+     * checking that first would silently promote them to platform scope and leak every workspace.
+     */
+    const scope = await resolveActorTenantScope(pool, req.user, { requestHost: requestHostFromReq(req) });
+    if (scope.mode === 'tenant') {
+      req.tenantScope = scope;
+      if (canAccessAdminPanel(req.user) || userCanManageTenantUsers(req.user, scope)) {
+        return next();
+      }
+      return res.status(403).json({ success: false, error: 'Admin access required' });
+    }
     if (canAccessAdminPanel(req.user)) {
       req.tenantScope = { mode: 'platform' };
       return next();
     }
-    const scope = await resolveActorTenantScope(pool, req.user, { requestHost: requestHostFromReq(req) });
     req.tenantScope = scope;
-    if (scope.mode === 'tenant' && userCanManageTenantUsers(req.user, scope)) {
-      return next();
-    }
     return res.status(403).json({ success: false, error: 'Admin access required' });
   } catch (error) {
     console.error('TENANT ADMIN AUTH ERROR:', error);
@@ -7645,9 +7676,11 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
   }
   const actorIsMike = isMikeStricklandUser(req.user);
   const targetLooksMike =
-    looksLikeMike({ username, displayName, email: req.body?.email }) || username.toLowerCase() === 'mik';
+    matchesPlatformOperatorIdentity({ username, displayName, email: req.body?.email }) ||
+    username.toLowerCase() === 'mik';
   if (employeeRole === EMPLOYEE_ROLES.SUPERADMIN) {
-    if (!actorIsMike || !targetLooksMike) {
+    /** A workspace gets its super admin from the owner account, never from a name match. */
+    if (req.tenantScope?.mode === 'tenant' || !actorIsMike || !targetLooksMike) {
       return res.status(403).json({
         success: false,
         error: 'SuperAdmin can only be assigned by Mike Strickland to Mike Strickland.'
@@ -7674,38 +7707,57 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
     if (WASABI_WRITES_PRIMARY_ENABLED && req.tenantScope?.mode !== 'tenant') {
       try {
         const snapshot = await loadWasabiLatestStateSnapshot(true);
-        const usernameLower = String(username).trim().toLowerCase();
-        if (
-          snapshotRows(snapshot, 'users').some(
-            (u) => String(u.username || '').trim().toLowerCase() === usernameLower
-          )
-        ) {
-          return res.status(409).json({ success: false, error: 'Username already exists' });
+        const conflict = findSnapshotUsernameConflict(
+          snapshotRows(snapshot, 'users'),
+          username,
+          req.tenantScope
+        );
+        if (conflict) {
+          const shown =
+            cleanString(conflict.display_name || conflict.displayName) ||
+            cleanString(conflict.username) ||
+            username;
+          return res.status(409).json({
+            success: false,
+            error: `Username already exists: ${shown}`,
+            existingUserId: conflict.id != null ? String(conflict.id) : undefined,
+            existingUsername: cleanString(conflict.username) || username
+          });
         }
       } catch (preSnapErr) {
         console.warn('[create-user] Could not pre-check Wasabi users list:', preSnapErr?.message || preSnapErr);
       }
     }
 
-    const result = await pool.query(
-      `INSERT INTO users (
+    const insertSql = `INSERT INTO users (
          username, display_name, password, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup
        )
        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, true, $8, $9, $10, false)
-       RETURNING id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, self_signup`,
-      [
-        username,
-        displayName,
-        hash,
-        isAdmin,
-        accountType,
-        employeeRole,
-        JSON.stringify(roles),
-        req.tenantScope?.mode === 'tenant' ? req.tenantScope.portalClientId : null,
-        req.tenantScope?.mode === 'tenant' ? req.tenantScope.portalJobId || '1' : null,
-        false
-      ]
-    );
+       RETURNING id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, self_signup`;
+    const insertParams = [
+      username,
+      displayName,
+      hash,
+      isAdmin,
+      accountType,
+      employeeRole,
+      JSON.stringify(roles),
+      req.tenantScope?.mode === 'tenant' ? req.tenantScope.portalClientId : null,
+      req.tenantScope?.mode === 'tenant' ? req.tenantScope.portalJobId || '1' : null,
+      false
+    ];
+    let result;
+    try {
+      result = await pool.query(insertSql, insertParams);
+    } catch (insertErr) {
+      /** Stale id sequence (snapshot mirrors insert explicit ids) — resync and retry once. */
+      if (insertErr?.code === '23505' && insertErr?.constraint === 'users_pkey') {
+        await syncUsersIdSequence();
+        result = await pool.query(insertSql, insertParams);
+      } else {
+        throw insertErr;
+      }
+    }
     insertedPgId = result.rows[0].id;
 
     if (req.tenantScope?.mode === 'tenant') {
@@ -7726,10 +7778,13 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
     if (WASABI_WRITES_PRIMARY_ENABLED && req.tenantScope?.mode !== 'tenant') {
       const wrote = await tryWasabiStateWrite('create-user', async (data) => {
         const users = ensureSnapshotTable(data, 'users');
-        const usernameLower = String(username).trim().toLowerCase();
-        const duplicate = users.some((u) => String(u.username || '').trim().toLowerCase() === usernameLower);
-        if (duplicate) {
-          const err = new Error('Username already exists');
+        const conflict = findSnapshotUsernameConflict(users, username, req.tenantScope);
+        if (conflict) {
+          const shown =
+            cleanString(conflict.display_name || conflict.displayName) ||
+            cleanString(conflict.username) ||
+            username;
+          const err = new Error(`Username already exists: ${shown}`);
           err.code = '23505';
           throw err;
         }
@@ -7788,7 +7843,20 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
     }
     console.error('CREATE USER ERROR:', error);
     if (error.code === '23505') {
-      return res.status(409).json({ success: false, error: 'Username already exists' });
+      /** Only report a duplicate when the username really collided — never for an id/sequence clash. */
+      if (error.constraint === 'users_pkey') {
+        await syncUsersIdSequence();
+        return res.status(500).json({
+          success: false,
+          error: 'Could not assign a user id. Please try creating the user again.'
+        });
+      }
+      return res.status(409).json({
+        success: false,
+        error: error.message && /already exists/i.test(error.message)
+          ? error.message
+          : 'Username already exists'
+      });
     }
     res.status(500).json({ success: false, error: error.message });
   }
@@ -7958,14 +8026,14 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
         nextEmployeeRole = null;
       }
     }
-    if (looksLikeMike({ username: current.username, display_name: current.display_name, email: current.email })) {
+    if (looksLikeMike(current)) {
       nextAccountType = ACCOUNT_TYPES.EMPLOYEE;
       adminAccess = true;
       superAdminAccess = true;
       nextEmployeeRole = EMPLOYEE_ROLES.SUPERADMIN;
     }
     if (nextEmployeeRole === EMPLOYEE_ROLES.SUPERADMIN) {
-      const targetLooksMike = looksLikeMike({ username: current.username, display_name: nextDisplayName, email: current.email });
+      const targetLooksMike = looksLikeMike({ ...current, display_name: nextDisplayName });
       if (!actorIsMike || !targetLooksMike) {
         return res.status(403).json({
           success: false,
@@ -8014,7 +8082,7 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
     if (nextPortalFilesAccessGranted === true || nextAutosyncMasterGranted === true || nextIsAdmin === true) {
       nextSelfSignup = false;
     }
-    if (looksLikeMike({ username: current.username, display_name: current.display_name, email: current.email })) {
+    if (looksLikeMike(current)) {
       nextSelfSignup = false;
     }
 
@@ -11516,7 +11584,7 @@ async function createSignupUserWithWasabi({ email, verificationRow, saasSignup }
   const wrote = await tryWasabiStateWrite('signup-create-user', async (data) => {
     const users = ensureSnapshotTable(data, 'users');
     const emailNeedle = String(email || '').trim().toLowerCase();
-    if (looksLikeMike({ email: emailNeedle, username: emailNeedle })) {
+    if (matchesPlatformOperatorIdentity({ email: emailNeedle, username: emailNeedle })) {
       response = {
         status: 403,
         body: { success: false, error: 'This email is reserved for the Horizon Pipe BASE operator account.' }
@@ -11789,6 +11857,7 @@ process.on('SIGTERM', () => {
 
 ensureSchema()
   .then(async () => {
+    await syncUsersIdSequence();
     await autoImportPlugin.initSchema();
     if (wasabiStateClient && WASABI_STATE_BUCKET) {
       await runWasabiStateSnapshot();
