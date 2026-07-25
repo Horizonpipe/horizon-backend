@@ -7864,9 +7864,6 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
 
 app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, async (req, res) => {
   const id = cleanString(req.params.id);
-  console.log(
-    `[DBG put-user] id=${JSON.stringify(id)} scope=${req.tenantScope?.mode} actor=${JSON.stringify(req.user?.username)} actorId=${req.user?.id} host=${requestHostFromReq(req)}`
-  );
   if (!id) {
     return res.status(400).json({ success: false, error: 'User id is required' });
   }
@@ -7946,9 +7943,6 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
       }
     }
     if (!current) {
-      console.log(
-        `[DBG put-user] NOT FOUND id=${JSON.stringify(id)} pgRows=${currentResult.rows.length} usersPrimary=${WASABI_USERS_PRIMARY_ENABLED} strict=${WASABI_USERS_PRIMARY_STRICT}`
-      );
       return res.status(404).json({ success: false, error: 'User not found' });
     }
     const legacyScopeWarnings = [];
@@ -8186,13 +8180,22 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
     }
 
     if (WASABI_WRITES_PRIMARY_ENABLED) {
+      /**
+       * The row can exist in Postgres but be missing from the snapshot (snapshot drift — e.g. created
+       * while a snapshot write failed, or a snapshot regenerated behind the newest ids). Upsert instead
+       * of throwing so approving/editing such an account still succeeds and heals the snapshot.
+       */
+      const snapshotSeedRow = await pool.query(
+        `SELECT id, username, display_name, password, email, email_verified, first_name, last_name, company,
+                title, phone, created_at
+         FROM users WHERE id = $1 LIMIT 1`,
+        [id]
+      );
+      const seed = snapshotSeedRow.rows[0] || {};
       await runWasabiStateWrite('update-user', async (data) => {
         const users = ensureSnapshotTable(data, 'users');
         const idx = users.findIndex((u) => String(u.id || '') === String(id || ''));
-        if (idx < 0) throw new Error('User not found');
-        const currentUserRow = users[idx];
-        users[idx] = {
-          ...currentUserRow,
+        const nextFields = {
           display_name: nextDisplayName,
           is_admin: nextIsAdmin === true,
           account_type: nextAccountType,
@@ -8206,14 +8209,27 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
           portal_permissions_access: nextPortalPermissionsAccess === true,
           updated_at: nowIso()
         };
-
-        if (passwordHash) {
-          users[idx] = {
-            ...users[idx],
-            password: passwordHash,
-            must_change_password: false,
-            updated_at: nowIso()
-          };
+        if (idx >= 0) {
+          users[idx] = { ...users[idx], ...nextFields };
+          if (passwordHash) {
+            users[idx] = { ...users[idx], password: passwordHash, must_change_password: false, updated_at: nowIso() };
+          }
+        } else {
+          users.push({
+            id: seed.id != null ? seed.id : id,
+            username: seed.username || nextDisplayName,
+            password: passwordHash || seed.password || '',
+            email: seed.email ?? null,
+            email_verified: seed.email_verified === true,
+            first_name: seed.first_name ?? null,
+            last_name: seed.last_name ?? null,
+            company: seed.company ?? null,
+            title: seed.title ?? null,
+            phone: seed.phone ?? null,
+            must_change_password: passwordHash ? false : true,
+            created_at: seed.created_at ? new Date(seed.created_at).toISOString() : nowIso(),
+            ...nextFields
+          });
         }
 
         const sessions = ensureSnapshotTable(data, 'auth_sessions');
