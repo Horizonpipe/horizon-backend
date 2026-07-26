@@ -1,11 +1,10 @@
 {
-  "title": "Billable package layout + pipe chart Videos/Reports/Images",
-  "description": "Build Billable Package always creates the job folder with Videos, Reports, and Images under the customer location you pick (for example AJJ/CALLAWAY…/Videos|Reports|Images), then copies your selected files into those folders.\n\nThe pipe chart View PDF / View Photos buttons now only look inside that job folder’s Videos, Reports, and Images folders (any capitalization). Manual folders with those names work the same way. DB3 linking is unchanged.\n\nWho is affected: PipeShare users building customer packages and reviewing pipe charts on the private server, and on SaaS after Push.",
+  "title": "Pipe chart finds WinCan Picture and Reports folders",
+  "description": "View PDF / View Photos on the pipe chart now work on both billable packages (Videos / Reports / Images) and raw WinCan job folders (Video / Picture / REPORTS…). Folder names are matched case-insensitively, including names like REPORTS 5-7-26.\n\nThe job project folder is loaded automatically so buttons can appear without browsing into Picture or Misc first.\n\nWho is affected: PipeShare users reviewing inspections on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Billable package always creates Videos, Reports, and Images under the job-named folder.",
-    "Pipe chart scans only Videos / Reports / Images under the open job folder (case-insensitive).",
-    "Those media folders hydrate automatically so PDF and photo buttons can appear.",
-    "DB3 binding on the package root and category folders is unchanged."
+    "Pipe chart accepts WinCan Picture / Photos aliases for Images.",
+    "Pipe chart treats folders named Reports… (e.g. REPORTS 5-7-26) as report folders.",
+    "Job project subtree hydrates automatically for PDF and photo buttons."
   ],
-  "updatedAt": "2026-07-26T18:00:00.000Z"
+  "updatedAt": "2026-07-26T18:10:00.000Z"
 }
