@@ -1,10 +1,13 @@
 {
-  "title": "\"Loading Please wait\" instead of a false empty-folder message",
-  "description": "When you click into a job or open a folder, the file list used to briefly say \"This folder is empty\" before the files finished loading, which was confusing on folders that actually had contents.\n\nNow the list shows \"Loading Please wait\" while it fetches, and only shows the empty-folder message (with the New folder / Create project structure hint) once loading finishes and there really is nothing there.\n\nWho is affected: everyone using the PipeShare file explorer on the private server, and on SaaS after Push.",
+  "title": "Production login, pipeshare.live routing, and faster deletes",
+  "description": "PipeShare BASE sign-in now lives at https://pipeshare.live/ with a cleaner production login layout, brand colors, and renamed theme labels (Horizon Brand, Abyssal Blue, Ember Shell). The HorizonPipe marketing site is at https://pipeshare.live/Horizonpipe/.\n\nDeletes no longer sit on a false empty wait: items leave the list immediately, then finish on Wasabi with batched DeleteObjects. Build Billable Package copies files through a new server-side batch CopyObject API instead of one browser request per file.\n\nWho is affected: everyone on the private server (pipeshare.live). SaaS (pipeshare.net) landing is unchanged until Push; delete/copy speed improvements apply on SaaS after Push.",
   "changeLog": [
-    "File explorer shows \"Loading Please wait\" while a folder's contents load.",
-    "The \"This folder is empty\" hint now only appears after loading finishes and the folder is truly empty.",
-    "Fixes the false empty-folder flash when first opening a job or navigating into a folder."
+    "https://pipeshare.live/ is the PipeShare BASE login; HorizonPipe site is at /Horizonpipe/.",
+    "Login screen redesigned for production (cleaner layout, brand orange CTAs, theme picker refined).",
+    "Theme labels renamed to Horizon Brand, Abyssal Blue, and Ember Shell.",
+    "Remember username and password option (username saved on device; browser can save the password).",
+    "Deletes remove items from the explorer immediately, then finish on Wasabi in the background.",
+    "Folder delete/move uses batched Wasabi DeleteObjects; billable packages use server batch CopyObject."
   ],
-  "updatedAt": "2026-07-26T13:26:00.000Z"
+  "updatedAt": "2026-07-26T14:00:00.000Z"
 }

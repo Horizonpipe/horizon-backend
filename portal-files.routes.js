@@ -30,6 +30,7 @@ const {
   S3Client,
   CopyObjectCommand,
   DeleteObjectCommand,
+  DeleteObjectsCommand,
   GetObjectCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
@@ -90,6 +91,10 @@ const PORTAL_NON_BROWSABLE_JOB_IDS = new Set(
 const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCURRENCY', 8, 1, 32);
 /** Parallel Wasabi CopyObject calls for folder clone/move (billable package / bridge). */
 const PORTAL_FOLDER_COPY_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_COPY_CONCURRENCY', 16, 1, 48);
+/** Parallel DeleteObjects batches (each batch ≤1000 keys) for folder delete / move cleanup. */
+const PORTAL_DELETE_OBJECTS_BATCH_CONCURRENCY = clampIntEnv('PORTAL_DELETE_OBJECTS_BATCH_CONCURRENCY', 4, 1, 8);
+/** Max items per {@code POST /copy-batch} (billable package / bulk clone). */
+const PORTAL_COPY_BATCH_MAX = clampIntEnv('PORTAL_COPY_BATCH_MAX', 500, 20, 2000);
 /** Max items per {@code POST /check-paths} (JSON body stays well under express 4mb). */
 const PORTAL_CHECK_PATHS_MAX = clampIntEnv('PORTAL_CHECK_PATHS_MAX', 800, 50, 2000);
 /** Parallel S3 HeadObject calls per check-paths request (Wasabi handles many concurrent small reads). */
@@ -411,6 +416,52 @@ async function runPoolCollectErrors(array, concurrency, fn) {
     }
   });
   return errors;
+}
+
+/**
+ * Delete many object keys via S3 DeleteObjects (≤1000 keys per request), with parallel batches.
+ * Much faster than N sequential DeleteObject round-trips for storm folders / move cleanup.
+ * @param {import('@aws-sdk/client-s3').S3Client} s3
+ * @param {string} bucket
+ * @param {string[]} keys
+ * @param {{ concurrency?: number }} [opts]
+ * @returns {Promise<{ deleted: number, batchCount: number, errors: Array<{ index: number, error: unknown }> }>}
+ */
+async function deleteObjectKeysBatched(s3, bucket, keys, opts = {}) {
+  const unique = [...new Set((keys || []).map((k) => String(k || '').trim()).filter(Boolean))];
+  if (!unique.length) return { deleted: 0, batchCount: 0, errors: [] };
+  const chunkSize = 1000;
+  /** @type {string[][]} */
+  const chunks = [];
+  for (let i = 0; i < unique.length; i += chunkSize) {
+    chunks.push(unique.slice(i, i + chunkSize));
+  }
+  const concurrency = Math.max(
+    1,
+    Math.min(
+      Number(opts.concurrency) || PORTAL_DELETE_OBJECTS_BATCH_CONCURRENCY,
+      PORTAL_DELETE_OBJECTS_BATCH_CONCURRENCY
+    )
+  );
+  const errors = await runPoolCollectErrors(chunks, concurrency, async (chunk) => {
+    const out = await s3.send(
+      new DeleteObjectsCommand({
+        Bucket: bucket,
+        Delete: {
+          Objects: chunk.map((Key) => ({ Key })),
+          Quiet: true
+        }
+      })
+    );
+    const fatal = (out.Errors || []).filter((e) => e && e.Code && e.Code !== 'NoSuchKey');
+    if (fatal.length) {
+      const first = fatal[0];
+      throw new Error(
+        `DeleteObjects failed (${fatal.length}): ${first.Code || 'Error'} ${first.Key || ''} ${first.Message || ''}`.trim()
+      );
+    }
+  });
+  return { deleted: unique.length, batchCount: chunks.length, errors };
 }
 
 function summarizePoolErrors(phase, errors, mapping) {
@@ -3608,15 +3659,18 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           return res.status(502).json({ error: summary || 'Folder copy failed' });
         }
         const deleteStartedAt = Date.now();
-        const deleteErrors = await runPoolCollectErrors(
-          mapping,
-          PORTAL_FOLDER_DELETE_CONCURRENCY,
-          async ({ from }) => {
-            await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: from }));
-          }
+        const delResult = await deleteObjectKeysBatched(
+          portalS3(),
+          portalBucket(),
+          mapping.map((m) => m.from)
         );
-        if (deleteErrors.length > 0) {
-          const summary = summarizePoolErrors('delete', deleteErrors, mapping);
+        if (delResult.errors.length > 0) {
+          const first = delResult.errors[0];
+          const firstMsg =
+            first && first.error instanceof Error
+              ? first.error.message
+              : String(first && first.error ? first.error : 'Delete failed');
+          const summary = `delete failed (${delResult.errors.length} batches). firstError=${firstMsg}`;
           console.warn('[portal-files] folder rename delete error', {
             clientId: String(clientId),
             jobId: String(jobId),
@@ -3641,12 +3695,167 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           grantsMs: Date.now() - grantsStartedAt,
           totalMs: Date.now() - transferStartedAt,
           copyConcurrency: PORTAL_FOLDER_COPY_CONCURRENCY,
-          deleteConcurrency: PORTAL_FOLDER_DELETE_CONCURRENCY
+          deleteBatchCount: delResult.batchCount,
+          deleteBatchConcurrency: PORTAL_DELETE_OBJECTS_BATCH_CONCURRENCY
         });
         return res.json({ path: newRel, parentPath: parentRelPath(newRel), name: seg });
       }
 
       return res.status(400).json({ error: 'Provide fileId or path for folder rename' });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  /**
+   * Bulk server-side CopyObject (same bucket). Used by billable package builds so N files
+   * are one HTTP request + a Wasabi concurrency pool instead of N browser→API round trips.
+   */
+  r.post('/copy-batch', express.json({ limit: '4mb' }), async (req, res) => {
+    try {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      const copyOnly = body.copyOnly === true || body.copyOnly === 'true' || body.copyOnly === 1 || body.copyOnly == null;
+      const itemsIn = Array.isArray(body.items) ? body.items : [];
+      if (scope.error) {
+        return res.status(400).json({ error: 'clientId and jobId are required' });
+      }
+      if (!itemsIn.length) {
+        return res.status(400).json({ error: 'items array is required' });
+      }
+      if (itemsIn.length > PORTAL_COPY_BATCH_MAX) {
+        return res.status(400).json({
+          error: `Too many items (max ${PORTAL_COPY_BATCH_MAX})`
+        });
+      }
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (!userCanPortalCapability(req.user, 'edit')) {
+        return res.status(403).json({ error: 'Portal edit is not enabled for this account' });
+      }
+      const targetClientId = String(body.toClientId || clientId || '').trim();
+      const targetJobId = String(body.toJobId || jobId || '').trim();
+      if (!targetClientId || !targetJobId) {
+        return res.status(400).json({ error: 'Destination client/job is required' });
+      }
+      const crossScope =
+        String(targetClientId) !== String(clientId) || String(targetJobId) !== String(jobId);
+      if (crossScope && !userIsPortalAdmin(req.user)) {
+        return res.status(403).json({ error: 'Only admins can copy across folder roots/jobs' });
+      }
+      const mode = readPortalMode(req, body);
+      const allowClientWideDataAutoSync = mode === DATA_AUTO_SYNC_MODE;
+      if (
+        !(await assertPortalJobAccess(aclPool, req.user, String(targetClientId), String(targetJobId), {
+          allowClientWideDataAutoSync
+        }))
+      ) {
+        return res.status(403).json({ error: 'Forbidden destination scope' });
+      }
+
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
+      const targetPref = jobPrefix(String(targetClientId), String(targetJobId), storageRoot(req));
+      const startedAt = Date.now();
+
+      /** @type {Array<{ index: number, oldKey: string, newKey: string, newRel: string, name: string }>} */
+      const prepared = [];
+      /** @type {Array<{ index: number, error: string }>} */
+      const prepareErrors = [];
+
+      for (let index = 0; index < itemsIn.length; index++) {
+        const item = itemsIn[index] || {};
+        try {
+          const fileId = String(item.fileId || '').trim();
+          if (!fileId) throw new Error('fileId is required');
+          const oldKey = idToKey(fileId);
+          if (!oldKey.startsWith(pref) || isFolderMarkerKey(oldKey.slice(pref.length))) {
+            throw new Error('Invalid file id');
+          }
+          const oldRel = oldKey.slice(pref.length);
+          const name = basenameRel(oldRel);
+          const destParent = normalizeRelPath(item.toParentPath || '');
+          const explicitRel = item.toRelPath != null ? normalizeRelPath(item.toRelPath) : '';
+          const newRel = explicitRel || (destParent ? `${destParent}/${name}` : name);
+          if (!newRel) throw new Error('Destination path is required');
+          if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, oldRel, 'full'))) {
+            throw new Error('Forbidden source path');
+          }
+          if (!(await assertPortalPathRel(aclPool, req.user, targetClientId, targetJobId, newRel, 'full'))) {
+            throw new Error('Forbidden destination path');
+          }
+          const newKey = `${targetPref}${newRel}`;
+          prepared.push({ index, oldKey, newKey, newRel, name });
+        } catch (e) {
+          prepareErrors.push({
+            index,
+            error: e instanceof Error ? e.message : String(e)
+          });
+        }
+      }
+
+      const copyErrors = await runPoolCollectErrors(prepared, PORTAL_FOLDER_COPY_CONCURRENCY, async (row) => {
+        if (row.oldKey === row.newKey) return;
+        await portalS3().send(
+          new CopyObjectCommand({
+            Bucket: portalBucket(),
+            Key: row.newKey,
+            CopySource: copySourceHeader(portalBucket(), row.oldKey),
+            MetadataDirective: 'COPY'
+          })
+        );
+        if (!copyOnly) {
+          await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: row.oldKey }));
+        }
+      });
+
+      /** @type {Array<{ index: number, id: string, path: string, name: string }>} */
+      const ok = [];
+      const failedIndexes = new Set([
+        ...prepareErrors.map((e) => e.index),
+        ...copyErrors.map((e) => prepared[e.index]?.index).filter((i) => i != null)
+      ]);
+      for (const row of prepared) {
+        if (failedIndexes.has(row.index)) continue;
+        ok.push({
+          index: row.index,
+          id: keyToId(row.newKey),
+          path: row.newRel,
+          name: row.name
+        });
+      }
+
+      const errors = [
+        ...prepareErrors,
+        ...copyErrors.map((e) => {
+          const row = prepared[e.index];
+          const msg =
+            e.error instanceof Error ? e.error.message : String(e.error || 'Copy failed');
+          return { index: row ? row.index : e.index, error: msg };
+        })
+      ];
+
+      console.info('[portal-files] copy-batch stats', {
+        clientId: String(clientId),
+        jobId: String(jobId),
+        targetClientId: String(targetClientId),
+        targetJobId: String(targetJobId),
+        itemCount: itemsIn.length,
+        okCount: ok.length,
+        errorCount: errors.length,
+        copyConcurrency: PORTAL_FOLDER_COPY_CONCURRENCY,
+        totalMs: Date.now() - startedAt,
+        copyOnly: !!copyOnly
+      });
+
+      return res.json({
+        ok,
+        errors,
+        copied: ok.length,
+        failed: errors.length
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
@@ -3809,16 +4018,21 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           return res.status(502).json({ error: summary || 'Folder copy failed' });
         }
         const deleteStartedAt = Date.now();
+        let deleteBatchCount = 0;
         if (!copyOnly) {
-          const deleteErrors = await runPoolCollectErrors(
-            mapping,
-            PORTAL_FOLDER_DELETE_CONCURRENCY,
-            async ({ from }) => {
-              await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: from }));
-            }
+          const delResult = await deleteObjectKeysBatched(
+            portalS3(),
+            portalBucket(),
+            mapping.map((m) => m.from)
           );
-          if (deleteErrors.length > 0) {
-            const summary = summarizePoolErrors('delete', deleteErrors, mapping);
+          deleteBatchCount = delResult.batchCount;
+          if (delResult.errors.length > 0) {
+            const first = delResult.errors[0];
+            const firstMsg =
+              first && first.error instanceof Error
+                ? first.error.message
+                : String(first && first.error ? first.error : 'Delete failed');
+            const summary = `delete failed (${delResult.errors.length} batches). firstError=${firstMsg}`;
             console.warn('[portal-files] folder move delete error', {
               clientId: String(clientId),
               jobId: String(jobId),
@@ -3855,7 +4069,8 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           grantsMs: Date.now() - grantsStartedAt,
           totalMs: Date.now() - transferStartedAt,
           copyConcurrency: PORTAL_FOLDER_COPY_CONCURRENCY,
-          deleteConcurrency: PORTAL_FOLDER_DELETE_CONCURRENCY
+          deleteBatchCount,
+          deleteBatchConcurrency: PORTAL_DELETE_OBJECTS_BATCH_CONCURRENCY
         });
         return res.json({
           path: newRel,
@@ -3899,18 +4114,39 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       });
       const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const prefix = `${pref}${folderRel}/`;
+      const listStartedAt = Date.now();
       const keys = await listAllKeys(portalS3(), portalBucket(), prefix);
       const markerKey = `${pref}${folderRel}/${FOLDER_MARKER}`;
-      const toDelete = new Set(keys.map((k) => k.Key));
-      toDelete.add(markerKey);
-      for (const Key of toDelete) {
-        try {
-          await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key }));
-        } catch (err) {
-          if (err && err.name !== 'NoSuchKey') throw err;
-        }
+      const toDelete = [...new Set([...keys.map((k) => k.Key).filter(Boolean), markerKey])];
+      const deleteStartedAt = Date.now();
+      const delResult = await deleteObjectKeysBatched(portalS3(), portalBucket(), toDelete);
+      if (delResult.errors.length) {
+        const first = delResult.errors[0];
+        const firstMsg =
+          first && first.error instanceof Error
+            ? first.error.message
+            : String(first && first.error ? first.error : 'Delete failed');
+        console.warn('[portal-files] folder-delete error', {
+          clientId: String(clientId),
+          jobId: String(jobId),
+          folderRel,
+          itemCount: toDelete.length,
+          batchCount: delResult.batchCount,
+          summary: firstMsg
+        });
+        return res.status(502).json({ error: firstMsg });
       }
       await removePortalPathGrantPrefixes(aclPool, clientId, jobId, folderRel);
+      console.info('[portal-files] folder-delete stats', {
+        clientId: String(clientId),
+        jobId: String(jobId),
+        folderRel,
+        itemCount: toDelete.length,
+        listMs: deleteStartedAt - listStartedAt,
+        deleteMs: Date.now() - deleteStartedAt,
+        batchCount: delResult.batchCount,
+        batchConcurrency: PORTAL_DELETE_OBJECTS_BATCH_CONCURRENCY
+      });
       return res.status(204).send();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
