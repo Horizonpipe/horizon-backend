@@ -1,11 +1,10 @@
 {
-  "title": "Pipe chart layout reset — flex fit that actually works",
-  "description": "Reworked the pipe chart float panel from a fragile CSS subgrid to a simple flex layout: top sphere, pipe track, bottom sphere. The shaft can no longer run past the end caps. Observation tags shrink to the available track height, and a final uniform zoom keeps the whole chart inside the panel without clipping remarks or spheres.\n\nWho is affected: everyone on the private server, and on SaaS after Push.",
+  "title": "Pipe chart: spheres cap the pipe, all remarks fit",
+  "description": "The pipe chart now budgets an exact track height between the From/To spheres, tucks the sphere centers onto the shaft ends so the pipe never runs past the caps, and shrinks observation tags to fit every remark in that track — including dense 26-observation runs.\n\nWho is affected: everyone on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Pipe chart float panel rebuilt on flex: shaft stays between From/To spheres.",
-    "Observation tags shrink to fit the track height.",
-    "Uniform zoom keeps the full chart visible with no clipping.",
-    "Removed the broken min-height / subgrid fit path that made the layout look off."
+    "Pipe shaft ends at the sphere centers — no more running past the caps.",
+    "Track height is budgeted exactly to the panel so nothing clips at the bottom.",
+    "Observation tags shrink further on dense runs so all remarks stay visible."
   ],
-  "updatedAt": "2026-07-26T15:20:00.000Z"
+  "updatedAt": "2026-07-26T15:35:00.000Z"
 }
