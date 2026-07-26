@@ -1,11 +1,11 @@
 {
-  "title": "Pipe chart scales to fit any run length",
-  "description": "The pipe chart now dynamically fits every observation, even on long runs with many codes. The observation code tags shrink automatically so they never overlap or get cut off, and the whole chart stays clean and readable at any panel size. Pipe marks stay pinned to their true chainage, so positions remain exactly correct.\n\nWho is affected: everyone on the private server, and on SaaS after Push.",
+  "title": "Pipe chart fit fix — no more clipped spheres",
+  "description": "The pipe chart was still clipping the From/To end caps on longer runs because observation tags spilled into the sphere rows and got cut by the panel edge. Tags now shrink and re-seat entirely inside the pipe track, end caps scale down when the panel is short, and the full From-to-To chart stays visible without weird clipping.\n\nPipe marks remain locked to true chainage. Only the tag sizes and their display spacing adjust so everything fits cleanly.\n\nWho is affected: everyone on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Pipe chart observation tags auto-scale to fit long runs without overlap or clipping.",
-    "Code tags shrink as needed based on observation count and available height.",
-    "Pipe marks remain locked to true chainage, so positions stay accurate.",
-    "Chart re-fits automatically when the pipe panel is resized."
+    "Pipe chart observation tags stay inside the track — no more bleeding over From/To spheres.",
+    "Tags shrink and re-space automatically based on panel height and observation count.",
+    "End-cap spheres and labels scale down on short panels so the full run stays visible.",
+    "Overflow clipping that cut through the top/bottom of the chart is fixed."
   ],
-  "updatedAt": "2026-07-26T15:05:00.000Z"
+  "updatedAt": "2026-07-26T15:10:00.000Z"
 }
