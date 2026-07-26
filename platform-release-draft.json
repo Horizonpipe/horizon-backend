@@ -1,10 +1,9 @@
 {
-  "title": "Pipe chart PDF and photos for the open run",
-  "description": "The pipe chart can now open the report PDF and photos that belong to the inspection you have open — not every file in the package. After a billable package is built with Videos/Reports/Images, opening a run’s video shows photo marks on the pipe at their chainage and offers View PDF / View Photos only when those files are linked to that run.\n\nWho is affected: PipeShare users reviewing WinCan packages on the private server, and on SaaS after Push.",
+  "title": "Pipe chart scans job folder for PDF and photos",
+  "description": "View PDF / View Photos on the pipe chart now look under the job root — Reports, Misc, Docu, Images, and similar folders — instead of only a Videos/Reports package layout. Those folders are loaded automatically so buttons appear without browsing into them first.\n\nWho is affected: PipeShare users reviewing inspections on the private server, and on SaaS after Push.",
   "changeLog": [
-    "View PDF and View Photos buttons appear on the pipe chart only when that run has matching files.",
-    "Photo marks show on the pipe at WinCan observation chainages for linked images.",
-    "PDF and photo viewers open without losing the selected inspection video."
+    "Pipe chart scans the job root (Reports / Misc / Docu / Images) for run-linked PDF and photos.",
+    "Media folders hydrate automatically so View PDF / View Photos can appear without opening those folders."
   ],
-  "updatedAt": "2026-07-26T16:00:00.000Z"
+  "updatedAt": "2026-07-26T17:45:00.000Z"
 }
