@@ -1,9 +1,10 @@
 {
-  "title": "Pipe chart playhead aligns with remarks",
-  "description": "The pipe chart playhead now follows the inspection's observation timecodes instead of assuming the camera moved at a constant speed. Clicking a remark places both the video and playhead on that remark's exact pipe line.\n\nWho is affected: everyone using WinCan video remarks on the private server, and on SaaS after Push.",
+  "title": "Pipe chart PDF and photos for the open run",
+  "description": "The pipe chart can now open the report PDF and photos that belong to the inspection you have open — not every file in the package. After a billable package is built with Videos/Reports/Images, opening a run’s video shows photo marks on the pipe at their chainage and offers View PDF / View Photos only when those files are linked to that run.\n\nWho is affected: PipeShare users reviewing WinCan packages on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Clicked remarks now align exactly with the pipe playhead.",
-    "The playhead interpolates smoothly between observation timecodes during playback."
+    "View PDF and View Photos buttons appear on the pipe chart only when that run has matching files.",
+    "Photo marks show on the pipe at WinCan observation chainages for linked images.",
+    "PDF and photo viewers open without losing the selected inspection video."
   ],
-  "updatedAt": "2026-07-26T15:45:00.000Z"
+  "updatedAt": "2026-07-26T16:00:00.000Z"
 }
