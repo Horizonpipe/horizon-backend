@@ -1,9 +1,12 @@
 {
-  "title": "Transfers popup respects your workspace layout",
-  "description": "If you hide the Transfers panel in a workspace, starting an upload, billable package copy, or any cloud move/copy will no longer force that panel back open. Transfers continue to run in the background exactly as before, they just won't reopen a popup you deliberately closed.\n\nWho is affected: everyone on the private server, and on SaaS after Push. Workspaces that keep the Transfers panel visible (the default) are unchanged.",
+  "title": "Workspace polish + Transfers popup respects your layout",
+  "description": "Two changes in this release.\n\n1) Transfers popup no longer forces itself open. If you hide the Transfers panel in a workspace, starting an upload, a billable package copy, or any cloud move/copy will keep it closed. Transfers still run and track progress in the background exactly as before.\n\n2) Production polish on the workspace wrapper. Panel title bars now carry the PIPESHARE brand accent with cleaner uppercase titles, panels lift slightly on hover, and the active workspace tab is marked with a brand underline. Core functionality, the right-click menus, and the file delete confirmation are unchanged.\n\nWho is affected: everyone on the private server, and on SaaS after Push.",
   "changeLog": [
     "Transfers panel no longer auto-opens on transfer start if you hid it for that workspace.",
-    "Uploads, billable package copies, and cloud moves still run and track progress in the background when the panel is hidden."
+    "Uploads, billable copies, and cloud moves still run and track progress in the background when the panel is hidden.",
+    "Refined panel title bars with brand accent and cleaner titles.",
+    "Panels gently elevate on hover; active workspace tab now shows a brand accent bar.",
+    "New-workspace-tab button restyled to match the brand."
   ],
-  "updatedAt": "2026-07-26T14:35:00.000Z"
+  "updatedAt": "2026-07-26T14:50:00.000Z"
 }
