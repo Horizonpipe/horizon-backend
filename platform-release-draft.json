@@ -1,13 +1,8 @@
 {
-  "title": "Production login, pipeshare.live routing, and faster deletes",
-  "description": "PipeShare BASE sign-in now lives at https://pipeshare.live/ with a cleaner production login layout, brand colors, and renamed theme labels (Horizon Brand, Abyssal Blue, Ember Shell). The HorizonPipe marketing site is at https://pipeshare.live/Horizonpipe/.\n\nDeletes no longer sit on a false empty wait: items leave the list immediately, then finish on Wasabi with batched DeleteObjects. Build Billable Package copies files through a new server-side batch CopyObject API instead of one browser request per file.\n\nWho is affected: everyone on the private server (pipeshare.live). SaaS (pipeshare.net) landing is unchanged until Push; delete/copy speed improvements apply on SaaS after Push.",
+  "title": "Theme label: Horizon Brand → PIPESHARE",
+  "description": "The default theme in the login and app theme dropdown is now labeled PIPESHARE instead of Horizon Brand. The theme itself is unchanged — only the name in the menu.\n\nWho is affected: everyone on the private server, and on SaaS after Push.",
   "changeLog": [
-    "https://pipeshare.live/ is the PipeShare BASE login; HorizonPipe site is at /Horizonpipe/.",
-    "Login screen redesigned for production (cleaner layout, brand orange CTAs, theme picker refined).",
-    "Theme labels renamed to Horizon Brand, Abyssal Blue, and Ember Shell.",
-    "Remember username and password option (username saved on device; browser can save the password).",
-    "Deletes remove items from the explorer immediately, then finish on Wasabi in the background.",
-    "Folder delete/move uses batched Wasabi DeleteObjects; billable packages use server batch CopyObject."
+    "Default theme dropdown label renamed from Horizon Brand to PIPESHARE."
   ],
-  "updatedAt": "2026-07-26T14:00:00.000Z"
+  "updatedAt": "2026-07-26T14:20:00.000Z"
 }
