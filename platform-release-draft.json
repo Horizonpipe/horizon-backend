@@ -1,10 +1,10 @@
 {
-  "title": "New seamless PIPESHARE animation on login and splash",
-  "description": "The PIPESHARE brand animation on the sign-in screen and the post-login splash has been replaced with a new seamless-loop version, so it no longer visibly jumps when it repeats.\n\nBoth screens now also show a still first frame of the animation while the video loads, instead of a brief black box. The new clip is much smaller than the old one, so the sign-in page loads a little faster.\n\nIf the browser blocks video or the user prefers reduced motion, the CSS PIPE/SHARE wordmark still shows so nothing breaks.\n\nWho is affected: everyone signing into PipeShare on the private server, and on SaaS after Push.",
+  "title": "\"Loading Please wait\" instead of a false empty-folder message",
+  "description": "When you click into a job or open a folder, the file list used to briefly say \"This folder is empty\" before the files finished loading, which was confusing on folders that actually had contents.\n\nNow the list shows \"Loading Please wait\" while it fetches, and only shows the empty-folder message (with the New folder / Create project structure hint) once loading finishes and there really is nothing there.\n\nWho is affected: everyone using the PipeShare file explorer on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Sign-in screen and post-login splash use the new seamless PIPESHARE loop (no visible jump on repeat).",
-    "Both screens show a still poster frame while the animation loads, removing the black flash.",
-    "Removed the previous animation file; CSS PIPE/SHARE wordmark remains the fallback."
+    "File explorer shows \"Loading Please wait\" while a folder's contents load.",
+    "The \"This folder is empty\" hint now only appears after loading finishes and the folder is truly empty.",
+    "Fixes the false empty-folder flash when first opening a job or navigating into a folder."
   ],
-  "updatedAt": "2026-07-26T04:35:00.000Z"
+  "updatedAt": "2026-07-26T13:26:00.000Z"
 }
