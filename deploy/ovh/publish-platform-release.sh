@@ -167,16 +167,24 @@ NODE
 
 if [[ -n "${HP_RELEASE_ADMIN_TOKEN:-}" ]]; then
   echo "[publish] registering release via API…"
-  curl -sfS -X POST "${API_BASE}/saas/platform/releases/publish" \
+  if curl -sfS -X POST "${API_BASE}/saas/platform/releases/publish" \
     -H "Authorization: Bearer ${HP_RELEASE_ADMIN_TOKEN}" \
     -H "Content-Type: application/json" \
-    --data-binary @"$PAYLOAD"
-  echo
-  echo "[publish] done — v${NEXT_VERSION} published and registered (recommended for SaaS)."
+    --data-binary @"$PAYLOAD"; then
+    echo
+    echo "[publish] done — v${NEXT_VERSION} published and registered (recommended for SaaS)."
+  else
+    echo
+    echo "[publish] API register failed (token may not be an admin JWT). Falling back to local Wasabi register…"
+    HP_DEPLOYMENT_MODE=non-saas node "$BACKEND_DIR/scripts/register-platform-release-local.cjs" "$NEXT_VERSION"
+    echo "[publish] done — v${NEXT_VERSION} published and registered locally."
+  fi
 else
   echo "[publish] artifacts uploaded for v${NEXT_VERSION}."
-  echo "[publish] Set HP_RELEASE_ADMIN_TOKEN in .env to auto-register, or open:"
-  echo "          ${API_BASE}/horizonpipe-cpanel/releases.html → Register release"
+  echo "[publish] Registering locally (no HP_RELEASE_ADMIN_TOKEN)…"
+  HP_DEPLOYMENT_MODE=non-saas node "$BACKEND_DIR/scripts/register-platform-release-local.cjs" "$NEXT_VERSION"
+  echo "[publish] done — v${NEXT_VERSION} published and registered locally."
+  echo "          SaaS Push: ${API_BASE}/horizonpipe-cpanel/releases.html"
 fi
 
 if command -v git >/dev/null 2>&1; then
