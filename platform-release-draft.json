@@ -1,8 +1,9 @@
 {
-  "title": "Theme label: Horizon Brand → PIPESHARE",
-  "description": "The default theme in the login and app theme dropdown is now labeled PIPESHARE instead of Horizon Brand. The theme itself is unchanged — only the name in the menu.\n\nWho is affected: everyone on the private server, and on SaaS after Push.",
+  "title": "Transfers popup respects your workspace layout",
+  "description": "If you hide the Transfers panel in a workspace, starting an upload, billable package copy, or any cloud move/copy will no longer force that panel back open. Transfers continue to run in the background exactly as before, they just won't reopen a popup you deliberately closed.\n\nWho is affected: everyone on the private server, and on SaaS after Push. Workspaces that keep the Transfers panel visible (the default) are unchanged.",
   "changeLog": [
-    "Default theme dropdown label renamed from Horizon Brand to PIPESHARE."
+    "Transfers panel no longer auto-opens on transfer start if you hid it for that workspace.",
+    "Uploads, billable package copies, and cloud moves still run and track progress in the background when the panel is hidden."
   ],
-  "updatedAt": "2026-07-26T14:20:00.000Z"
+  "updatedAt": "2026-07-26T14:35:00.000Z"
 }
