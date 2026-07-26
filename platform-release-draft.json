@@ -1,9 +1,9 @@
 {
-  "title": "Pipe chart: pipe lines up through structure spheres",
-  "description": "The pipe shaft now paints through the centers of the From/To structure spheres so the pipe and end caps line up cleanly — no more butting against the sphere rims.\n\nWho is affected: everyone on the private server, and on SaaS after Push.",
+  "title": "Pipe chart playhead aligns with remarks",
+  "description": "The pipe chart playhead now follows the inspection's observation timecodes instead of assuming the camera moved at a constant speed. Clicking a remark places both the video and playhead on that remark's exact pipe line.\n\nWho is affected: everyone using WinCan video remarks on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Pipe shaft aligns through the center of each structure sphere.",
-    "Structure spheres sit behind the pipe so the connection reads cleanly."
+    "Clicked remarks now align exactly with the pipe playhead.",
+    "The playhead interpolates smoothly between observation timecodes during playback."
   ],
-  "updatedAt": "2026-07-26T15:40:00.000Z"
+  "updatedAt": "2026-07-26T15:45:00.000Z"
 }
