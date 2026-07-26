@@ -1,10 +1,10 @@
 {
-  "title": "Animated PIPESHARE logo on login and splash (login fix)",
-  "description": "PipeShare now uses the branded animated login loop on the sign-in screen and again as the short splash that plays right after you log in. The login card loops the animation quietly while you enter credentials, and the post-login splash plays it once before fading into the file explorer.\n\nThe previous update wired the animation into the splash and an unused login file, so the sign-in screen never actually changed. This build wires the loop into the real (React) login screen and rebuilds it, so the animation now shows on both login and splash.\n\nIf the browser blocks video or the user prefers reduced motion, the CSS PIPE/SHARE wordmark still shows so nothing breaks.\n\nWho is affected: everyone signing into PipeShare on the private server, and on SaaS after Push.",
+  "title": "New seamless PIPESHARE animation on login and splash",
+  "description": "The PIPESHARE brand animation on the sign-in screen and the post-login splash has been replaced with a new seamless-loop version, so it no longer visibly jumps when it repeats.\n\nBoth screens now also show a still first frame of the animation while the video loads, instead of a brief black box. The new clip is much smaller than the old one, so the sign-in page loads a little faster.\n\nIf the browser blocks video or the user prefers reduced motion, the CSS PIPE/SHARE wordmark still shows so nothing breaks.\n\nWho is affected: everyone signing into PipeShare on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Sign-in screen now shows the animated PIPESHARE brand loop (fixes prior build that edited an unused login file).",
-    "Post-login splash plays the same brand animation once, then fades out.",
-    "CSS PIPE/SHARE wordmark remains as the fallback for reduced motion or video errors."
+    "Sign-in screen and post-login splash use the new seamless PIPESHARE loop (no visible jump on repeat).",
+    "Both screens show a still poster frame while the animation loads, removing the black flash.",
+    "Removed the previous animation file; CSS PIPE/SHARE wordmark remains the fallback."
   ],
-  "updatedAt": "2026-07-25T22:30:00.000Z"
+  "updatedAt": "2026-07-26T04:35:00.000Z"
 }
