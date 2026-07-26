@@ -1,10 +1,9 @@
 {
-  "title": "Pipe chart: spheres cap the pipe, all remarks fit",
-  "description": "The pipe chart now budgets an exact track height between the From/To spheres, tucks the sphere centers onto the shaft ends so the pipe never runs past the caps, and shrinks observation tags to fit every remark in that track — including dense 26-observation runs.\n\nWho is affected: everyone on the private server, and on SaaS after Push.",
+  "title": "Pipe chart: pipe lines up through structure spheres",
+  "description": "The pipe shaft now paints through the centers of the From/To structure spheres so the pipe and end caps line up cleanly — no more butting against the sphere rims.\n\nWho is affected: everyone on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Pipe shaft ends at the sphere centers — no more running past the caps.",
-    "Track height is budgeted exactly to the panel so nothing clips at the bottom.",
-    "Observation tags shrink further on dense runs so all remarks stay visible."
+    "Pipe shaft aligns through the center of each structure sphere.",
+    "Structure spheres sit behind the pipe so the connection reads cleanly."
   ],
-  "updatedAt": "2026-07-26T15:35:00.000Z"
+  "updatedAt": "2026-07-26T15:40:00.000Z"
 }
