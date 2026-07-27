@@ -1,10 +1,10 @@
 {
-  "title": "Pipe chart finds WinCan Picture and Reports folders",
-  "description": "View PDF / View Photos on the pipe chart now work on both billable packages (Videos / Reports / Images) and raw WinCan job folders (Video / Picture / REPORTS…). Folder names are matched case-insensitively, including names like REPORTS 5-7-26.\n\nThe job project folder is loaded automatically so buttons can appear without browsing into Picture or Misc first.\n\nWho is affected: PipeShare users reviewing inspections on the private server, and on SaaS after Push.",
+  "title": "Sleek in-viewer PDF with Exit back to video",
+  "description": "View PDF from the pipe chart now opens a sleek full-panel PDF viewer inside the media window. Use Exit (or Escape) to close it and return to the video without leaving the workspace.\n\nWho is affected: PipeShare users reviewing pipe inspections on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Pipe chart accepts WinCan Picture / Photos aliases for Images.",
-    "Pipe chart treats folders named Reports… (e.g. REPORTS 5-7-26) as report folders.",
-    "Job project subtree hydrates automatically for PDF and photo buttons."
+    "Pipe chart View PDF opens inside the media viewer with a clean Exit control.",
+    "Exit / Escape closes the PDF overlay and restores the video.",
+    "Pipe-run photos use the same overlay chrome for a consistent handoff."
   ],
-  "updatedAt": "2026-07-26T18:10:00.000Z"
+  "updatedAt": "2026-07-27T00:55:00.000Z"
 }
