@@ -1,10 +1,10 @@
 {
-  "title": "Sleek in-viewer PDF with Exit back to video",
-  "description": "View PDF from the pipe chart now opens a sleek full-panel PDF viewer inside the media window. Use Exit (or Escape) to close it and return to the video without leaving the workspace.\n\nWho is affected: PipeShare users reviewing pipe inspections on the private server, and on SaaS after Push.",
+  "title": "PDF opens in viewer instead of downloading",
+  "description": "View PDF from the pipe chart (and selecting a PDF in the media viewer) now forces an inline application/pdf preview. Wasabi objects that were stored as octet-stream no longer trigger a browser download — the PDF stays in the sleek media overlay with Exit back to video.\n\nWho is affected: PipeShare users opening report PDFs on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Pipe chart View PDF opens inside the media viewer with a clean Exit control.",
-    "Exit / Escape closes the PDF overlay and restores the video.",
-    "Pipe-run photos use the same overlay chrome for a consistent handoff."
+    "PDF preview presigns request inline Content-Type / Content-Disposition.",
+    "Pipe chart View PDF loads a same-origin PDF blob so the iframe displays instead of downloading.",
+    "Exit still returns from the PDF overlay to the video."
   ],
-  "updatedAt": "2026-07-27T00:55:00.000Z"
+  "updatedAt": "2026-07-27T01:00:00.000Z"
 }

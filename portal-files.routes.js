@@ -5533,7 +5533,18 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       // Skip HeadObject — auth already validated the key; browser 404s if missing.
       // Saves one Wasabi RTT on every video open / scrub-presign refresh.
-      const url = await getSignedUrl(portalS3(), new GetObjectCommand({ Bucket: portalBucket(), Key: auth.Key }), {
+      const filename = path.basename(auth.Key);
+      const guessedType = contentTypeFromFilename(filename);
+      // Preview callers pass ?inline=1 so iframe/img open instead of downloading
+      // (WinCan / sync uploads often land as application/octet-stream + attachment).
+      const wantInline = String(req.query?.inline || '') === '1';
+      /** @type {import('@aws-sdk/client-s3').GetObjectCommandInput} */
+      const getInput = { Bucket: portalBucket(), Key: auth.Key };
+      if (wantInline) {
+        if (guessedType) getInput.ResponseContentType = guessedType;
+        getInput.ResponseContentDisposition = `inline; filename="${encodeURIComponent(filename)}"`;
+      }
+      const url = await getSignedUrl(portalS3(), new GetObjectCommand(getInput), {
         expiresIn: PORTAL_PRESIGN_TTL_SECONDS
       });
       res.set('Cache-Control', 'private, max-age=300');
