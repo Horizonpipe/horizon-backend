@@ -1,10 +1,12 @@
 {
-  "title": "Pipe photo gallery with Previous / Next and sidebar",
-  "description": "View Photos opens a custom gallery popup for the pipe run: a large photo stage, Previous / Next controls, and a scrollable sidebar of thumbnails to jump quickly. Exit (or Escape) closes the gallery. Arrow keys also move between photos. Shaft photo marks open the same gallery on that photo.\n\nWho is affected: PipeShare users reviewing pipe inspections on the private server, and on SaaS after Push.",
+  "title": "Faster pipe-chart PDF and photo loading",
+  "description": "PipeShare now loads job media for the open pipe run with one deep folder list (instead of many sequential folder fetches), then shows View PDF / View Photos as soon as files are known. Photo gallery thumbs use batch Wasabi presigns, and PDF/photo URLs are prefetched into a cache so opening them feels near-instant after the first resolve.\n\nWho is affected: PipeShare users reviewing pipe inspections on the private server, and on SaaS after Push.",
   "changeLog": [
-    "View Photos opens a custom gallery popup with Exit.",
-    "Previous / Next buttons and arrow keys step through run photos.",
-    "Scrollable sidebar thumbnails jump to any photo in the run."
+    "Deep-list the pipe project once, then refresh media buttons immediately.",
+    "Skip redundant folder hydrates when files are already in the tree.",
+    "Batch-presign gallery photo URLs instead of one request per photo.",
+    "Prefetch PDF and photo preview URLs in the background after assets resolve.",
+    "Show a loading shell for PDF/photo while the first fetch finishes."
   ],
-  "updatedAt": "2026-07-27T01:15:00.000Z"
+  "updatedAt": "2026-07-27T01:30:00.000Z"
 }
