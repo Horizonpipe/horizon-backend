@@ -1,10 +1,11 @@
 {
-  "title": "Solid site menu (no glass lag)",
-  "description": "The top-right Menu panel is solid again instead of translucent glass over the video/PACP overlays. Hover-open, backdrop blur, and staggered item animations are removed so the menu opens on click and feels snappy.\n\nWho is affected: PipeShare users on the private server, and on SaaS after Push.",
+  "title": "Polished Build Billable Package wizard",
+  "description": "The Build Billable Package flow is cleaned up for production: clearer step progress, simpler folder choices (customer folders as chips instead of a cluttered dropdown), and short plain-English tips instead of developer-style notes.\n\nWho is affected: PipeShare users building customer packages on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Site menu panel uses a solid opaque background (no see-through glass).",
-    "Removed backdrop blur and staggered item animations that lagged over video.",
-    "Menu opens on click/tap only; outside click closes it."
+    "Billable package wizard has a clean step progress header.",
+    "Customer save location uses folder chips plus an optional new-folder field.",
+    "Source folder lists are shortened; advanced folder picks are tucked under Looking in the wrong folder?",
+    "Wizard and toast copy rewritten for clear product language."
   ],
-  "updatedAt": "2026-07-27T02:00:00.000Z"
+  "updatedAt": "2026-07-27T02:10:00.000Z"
 }
