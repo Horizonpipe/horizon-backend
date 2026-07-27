@@ -1,10 +1,10 @@
 {
-  "title": "PDF opens in viewer instead of downloading",
-  "description": "View PDF from the pipe chart (and selecting a PDF in the media viewer) now forces an inline application/pdf preview. Wasabi objects that were stored as octet-stream no longer trigger a browser download — the PDF stays in the sleek media overlay with Exit back to video.\n\nWho is affected: PipeShare users opening report PDFs on the private server, and on SaaS after Push.",
+  "title": "PDF viewer no longer re-downloads on workspace switch",
+  "description": "Opening a pipe-chart PDF now loads through the portal as a stable in-viewer blob, so the browser will not keep prompting to download when you switch workspace layouts. The iframe also skips reloading the same document on remount, and Exit still returns to the video.\n\nWho is affected: PipeShare users reviewing report PDFs on the private server, and on SaaS after Push.",
   "changeLog": [
-    "PDF preview presigns request inline Content-Type / Content-Disposition.",
-    "Pipe chart View PDF loads a same-origin PDF blob so the iframe displays instead of downloading.",
-    "Exit still returns from the PDF overlay to the video."
+    "PDF preview uses authenticated portal download + blob URL (no Wasabi attachment iframe).",
+    "Workspace tab switches no longer re-trigger PDF preview reloads while a PDF overlay is open.",
+    "PDF iframe skips re-setting src when the same document is already loaded."
   ],
-  "updatedAt": "2026-07-27T01:00:00.000Z"
+  "updatedAt": "2026-07-27T01:05:00.000Z"
 }
