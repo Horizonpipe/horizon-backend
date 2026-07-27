@@ -1,10 +1,10 @@
 {
-  "title": "Billable package flattens Videos (no Sec nesting)",
-  "description": "Build Billable Package now copies every selected video, report, and image directly into Videos / Reports / Images — it no longer keeps WinCan Video/Sec nesting, and it no longer re-nests paths when two files share a name (those get a _2 suffix instead).\n\nWho is affected: PipeShare users building customer billable packages on the private server, and on SaaS after Push.",
+  "title": "Solid site menu (no glass lag)",
+  "description": "The top-right Menu panel is solid again instead of translucent glass over the video/PACP overlays. Hover-open, backdrop blur, and staggered item animations are removed so the menu opens on click and feels snappy.\n\nWho is affected: PipeShare users on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Billable Videos / Reports / Images folders are flat — files only, no Sec.",
-    "Duplicate file names get a _2 suffix instead of nested Video/Sec paths.",
-    "Wizard copy hint updated to describe the flat layout."
+    "Site menu panel uses a solid opaque background (no see-through glass).",
+    "Removed backdrop blur and staggered item animations that lagged over video.",
+    "Menu opens on click/tap only; outside click closes it."
   ],
-  "updatedAt": "2026-07-27T01:50:00.000Z"
+  "updatedAt": "2026-07-27T02:00:00.000Z"
 }
