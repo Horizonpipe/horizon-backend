@@ -1,10 +1,9 @@
 {
-  "title": "PDF preview uses Wasabi presign (proxy disabled)",
-  "description": "View PDF no longer calls the disabled proxy download endpoint. It uses an inline Wasabi presign, loads the bytes into a same-origin PDF blob, and shows that in the media viewer so the browser does not download or error on USE_PRESIGN.\n\nWho is affected: PipeShare users opening report PDFs on the private server, and on SaaS after Push.",
+  "title": "PDF overlay fills the Live Media panel",
+  "description": "View PDF now stretches to the full height of the Live Media panel instead of sitting in a short strip at the top. Exit still returns to the video.\n\nWho is affected: PipeShare users opening report PDFs on the private server, and on SaaS after Push.",
   "changeLog": [
-    "PDF preview uses GET /api/files/presign/:id?inline=1 (proxy download stays disabled).",
-    "PDF bytes are wrapped in an application/pdf blob for the in-viewer iframe.",
-    "Workspace-switch remount still skips reloading the same open PDF."
+    "Pipe-chart PDF overlay fills the media panel height.",
+    "Fixed CSS conflict that capped the PDF iframe to a short strip."
   ],
-  "updatedAt": "2026-07-27T01:05:00.000Z"
+  "updatedAt": "2026-07-27T01:08:00.000Z"
 }
