@@ -1586,6 +1586,33 @@ async function assertPortalPathRel(grantPool, user, clientId, jobId, relPath, re
 }
 
 /**
+ * Same rules as {@link assertPortalPathRel} but loads job access + grants once per request.
+ * Used by {@code POST /copy-batch} so large packages do not re-hit Postgres for every file.
+ * @param {string} [required]
+ */
+async function createPortalPathAccessChecker(grantPool, user, clientId, jobId, required = 'full') {
+  if (!user) return { check: () => false };
+  if (userIsPortalAdmin(user)) return { check: () => true };
+  const jobOk = await assertPortalJobAccess(grantPool, user, String(clientId), String(jobId));
+  if (!jobOk) return { check: () => false };
+  const anyGrants = await portalOrCompanyJobHasPathGrants(grantPool, user, clientId, jobId);
+  if (!anyGrants) return { check: () => true };
+  const grants = await loadCombinedUserPathGrants(grantPool, clientId, jobId, user);
+  if (!grants.length) {
+    const ok = bypassPathGrantsForLenientPortalClient(user, grants);
+    return { check: () => ok };
+  }
+  return {
+    check(relPath) {
+      const rp = normalizeRelPath(relPath);
+      const best = bestPathGrantForRelPath(grants, rp);
+      if (!best) return false;
+      return grantModeAllows(best.access_mode, required);
+    }
+  };
+}
+
+/**
  * Whether {@code relPath} would appear in {@code GET /api/files/tree} for this user (path grants, DAS user folder, PSR).
  * Used by lightweight POST helpers so they cannot probe keys outside the visible tree.
  */
@@ -3505,9 +3532,16 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const markerKey = rel ? `${pref}${rel}/${FOLDER_MARKER}` : `${pref}${FOLDER_MARKER}`;
 
+      // Existence probe: MaxKeys=1 — do NOT deep-list the whole subtree (billable package creates many folders).
       const probeP = `${pref}${rel}`;
-      const under = await listAllKeys(portalS3(), portalBucket(), `${probeP}/`);
-      if (under.length > 0) {
+      const under = await portalS3().send(
+        new ListObjectsV2Command({
+          Bucket: portalBucket(),
+          Prefix: `${probeP}/`,
+          MaxKeys: 1
+        })
+      );
+      if ((under.Contents && under.Contents.length > 0) || (under.CommonPrefixes && under.CommonPrefixes.length > 0)) {
         return res.status(409).json({ error: 'A file or folder already exists at this path' });
       }
       try {
@@ -3759,6 +3793,14 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const targetPref = jobPrefix(String(targetClientId), String(targetJobId), storageRoot(req));
       const startedAt = Date.now();
+      const srcPathGate = await createPortalPathAccessChecker(aclPool, req.user, clientId, jobId, 'full');
+      const dstPathGate = await createPortalPathAccessChecker(
+        aclPool,
+        req.user,
+        targetClientId,
+        targetJobId,
+        'full'
+      );
 
       /** @type {Array<{ index: number, oldKey: string, newKey: string, newRel: string, name: string }>} */
       const prepared = [];
@@ -3780,10 +3822,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           const explicitRel = item.toRelPath != null ? normalizeRelPath(item.toRelPath) : '';
           const newRel = explicitRel || (destParent ? `${destParent}/${name}` : name);
           if (!newRel) throw new Error('Destination path is required');
-          if (!(await assertPortalPathRel(aclPool, req.user, clientId, jobId, oldRel, 'full'))) {
+          if (!srcPathGate.check(oldRel)) {
             throw new Error('Forbidden source path');
           }
-          if (!(await assertPortalPathRel(aclPool, req.user, targetClientId, targetJobId, newRel, 'full'))) {
+          if (!dstPathGate.check(newRel)) {
             throw new Error('Forbidden destination path');
           }
           const newKey = `${targetPref}${newRel}`;

@@ -1,12 +1,12 @@
 {
-  "title": "Faster pipe-chart PDF and photo loading",
-  "description": "PipeShare now loads job media for the open pipe run with one deep folder list (instead of many sequential folder fetches), then shows View PDF / View Photos as soon as files are known. Photo gallery thumbs use batch Wasabi presigns, and PDF/photo URLs are prefetched into a cache so opening them feels near-instant after the first resolve.\n\nWho is affected: PipeShare users reviewing pipe inspections on the private server, and on SaaS after Push.",
+  "title": "PDF gallery popup + faster billable package copies",
+  "description": "View PDF now opens in the same style popup as View Photos (stage, Exit, Previous/Next, sidebar) instead of covering the Live Media video panel.\n\nBuild Billable Package is faster on the Wasabi path: folder creates no longer deep-list the whole tree just to check emptiness, copy batches are larger with higher parallelism, path permission checks load once per batch, and DB3 bindings for the package folders run in parallel. Source scans reuse the warm file-tree cache when available.\n\nWho is affected: PipeShare users on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Deep-list the pipe project once, then refresh media buttons immediately.",
-    "Skip redundant folder hydrates when files are already in the tree.",
-    "Batch-presign gallery photo URLs instead of one request per photo.",
-    "Prefetch PDF and photo preview URLs in the background after assets resolve.",
-    "Show a loading shell for PDF/photo while the first fetch finishes."
+    "View PDF opens in a popup gallery matching the photo viewer.",
+    "Billable package folder creates use a fast MaxKeys=1 existence probe.",
+    "Billable copy batches raised to 200 files with higher queue concurrency.",
+    "copy-batch loads path grants once instead of per file.",
+    "Package DB3 folder bindings save in parallel after copy."
   ],
-  "updatedAt": "2026-07-27T01:30:00.000Z"
+  "updatedAt": "2026-07-27T01:45:00.000Z"
 }
