@@ -1,9 +1,10 @@
 {
-  "title": "PDF overlay fills the Live Media panel",
-  "description": "View PDF now stretches to the full height of the Live Media panel instead of sitting in a short strip at the top. Exit still returns to the video.\n\nWho is affected: PipeShare users opening report PDFs on the private server, and on SaaS after Push.",
+  "title": "Pipe photo gallery with Previous / Next and sidebar",
+  "description": "View Photos opens a custom gallery popup for the pipe run: a large photo stage, Previous / Next controls, and a scrollable sidebar of thumbnails to jump quickly. Exit (or Escape) closes the gallery. Arrow keys also move between photos. Shaft photo marks open the same gallery on that photo.\n\nWho is affected: PipeShare users reviewing pipe inspections on the private server, and on SaaS after Push.",
   "changeLog": [
-    "Pipe-chart PDF overlay fills the media panel height.",
-    "Fixed CSS conflict that capped the PDF iframe to a short strip."
+    "View Photos opens a custom gallery popup with Exit.",
+    "Previous / Next buttons and arrow keys step through run photos.",
+    "Scrollable sidebar thumbnails jump to any photo in the run."
   ],
-  "updatedAt": "2026-07-27T01:08:00.000Z"
+  "updatedAt": "2026-07-27T01:15:00.000Z"
 }
