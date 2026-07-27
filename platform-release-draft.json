@@ -1,12 +1,10 @@
 {
-  "title": "PDF gallery popup + faster billable package copies",
-  "description": "View PDF now opens in the same style popup as View Photos (stage, Exit, Previous/Next, sidebar) instead of covering the Live Media video panel.\n\nBuild Billable Package is faster on the Wasabi path: folder creates no longer deep-list the whole tree just to check emptiness, copy batches are larger with higher parallelism, path permission checks load once per batch, and DB3 bindings for the package folders run in parallel. Source scans reuse the warm file-tree cache when available.\n\nWho is affected: PipeShare users on the private server, and on SaaS after Push.",
+  "title": "Billable package flattens Videos (no Sec nesting)",
+  "description": "Build Billable Package now copies every selected video, report, and image directly into Videos / Reports / Images — it no longer keeps WinCan Video/Sec nesting, and it no longer re-nests paths when two files share a name (those get a _2 suffix instead).\n\nWho is affected: PipeShare users building customer billable packages on the private server, and on SaaS after Push.",
   "changeLog": [
-    "View PDF opens in a popup gallery matching the photo viewer.",
-    "Billable package folder creates use a fast MaxKeys=1 existence probe.",
-    "Billable copy batches raised to 200 files with higher queue concurrency.",
-    "copy-batch loads path grants once instead of per file.",
-    "Package DB3 folder bindings save in parallel after copy."
+    "Billable Videos / Reports / Images folders are flat — files only, no Sec.",
+    "Duplicate file names get a _2 suffix instead of nested Video/Sec paths.",
+    "Wizard copy hint updated to describe the flat layout."
   ],
-  "updatedAt": "2026-07-27T01:45:00.000Z"
+  "updatedAt": "2026-07-27T01:50:00.000Z"
 }
