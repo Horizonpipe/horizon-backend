@@ -1,11 +1,11 @@
 {
-  "title": "Fix Refine edges on Map Builder sheets",
-  "description": "Refine edges treated Map sheet layout size (about 2.8× native crop) as the PDF's native size. That inflated natW/natH, then media CSS scale applied again — so the sheet looked like it zoomed itself instead of only changing the crop. Viewport zoom was never the real issue.\n\nCrop now stays in native units, layout size stays vis × viewDispScale, edge dragging divides out that layout scale so bars track the cursor, and applying a crop restores map layout scale and re-rasters the sheet.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync. If a sheet was already corrupted by the old tool, open Refine edges once (or Cancel after open) so nat size can recover.",
+  "title": "Map sheets no longer mismatch zoom",
+  "description": "After the Refine edges bug, some Map Builder sheets kept an inflated native size while CSS still scaled them by ~2.8×. Those tiles looked zoomed in compared to neighbors, so puzzle seams no longer lined up.\n\nOpening a map workspace now heals that geometry: true native size is restored from layout ÷ display scale, every sheet is normalized to the same map layout scale, and reconcile will not re-inflate nat from layout size.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, then reopen the map workspace (or switch away and back).",
   "changeLog": [
-    "Stop Refine edges from treating map layout size as PDF native size.",
-    "Keep map page.w/h = native crop × viewDispScale while cropping.",
-    "Edge drag deltas account for map layout display scale.",
-    "After Apply crop, restore map layout scale and re-raster the sheet."
+    "Auto-heal map pages whose nat size was inflated to layout size.",
+    "Normalize all map sheets to the same viewDispScale layout.",
+    "Stop reconcile from setting nat = layout when display scale is set.",
+    "Re-raster map sheets after geometry heal."
   ],
-  "updatedAt": "2026-07-30T21:50:00.000Z"
+  "updatedAt": "2026-07-30T22:00:00.000Z"
 }
