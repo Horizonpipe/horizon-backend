@@ -1,10 +1,11 @@
 {
-  "title": "Structure placement crosshair cursor",
-  "description": "When Structure Mode is on and you press 1, 2, or 3 to place a node, the mouse pointer now becomes a short custom crosshair with a red center dot (default neon orange arms).\n\nThe Structure nodes floating panel also has a Placement crosshair color row — quick swatches plus a custom color picker. Your choice is remembered for next time.\n\nWho is affected: PipeSync Map Building + PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, enable Structure Mode, press 1 — the orange/red crosshair should appear over the map.",
+  "title": "Map Builder sheet scale repair",
+  "description": "Some Map Builder PDF sheets were rendering as a tiny drawing in the corner of a huge white page, with highlights/structure overlays stretched across the empty paper. Root cause: page layout size stayed large while viewDispScale was stuck at 1 (or native size was wrongly set equal to the layout box), so the PDF media was not CSS-scaled into the sheet.\n\nReconcile now forces viewDispScale to match layout÷native crop, recovers inflated native sizes, and first-paint HTML applies the same scale transform. Legacy map rebuild uses the correct map display scale.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync and reopen Map Builder — every sheet should fill its paper box with overlays aligned.",
   "changeLog": [
-    "Keys 1/2/3 in Structure Mode show a short neon-orange crosshair with a red center.",
-    "Placement crosshair applies on Map Builder and PDF Viewer hit areas.",
-    "Structure panel: change crosshair color via swatches or custom picker (saved preference)."
+    "Fix Map sheets stuck with viewDispScale=1 inside oversized paper boxes.",
+    "Recover native size when it was wrongly set to the layout footprint.",
+    "Apply CSS scale on first paint so sheets are not briefly unscaled.",
+    "Legacy map scale rebuild uses the intended Map display scale."
   ],
-  "updatedAt": "2026-07-31T00:50:00.000Z"
+  "updatedAt": "2026-07-31T01:05:00.000Z"
 }
