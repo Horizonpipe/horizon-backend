@@ -1,11 +1,10 @@
 {
-  "title": "Map sheets no longer mismatch zoom",
-  "description": "After the Refine edges bug, some Map Builder sheets kept an inflated native size while CSS still scaled them by ~2.8×. Those tiles looked zoomed in compared to neighbors, so puzzle seams no longer lined up.\n\nOpening a map workspace now heals that geometry: true native size is restored from layout ÷ display scale, every sheet is normalized to the same map layout scale, and reconcile will not re-inflate nat from layout size.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, then reopen the map workspace (or switch away and back).",
+  "title": "Fix Map sheet chop and lag",
+  "description": "The last Map geometry heal forced every sheet to the theoretical ~2.8× display scale. Import already clamps sheet layout width to 8000px, so real scale is often lower. Forcing 2.8 made the PDF media larger than the sheet box (half-chopped pages) and kept kicking full-DPI re-rasters (heavy lag).\n\nHeal now only fixes clearly bad nat sizes or scale overflow, and derives display scale from layout ÷ native size so media fits the box. No full zoom re-raster from that path.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, then reopen the map workspace.",
   "changeLog": [
-    "Auto-heal map pages whose nat size was inflated to layout size.",
-    "Normalize all map sheets to the same viewDispScale layout.",
-    "Stop reconcile from setting nat = layout when display scale is set.",
-    "Re-raster map sheets after geometry heal."
+    "Stop forcing map sheets to 2.8× when layout is clamped to 8000px.",
+    "Heal scale overflow so pages are not half-chopped.",
+    "Remove full-DPI re-raster loop that made Map Builder laggy."
   ],
-  "updatedAt": "2026-07-30T22:00:00.000Z"
+  "updatedAt": "2026-07-30T22:05:00.000Z"
 }
