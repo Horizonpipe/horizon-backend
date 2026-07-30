@@ -1,11 +1,11 @@
 {
-  "title": "Fix Map sheet scale mismatch and black workspace frame",
-  "description": "Map Builder had sheets at different sizes, PDF content floating outside white page boxes, and highlights drawn at the wrong scale. That came from a broken per-axis media transform plus corrupted per-page layout scales after earlier geometry heals.\n\nEvery map sheet is now normalized to the same layout scale (native crop × map display scale). Media is back to the proven uniform CSS scale + crop margins model. The dark scroll letterbox no longer looks like a solid black blocking box, and the zoomport always fills the viewport.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, then reopen the map workspace (or switch away and back) so sheets renormalize.",
+  "title": "Structure nodes visible again; auto-highlights stay aligned",
+  "description": "Map Builder was burying structure nodes under opaque PDF sheets (world SVG z-index was too low), and map sheet normalize was healing highlight lines but not structure-node coordinates. Load/persist also stripped page-fraction anchors (nrx/nry), so Auto Highlight rebuilt lines from stale world positions after sheets resized.\n\nStructure markers now always paint above every sheet. Opening/normalizing a map locks and rematerializes both highlights and structure nodes from page fractions, refreshes node markers in the DOM, and Auto Highlight anchors to the active Map page geometry.\n\nWho is affected: PipeSync Map Building + Plan Sync Auto Highlight on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, reopen the map, and re-run Auto Highlight if older lines look off. Nodes placed after this update keep stable alignment across sheet scale fixes.",
   "changeLog": [
-    "Normalize all Map sheets to one consistent layout scale.",
-    "Restore uniform PDF media scale + crop margins (fixes content outside page box).",
-    "Heal highlight coords after sheet size renormalize.",
-    "Remove black letterbox frame around Map workspace."
+    "Show structure nodes above map sheets (fix world SVG stacking).",
+    "Heal structure-node coords when map sheets normalize (was skipped).",
+    "Persist and restore structure-node + highlight page fractions (nrx/nry).",
+    "Auto Highlight uses active Map page geometry so lines match nodes."
   ],
-  "updatedAt": "2026-07-30T23:00:00.000Z"
+  "updatedAt": "2026-07-30T23:15:00.000Z"
 }
