@@ -1,11 +1,11 @@
 {
-  "title": "Instant folder create — no clunky list refresh",
-  "description": "Creating folders in PipeShare felt slow: the browser name box, then a full list refresh with a “Refreshing file list…” banner before the folder showed up.\n\nNew folder now uses a clean in-app name dialog, paints the folder in the list as soon as the server creates it, and syncs quietly in the background — no refresh banner.\n\nWho is affected: PipeShare file explorer on BASE (and SaaS after Push).",
+  "title": "PipeSync plan upload from explorer",
+  "description": "On the Plans page, + PDF / + Raster (and folder Add PDF) opened a file dialog but never imported the files. Explorer-only mode does not mount the plan board, so the change handler for the hidden file input never ran — uploads looked broken and the progress bar never appeared.\n\nThis release wires a programmatic file picker for explorer uploads, keeps explorer DnD/file inputs active without a board host, shows a clearer upload progress bar, and coerces empty PDF/image MIME types from the filename so Wasabi presign does not reject them.\n\nWho is affected: PipeSync Plans on pipeshare.live (BASE). SaaS unchanged until you apply the next platform release from cPanel.",
   "changeLog": [
-    "New folder appears immediately after create (no waiting on full list reload).",
-    "Remove the “Refreshing file list…” banner during mutations.",
-    "In-app New folder name dialog instead of the browser prompt.",
-    "Project structure folders paint as each subfolder is created."
+    "Fix Plans explorer + PDF / + Raster upload (files now import and show progress).",
+    "Keep explorer upload wiring active in explorer-only mode (no open board required).",
+    "Add/visible plan upload progress bar styling on desktop and mobile.",
+    "Coerce empty plan file MIME types from filename before Wasabi presign."
   ],
-  "updatedAt": "2026-07-09T17:25:00.000Z"
+  "updatedAt": "2026-07-30T20:10:00.000Z"
 }
