@@ -1,12 +1,10 @@
 {
-  "title": "Structure Mode floating node panel",
-  "description": "When Structure Mode is on, PipeSync now shows a floating Structure nodes panel. You can set the default placement size for new nodes, browse every node on the board, and click a row to jump the PDF Viewer to that page with the node in view.\n\nRight-click the list to enter Select nodes mode (Windows-style: click, Shift+click range, Ctrl+click toggle). With a selection, right-click again for Adjust node size — slider, +/−, or type a value — then Apply (exits edit mode) or Cancel (keeps selection).\n\nWho is affected: PipeSync Map Building + PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, turn on Structure Mode, and use the panel on the left.",
+  "title": "Structure placement crosshair cursor",
+  "description": "When Structure Mode is on and you press 1, 2, or 3 to place a node, the mouse pointer now becomes a short custom crosshair with a red center dot (default neon orange arms).\n\nThe Structure nodes floating panel also has a Placement crosshair color row — quick swatches plus a custom color picker. Your choice is remembered for next time.\n\nWho is affected: PipeSync Map Building + PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, enable Structure Mode, press 1 — the orange/red crosshair should appear over the map.",
   "changeLog": [
-    "Structure Mode floating panel: placement size + full node list.",
-    "Click a list row to open PDF Viewer on that node’s page and center it.",
-    "Right-click list: Select nodes with Windows-style multi-select.",
-    "With selection: Adjust node size (slider / +− / typed value), Apply or Cancel.",
-    "Per-node radius scales marker, label, and hit target; default placement size persists."
+    "Keys 1/2/3 in Structure Mode show a short neon-orange crosshair with a red center.",
+    "Placement crosshair applies on Map Builder and PDF Viewer hit areas.",
+    "Structure panel: change crosshair color via swatches or custom picker (saved preference)."
   ],
-  "updatedAt": "2026-07-31T00:15:00.000Z"
+  "updatedAt": "2026-07-31T00:50:00.000Z"
 }
