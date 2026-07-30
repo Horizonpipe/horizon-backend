@@ -1,12 +1,11 @@
 {
-  "title": "Map Builder drag, zoom, and framing",
-  "description": "Map Building sheets no longer snap back after you drag them. Persist was rebuilding highlights from a stale workspace snapshot before saving the live board, which undid page moves.\n\nYou can zoom further out (down to ~5%) so sheets look like puzzle pieces. The map canvas starts with a very large dead-space baseline and still grows in all directions as you move pieces. Opening Map Builder now frames the camera on the average center of all pages (and fits them in view) so you are not hunting in empty space.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync after deploy.",
+  "title": "Map Builder drag + mask tools at deep zoom",
+  "description": "After Map Builder started fitting pages at zoom below 25%, pointer→world math still assumed a 0.25 floor. Hit-testing missed the sheets, so hand-drag and mask brush felt dead on open. World origin also re-centered every bounds sync during drag, which made pieces look stuck.\n\nThis release uses the real viewport zoom for board coordinates, keeps the world origin stable while dragging, falls back to DOM sheet hit-testing for hand mode, and caps mask canvases at 2048px so oversized Map sheets no longer fail mask bake/toDataURL.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync after deploy.",
   "changeLog": [
-    "Fix Map Builder sheet drag snap-back (capture live positions before highlight rebuild on persist).",
-    "Keep dragged moves when PDF iframes fire pointercancel mid-drag.",
-    "Lower map zoom floor to ~5% for puzzle-piece overview.",
-    "Huge map workspace baseline (~96 page spans) that still grows with layout.",
-    "Open Map Builder centered on the average of all page centers, fit-to-content."
+    "Fix pointer→world zoom so drag/mask work when Map Builder opens below 25% zoom.",
+    "Keep map world origin stable while dragging sheets.",
+    "Hand-mode page pick falls back to the sheet hitbox under the cursor.",
+    "Cap mask working canvases so large Map sheets can paint/erase masks again."
   ],
-  "updatedAt": "2026-07-30T21:20:00.000Z"
+  "updatedAt": "2026-07-30T21:30:00.000Z"
 }
