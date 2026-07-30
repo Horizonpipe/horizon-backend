@@ -1,11 +1,10 @@
 {
-  "title": "Structure nodes visible again; auto-highlights stay aligned",
-  "description": "Map Builder was burying structure nodes under opaque PDF sheets (world SVG z-index was too low), and map sheet normalize was healing highlight lines but not structure-node coordinates. Load/persist also stripped page-fraction anchors (nrx/nry), so Auto Highlight rebuilt lines from stale world positions after sheets resized.\n\nStructure markers now always paint above every sheet. Opening/normalizing a map locks and rematerializes both highlights and structure nodes from page fractions, refreshes node markers in the DOM, and Auto Highlight anchors to the active Map page geometry.\n\nWho is affected: PipeSync Map Building + Plan Sync Auto Highlight on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, reopen the map, and re-run Auto Highlight if older lines look off. Nodes placed after this update keep stable alignment across sheet scale fixes.",
+  "title": "Structure nodes stay on their own PDF only",
+  "description": "Map Builder was showing structure nodes from other PDFs on the open map. Nodes are stored in one list (correct), but the renderer was treating every workspace PDF as “on this board,” and DOM refresh re-painted every node with no filter.\n\nMarkers now only appear when their storageKey matches the currently open PDF pages. Switching maps no longer pulls in nodes from other files.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync and reopen the map — you should only see nodes created on that PDF.",
   "changeLog": [
-    "Show structure nodes above map sheets (fix world SVG stacking).",
-    "Heal structure-node coords when map sheets normalize (was skipped).",
-    "Persist and restore structure-node + highlight page fractions (nrx/nry).",
-    "Auto Highlight uses active Map page geometry so lines match nodes."
+    "Scope structure-node display to the open PDF’s storageKeys only.",
+    "Stop unioning all map workspaces when painting structure markers.",
+    "Filter DOM refresh so foreign PDF nodes are not re-appended."
   ],
-  "updatedAt": "2026-07-30T23:15:00.000Z"
+  "updatedAt": "2026-07-30T23:20:00.000Z"
 }
