@@ -1,11 +1,10 @@
 {
-  "title": "Fix highlight scale and position",
-  "description": "Highlights drawn in the PDF Viewer (especially when zoomed in) were mirrored into Map Building using the wrong page size, so lines looked far off scale and out of place. Zooming far in the continuous PDF Viewer also broke overlay placement because normalized coords were computed against a native-size cap instead of the live display size.\n\nThis release treats normalized page fractions (nrx/nry) as the source of truth: viewer→map mirroring resolves those fractions first, continuous zoom re-syncs line and structure-node coords on every zoom/aspect change, and bake/export use the same resolved endpoints. New structure nodes store nrx/nry so Auto Highlights stay locked to the PDF content across zoom and workspace switches. Map lines are no longer tagged as viewer mirrors (fixes bake/dedupe).\n\nWho is affected: PipeSync Plans / PDF Viewer / Map Building on pipeshare.live (BASE). SaaS unchanged until you apply the next platform release from cPanel.\n\nIf existing auto-highlights or bad map mirrors still look off, re-run Auto Highlights / re-draw those lines once after this update.",
+  "title": "Fix Map Building highlight alignment",
+  "description": "Map workspace sheets were being laid out at ~2.8× crop size, then clamped back down to native size without keeping the display scale. PDF media and highlight overlays no longer shared the same box, so lines looked far off on Map Building even when they were correct in the PDF Viewer.\n\nThis release keeps map page display scale intact, restores clamped map pages on load, and rebuilds map highlight geometry from the viewer mirror copies using normalized coords.\n\nWho is affected: PipeSync Map Building / PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync after deploy. Open the map workspace once so projections rebuild; re-draw only if a line has no viewer mirror.",
   "changeLog": [
-    "Fix PDF Viewer zoom: highlights stay locked when zooming far in/out (nrx-based overlays).",
-    "Fix viewer→map highlight mirroring: live page size + normalized coords, not stale workspace dims.",
-    "Auto Highlights project onto Map when Map Building is active; structure nodes store nrx/nry.",
-    "Map lines are canonical (no mirroredFrom); bake/download use the same resolved endpoints."
+    "Keep Map Building page display scale (stop clamping sheets back to native crop size).",
+    "Restore already-clamped map pages and rebuild highlight overlays from viewer mirrors.",
+    "PDF Viewer zoom + viewer→map mirror still use nrx as the source of truth."
   ],
-  "updatedAt": "2026-07-30T20:45:00.000Z"
+  "updatedAt": "2026-07-30T21:00:00.000Z"
 }
