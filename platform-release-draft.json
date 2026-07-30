@@ -1,11 +1,11 @@
 {
-  "title": "Sharp Map sheets and no black dead-space box",
-  "description": "Map Builder sheets were soft because PDF paint multiplied DPI by zoom-out (under-rasterizing), and the workspace still reserved empty dark padding that looked like a black box. Zooming in hid that padding; zooming back out put the camera in empty space so sheets looked blocked.\n\nWorkspace bounds are now content-tight. Zoom-out recenters if sheets leave the view. PDF paint keeps full base DPI for on-screen size and re-rasters with a 0.7× layout floor after zoom so sheets stay sharp.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, then reopen the map workspace.",
+  "title": "Fix Map sheet scale mismatch and black workspace frame",
+  "description": "Map Builder had sheets at different sizes, PDF content floating outside white page boxes, and highlights drawn at the wrong scale. That came from a broken per-axis media transform plus corrupted per-page layout scales after earlier geometry heals.\n\nEvery map sheet is now normalized to the same layout scale (native crop × map display scale). Media is back to the proven uniform CSS scale + crop margins model. The dark scroll letterbox no longer looks like a solid black blocking box, and the zoomport always fills the viewport.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, then reopen the map workspace (or switch away and back) so sheets renormalize.",
   "changeLog": [
-    "Content-tight Map workspace (no giant black dead-space box).",
-    "Recenters on sheets when zooming out into empty space.",
-    "Restore sharp PDF paint DPI/oversample after zoom.",
-    "Re-raster with a 0.7× layout floor so zoom-in is not soft."
+    "Normalize all Map sheets to one consistent layout scale.",
+    "Restore uniform PDF media scale + crop margins (fixes content outside page box).",
+    "Heal highlight coords after sheet size renormalize.",
+    "Remove black letterbox frame around Map workspace."
   ],
-  "updatedAt": "2026-07-30T22:25:00.000Z"
+  "updatedAt": "2026-07-30T23:00:00.000Z"
 }
