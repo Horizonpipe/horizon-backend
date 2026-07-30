@@ -1,11 +1,11 @@
 {
-  "title": "Map Builder clip and lag fix",
-  "description": "Map sheets were still getting clipped and the board felt extremely laggy. Three compounding bugs: geometry heal ran on every highlight rebuild and kept rewriting sheets; PDF paint double-counted display scale into huge canvases and refused to drop DPI when zoomed out; and media used one uniform CSS scale that could overflow the sheet box.\n\nMedia now fills each sheet with per-axis translate+scale, paint targets the layout box only, zoom-out lowers raster DPI, and layout heal runs only when opening a map workspace.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, then reopen the map workspace.",
+  "title": "Map dead-space, lag, and Refine edges fixes",
+  "description": "Map Builder had a huge black dead-space box because the workspace floor was ~96 page-widths. That also forced tiny fit-zoom and made PDF re-rasters feel extremely laggy.\n\nWorkspace padding is back to a modest size. Refine edges cancel/apply no longer full-re-renders the board (that wiped canvases white). Edge bars bind their own pointer drag, and crop deltas keep sub-pixel precision while dragging.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, then reopen the map workspace.",
   "changeLog": [
-    "Fill map sheets with per-axis media scale so pages are not clipped.",
-    "Stop double-counting viewDispScale in PDF canvas paint size/DPI.",
-    "Lower raster DPI when zoomed out instead of keeping full-DPI paints.",
-    "Remove map geometry heal from the highlight-rebuild hot path."
+    "Shrink Map workspace dead-space floor (was ~96 pages wide).",
+    "Cancel/Apply Refine edges without wiping sheets white.",
+    "Bind Refine edge bar drag directly on the blue bars.",
+    "Lower map PDF oversample and lengthen zoom repaint debounce for less lag."
   ],
-  "updatedAt": "2026-07-30T22:15:00.000Z"
+  "updatedAt": "2026-07-30T22:20:00.000Z"
 }
