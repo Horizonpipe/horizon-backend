@@ -1,10 +1,11 @@
 {
-  "title": "Structure nodes stay on their own PDF only",
-  "description": "Map Builder was showing structure nodes from other PDFs on the open map. Nodes are stored in one list (correct), but the renderer was treating every workspace PDF as “on this board,” and DOM refresh re-painted every node with no filter.\n\nMarkers now only appear when their storageKey matches the currently open PDF pages. Switching maps no longer pulls in nodes from other files.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync and reopen the map — you should only see nodes created on that PDF.",
+  "title": "Structure nodes visible in PDF Viewer; Map positions stay accurate",
+  "description": "Structure nodes placed in the PDF Viewer were saved but never painted — Viewer mode has no world SVG, and overlays only drew highlight lines. Nodes could also jump to the wrong place in Map Builder because Viewer zoom heal rewrote shared world coordinates (and sometimes corrupted page fractions).\n\nViewer now draws structure markers in each page overlay using stable page fractions (nrx/nry). Heal only rematerializes from those fractions and no longer overwrites them from absolute coordinates after a resize. Map markers also prefer fractions when painting.\n\nWho is affected: PipeSync PDF Viewer + Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync. Place a node in Viewer — it should appear immediately. Switch to Map Building — markers should sit on the correct pipes.",
   "changeLog": [
-    "Scope structure-node display to the open PDF’s storageKeys only.",
-    "Stop unioning all map workspaces when painting structure markers.",
-    "Filter DOM refresh so foreign PDF nodes are not re-appended."
+    "Paint structure nodes in PDF Viewer continuous page overlays.",
+    "Stop Viewer zoom heal from corrupting structure-node page fractions.",
+    "Map markers prefer nrx/nry so positions stay accurate across Viewer/Map.",
+    "Refresh Viewer overlays immediately after placing a structure node."
   ],
-  "updatedAt": "2026-07-30T23:20:00.000Z"
+  "updatedAt": "2026-07-30T23:30:00.000Z"
 }
