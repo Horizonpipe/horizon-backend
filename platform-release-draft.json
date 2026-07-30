@@ -1,10 +1,12 @@
 {
-  "title": "Fix Map Building highlight alignment",
-  "description": "Map workspace sheets were being laid out at ~2.8× crop size, then clamped back down to native size without keeping the display scale. PDF media and highlight overlays no longer shared the same box, so lines looked far off on Map Building even when they were correct in the PDF Viewer.\n\nThis release keeps map page display scale intact, restores clamped map pages on load, and rebuilds map highlight geometry from the viewer mirror copies using normalized coords.\n\nWho is affected: PipeSync Map Building / PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync after deploy. Open the map workspace once so projections rebuild; re-draw only if a line has no viewer mirror.",
+  "title": "Map Builder drag, zoom, and framing",
+  "description": "Map Building sheets no longer snap back after you drag them. Persist was rebuilding highlights from a stale workspace snapshot before saving the live board, which undid page moves.\n\nYou can zoom further out (down to ~5%) so sheets look like puzzle pieces. The map canvas starts with a very large dead-space baseline and still grows in all directions as you move pieces. Opening Map Builder now frames the camera on the average center of all pages (and fits them in view) so you are not hunting in empty space.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync after deploy.",
   "changeLog": [
-    "Keep Map Building page display scale (stop clamping sheets back to native crop size).",
-    "Restore already-clamped map pages and rebuild highlight overlays from viewer mirrors.",
-    "PDF Viewer zoom + viewer→map mirror still use nrx as the source of truth."
+    "Fix Map Builder sheet drag snap-back (capture live positions before highlight rebuild on persist).",
+    "Keep dragged moves when PDF iframes fire pointercancel mid-drag.",
+    "Lower map zoom floor to ~5% for puzzle-piece overview.",
+    "Huge map workspace baseline (~96 page spans) that still grows with layout.",
+    "Open Map Builder centered on the average of all page centers, fit-to-content."
   ],
-  "updatedAt": "2026-07-30T21:00:00.000Z"
+  "updatedAt": "2026-07-30T21:20:00.000Z"
 }
