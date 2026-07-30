@@ -1,10 +1,11 @@
 {
-  "title": "Crisp Map Builder sheets (pdf.js like Viewer)",
-  "description": "Map Building sheets looked soft when zoomed in because they were native browser PDF iframes scaled with CSS (including the ~2.8× layout scale). PDF Viewer stays sharp because it re-renders pdf.js canvases at each zoom.\n\nMap Builder now uses the same pdf.js canvas path: sheets re-rasterize as you zoom, with a screen-pixel floor that includes layout display scale and a higher oversample. Text may briefly look soft for a moment while a sheet re-paints, then match Viewer clarity.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync after deploy.",
+  "title": "Map Builder zoom re-raster (fix blur)",
+  "description": "Zooming in on Map Building still looked blurry because sheet bitmaps were not reliably re-rasterized at the new scale. The paint floor also ignored the ~2.8× map layout scale, so backing stores stayed too small. Failed paints could swap in a native PDF iframe that never re-renders on zoom.\n\nMap zoom now debounces, clears stale quality tiers, re-paints visible sheets at full DPI with a layout-scale-aware screen-pixel floor, and keeps the previous canvas if a paint fails instead of falling back to a soft iframe.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync. After zooming, wait a short beat for sheets to sharpen.",
   "changeLog": [
-    "Map Builder sheets use pdf.js canvas instead of native PDF iframes.",
-    "Re-rasterize map sheets on zoom with a display-scale-aware screen-pixel floor.",
-    "Raise map oversample so deep zoom stays crisp like the PDF Viewer."
+    "Force Map Builder sheet re-raster on zoom at full DPI.",
+    "Include map layout display scale in the on-screen bitmap floor.",
+    "Debounce zoom repaint so the final zoom gets a sharp pass.",
+    "Do not replace failed canvas paints with native iframes that stay blurry."
   ],
-  "updatedAt": "2026-07-30T21:40:00.000Z"
+  "updatedAt": "2026-07-30T21:45:00.000Z"
 }
