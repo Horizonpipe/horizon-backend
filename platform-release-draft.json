@@ -1,10 +1,11 @@
 {
-  "title": "Fix Map sheet chop and lag",
-  "description": "The last Map geometry heal forced every sheet to the theoretical ~2.8× display scale. Import already clamps sheet layout width to 8000px, so real scale is often lower. Forcing 2.8 made the PDF media larger than the sheet box (half-chopped pages) and kept kicking full-DPI re-rasters (heavy lag).\n\nHeal now only fixes clearly bad nat sizes or scale overflow, and derives display scale from layout ÷ native size so media fits the box. No full zoom re-raster from that path.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, then reopen the map workspace.",
+  "title": "Map Builder clip and lag fix",
+  "description": "Map sheets were still getting clipped and the board felt extremely laggy. Three compounding bugs: geometry heal ran on every highlight rebuild and kept rewriting sheets; PDF paint double-counted display scale into huge canvases and refused to drop DPI when zoomed out; and media used one uniform CSS scale that could overflow the sheet box.\n\nMedia now fills each sheet with per-axis translate+scale, paint targets the layout box only, zoom-out lowers raster DPI, and layout heal runs only when opening a map workspace.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, then reopen the map workspace.",
   "changeLog": [
-    "Stop forcing map sheets to 2.8× when layout is clamped to 8000px.",
-    "Heal scale overflow so pages are not half-chopped.",
-    "Remove full-DPI re-raster loop that made Map Builder laggy."
+    "Fill map sheets with per-axis media scale so pages are not clipped.",
+    "Stop double-counting viewDispScale in PDF canvas paint size/DPI.",
+    "Lower raster DPI when zoomed out instead of keeping full-DPI paints.",
+    "Remove map geometry heal from the highlight-rebuild hot path."
   ],
-  "updatedAt": "2026-07-30T22:05:00.000Z"
+  "updatedAt": "2026-07-30T22:15:00.000Z"
 }
