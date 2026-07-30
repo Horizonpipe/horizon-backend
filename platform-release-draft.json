@@ -1,11 +1,10 @@
 {
-  "title": "Structure nodes visible in PDF Viewer; Map positions stay accurate",
-  "description": "Structure nodes placed in the PDF Viewer were saved but never painted — Viewer mode has no world SVG, and overlays only drew highlight lines. Nodes could also jump to the wrong place in Map Builder because Viewer zoom heal rewrote shared world coordinates (and sometimes corrupted page fractions).\n\nViewer now draws structure markers in each page overlay using stable page fractions (nrx/nry). Heal only rematerializes from those fractions and no longer overwrites them from absolute coordinates after a resize. Map markers also prefer fractions when painting.\n\nWho is affected: PipeSync PDF Viewer + Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync. Place a node in Viewer — it should appear immediately. Switch to Map Building — markers should sit on the correct pipes.",
+  "title": "Structure nodes stick to their Map sheet when moved",
+  "description": "Structure nodes in Map Builder were drawn on the world SVG, so dragging a PDF sheet left the markers behind. They are now drawn inside each page’s local overlay (same as highlights), so markers ride with the sheet. Page fractions (nrx/nry) stay the anchor — PDF Viewer scroll/layout does not float nodes off the page.\n\nWho is affected: PipeSync Map Building + PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, place a node, then drag that sheet in Map Builder — the marker should stay on the same spot on the drawing.",
   "changeLog": [
-    "Paint structure nodes in PDF Viewer continuous page overlays.",
-    "Stop Viewer zoom heal from corrupting structure-node page fractions.",
-    "Map markers prefer nrx/nry so positions stay accurate across Viewer/Map.",
-    "Refresh Viewer overlays immediately after placing a structure node."
+    "Draw Map structure nodes in page-local SVG so they move with the sheet.",
+    "Remove structure markers from the world SVG (no more left-behind nodes).",
+    "Keep Viewer nodes page-anchored; scroll does not detach them from the sheet."
   ],
-  "updatedAt": "2026-07-30T23:30:00.000Z"
+  "updatedAt": "2026-07-30T23:45:00.000Z"
 }
