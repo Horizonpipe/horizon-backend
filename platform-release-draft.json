@@ -1,10 +1,12 @@
 {
-  "title": "Structure nodes stick to their Map sheet when moved",
-  "description": "Structure nodes in Map Builder were drawn on the world SVG, so dragging a PDF sheet left the markers behind. They are now drawn inside each page’s local overlay (same as highlights), so markers ride with the sheet. Page fractions (nrx/nry) stay the anchor — PDF Viewer scroll/layout does not float nodes off the page.\n\nWho is affected: PipeSync Map Building + PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, place a node, then drag that sheet in Map Builder — the marker should stay on the same spot on the drawing.",
+  "title": "Structure Mode floating node panel",
+  "description": "When Structure Mode is on, PipeSync now shows a floating Structure nodes panel. You can set the default placement size for new nodes, browse every node on the board, and click a row to jump the PDF Viewer to that page with the node in view.\n\nRight-click the list to enter Select nodes mode (Windows-style: click, Shift+click range, Ctrl+click toggle). With a selection, right-click again for Adjust node size — slider, +/−, or type a value — then Apply (exits edit mode) or Cancel (keeps selection).\n\nWho is affected: PipeSync Map Building + PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, turn on Structure Mode, and use the panel on the left.",
   "changeLog": [
-    "Draw Map structure nodes in page-local SVG so they move with the sheet.",
-    "Remove structure markers from the world SVG (no more left-behind nodes).",
-    "Keep Viewer nodes page-anchored; scroll does not detach them from the sheet."
+    "Structure Mode floating panel: placement size + full node list.",
+    "Click a list row to open PDF Viewer on that node’s page and center it.",
+    "Right-click list: Select nodes with Windows-style multi-select.",
+    "With selection: Adjust node size (slider / +− / typed value), Apply or Cancel.",
+    "Per-node radius scales marker, label, and hit target; default placement size persists."
   ],
-  "updatedAt": "2026-07-30T23:45:00.000Z"
+  "updatedAt": "2026-07-31T00:15:00.000Z"
 }
