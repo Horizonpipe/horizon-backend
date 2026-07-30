@@ -1,11 +1,11 @@
 {
-  "title": "Map dead-space, lag, and Refine edges fixes",
-  "description": "Map Builder had a huge black dead-space box because the workspace floor was ~96 page-widths. That also forced tiny fit-zoom and made PDF re-rasters feel extremely laggy.\n\nWorkspace padding is back to a modest size. Refine edges cancel/apply no longer full-re-renders the board (that wiped canvases white). Edge bars bind their own pointer drag, and crop deltas keep sub-pixel precision while dragging.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, then reopen the map workspace.",
+  "title": "Sharp Map sheets and no black dead-space box",
+  "description": "Map Builder sheets were soft because PDF paint multiplied DPI by zoom-out (under-rasterizing), and the workspace still reserved empty dark padding that looked like a black box. Zooming in hid that padding; zooming back out put the camera in empty space so sheets looked blocked.\n\nWorkspace bounds are now content-tight. Zoom-out recenters if sheets leave the view. PDF paint keeps full base DPI for on-screen size and re-rasters with a 0.7× layout floor after zoom so sheets stay sharp.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, then reopen the map workspace.",
   "changeLog": [
-    "Shrink Map workspace dead-space floor (was ~96 pages wide).",
-    "Cancel/Apply Refine edges without wiping sheets white.",
-    "Bind Refine edge bar drag directly on the blue bars.",
-    "Lower map PDF oversample and lengthen zoom repaint debounce for less lag."
+    "Content-tight Map workspace (no giant black dead-space box).",
+    "Recenters on sheets when zooming out into empty space.",
+    "Restore sharp PDF paint DPI/oversample after zoom.",
+    "Re-raster with a 0.7× layout floor so zoom-in is not soft."
   ],
-  "updatedAt": "2026-07-30T22:20:00.000Z"
+  "updatedAt": "2026-07-30T22:25:00.000Z"
 }
