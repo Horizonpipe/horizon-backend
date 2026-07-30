@@ -1,11 +1,11 @@
 {
-  "title": "PipeSync plan upload from explorer",
-  "description": "On the Plans page, + PDF / + Raster (and folder Add PDF) opened a file dialog but never imported the files. Explorer-only mode does not mount the plan board, so the change handler for the hidden file input never ran — uploads looked broken and the progress bar never appeared.\n\nThis release wires a programmatic file picker for explorer uploads, keeps explorer DnD/file inputs active without a board host, shows a clearer upload progress bar, and coerces empty PDF/image MIME types from the filename so Wasabi presign does not reject them.\n\nWho is affected: PipeSync Plans on pipeshare.live (BASE). SaaS unchanged until you apply the next platform release from cPanel.",
+  "title": "Fix highlight scale and position",
+  "description": "Highlights drawn in the PDF Viewer (especially when zoomed in) were mirrored into Map Building using the wrong page size, so lines looked far off scale and out of place. Zooming far in the continuous PDF Viewer also broke overlay placement because normalized coords were computed against a native-size cap instead of the live display size.\n\nThis release treats normalized page fractions (nrx/nry) as the source of truth: viewer→map mirroring resolves those fractions first, continuous zoom re-syncs line and structure-node coords on every zoom/aspect change, and bake/export use the same resolved endpoints. New structure nodes store nrx/nry so Auto Highlights stay locked to the PDF content across zoom and workspace switches. Map lines are no longer tagged as viewer mirrors (fixes bake/dedupe).\n\nWho is affected: PipeSync Plans / PDF Viewer / Map Building on pipeshare.live (BASE). SaaS unchanged until you apply the next platform release from cPanel.\n\nIf existing auto-highlights or bad map mirrors still look off, re-run Auto Highlights / re-draw those lines once after this update.",
   "changeLog": [
-    "Fix Plans explorer + PDF / + Raster upload (files now import and show progress).",
-    "Keep explorer upload wiring active in explorer-only mode (no open board required).",
-    "Add/visible plan upload progress bar styling on desktop and mobile.",
-    "Coerce empty plan file MIME types from filename before Wasabi presign."
+    "Fix PDF Viewer zoom: highlights stay locked when zooming far in/out (nrx-based overlays).",
+    "Fix viewer→map highlight mirroring: live page size + normalized coords, not stale workspace dims.",
+    "Auto Highlights project onto Map when Map Building is active; structure nodes store nrx/nry.",
+    "Map lines are canonical (no mirroredFrom); bake/download use the same resolved endpoints."
   ],
-  "updatedAt": "2026-07-30T20:10:00.000Z"
+  "updatedAt": "2026-07-30T20:45:00.000Z"
 }
