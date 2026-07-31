@@ -1,10 +1,10 @@
 ﻿{
-  "title": "Fix Structure Mode edit label position drag",
-  "description": "Edit label position in Structure Mode was not moving labels on click-drag. Drag used the wrong coordinate space (world vs page-local), and continuous Viewer overlays blocked pointer hits on the label text. Labels can now be dragged again; Escape still cancels.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map38). Structure Mode → right-click a node → Edit label position → drag the label.",
+  "title": "Structure label drag actually moves again",
+  "description": "Edit label position was shrinking text and ignoring drag in continuous Viewer. Entering edit mode reapplied marker styles without the page zoom (so text looked smaller), and the sheet hitbox sat on top of the overlay so clicks never reached the label. Both are fixed: text keeps its size, and you can drag on the sheet to move the label.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map39). Structure Mode → Edit label position → drag on the sheet.",
   "changeLog": [
-    "Fix label drag to use page-local offsets matching how markers are painted.",
-    "Make continuous Viewer label text hittable during tether edit.",
-    "Re-apply tether-edit chrome after overlay refresh so drag keeps working."
+    "Keep structure label font size when entering Edit label position (pass page zoom into sync).",
+    "Disable continuous Viewer sheet hitbox during label reposition so drag can hit the overlay.",
+    "Start label drag from hit-testing / the node’s page, not only a direct text target."
   ],
-  "updatedAt": "2026-07-31T03:20:00.000Z"
+  "updatedAt": "2026-07-31T03:25:00.000Z"
 }
