@@ -1,10 +1,10 @@
 ﻿{
-  "title": "Force redraw auto-highlights in Structure Mode",
-  "description": "After placing new structure nodes, PSR auto-highlight lines do not rebuild on their own. Structure Mode now has a Force redraw auto-highlights button on the floating panel (and in the node-list right-click menu) that clears prior DB3 auto-highlights and rebuilds them from the current nodes + Plan Sync group.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync, enter Structure Mode, click Force redraw auto-highlights after adding nodes.",
+  "title": "Fix Structure Mode right-click + auto-highlight feedback",
+  "description": "Right-click on nodes in the Structure Mode floating list was swallowed by the PDF board context-menu suppressor (the float sits over the plan, so document capture stopped the event before the list menu could open). That is fixed so Edit name / highline / Force redraw work again.\n\nForce redraw auto-highlights was also failing silently because it used an incomplete Plan View context. It now calls the same full auto-highlight path as Plan Sync, shows a toast immediately, and writes a status line in the Structure panel (working / success / error).\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map31).",
   "changeLog": [
-    "Add Force redraw auto-highlights button to Structure Mode floating panel.",
-    "Same action available in the structure node list right-click menu.",
-    "Rebuilds green PSR auto-highlights from current PDF structure nodes."
+    "Allow Structure Mode list right-click menu to open over the PDF board.",
+    "Force redraw uses full Plan Sync auto-highlight context (no silent failure).",
+    "Toast + in-panel status message while/after redrawing auto-highlights."
   ],
-  "updatedAt": "2026-07-31T02:15:00.000Z"
+  "updatedAt": "2026-07-31T02:20:00.000Z"
 }
