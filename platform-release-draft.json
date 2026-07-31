@@ -1,12 +1,11 @@
 {
-  "title": "Structure highline names and dual H/L highlights",
-  "description": "Structure Mode can mark a manhole as having a highline (upper/lower at the same spot). Check “Has a highline” when naming a node; the second name defaults to the main name plus H (e.g. MH-83 → MH-83H), and you can override it. On the map, the main name stays large with the highline name under it at half size.\n\nAuto-highlight lines that touch a highline node draw as a two-tone green pair (mint upper / deeper green lower) with H and L letters on the strokes so upper vs lower is obvious at a glance.\n\nWho is affected: PipeSync Map Building + PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, place a structure with Has a highline checked, confirm dual labels, then run Auto Highlight on a segment that uses that node.",
+  "title": "Edit existing nodes for highline",
+  "description": "Existing structure nodes can now be marked as highlines after they are placed. Right-click a node (or a row in the Structure list) for Edit name or Has a highline. The highline checkbox in the name dialog is larger and clearer, and saving applies the same default name + H behavior as when placing a new node.\n\nWho is affected: PipeSync Map Building + PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, Structure Mode → right-click an existing node → Has a highline → Save.",
   "changeLog": [
-    "Add Has a highline checkbox on the structure name modal with default name + H.",
-    "Persist hasHighline / highlineName on structure nodes (create, edit, reload).",
-    "Show main structure name large and highline name half-size under it.",
-    "Index highline names for Plan Sync / auto-highlight matching.",
-    "Render highline auto-highlights as dual mint/green strokes with H and L labels."
+    "Add Has a highline / Clear highline on structure node right-click menu.",
+    "Add Edit name and highline options when right-clicking a Structure list row.",
+    "Make the highline checkbox larger and keep it in sync while editing existing nodes.",
+    "Refresh map labels immediately when highline is set or cleared on an existing node."
   ],
-  "updatedAt": "2026-07-31T00:10:00.000Z"
+  "updatedAt": "2026-07-31T00:25:00.000Z"
 }
