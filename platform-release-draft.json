@@ -1,10 +1,10 @@
 ﻿{
-  "title": "Adjust structure node text size",
-  "description": "Structure Mode can now resize label text separately from the node circle. Use Placement text size for new nodes, or select nodes → right-click → Adjust node / text size for existing ones. CSS no longer locks text to a fixed 47px size.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map37). Structure Mode → select nodes → Adjust node / text size.",
+  "title": "Fix Structure Mode edit label position drag",
+  "description": "Edit label position in Structure Mode was not moving labels on click-drag. Drag used the wrong coordinate space (world vs page-local), and continuous Viewer overlays blocked pointer hits on the label text. Labels can now be dragged again; Escape still cancels.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map38). Structure Mode → right-click a node → Edit label position → drag the label.",
   "changeLog": [
-    "Add independent structure node text size (placement default + batch adjust).",
-    "Persist per-node fontSize and board default text size with plan view.",
-    "Stop CSS from forcing structure labels to a fixed font size."
+    "Fix label drag to use page-local offsets matching how markers are painted.",
+    "Make continuous Viewer label text hittable during tether edit.",
+    "Re-apply tether-edit chrome after overlay refresh so drag keeps working."
   ],
-  "updatedAt": "2026-07-31T03:10:00.000Z"
+  "updatedAt": "2026-07-31T03:20:00.000Z"
 }
