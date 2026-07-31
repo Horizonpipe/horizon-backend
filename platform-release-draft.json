@@ -1,10 +1,10 @@
 ﻿{
-  "title": "Remove ghost fat highlight doubles",
-  "description": "Plan View was drawing highlights twice: once from baked PDF ink annotations (often oversized after the zoom bug) and once from the editable SVG overlay (correct size). That looked like a correct line with a huge yellow ghost behind it.\n\nCanvas PDF rendering now skips annotations in Viewer and Map Builder so only the SVG layer shows while you edit. Downloads/shares still include baked annots for external readers.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync after deploy.",
+  "title": "Export/share use healed highlight thickness",
+  "description": "Hiding fat ghost lines in Plan View was not enough for Share: that path serves the baked PDF bytes, which could still hold oversized ink from the zoom bug. Download already cleared and reburned from the overlay, so it was mostly fine.\n\nNow bake/export stroke helpers sanitize thickness, healed plans queue a one-shot Save Highlights rebake into storage, and Share auto-saves dirty highlights before creating the link.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync. If you see Save Highlights, click it once (or Share) so the PDF bytes match the normal line width.",
   "changeLog": [
-    "Disable PDF.js annotation painting under Plan View canvases (no ghost doubles).",
-    "Bust continuous-viewer tile cache so old annotated tiles are not reused.",
-    "Map Builder canvas render also skips baked ink annots."
+    "Sanitize stroke width when baking/burning PDF ink annotations.",
+    "Queue one-shot rebake after stroke heal so storage PDFs lose fat ink.",
+    "Share waits for dirty highlight save before serving raw annotated PDF."
   ],
-  "updatedAt": "2026-07-31T02:00:00.000Z"
+  "updatedAt": "2026-07-31T02:10:00.000Z"
 }
