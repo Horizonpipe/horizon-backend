@@ -9987,7 +9987,7 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
           saved_by: req.user.displayName || req.user.username,
           systems: { storm: [], sanitary: [] }
         };
-        record = await createPlannerRecord(record);
+        record = await createPlannerRecord(record, req);
       }
     }
     ensureImportTargetSystemBranch(record, targetSystem);
@@ -10003,18 +10003,25 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
       jobsite: targetJobsite
     });
 
+    let added = 0;
+    let skippedExcluded = 0;
+    let skippedExisting = 0;
     rows.forEach((row) => {
       if (!row) return;
       const jobsiteDup = rowHasJobsiteDuplicateFlag(row);
-      if (jobsiteDup && isDb3DuplicateExcludeDecision(row)) return;
+      if (jobsiteDup && isDb3DuplicateExcludeDecision(row)) {
+        skippedExcluded += 1;
+        return;
+      }
       const refLower = String(row.reference || '').trim().toLowerCase();
       const identity = buildDb3DeterministicIdentity(row);
       const dedupeKey = String(row.db3DedupeKey || identity.dedupeKey || '').trim();
       const dedupeHash = String(row.db3RowHash || identity.dedupeHash || '').trim().toLowerCase();
       if (!jobsiteDup || !isDb3DuplicateIncludeDecision(row)) {
-        if (refSet.has(refLower)) return;
-        if (dedupeKey && dedupeKeySet.has(dedupeKey)) return;
-        if (dedupeHash && dedupeHashSet.has(dedupeHash)) return;
+        if (refSet.has(refLower) || (dedupeKey && dedupeKeySet.has(dedupeKey)) || (dedupeHash && dedupeHashSet.has(dedupeHash))) {
+          skippedExisting += 1;
+          return;
+        }
       }
       const refKey = String(row.reference || '').trim().toLowerCase();
       const placedDup = placedAtCommit.get(refKey) || row.placedDuplicateOf || null;
@@ -10058,11 +10065,44 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
       refSet.add(String(segment.reference || '').toLowerCase());
       if (dedupeKey) dedupeKeySet.add(dedupeKey);
       if (dedupeHash) dedupeHashSet.add(dedupeHash);
+      added += 1;
     });
+
+    if (!added) {
+      const reasonParts = [];
+      if (skippedExcluded) reasonParts.push(`${skippedExcluded} excluded as duplicates`);
+      if (skippedExisting) reasonParts.push(`${skippedExisting} already on this jobsite`);
+      const reason = reasonParts.length ? reasonParts.join(', ') : 'no valid preview rows';
+      return res.status(400).json({
+        success: false,
+        added: 0,
+        skippedExcluded,
+        skippedExisting,
+        error: `Nothing imported — ${reason}. Mark duplicates as Include (#2+) or pick a different jobsite, then commit again.`,
+        recordId: record?.id || null,
+        targetClient,
+        targetCity,
+        targetJobsite,
+        targetSystem,
+        landedOnImportQueue: String(targetClient || '') === PSR_IMPORT_QUEUE_CLIENT
+      });
+    }
 
     record.saved_by = req.user.displayName || req.user.username;
     const saved = await persistRecord(record);
-    res.json({ success: true, record: saved });
+    res.json({
+      success: true,
+      added,
+      skippedExcluded,
+      skippedExisting,
+      record: saved,
+      recordId: saved?.id || record?.id || null,
+      targetClient,
+      targetCity,
+      targetJobsite,
+      targetSystem,
+      landedOnImportQueue: String(targetClient || '') === PSR_IMPORT_QUEUE_CLIENT
+    });
   } catch (error) {
     console.error('IMPORT COMMIT ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
