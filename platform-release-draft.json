@@ -1,11 +1,11 @@
 {
-  "title": "Fix highlight misalignment when zooming",
-  "description": "Zooming the PDF Viewer could briefly (or stuck) drift highlight lines off the sheet. Root cause: page width/height changed on zoom, then highlight math rewrote position fractions from the old pixel coords against the new size. Zooming again sometimes realigned them by accident.\n\nPipeSync now locks highlight positions before any zoom resize, then rematerializes only from the stored fractions — same safe pattern structure nodes already used. Page height also prefers the known PDF aspect so overlays paint correctly on the first zoom tick.\n\nWho is affected: PipeSync PDF Viewer (continuous) on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh, draw or auto-highlight a line, then Ctrl+wheel zoom in/out repeatedly — highlights should stay glued to the sheet.",
+  "title": "Keep highlight thickness stable while zooming",
+  "description": "After zooming the PDF Viewer in and out quickly, highlight lines and structure markers could look massively thick — wide enough to cover the sheet notes. Stroke width was staying fixed in page pixels while the sheet shrank, and Viewer→Map sync sometimes multiplied thickness by the zoomed page size ratio.\n\nPipeSync now paints strokes and structure markers scaled to the current Viewer zoom (page size vs base size), and no longer inflates stroke width when projecting highlights onto the Map.\n\nWho is affected: PipeSync PDF Viewer (continuous) on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh, then Ctrl+wheel zoom in/out rapidly — lines and MH markers should stay proportional to the plan.",
   "changeLog": [
-    "Lock highlight nrx/nry before Viewer zoom changes page size.",
-    "Heal highlights from fractions only (never rewrite fractions after resize).",
-    "Use known PDF aspect for page height so first overlay paint matches the sheet.",
-    "Apply the same lock→resize→heal pattern on mount and aspect corrections."
+    "Scale Viewer highlight stroke width with page zoom so zoom-out cannot fatten lines.",
+    "Scale structure node markers/labels with the same Viewer zoom factor.",
+    "Stop multiplying stroke by zoomed page size when projecting Viewer→Map highlights.",
+    "Store overlayZoom as intrinsic page zoom (page.w / viewerBaseW), not CSS viewport zoom."
   ],
-  "updatedAt": "2026-07-31T00:55:00.000Z"
+  "updatedAt": "2026-07-31T01:05:00.000Z"
 }
