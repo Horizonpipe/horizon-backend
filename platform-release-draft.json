@@ -1,10 +1,10 @@
 ﻿{
-  "title": "Shrink fat zoom highlights + green auto-highlight",
-  "description": "Highlights that got massively thick after rapid Viewer zoom are snapped back to normal thickness on load (stored widths above 16 reset to 10). Auto-highlight lines now use green instead of the board yellow/color-picker color.\n\nWho is affected: PipeSync Map Builder / Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync. Fat lines should look normal again; re-run Auto Highlight to regenerate pipes in green (existing auto lines are also recolored on load).",
+  "title": "Remove ghost fat highlight doubles",
+  "description": "Plan View was drawing highlights twice: once from baked PDF ink annotations (often oversized after the zoom bug) and once from the editable SVG overlay (correct size). That looked like a correct line with a huge yellow ghost behind it.\n\nCanvas PDF rendering now skips annotations in Viewer and Map Builder so only the SVG layer shows while you edit. Downloads/shares still include baked annots for external readers.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync after deploy.",
   "changeLog": [
-    "Heal inflated highlight stroke widths left by the zoom projection bug.",
-    "Cap Viewer zoom contribution to stroke painting so thickness cannot explode.",
-    "DB3 auto-highlight color is fixed green (#3ddc84)."
+    "Disable PDF.js annotation painting under Plan View canvases (no ghost doubles).",
+    "Bust continuous-viewer tile cache so old annotated tiles are not reused.",
+    "Map Builder canvas render also skips baked ink annots."
   ],
-  "updatedAt": "2026-07-31T01:50:00.000Z"
+  "updatedAt": "2026-07-31T02:00:00.000Z"
 }
