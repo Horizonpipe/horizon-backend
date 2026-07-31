@@ -1,10 +1,11 @@
 ﻿{
-  "title": "Structure Mode Plan Sync group picker for auto-highlight",
-  "description": "Force redraw auto-highlights needs an active Plan Sync group. Structure Mode now includes a searchable group list above that button so you can pick the group without opening Plan Sync first. If only one saved group exists, it is selected automatically.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map33). In Structure Mode, search/select your group, then Force redraw.",
+  "title": "Plan Sync groups stop disappearing",
+  "description": "Saving Plan View was stripping Plan Sync groups from storage, so groups looked fine until refresh/login and then vanished. The server now keeps planSync (groups) on every save, merges groups safely so a stale empty write cannot wipe them, and the client saves immediately when you create a group.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map34). Re-save any group once if it was lost before this fix so it is written back to storage.",
   "changeLog": [
-    "Add searchable Plan Sync group picker to Structure Mode panel.",
-    "Force redraw uses the selected group and explains when none is selected.",
-    "Auto-select the only saved group when none is active."
+    "Server plan-view save no longer drops planSync/groups on v2 payloads.",
+    "Merge Plan Sync groups on save so empty/stale writes cannot wipe them.",
+    "Saving a Plan Sync group now persists immediately (not only after debounce).",
+    "Hydrate merges groups instead of replacing local groups with empty server data."
   ],
-  "updatedAt": "2026-07-31T02:35:00.000Z"
+  "updatedAt": "2026-07-31T02:50:00.000Z"
 }

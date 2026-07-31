@@ -1016,6 +1016,75 @@ function sanitizePlanBoardBranch(branch) {
   return clone;
 }
 
+function sanitizePlanSyncForPersist(planSync) {
+  if (!planSync || typeof planSync !== 'object' || Array.isArray(planSync)) {
+    return { groups: [], builder: { name: '', psr: [], pdf: [], db3: [], nodes: [], psrSubtype: 'both' }, searchQuery: '', selectedGroupId: '', activeGroupId: '' };
+  }
+  const groups = Array.isArray(planSync.groups)
+    ? planSync.groups
+        .filter((g) => g && typeof g === 'object' && !Array.isArray(g))
+        .map((g) => ({
+          id: String(g.id || '').slice(0, 80),
+          name: String(g.name || '').slice(0, 200),
+          psr: Array.isArray(g.psr) ? g.psr.slice(0, 500) : [],
+          pdf: Array.isArray(g.pdf) ? g.pdf.slice(0, 500) : [],
+          db3: Array.isArray(g.db3) ? g.db3.slice(0, 200) : [],
+          nodes: Array.isArray(g.nodes) ? g.nodes.slice(0, 5000) : [],
+          psrSubtype: String(g.psrSubtype || 'both').slice(0, 32),
+          updatedAt: String(g.updatedAt || '').slice(0, 64)
+        }))
+        .filter((g) => g.id && g.name)
+        .slice(0, 200)
+    : [];
+  const builderSrc = planSync.builder && typeof planSync.builder === 'object' ? planSync.builder : {};
+  return {
+    groups,
+    builder: {
+      name: String(builderSrc.name || '').slice(0, 200),
+      psr: Array.isArray(builderSrc.psr) ? builderSrc.psr.slice(0, 500) : [],
+      pdf: Array.isArray(builderSrc.pdf) ? builderSrc.pdf.slice(0, 500) : [],
+      db3: Array.isArray(builderSrc.db3) ? builderSrc.db3.slice(0, 200) : [],
+      nodes: Array.isArray(builderSrc.nodes) ? builderSrc.nodes.slice(0, 5000) : [],
+      psrSubtype: String(builderSrc.psrSubtype || 'both').slice(0, 32)
+    },
+    searchQuery: String(planSync.searchQuery || '').slice(0, 200),
+    selectedGroupId: String(planSync.selectedGroupId || '').slice(0, 80),
+    activeGroupId: String(planSync.activeGroupId || '').slice(0, 80)
+  };
+}
+
+/** Prefer incoming groups by id; never let an empty incoming wipe non-empty stored groups. */
+function mergePlanSyncForPersist(existingPlanSync, incomingPlanSync) {
+  if (!incomingPlanSync || typeof incomingPlanSync !== 'object') {
+    return existingPlanSync && typeof existingPlanSync === 'object'
+      ? sanitizePlanSyncForPersist(existingPlanSync)
+      : undefined;
+  }
+  const incoming = sanitizePlanSyncForPersist(incomingPlanSync);
+  if (!existingPlanSync || typeof existingPlanSync !== 'object') return incoming;
+  const existing = sanitizePlanSyncForPersist(existingPlanSync);
+  if (!incoming.groups.length && existing.groups.length) {
+    return { ...incoming, groups: existing.groups };
+  }
+  const byId = new Map();
+  for (const g of existing.groups) {
+    if (g?.id) byId.set(String(g.id), g);
+  }
+  for (const g of incoming.groups) {
+    if (!g?.id) continue;
+    const id = String(g.id);
+    const prev = byId.get(id);
+    if (!prev) {
+      byId.set(id, g);
+      continue;
+    }
+    const tIn = Date.parse(g.updatedAt || '') || 0;
+    const tEx = Date.parse(prev.updatedAt || '') || 0;
+    byId.set(id, tIn >= tEx ? g : prev);
+  }
+  return { ...incoming, groups: Array.from(byId.values()).slice(0, 200) };
+}
+
 function sanitizePlanViewPayloadForPersist(payload) {
   if (!payload || typeof payload !== 'object') return payload;
   let clone;
@@ -1025,13 +1094,39 @@ function sanitizePlanViewPayloadForPersist(payload) {
     return payload;
   }
   if (clone.v === 2 && clone.imagePlan && clone.pdfMap) {
-    return {
+    const out = {
       v: 2,
       imagePlan: sanitizePlanBoardBranch(clone.imagePlan),
       pdfMap: sanitizePlanBoardBranch(clone.pdfMap)
     };
+    // Bugfix: v2 rebuild previously dropped planSync, so Plan Sync groups never persisted.
+    if (clone.planSync && typeof clone.planSync === 'object') {
+      out.planSync = sanitizePlanSyncForPersist(clone.planSync);
+    }
+    return out;
   }
-  return sanitizePlanBoardBranch(clone);
+  const branch = sanitizePlanBoardBranch(clone);
+  if (clone.planSync && typeof clone.planSync === 'object') {
+    branch.planSync = sanitizePlanSyncForPersist(clone.planSync);
+  }
+  return branch;
+}
+
+function attachMergedPlanSyncToPayload(existingPayload, sanitizedPayload) {
+  if (!sanitizedPayload || typeof sanitizedPayload !== 'object') return sanitizedPayload;
+  const existingPs =
+    existingPayload && typeof existingPayload === 'object' ? existingPayload.planSync : null;
+  const incomingPs = sanitizedPayload.planSync;
+  const merged = mergePlanSyncForPersist(existingPs, incomingPs);
+  if (!merged) {
+    if (sanitizedPayload.planSync) {
+      const copy = { ...sanitizedPayload };
+      delete copy.planSync;
+      return copy;
+    }
+    return sanitizedPayload;
+  }
+  return { ...sanitizedPayload, planSync: merged };
 }
 
 let wasabiStateSnapshotBusy = false;
@@ -8540,12 +8635,17 @@ function prunePlanWorkspaceSaveIndex(rows, username, board) {
 }
 
 function mergePlanViewPayloadBranch(existingPayload, boardKey, sanitizedBoard) {
+  const prevPlanSync =
+    existingPayload && typeof existingPayload === 'object' && existingPayload.planSync
+      ? existingPayload.planSync
+      : null;
   let payload =
     existingPayload && typeof existingPayload === 'object' && !Array.isArray(existingPayload)
       ? JSON.parse(JSON.stringify(existingPayload))
-      : { v: 2, imagePlan: {}, pdfMapView: {} };
+      : { v: 2, imagePlan: {}, pdfMap: {} };
   if (payload.v !== 2 || !payload.imagePlan || !payload.pdfMap) {
-    payload = { v: 2, imagePlan: {}, pdfMapView: {} };
+    payload = { v: 2, imagePlan: {}, pdfMap: {} };
+    if (prevPlanSync) payload.planSync = prevPlanSync;
   }
   if (boardKey === 'planView') payload.imagePlan = sanitizedBoard;
   else payload.pdfMap = sanitizedBoard;
@@ -8602,7 +8702,9 @@ app.put('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, 
     await runWasabiStateWriteForRequest(req, `pipesync-plan-view:${un}`, async (data) => {
       const rows = ensureSnapshotTable(data, PIPESYNC_PLAN_VIEW_TABLE);
       const idx = rows.findIndex((r) => String(r?.username || '').toLowerCase() === un);
-      const row = { username: un, payload: sanitized, updated_at: now };
+      const prevPayload = idx >= 0 && rows[idx]?.payload && typeof rows[idx].payload === 'object' ? rows[idx].payload : null;
+      const mergedPayload = attachMergedPlanSyncToPayload(prevPayload, sanitized);
+      const row = { username: un, payload: mergedPayload, updated_at: now };
       if (idx >= 0) rows[idx] = row;
       else rows.push(row);
     });
