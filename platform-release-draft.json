@@ -1,10 +1,10 @@
 ﻿{
-  "title": "Export/share use healed highlight thickness",
-  "description": "Hiding fat ghost lines in Plan View was not enough for Share: that path serves the baked PDF bytes, which could still hold oversized ink from the zoom bug. Download already cleared and reburned from the overlay, so it was mostly fine.\n\nNow bake/export stroke helpers sanitize thickness, healed plans queue a one-shot Save Highlights rebake into storage, and Share auto-saves dirty highlights before creating the link.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync. If you see Save Highlights, click it once (or Share) so the PDF bytes match the normal line width.",
+  "title": "Force redraw auto-highlights in Structure Mode",
+  "description": "After placing new structure nodes, PSR auto-highlight lines do not rebuild on their own. Structure Mode now has a Force redraw auto-highlights button on the floating panel (and in the node-list right-click menu) that clears prior DB3 auto-highlights and rebuilds them from the current nodes + Plan Sync group.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync, enter Structure Mode, click Force redraw auto-highlights after adding nodes.",
   "changeLog": [
-    "Sanitize stroke width when baking/burning PDF ink annotations.",
-    "Queue one-shot rebake after stroke heal so storage PDFs lose fat ink.",
-    "Share waits for dirty highlight save before serving raw annotated PDF."
+    "Add Force redraw auto-highlights button to Structure Mode floating panel.",
+    "Same action available in the structure node list right-click menu.",
+    "Rebuilds green PSR auto-highlights from current PDF structure nodes."
   ],
-  "updatedAt": "2026-07-31T02:10:00.000Z"
+  "updatedAt": "2026-07-31T02:15:00.000Z"
 }
