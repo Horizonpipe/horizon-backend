@@ -395,6 +395,8 @@ function requestPathSkipsWasabiStateSnapshot(req) {
   if (WASABI_STATE_SNAPSHOT_HTTP_SKIP_PATH_SET.has(n)) return true;
   /* Desktop telemetry / heartbeats: no app-wide snapshot (indexing + uploads already skip most /api/files paths). */
   if (n.startsWith('/auto-import-plugin/')) return true;
+  /* DB3 import already wrote latest.json via the mutation queue — skip the follow-up PG snapshot race. */
+  if (n === '/imports/wincan/commit' || n === '/imports/wincan/preview') return true;
   return false;
 }
 
@@ -1045,6 +1047,7 @@ let wasabiSqlMirrorTotalFlushed = 0;
 let wasabiSqlMirrorLastError = '';
 let wasabiLatestStateCache = null;
 let wasabiLatestStateCacheAt = 0;
+let wasabiLatestStateCacheEtag = null;
 let wasabiStateWriteQueue = Promise.resolve();
 let wasabiAutoImportHandledByWasabi = 0;
 let wasabiAutoImportFallbackToPostgres = 0;
@@ -1091,10 +1094,15 @@ function decodeWasabiStateSnapshotBody(raw, contentEncoding) {
 }
 
 async function loadWasabiLatestStateSnapshot(force = false) {
+  const loaded = await loadWasabiLatestStateSnapshotWithMeta(force);
+  return loaded?.snapshot || null;
+}
+
+async function loadWasabiLatestStateSnapshotWithMeta(force = false) {
   if (!wasabiStateClient || !WASABI_STATE_BUCKET) return null;
   const now = Date.now();
   if (!force && wasabiLatestStateCache && now - wasabiLatestStateCacheAt <= WASABI_LATEST_STATE_CACHE_MS) {
-    return wasabiLatestStateCache;
+    return { snapshot: wasabiLatestStateCache, etag: wasabiLatestStateCacheEtag || null };
   }
   const out = await wasabiStateClient.send(
     new GetObjectCommand({
@@ -1105,9 +1113,11 @@ async function loadWasabiLatestStateSnapshot(force = false) {
   const raw = await bodyToBuffer(out.Body);
   const jsonText = decodeWasabiStateSnapshotBody(raw, out.ContentEncoding);
   const parsed = JSON.parse(jsonText);
+  const etag = out.ETag ? String(out.ETag) : null;
   wasabiLatestStateCache = parsed;
   wasabiLatestStateCacheAt = now;
-  return parsed;
+  wasabiLatestStateCacheEtag = etag;
+  return { snapshot: parsed, etag };
 }
 
 async function loadWasabiStateForRequest(req, force = false) {
@@ -1178,7 +1188,19 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-async function putWasabiStateObject(stateObject) {
+function wasabiStatePreconditionError(err) {
+  const status = err?.$metadata?.httpStatusCode;
+  const name = String(err?.name || '');
+  const code = String(err?.Code || err?.code || '');
+  return (
+    status === 412 ||
+    name === 'PreconditionFailed' ||
+    code === 'PreconditionFailed' ||
+    code === 'WASABI_STATE_PRECONDITION_FAILED'
+  );
+}
+
+async function putWasabiStateObject(stateObject, options = {}) {
   if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
     throw new Error('Wasabi state client is not configured');
   }
@@ -1198,12 +1220,26 @@ async function putWasabiStateObject(stateObject) {
     ContentType: 'application/json'
   };
   if (contentEncoding) putBase.ContentEncoding = contentEncoding;
-  await wasabiStateClient.send(
-    new PutObjectCommand({
-      ...putBase,
-      Key: latestKey
-    })
-  );
+  const latestPut = {
+    ...putBase,
+    Key: latestKey
+  };
+  const ifMatch = options?.ifMatch ? String(options.ifMatch).trim() : '';
+  if (ifMatch) {
+    // S3/Wasabi expects the exact ETag (usually quoted).
+    latestPut.IfMatch = ifMatch;
+  }
+  try {
+    await wasabiStateClient.send(new PutObjectCommand(latestPut));
+  } catch (err) {
+    if (ifMatch && wasabiStatePreconditionError(err)) {
+      const conflict = new Error('WASABI_STATE_PRECONDITION_FAILED');
+      conflict.code = 'WASABI_STATE_PRECONDITION_FAILED';
+      conflict.cause = err;
+      throw conflict;
+    }
+    throw err;
+  }
   if (WASABI_STATE_ARCHIVE_SNAPSHOTS) {
     await wasabiStateClient.send(
       new PutObjectCommand({
@@ -1214,6 +1250,7 @@ async function putWasabiStateObject(stateObject) {
   }
   wasabiLatestStateCache = stateObject;
   wasabiLatestStateCacheAt = Date.now();
+  wasabiLatestStateCacheEtag = null; // force next GET to refresh ETag
 }
 
 /**
@@ -1276,13 +1313,31 @@ async function runWasabiStateWrite(reason, mutator) {
     throw new Error('Wasabi state client is not configured');
   }
   const task = async () => {
-    const snapshot = await loadWasabiLatestStateSnapshot(true);
-    const next = snapshotStateShape(snapshot || {});
-    await mutator(next.data);
-    next.generatedAt = nowIso();
-    next.reason = String(reason || 'mutation');
-    await putWasabiStateObject(next);
-    return next;
+    let lastErr = null;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const loaded = await loadWasabiLatestStateSnapshotWithMeta(true);
+      const snapshot = loaded?.snapshot || {};
+      const etag = loaded?.etag || null;
+      const next = snapshotStateShape(snapshot);
+      await mutator(next.data);
+      next.generatedAt = nowIso();
+      next.reason = String(reason || 'mutation');
+      try {
+        // IfMatch prevents PM2 workers / snapshot jobs from clobbering a newer latest.json.
+        await putWasabiStateObject(next, etag ? { ifMatch: etag } : {});
+        return next;
+      } catch (err) {
+        if (err?.code === 'WASABI_STATE_PRECONDITION_FAILED' || wasabiStatePreconditionError(err)) {
+          lastErr = err;
+          wasabiLatestStateCache = null;
+          wasabiLatestStateCacheAt = 0;
+          wasabiLatestStateCacheEtag = null;
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastErr || new Error(`Wasabi state write conflict after retries (${reason})`);
   };
   const run = wasabiStateWriteQueue.then(task, task);
   wasabiStateWriteQueue = run.catch(() => {});
@@ -1564,75 +1619,110 @@ function wasabiSnapshotTablesPreservedFromLatest() {
 
 async function runWasabiStateSnapshot() {
   if (!wasabiStateClient || !WASABI_STATE_BUCKET) return;
-  if (wasabiStateSnapshotBusy) return;
-  wasabiStateSnapshotBusy = true;
-  wasabiStateLastRunAt = Date.now();
-  try {
-    const tables = await listSnapshotTables();
-    const preserveFromLatest = wasabiSnapshotTablesPreservedFromLatest();
-    let previousSnapshot = null;
-    if (preserveFromLatest.size > 0) {
-      try {
-        previousSnapshot = await loadWasabiLatestStateSnapshot(true);
-      } catch {
-        previousSnapshot = null;
-      }
-    }
-    const data = {};
-    const prevData = readWasabiSnapshotDataTables(previousSnapshot || {}, { strict: false });
-    for (const tableName of tables) {
-      if (preserveFromLatest.has(tableName)) {
-        const prevRows = Array.isArray(prevData[tableName]) ? prevData[tableName] : null;
-        if (prevRows !== null) {
-          data[tableName] = cloneSnapshotRows(prevRows);
-          continue;
-        }
-        // No Wasabi rows yet for this preserved table — pull Postgres once instead of writing [] over latest.json.
-      }
-      try {
-        const q = await pool.query(`SELECT * FROM ${tableName}`);
-        data[tableName] = q.rows;
-      } catch (err) {
-        data[tableName] = { error: String(err?.message || err) };
-      }
-    }
-    // Wasabi-only rows (no Postgres mirror) — merge from current latest so periodic snapshots never erase plan markup.
+  // Serialize with mutation writes so a Postgres→Wasabi snapshot cannot overwrite a
+  // just-committed DB3/PSR import (especially with PM2 cluster workers).
+  const task = async () => {
+    if (wasabiStateSnapshotBusy) return;
+    wasabiStateSnapshotBusy = true;
+    wasabiStateLastRunAt = Date.now();
     try {
-      let mergeSource = previousSnapshot;
-      if (!mergeSource) {
+      const tables = await listSnapshotTables();
+      const preserveFromLatest = wasabiSnapshotTablesPreservedFromLatest();
+      let previousSnapshot = null;
+      let previousEtag = null;
+      if (preserveFromLatest.size > 0) {
         try {
-          mergeSource = await loadWasabiLatestStateSnapshot(false);
+          const loaded = await loadWasabiLatestStateSnapshotWithMeta(true);
+          previousSnapshot = loaded?.snapshot || null;
+          previousEtag = loaded?.etag || null;
         } catch {
-          mergeSource = null;
+          previousSnapshot = null;
+          previousEtag = null;
         }
       }
-      const mergeTables = readWasabiSnapshotDataTables(mergeSource || {}, { strict: false });
-      if (Array.isArray(mergeTables[PIPESYNC_PLAN_VIEW_TABLE])) {
-        data[PIPESYNC_PLAN_VIEW_TABLE] = cloneSnapshotRows(mergeTables[PIPESYNC_PLAN_VIEW_TABLE]);
-      } else if (!Array.isArray(data[PIPESYNC_PLAN_VIEW_TABLE])) {
-        data[PIPESYNC_PLAN_VIEW_TABLE] = [];
+      const data = {};
+      const prevData = readWasabiSnapshotDataTables(previousSnapshot || {}, { strict: false });
+      for (const tableName of tables) {
+        if (preserveFromLatest.has(tableName)) {
+          const prevRows = Array.isArray(prevData[tableName]) ? prevData[tableName] : null;
+          if (prevRows !== null) {
+            data[tableName] = cloneSnapshotRows(prevRows);
+            continue;
+          }
+          // No Wasabi rows yet for this preserved table — pull Postgres once instead of writing [] over latest.json.
+        }
+        try {
+          const q = await pool.query(`SELECT * FROM ${tableName}`);
+          data[tableName] = q.rows;
+        } catch (err) {
+          data[tableName] = { error: String(err?.message || err) };
+        }
       }
-      if (Array.isArray(mergeTables[PIPESYNC_PRICING_STATE_TABLE])) {
-        data[PIPESYNC_PRICING_STATE_TABLE] = cloneSnapshotRows(mergeTables[PIPESYNC_PRICING_STATE_TABLE]);
-      } else if (!Array.isArray(data[PIPESYNC_PRICING_STATE_TABLE])) {
-        data[PIPESYNC_PRICING_STATE_TABLE] = [];
+      // Wasabi-only rows (no Postgres mirror) — merge from current latest so periodic snapshots never erase plan markup.
+      try {
+        let mergeSource = previousSnapshot;
+        if (!mergeSource) {
+          try {
+            mergeSource = await loadWasabiLatestStateSnapshot(false);
+          } catch {
+            mergeSource = null;
+          }
+        }
+        const mergeTables = readWasabiSnapshotDataTables(mergeSource || {}, { strict: false });
+        if (Array.isArray(mergeTables[PIPESYNC_PLAN_VIEW_TABLE])) {
+          data[PIPESYNC_PLAN_VIEW_TABLE] = cloneSnapshotRows(mergeTables[PIPESYNC_PLAN_VIEW_TABLE]);
+        } else if (!Array.isArray(data[PIPESYNC_PLAN_VIEW_TABLE])) {
+          data[PIPESYNC_PLAN_VIEW_TABLE] = [];
+        }
+        if (Array.isArray(mergeTables[PIPESYNC_PRICING_STATE_TABLE])) {
+          data[PIPESYNC_PRICING_STATE_TABLE] = cloneSnapshotRows(mergeTables[PIPESYNC_PRICING_STATE_TABLE]);
+        } else if (!Array.isArray(data[PIPESYNC_PRICING_STATE_TABLE])) {
+          data[PIPESYNC_PRICING_STATE_TABLE] = [];
+        }
+      } catch {
+        if (!Array.isArray(data[PIPESYNC_PLAN_VIEW_TABLE])) data[PIPESYNC_PLAN_VIEW_TABLE] = [];
+        if (!Array.isArray(data[PIPESYNC_PRICING_STATE_TABLE])) data[PIPESYNC_PRICING_STATE_TABLE] = [];
       }
-    } catch {
-      if (!Array.isArray(data[PIPESYNC_PLAN_VIEW_TABLE])) data[PIPESYNC_PLAN_VIEW_TABLE] = [];
-      if (!Array.isArray(data[PIPESYNC_PRICING_STATE_TABLE])) data[PIPESYNC_PRICING_STATE_TABLE] = [];
+      const next = {
+        generatedAt: nowIso(),
+        source: 'horizon-backend',
+        scope: { clientId: 'portal-users', jobId: '3' },
+        data
+      };
+      // Re-check latest under the write lock; if a mutation landed while we built PG tables,
+      // prefer that planner/app-data so we never clobber a fresher import.
+      try {
+        const fresh = await loadWasabiLatestStateSnapshotWithMeta(true);
+        const freshData = readWasabiSnapshotDataTables(fresh?.snapshot || {}, { strict: false });
+        for (const tableName of preserveFromLatest) {
+          if (Array.isArray(freshData[tableName])) {
+            data[tableName] = cloneSnapshotRows(freshData[tableName]);
+          }
+        }
+        if (Array.isArray(freshData[PIPESYNC_PLAN_VIEW_TABLE])) {
+          data[PIPESYNC_PLAN_VIEW_TABLE] = cloneSnapshotRows(freshData[PIPESYNC_PLAN_VIEW_TABLE]);
+        }
+        if (Array.isArray(freshData[PIPESYNC_PRICING_STATE_TABLE])) {
+          data[PIPESYNC_PRICING_STATE_TABLE] = cloneSnapshotRows(freshData[PIPESYNC_PRICING_STATE_TABLE]);
+        }
+        previousEtag = fresh?.etag || previousEtag;
+      } catch {
+        // keep assembled data
+      }
+      await putWasabiStateObject(next, previousEtag ? { ifMatch: previousEtag } : {});
+    } catch (err) {
+      if (err?.code === 'WASABI_STATE_PRECONDITION_FAILED' || wasabiStatePreconditionError(err)) {
+        console.warn('[wasabi-state] snapshot skipped due to concurrent write (safe)');
+        return;
+      }
+      console.warn('[wasabi-state] snapshot failed:', err && err.message ? err.message : err);
+    } finally {
+      wasabiStateSnapshotBusy = false;
     }
-    const next = {
-      generatedAt: nowIso(),
-      source: 'horizon-backend',
-      scope: { clientId: 'portal-users', jobId: '3' },
-      data
-    };
-    await putWasabiStateObject(next);
-  } catch (err) {
-    console.warn('[wasabi-state] snapshot failed:', err && err.message ? err.message : err);
-  } finally {
-    wasabiStateSnapshotBusy = false;
-  }
+  };
+  const run = wasabiStateWriteQueue.then(task, task);
+  wasabiStateWriteQueue = run.catch(() => {});
+  return run;
 }
 
 async function syncWasabiNow(reason = 'manual') {
@@ -10089,14 +10179,44 @@ app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) =>
     }
 
     record.saved_by = req.user.displayName || req.user.username;
-    const saved = await persistRecord(record);
+    const expectedCount = (record.systems?.[targetSystem] || []).length;
+    let saved = await persistRecord(record);
+    // Re-read from Wasabi (force) so we never toast success if a concurrent snapshot wiped the write.
+    let verified = await fetchRecordById(saved?.id || record.id);
+    let verifiedCount = (verified?.systems?.[targetSystem] || []).length;
+    if (verifiedCount < expectedCount) {
+      console.warn('[db3-commit] Wasabi re-read lost segments; retrying persist', {
+        recordId: String(saved?.id || record.id || ''),
+        targetSystem,
+        expectedCount,
+        verifiedCount
+      });
+      saved = await persistRecord(record);
+      verified = await fetchRecordById(saved?.id || record.id);
+      verifiedCount = (verified?.systems?.[targetSystem] || []).length;
+    }
+    if (verifiedCount < expectedCount) {
+      return res.status(500).json({
+        success: false,
+        added,
+        skippedExcluded,
+        skippedExisting,
+        error: `Import write did not stick in Wasabi (expected ${expectedCount} ${targetSystem} segments, found ${verifiedCount}). Retry commit.`,
+        recordId: saved?.id || record?.id || null,
+        targetClient,
+        targetCity,
+        targetJobsite,
+        targetSystem,
+        landedOnImportQueue: String(targetClient || '') === PSR_IMPORT_QUEUE_CLIENT
+      });
+    }
     res.json({
       success: true,
       added,
       skippedExcluded,
       skippedExisting,
-      record: saved,
-      recordId: saved?.id || record?.id || null,
+      record: verified || saved,
+      recordId: verified?.id || saved?.id || record?.id || null,
       targetClient,
       targetCity,
       targetJobsite,
