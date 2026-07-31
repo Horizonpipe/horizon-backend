@@ -1,10 +1,10 @@
 ﻿{
-  "title": "Structure Mode panel scrollable and resizable",
-  "description": "The Structure Mode floating menu grew too tall after the Plan Sync group picker was added, so the structure node list was clipped off the bottom with no way to reach it. The panel now stays within the viewport, the node list scrolls, and you can drag the bottom-right corner to resize (size is remembered).\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map35). Open Structure Mode — the node list should be visible under placement controls; drag the corner if you want it larger.",
+  "title": "Plan Sync picker lists keep scroll position",
+  "description": "Choosing a PSR jobsite or PDF plan in Plan Sync was rebuilding the whole modal, which jumped every list back to the top. Scroll position is now preserved across those updates (and while searching), so you can keep picking without losing your place.\n\nWho is affected: PipeSync Plan Sync on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map36). Open Plan Sync, scroll a list, click/right-click rows — the list should stay put.",
   "changeLog": [
-    "Structure Mode float stays within the viewport and scrolls the node list.",
-    "Panel is resizable from the bottom-right corner; size is remembered.",
-    "Move structure node list above the Plan Sync group picker so nodes stay reachable."
+    "Preserve Plan Sync list scroll when adding/removing PSR or PDF rows.",
+    "Preserve scroll while typing in the Plan Sync search box.",
+    "Mark rows already in the group builder; click or right-click to add."
   ],
-  "updatedAt": "2026-07-31T02:55:00.000Z"
+  "updatedAt": "2026-07-31T03:00:00.000Z"
 }
