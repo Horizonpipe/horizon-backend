@@ -1,10 +1,10 @@
 ﻿{
-  "title": "Plan Sync picker lists keep scroll position",
-  "description": "Choosing a PSR jobsite or PDF plan in Plan Sync was rebuilding the whole modal, which jumped every list back to the top. Scroll position is now preserved across those updates (and while searching), so you can keep picking without losing your place.\n\nWho is affected: PipeSync Plan Sync on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map36). Open Plan Sync, scroll a list, click/right-click rows — the list should stay put.",
+  "title": "Adjust structure node text size",
+  "description": "Structure Mode can now resize label text separately from the node circle. Use Placement text size for new nodes, or select nodes → right-click → Adjust node / text size for existing ones. CSS no longer locks text to a fixed 47px size.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map37). Structure Mode → select nodes → Adjust node / text size.",
   "changeLog": [
-    "Preserve Plan Sync list scroll when adding/removing PSR or PDF rows.",
-    "Preserve scroll while typing in the Plan Sync search box.",
-    "Mark rows already in the group builder; click or right-click to add."
+    "Add independent structure node text size (placement default + batch adjust).",
+    "Persist per-node fontSize and board default text size with plan view.",
+    "Stop CSS from forcing structure labels to a fixed font size."
   ],
-  "updatedAt": "2026-07-31T03:00:00.000Z"
+  "updatedAt": "2026-07-31T03:10:00.000Z"
 }
