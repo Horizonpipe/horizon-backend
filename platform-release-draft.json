@@ -1,11 +1,12 @@
 {
-  "title": "Structure panel click, right-click menu, and ` toggle",
-  "description": "The Structure nodes floating list now responds correctly: click a row to jump the PDF Viewer to that node’s page, and right-click the list for Select nodes / Adjust node size only (board menus no longer steal those right-clicks).\n\nAlso: press the ` key while your mouse is over the Map/Viewer workspace (and you are not typing in a text box) to enter or exit Structure Mode.\n\nWho is affected: PipeSync Map Building + PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, open Structure Mode, click a list row and right-click the list to confirm.",
+  "title": "Structure highline names and dual H/L highlights",
+  "description": "Structure Mode can mark a manhole as having a highline (upper/lower at the same spot). Check “Has a highline” when naming a node; the second name defaults to the main name plus H (e.g. MH-83 → MH-83H), and you can override it. On the map, the main name stays large with the highline name under it at half size.\n\nAuto-highlight lines that touch a highline node draw as a two-tone green pair (mint upper / deeper green lower) with H and L letters on the strokes so upper vs lower is obvious at a glance.\n\nWho is affected: PipeSync Map Building + PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, place a structure with Has a highline checked, confirm dual labels, then run Auto Highlight on a segment that uses that node.",
   "changeLog": [
-    "Fix Structure list click so it snaps the Viewer to the selected node.",
-    "Fix Structure list right-click menu (Select nodes / Adjust node size only).",
-    "Stop Map board context-menu capture from stealing clicks on the Structure float.",
-    "Add ` hotkey to toggle Structure Mode when the pointer is over the workspace."
+    "Add Has a highline checkbox on the structure name modal with default name + H.",
+    "Persist hasHighline / highlineName on structure nodes (create, edit, reload).",
+    "Show main structure name large and highline name half-size under it.",
+    "Index highline names for Plan Sync / auto-highlight matching.",
+    "Render highline auto-highlights as dual mint/green strokes with H and L labels."
   ],
-  "updatedAt": "2026-07-31T01:20:00.000Z"
+  "updatedAt": "2026-07-31T00:10:00.000Z"
 }
