@@ -1,10 +1,10 @@
 ﻿{
-  "title": "Fix Structure Mode right-click + auto-highlight feedback",
-  "description": "Right-click on nodes in the Structure Mode floating list was swallowed by the PDF board context-menu suppressor (the float sits over the plan, so document capture stopped the event before the list menu could open). That is fixed so Edit name / highline / Force redraw work again.\n\nForce redraw auto-highlights was also failing silently because it used an incomplete Plan View context. It now calls the same full auto-highlight path as Plan Sync, shows a toast immediately, and writes a status line in the Structure panel (working / success / error).\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map31).",
+  "title": "Fix highlight misalignment after bookmark jump",
+  "description": "Jumping to a bookmark in PDF Viewer was resetting page layout to intrinsic sheet size while the continuous Viewer was still showing zoomed pages. Structure nodes kept using the live zoom size, but highlight lines painted from the reset board.pages size — so highlights drifted off the nodes (fat wrong-position lines with labels).\n\nBookmark focus no longer normalizes/replaces live page geometry when continuous Viewer is mounted. Overlay painting now uses the same live width/height for lines as for structure nodes.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map32). If highlights still look wrong, Force redraw auto-highlights after refresh.",
   "changeLog": [
-    "Allow Structure Mode list right-click menu to open over the PDF board.",
-    "Force redraw uses full Plan Sync auto-highlight context (no silent failure).",
-    "Toast + in-panel status message while/after redrawing auto-highlights."
+    "Skip Viewer layout normalize on bookmark jump when continuous Viewer owns page size.",
+    "Paint highlight overlays using live slot width/height (same as structure nodes).",
+    "Refresh continuous overlays after bookmark focus."
   ],
-  "updatedAt": "2026-07-31T02:20:00.000Z"
+  "updatedAt": "2026-07-31T02:25:00.000Z"
 }
