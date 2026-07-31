@@ -1,10 +1,10 @@
 ﻿{
-  "title": "Fix highlight misalignment after bookmark jump",
-  "description": "Jumping to a bookmark in PDF Viewer was resetting page layout to intrinsic sheet size while the continuous Viewer was still showing zoomed pages. Structure nodes kept using the live zoom size, but highlight lines painted from the reset board.pages size — so highlights drifted off the nodes (fat wrong-position lines with labels).\n\nBookmark focus no longer normalizes/replaces live page geometry when continuous Viewer is mounted. Overlay painting now uses the same live width/height for lines as for structure nodes.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map32). If highlights still look wrong, Force redraw auto-highlights after refresh.",
+  "title": "Structure Mode Plan Sync group picker for auto-highlight",
+  "description": "Force redraw auto-highlights needs an active Plan Sync group. Structure Mode now includes a searchable group list above that button so you can pick the group without opening Plan Sync first. If only one saved group exists, it is selected automatically.\n\nWho is affected: PipeSync Plan View on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh Plan Sync (map33). In Structure Mode, search/select your group, then Force redraw.",
   "changeLog": [
-    "Skip Viewer layout normalize on bookmark jump when continuous Viewer owns page size.",
-    "Paint highlight overlays using live slot width/height (same as structure nodes).",
-    "Refresh continuous overlays after bookmark focus."
+    "Add searchable Plan Sync group picker to Structure Mode panel.",
+    "Force redraw uses the selected group and explains when none is selected.",
+    "Auto-select the only saved group when none is active."
   ],
-  "updatedAt": "2026-07-31T02:25:00.000Z"
+  "updatedAt": "2026-07-31T02:35:00.000Z"
 }
