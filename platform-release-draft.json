@@ -1,11 +1,11 @@
 {
-  "title": "Map Builder sheet scale repair",
-  "description": "Some Map Builder PDF sheets were rendering as a tiny drawing in the corner of a huge white page, with highlights/structure overlays stretched across the empty paper. Root cause: page layout size stayed large while viewDispScale was stuck at 1 (or native size was wrongly set equal to the layout box), so the PDF media was not CSS-scaled into the sheet.\n\nReconcile now forces viewDispScale to match layout÷native crop, recovers inflated native sizes, and first-paint HTML applies the same scale transform. Legacy map rebuild uses the correct map display scale.\n\nWho is affected: PipeSync Map Building on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync and reopen Map Builder — every sheet should fill its paper box with overlays aligned.",
+  "title": "Structure panel click, right-click menu, and ` toggle",
+  "description": "The Structure nodes floating list now responds correctly: click a row to jump the PDF Viewer to that node’s page, and right-click the list for Select nodes / Adjust node size only (board menus no longer steal those right-clicks).\n\nAlso: press the ` key while your mouse is over the Map/Viewer workspace (and you are not typing in a text box) to enter or exit Structure Mode.\n\nWho is affected: PipeSync Map Building + PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, open Structure Mode, click a list row and right-click the list to confirm.",
   "changeLog": [
-    "Fix Map sheets stuck with viewDispScale=1 inside oversized paper boxes.",
-    "Recover native size when it was wrongly set to the layout footprint.",
-    "Apply CSS scale on first paint so sheets are not briefly unscaled.",
-    "Legacy map scale rebuild uses the intended Map display scale."
+    "Fix Structure list click so it snaps the Viewer to the selected node.",
+    "Fix Structure list right-click menu (Select nodes / Adjust node size only).",
+    "Stop Map board context-menu capture from stealing clicks on the Structure float.",
+    "Add ` hotkey to toggle Structure Mode when the pointer is over the workspace."
   ],
-  "updatedAt": "2026-07-31T01:05:00.000Z"
+  "updatedAt": "2026-07-31T01:20:00.000Z"
 }
