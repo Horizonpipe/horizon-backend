@@ -1,12 +1,10 @@
-{
-  "title": "Plan Sync labels + DB3 import that actually lands in PSR",
-  "description": "Plan Sync list labels showed weird characters (quote + cent) between client, city, and jobsite because a bad character-repair pass corrupted the separator in the UI code. Those separators are restored to a normal middle-dot.\n\nDB3 Commit could toast success even when zero pipes were added. Cross-jobsite “same reference elsewhere” warnings were treated like hard duplicates and defaulted to Exclude, so a whole preview could be skipped while still saying success. Commit now reports how many segments were added, errors clearly when nothing imported, imports cross-jobsite warnings by default, and still excludes true same-jobsite duplicates unless you choose Include.\n\nWho is affected: PipeSync Plan Sync + DB3 importer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh. Plan Sync names should read Client · City · Jobsite. Re-preview/commit the DB3 — toast should say how many segments imported (or explain why none did).",
+﻿{
+  "title": "PSR placement picker shows jobs again for sanitary imports",
+  "description": "The DB3 importer placement picker could show an empty list when the active Plan Sync group was set to Sanitary. It was hiding every jobsite that did not already have sanitary pipes — so you could not pick a storm-only job to import sanitary into.\n\nThe picker now lists green PSR jobs regardless of whether that system branch already has segments, and falls back to all jobs if the group’s saved job keys do not match live records.\n\nWho is affected: PipeSync Plan Sync DB3 importer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh, open Upload/Update DB3, confirm the green job list loads, pick a job + Sanitary, then commit.",
   "changeLog": [
-    "Restore Plan Sync / importer client·city·jobsite separators (remove \"¢ garbage).",
-    "DB3 commit returns added/skipped counts and fails clearly when nothing imported.",
-    "Cross-jobsite placed-duplicate warnings default to Include; same-jobsite duplicates still default Exclude.",
-    "Toast shows where segments landed (including Import Sort when no client was set).",
-    "createPlannerRecord on DB3 commit now passes the request for correct tenancy/scopes."
+    "Stop filtering placement picker by empty storm/sanitary segment arrays.",
+    "Fall back to all PSR jobs if active group job keys match nothing.",
+    "Clearer empty-state message when no jobs are loaded vs no search hits."
   ],
-  "updatedAt": "2026-07-31T01:15:00.000Z"
+  "updatedAt": "2026-07-31T01:35:00.000Z"
 }
