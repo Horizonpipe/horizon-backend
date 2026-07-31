@@ -1,11 +1,11 @@
 {
-  "title": "Edit existing nodes for highline",
-  "description": "Existing structure nodes can now be marked as highlines after they are placed. Right-click a node (or a row in the Structure list) for Edit name or Has a highline. The highline checkbox in the name dialog is larger and clearer, and saving applies the same default name + H behavior as when placing a new node.\n\nWho is affected: PipeSync Map Building + PDF Viewer on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh PipeSync, Structure Mode → right-click an existing node → Has a highline → Save.",
+  "title": "Fix highlight misalignment when zooming",
+  "description": "Zooming the PDF Viewer could briefly (or stuck) drift highlight lines off the sheet. Root cause: page width/height changed on zoom, then highlight math rewrote position fractions from the old pixel coords against the new size. Zooming again sometimes realigned them by accident.\n\nPipeSync now locks highlight positions before any zoom resize, then rematerializes only from the stored fractions — same safe pattern structure nodes already used. Page height also prefers the known PDF aspect so overlays paint correctly on the first zoom tick.\n\nWho is affected: PipeSync PDF Viewer (continuous) on pipeshare.live (BASE). SaaS unchanged until cPanel apply.\n\nHard-refresh, draw or auto-highlight a line, then Ctrl+wheel zoom in/out repeatedly — highlights should stay glued to the sheet.",
   "changeLog": [
-    "Add Has a highline / Clear highline on structure node right-click menu.",
-    "Add Edit name and highline options when right-clicking a Structure list row.",
-    "Make the highline checkbox larger and keep it in sync while editing existing nodes.",
-    "Refresh map labels immediately when highline is set or cleared on an existing node."
+    "Lock highlight nrx/nry before Viewer zoom changes page size.",
+    "Heal highlights from fractions only (never rewrite fractions after resize).",
+    "Use known PDF aspect for page height so first overlay paint matches the sheet.",
+    "Apply the same lock→resize→heal pattern on mount and aspect corrections."
   ],
-  "updatedAt": "2026-07-31T00:25:00.000Z"
+  "updatedAt": "2026-07-31T00:55:00.000Z"
 }
