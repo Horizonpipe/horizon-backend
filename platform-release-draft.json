@@ -1,12 +1,10 @@
 {
-  "title": "AutoSync Shared Base + Uploaded by filter",
-  "description": "Crew AutoSync no longer creates a separate folder tree per username. Project files land under a shared Jobs/… path so Thomas and Trey on the same PC upload into one job folder. Each file records who uploaded it, and PipeShare adds an Uploaded by dropdown to filter the explorer.\n\nWho is affected: Data Auto Sync desktop uploaders and PipeShare file explorer on BASE (and SaaS after Push).",
+  "title": "PipeShare BASE login default (pipeshare.live)",
+  "description": "On https://pipeshare.live, sign-in now defaults to the PipeShare client portal instead of PipeSync. Explicit ?product=pipesync deep links still open PipeSync. SaaS tenant hosts are unchanged.\n\nWho is affected: anyone signing in at pipeshare.live / www.pipeshare.live without a product query param.",
   "changeLog": [
-    "AutoSync uploads under Jobs/{local relative path} instead of {username}/…",
-    "Optional continuity: reuse an existing user-prefixed job folder when Jobs/… does not exist yet",
-    "Stamp uploadedBy (username, display name, user id) on portal uploads",
-    "PipeShare explorer: Uploaded by column and filter dropdown (cache-bust dbgUploadedBy)",
-    "Backend: resolve-autosync-base route and portal_object_uploaded_by metadata"
+    "resolveLoginProduct: default product=pipeshare on pipeshare.live / www.pipeshare.live",
+    "login.js host check aligned with React login bundle",
+    "login.html cache-bust ?v=20260914pipeshareBase"
   ],
-  "updatedAt": "2026-09-14T15:30:00.000Z"
+  "updatedAt": "2026-09-14T16:40:00.000Z"
 }
