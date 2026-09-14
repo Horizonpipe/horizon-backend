@@ -73,6 +73,8 @@ const {
 const CATEGORIES = new Set(['videos', 'db3', 'pdf', 'photos']);
 const FOLDER_MARKER = '.hp-folder';
 const DATA_AUTO_SYNC_MODE = 'dataautosync';
+/** Shared Base folder for AutoSync Option 2 (crew share one tree; not per-user path prefixes). */
+const DATA_AUTO_SYNC_SHARED_BASE = String(process.env.DATA_AUTO_SYNC_SHARED_BASE || 'Jobs').trim() || 'Jobs';
 /** Client / non-employee AUTOSYNC accounts default to this job folder (default 8; override with DATA_AUTO_SYNC_CLIENT_JOB_ID). */
 const DATA_AUTO_SYNC_JOB_ID = String(process.env.DATA_AUTO_SYNC_CLIENT_JOB_ID || '8').trim() || '8';
 /** `roles.dataAutoSyncEmployee` users who are not portal admins are pinned to this folder (default 2). */
@@ -509,6 +511,34 @@ async function ensurePortalObjectSha256Schema(pool) {
     });
   }
   return portalObjectSha256SchemaReady;
+}
+
+let portalObjectUploadedBySchemaReady = null;
+
+/** Who uploaded each object (AutoSync Shared Base — filterable in PipeShare). */
+async function ensurePortalObjectUploadedBySchema(pool) {
+  if (!portalObjectUploadedBySchemaReady) {
+    portalObjectUploadedBySchemaReady = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS portal_object_uploaded_by (
+          object_key TEXT PRIMARY KEY,
+          client_id TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          username TEXT NOT NULL DEFAULT '',
+          display_name TEXT NOT NULL DEFAULT '',
+          user_id TEXT NOT NULL DEFAULT '',
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await pool.query(
+        `CREATE INDEX IF NOT EXISTS idx_portal_object_uploaded_by_scope ON portal_object_uploaded_by (client_id, job_id)`
+      );
+    })().catch((e) => {
+      portalObjectUploadedBySchemaReady = null;
+      throw e;
+    });
+  }
+  return portalObjectUploadedBySchemaReady;
 }
 
 function resumableChunkSize(raw) {
@@ -1522,13 +1552,20 @@ async function assertPortalPathRel(grantPool, user, clientId, jobId, relPath, re
   if (userIsPortalAdmin(user)) return true;
   const jobOk = await assertPortalJobAccess(grantPool, user, String(clientId), String(jobId));
   if (!jobOk) return false;
+  const rp = normalizeRelPath(relPath);
+  // AutoSync Shared Base (Jobs/…): any job member with DAS/portal files access may read/write here.
+  if (
+    isDataAutosyncSharedBaseRel(rp) &&
+    (userCanDataAutoSync(user) || userHasPortalFilesOrAutosyncMaster(user))
+  ) {
+    return true;
+  }
   const anyGrants = await portalOrCompanyJobHasPathGrants(grantPool, user, clientId, jobId);
   if (!anyGrants) return true;
   const grants = await loadCombinedUserPathGrants(grantPool, clientId, jobId, user);
   if (!grants.length) {
     return bypassPathGrantsForLenientPortalClient(user, grants);
   }
-  const rp = normalizeRelPath(relPath);
   const best = bestPathGrantForRelPath(grants, rp);
   if (!best) return false;
   return grantModeAllows(best.access_mode, required);
@@ -1547,8 +1584,7 @@ async function assertRelPathMatchesPortalTreeVisibility(grantPool, req, clientId
   const permEditorTree = readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
   if (!jobHasPathGrants || permEditorTree) {
     if (isDas) {
-      const ur = normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user));
-      if (ur && rp !== ur && !rp.startsWith(`${ur}/`)) return false;
+      if (!isDataAutosyncVisibleRel(req.user, rp)) return false;
     }
     return true;
   }
@@ -1556,12 +1592,17 @@ async function assertRelPathMatchesPortalTreeVisibility(grantPool, req, clientId
   if (bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) return true;
   if (treeUserGrants.length) {
     const best = bestPathGrantForRelPath(treeUserGrants, rp);
-    return Boolean(best && normalizeGrantAccessMode(best.access_mode) !== 'off');
+    if (best && normalizeGrantAccessMode(best.access_mode) !== 'off') return true;
+    if (
+      isDataAutosyncSharedBaseRel(rp) &&
+      (userCanDataAutoSync(req.user) || userHasPortalFilesOrAutosyncMaster(req.user))
+    ) {
+      return true;
+    }
+    return false;
   }
   if (isDas) {
-    const ur = normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user));
-    if (ur) return rp === ur || rp.startsWith(`${ur}/`);
-    return false;
+    return isDataAutosyncVisibleRel(req.user, rp);
   }
   return false;
 }
@@ -1581,12 +1622,11 @@ async function createPortalPathVisibilityChecker(grantPool, req, clientId, jobId
   const jobHasPathGrants = await portalOrCompanyJobHasPathGrants(grantPool, req.user, clientId, jobId);
   const permEditorTree = readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
   if (!jobHasPathGrants || permEditorTree) {
-    const ur = isDas ? normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user)) : '';
     return {
       check(relPath) {
         const rp = normalizeRelPath(relPath || '');
         if (!rp) return false;
-        if (isDas && ur && rp !== ur && !rp.startsWith(`${ur}/`)) return false;
+        if (isDas && !isDataAutosyncVisibleRel(req.user, rp)) return false;
         return true;
       }
     };
@@ -1600,23 +1640,84 @@ async function createPortalPathVisibilityChecker(grantPool, req, clientId, jobId
       check(relPath) {
         const rp = normalizeRelPath(relPath || '');
         if (!rp) return false;
+        if (
+          isDataAutosyncSharedBaseRel(rp) &&
+          (userCanDataAutoSync(req.user) || userHasPortalFilesOrAutosyncMaster(req.user))
+        ) {
+          return true;
+        }
         const best = bestPathGrantForRelPath(treeUserGrants, rp);
         return Boolean(best && normalizeGrantAccessMode(best.access_mode) !== 'off');
       }
     };
   }
   if (isDas) {
-    const ur = normalizeRelPath(dataAutosyncPortalUserFolderPrefix(req.user));
     return {
       check(relPath) {
-        const rp = normalizeRelPath(relPath || '');
-        if (!rp) return false;
-        if (ur) return rp === ur || rp.startsWith(`${ur}/`);
-        return false;
+        return isDataAutosyncVisibleRel(req.user, relPath);
       }
     };
   }
   return { check: () => false };
+}
+
+/** Union two tree listings (path-keyed). */
+function mergeTreeUnion(a, b) {
+  const folderMap = new Map();
+  const fileMap = new Map();
+  for (const fol of [...(a?.folders || []), ...(b?.folders || [])]) {
+    const p = normalizeRelPath(fol?.path || '');
+    if (p) folderMap.set(p, fol);
+  }
+  for (const f of [...(a?.files || []), ...(b?.files || [])]) {
+    const id = String(f?.id || f?.key || f?.path || '');
+    if (id) fileMap.set(id, f);
+  }
+  return {
+    folders: [...folderMap.values()].sort((x, y) =>
+      String(x.path || '').localeCompare(String(y.path || ''), undefined, { sensitivity: 'base' })
+    ),
+    files: [...fileMap.values()]
+  };
+}
+
+/** Keep files under Shared Base and/or the legacy user folder for Data Auto Sync visibility. */
+function filterTreeToDasVisiblePrefixes(tree, userRoot) {
+  const ur = normalizeRelPath(userRoot || '');
+  const base = normalizeRelPath(DATA_AUTO_SYNC_SHARED_BASE);
+  const files = (tree.files || []).filter((f) => {
+    const rp = normalizeRelPath(f.path || '');
+    if (base && (rp === base || rp.startsWith(`${base}/`))) return true;
+    if (ur && (rp === ur || rp.startsWith(`${ur}/`))) return true;
+    return false;
+  });
+  const keepFolders = new Set();
+  const seedPrefixes = [];
+  if (base) seedPrefixes.push(base);
+  if (ur) seedPrefixes.push(ur);
+  for (const p of seedPrefixes) {
+    let up = p;
+    while (up) {
+      keepFolders.add(up);
+      up = parentRelPath(up);
+    }
+  }
+  for (const f of files) {
+    let cur = f.parentPath || '';
+    while (cur) {
+      keepFolders.add(normalizeRelPath(cur));
+      cur = parentRelPath(cur);
+    }
+  }
+  // Also keep empty Shared Base / user folder markers when present in the listing.
+  for (const fol of tree.folders || []) {
+    const fp = normalizeRelPath(fol.path || '');
+    if (!fp) continue;
+    if (base && (fp === base || fp.startsWith(`${base}/`))) keepFolders.add(fp);
+    if (ur && (fp === ur || fp.startsWith(`${ur}/`))) keepFolders.add(fp);
+  }
+  const folders = (tree.folders || []).filter((fol) => keepFolders.has(normalizeRelPath(fol.path || '')));
+  return { folders, files };
 }
 
 /** Keep only files (and ancestor folders) under a relative path prefix — used for Data Auto Sync tree when job has grants but the user has no explicit grant rows yet. */
@@ -1652,6 +1753,23 @@ function dataAutosyncPortalUserFolderPrefix(user) {
   const safe = raw.replace(/[^A-Za-z0-9 _-]/g, '').trim();
   if (!safe) return '';
   return safe.length > 72 ? safe.slice(0, 72) : safe;
+}
+
+/** Shared Base (`Jobs/…`) is visible/writable for Data Auto Sync alongside the legacy user folder. */
+function isDataAutosyncSharedBaseRel(relPath) {
+  const rp = normalizeRelPath(relPath || '');
+  const base = normalizeRelPath(DATA_AUTO_SYNC_SHARED_BASE);
+  if (!base) return false;
+  return rp === base || rp.startsWith(`${base}/`);
+}
+
+function isDataAutosyncVisibleRel(user, relPath) {
+  const rp = normalizeRelPath(relPath || '');
+  if (!rp) return false;
+  if (isDataAutosyncSharedBaseRel(rp)) return true;
+  const ur = normalizeRelPath(dataAutosyncPortalUserFolderPrefix(user));
+  if (ur && (rp === ur || rp.startsWith(`${ur}/`))) return true;
+  return false;
 }
 
 function filterTreeByPathGrants(tree, grants, jobHasAnyGrant) {
@@ -2308,6 +2426,43 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     );
   }
 
+  function uploadedByFromRequestUser(user) {
+    const username = String(user?.username || '').trim();
+    const displayName = String(user?.displayName || username || '').trim();
+    const userId = String(user?.id ?? '').trim();
+    return {
+      username: username.slice(0, 120),
+      displayName: displayName.slice(0, 160),
+      userId: userId.slice(0, 80)
+    };
+  }
+
+  async function upsertPortalObjectUploadedBy(key, clientId, jobId, user) {
+    const meta = uploadedByFromRequestUser(user);
+    if (!meta.username && !meta.displayName && !meta.userId) return;
+    await ensurePortalObjectUploadedBySchema(uploadMetaPool);
+    await uploadMetaPool.query(
+      `INSERT INTO portal_object_uploaded_by
+         (object_key, client_id, job_id, username, display_name, user_id, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       ON CONFLICT (object_key) DO UPDATE SET
+         username = EXCLUDED.username,
+         display_name = EXCLUDED.display_name,
+         user_id = EXCLUDED.user_id,
+         client_id = EXCLUDED.client_id,
+         job_id = EXCLUDED.job_id,
+         updated_at = NOW()`,
+      [
+        String(key),
+        String(clientId),
+        String(jobId),
+        meta.username,
+        meta.displayName,
+        meta.userId
+      ]
+    );
+  }
+
   /**
    * Attach SHA-256 from `portal_upload_sessions` (resumable) and `portal_object_sha256` (presigned)
    * onto tree file nodes for client-side hash dedupe.
@@ -2351,6 +2506,42 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
     } catch (e) {
       console.warn('[portal-files] mergeCompletedUploadSha256IntoTree:', e?.message || e);
+    }
+  }
+
+  /** Attach uploadedBy metadata onto tree file nodes for PipeShare filter. */
+  async function mergeUploadedByIntoTree(clientId, jobId, tree) {
+    const files = tree && Array.isArray(tree.files) ? tree.files : [];
+    if (!files.length) return;
+    try {
+      await ensurePortalObjectUploadedBySchema(uploadMetaPool);
+      const r = await uploadMetaPool.query(
+        `SELECT object_key, username, display_name, user_id
+         FROM portal_object_uploaded_by WHERE client_id = $1 AND job_id = $2`,
+        [String(clientId), String(jobId)]
+      );
+      const byKey = new Map();
+      for (const row of r.rows || []) {
+        const k = String(row.object_key || '');
+        if (!k) continue;
+        byKey.set(k, {
+          username: String(row.username || '').trim(),
+          displayName: String(row.display_name || '').trim(),
+          userId: String(row.user_id || '').trim()
+        });
+      }
+      for (const f of files) {
+        const key = String(f.key || '');
+        const meta = byKey.get(key);
+        if (!meta) continue;
+        const label = meta.displayName || meta.username || '';
+        if (label) f.uploadedBy = label;
+        if (meta.username) f.uploadedByUsername = meta.username;
+        if (meta.displayName) f.uploadedByDisplayName = meta.displayName;
+        if (meta.userId) f.uploadedByUserId = meta.userId;
+      }
+    } catch (e) {
+      console.warn('[portal-files] mergeUploadedByIntoTree:', e?.message || e);
     }
   }
 
@@ -2654,22 +2845,36 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         treeUserGrants = await loadCombinedUserPathGrants(aclPool, clientId, jobId, req.user);
         if (!bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) {
           if (treeUserGrants.length) {
+            const unfilteredTree = tree;
             tree = filterTreeByPathGrants(tree, treeUserGrants, true);
+            // Also keep Shared Base for DAS-capable users (Option 2).
+            if (
+              isDataAutoSyncTreeList &&
+              (userCanDataAutoSync(req.user) || userHasPortalFilesOrAutosyncMaster(req.user))
+            ) {
+              const sharedOnly = filterTreeToDasVisiblePrefixes(unfilteredTree, '');
+              tree = mergeTreeUnion(tree, sharedOnly);
+            }
             appliedPathGrantFilter = true;
           } else if (isDataAutoSyncTreeList) {
             const userRoot = dataAutosyncPortalUserFolderPrefix(req.user);
-            if (userRoot) {
-              tree = filterTreeToDescendantPrefix(tree, userRoot);
-              appliedPathGrantFilter = true;
-            } else {
-              tree = filterTreeByPathGrants(tree, treeUserGrants, true);
-              appliedPathGrantFilter = true;
-            }
+            tree = filterTreeToDasVisiblePrefixes(tree, userRoot);
+            appliedPathGrantFilter = true;
           } else {
             tree = filterTreeByPathGrants(tree, treeUserGrants, true);
             appliedPathGrantFilter = true;
           }
         }
+      } else if (
+        isDataAutoSyncTreeList &&
+        !permEditorTree &&
+        !userIsPortalAdmin(req.user) &&
+        req.user?.autosyncMasterGranted !== true
+      ) {
+        // No path-grant rows: still limit DAS explorers to Shared Base + legacy user folder.
+        const userRoot = dataAutosyncPortalUserFolderPrefix(req.user);
+        tree = filterTreeToDasVisiblePrefixes(tree, userRoot);
+        appliedPathGrantFilter = true;
       }
       // #region agent log
       hpAgentDebugLog(
@@ -2710,6 +2915,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!skipHashMerge) {
         await mergeCompletedUploadSha256IntoTree(clientId, jobId, tree);
       }
+      await mergeUploadedByIntoTree(clientId, jobId, tree);
       if (!permEditorTree) {
         tree = filterHiddenPortalTreeForTenantClient(tree, clientId);
       }
@@ -2987,6 +3193,119 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
       }
       return res.json({ success: true, present, missing, sizeMismatch });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  /**
+   * AutoSync Shared Base resolver (Option 2).
+   * Body: `{ clientId, jobId, portalMode?: "dataautosync", projectFolder: "Creekview 24B" }`
+   * Returns `{ basePrefix }` —
+   *   - `Jobs/{project}` when Shared Base already has objects or nothing matches
+   *   - `{user}/{project}` when only a legacy user-prefixed folder exists (continuity)
+   */
+  r.post('/resolve-autosync-base', express.json({ limit: '32kb' }), async (req, res) => {
+    try {
+      const body = req.body || {};
+      const scope = resolvePortalScope(req, body);
+      if (scope.error) return res.status(400).json({ error: scope.error });
+      const { clientId, jobId } = scope;
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, String(clientId), String(jobId)))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      let projectFolder;
+      try {
+        projectFolder = normalizeRelPath(body.projectFolder || body.project || body.folder || '');
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        return res.status(400).json({ error: m });
+      }
+      if (!projectFolder || projectFolder.includes('/')) {
+        return res.status(400).json({ error: 'projectFolder must be a single top-level folder name' });
+      }
+      const sharedBase = normalizeRelPath(DATA_AUTO_SYNC_SHARED_BASE);
+      const sharedPrefix = `${sharedBase}/${projectFolder}`;
+      const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
+      const treePortalMode = readPortalMode(req, body);
+      const pathGate = await createPortalPathVisibilityChecker(aclPool, req, clientId, jobId, treePortalMode);
+
+      const hasAnyUnder = async (relPrefix) => {
+        const listP = `${pref}${relPrefix}/`;
+        try {
+          const resp = await portalS3().send(
+            new ListObjectsV2Command({
+              Bucket: portalBucket(),
+              Prefix: listP,
+              MaxKeys: 1
+            })
+          );
+          return Array.isArray(resp.Contents) && resp.Contents.length > 0;
+        } catch {
+          return false;
+        }
+      };
+
+      if (await hasAnyUnder(sharedPrefix)) {
+        if (!pathGate.check(sharedPrefix) && !pathGate.check(sharedBase)) {
+          return res.status(403).json({ error: 'Forbidden' });
+        }
+        return res.json({
+          success: true,
+          basePrefix: sharedPrefix,
+          source: 'shared'
+        });
+      }
+
+      // Legacy continuity: any top-level `{Someone}/{projectFolder}`
+      const legacyCandidates = [];
+      try {
+        let pageToken;
+        do {
+          const resp = await portalS3().send(
+            new ListObjectsV2Command({
+              Bucket: portalBucket(),
+              Prefix: pref,
+              Delimiter: '/',
+              ContinuationToken: pageToken
+            })
+          );
+          for (const cp of resp.CommonPrefixes || []) {
+            const full = String(cp.Prefix || '');
+            if (!full.startsWith(pref)) continue;
+            const top = full.slice(pref.length).replace(/\/+$/, '');
+            if (!top || top === sharedBase) continue;
+            if (await hasAnyUnder(`${top}/${projectFolder}`)) {
+              legacyCandidates.push(`${top}/${projectFolder}`);
+            }
+          }
+          pageToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+        } while (pageToken);
+      } catch (e) {
+        console.warn('[portal-files] resolve-autosync-base legacy scan:', e?.message || e);
+      }
+
+      legacyCandidates.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+      for (const cand of legacyCandidates) {
+        if (pathGate.check(cand)) {
+          return res.json({
+            success: true,
+            basePrefix: cand,
+            source: 'legacy'
+          });
+        }
+      }
+
+      // Prefer Shared Base going forward for brand-new jobs.
+      if (!pathGate.check(sharedPrefix) && !pathGate.check(sharedBase)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      return res.json({
+        success: true,
+        basePrefix: sharedPrefix,
+        source: 'shared-new'
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });
@@ -4003,6 +4322,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       );
       const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const rel = built.key.slice(pref.length);
+      try {
+        await upsertPortalObjectUploadedBy(built.key, clientId, jobId, req.user);
+      } catch (metaErr) {
+        console.warn('[portal-files] upload/presign uploadedBy:', metaErr?.message || metaErr);
+      }
       return res.json({
         url,
         expiresIn: PORTAL_PRESIGN_TTL_SECONDS,
@@ -4054,6 +4378,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!uploadId) return res.status(500).json({ error: 'Failed to start multipart upload' });
       const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const rel = built.key.slice(pref.length);
+      try {
+        await upsertPortalObjectUploadedBy(built.key, clientId, jobId, req.user);
+      } catch (metaErr) {
+        console.warn('[portal-files] multipart/init uploadedBy:', metaErr?.message || metaErr);
+      }
       return res.json({
         uploadId,
         key: built.key,
@@ -4174,6 +4503,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       } catch (e) {
         console.warn('[portal-files] upsertPortalObjectSha256FromClient (multipart complete):', e?.message || e);
       }
+      try {
+        await upsertPortalObjectUploadedBy(key, parsed.clientId, parsed.jobId, req.user);
+      } catch (e) {
+        console.warn('[portal-files] upsertPortalObjectUploadedBy (multipart complete):', e?.message || e);
+      }
       let size = 0;
       const clientSize = Number(req.body?.fileSize);
       if (
@@ -4229,6 +4563,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(403).json({ error: 'Forbidden for this path' });
       }
       await upsertPortalObjectSha256FromClient(key, parsed.clientId, parsed.jobId, h);
+      try {
+        await upsertPortalObjectUploadedBy(key, parsed.clientId, parsed.jobId, req.user);
+      } catch (e) {
+        console.warn('[portal-files] upsertPortalObjectUploadedBy (register-sha256):', e?.message || e);
+      }
       return res.status(204).end();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

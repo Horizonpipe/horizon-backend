@@ -1,11 +1,12 @@
 {
-  "title": "Instant folder create — no clunky list refresh",
-  "description": "Creating folders in PipeShare felt slow: the browser name box, then a full list refresh with a “Refreshing file list…” banner before the folder showed up.\n\nNew folder now uses a clean in-app name dialog, paints the folder in the list as soon as the server creates it, and syncs quietly in the background — no refresh banner.\n\nWho is affected: PipeShare file explorer on BASE (and SaaS after Push).",
+  "title": "AutoSync Shared Base + Uploaded by filter",
+  "description": "Crew AutoSync no longer creates a separate folder tree per username. Project files land under a shared Jobs/… path so Thomas and Trey on the same PC upload into one job folder. Each file records who uploaded it, and PipeShare adds an Uploaded by dropdown to filter the explorer.\n\nWho is affected: Data Auto Sync desktop uploaders and PipeShare file explorer on BASE (and SaaS after Push).",
   "changeLog": [
-    "New folder appears immediately after create (no waiting on full list reload).",
-    "Remove the “Refreshing file list…” banner during mutations.",
-    "In-app New folder name dialog instead of the browser prompt.",
-    "Project structure folders paint as each subfolder is created."
+    "AutoSync uploads under Jobs/{local relative path} instead of {username}/…",
+    "Optional continuity: reuse an existing user-prefixed job folder when Jobs/… does not exist yet",
+    "Stamp uploadedBy (username, display name, user id) on portal uploads",
+    "PipeShare explorer: Uploaded by column and filter dropdown (cache-bust dbgUploadedBy)",
+    "Backend: resolve-autosync-base route and portal_object_uploaded_by metadata"
   ],
-  "updatedAt": "2026-07-09T17:25:00.000Z"
+  "updatedAt": "2026-09-14T15:30:00.000Z"
 }

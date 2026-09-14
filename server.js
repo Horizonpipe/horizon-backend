@@ -494,7 +494,7 @@ function sqlMirrorSkipBaseTable(raw) {
  */
 function buildWasabiSqlMirrorSkipTableSet() {
   const raw = process.env.WASABI_SQL_MIRROR_SKIP_TABLES;
-  const defaults = ['portal_object_sha256', 'portal_upload_sessions', 'portal_upload_session_parts'];
+  const defaults = ['portal_object_sha256', 'portal_object_uploaded_by', 'portal_upload_sessions', 'portal_upload_session_parts'];
   if (raw === undefined) return new Set(defaults);
   const trimmed = String(raw).trim();
   if (!trimmed || trimmed.toLowerCase() === 'none') return new Set();
