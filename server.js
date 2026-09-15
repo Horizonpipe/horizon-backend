@@ -1003,7 +1003,26 @@ function sanitizePlanBoardBranch(branch) {
         } else {
           o.pieces = [];
         }
-        if (!o.pieces.length) return null;
+        // Desktop / whole-PDF uploads often send archive storageKey with empty pieces.
+        // Previously those rows were dropped on PUT, so Push looked successful but the
+        // PDF never appeared in the Plan View library.
+        if (!o.pieces.length) {
+          if (sk && isPersistablePlanPdfStorageKey(sk)) {
+            o.pieces = [
+              {
+                name: String(o.name || 'Plan.pdf').slice(0, 260),
+                storageKey: sk,
+                w: 816,
+                h: 1056,
+                natW: 816,
+                natH: 1056,
+                pdfPageIndex: 0
+              }
+            ];
+          } else {
+            return null;
+          }
+        }
         if (!isPersistablePlanPdfStorageKey(sk)) {
           // Keep split-page metadata for docs whose original archive sync is still pending.
           // Without this, PDF doc identity disappears across saves and breaks unassigned parity.
@@ -1213,6 +1232,22 @@ function mergePlanViewMapWorkspaces(baseList, incomingList) {
   return [...byId.values()];
 }
 
+function mergePlanViewLegacyFolderId(baseDoc, incomingDoc) {
+  const a = String(baseDoc?.folderId || '').trim();
+  const b = String(incomingDoc?.folderId || '').trim();
+  if (a === b) return a || b;
+  const at = Date.parse(String(baseDoc?.folderUpdatedAt || '')) || 0;
+  const bt = Date.parse(String(incomingDoc?.folderUpdatedAt || '')) || 0;
+  // Stable identity is id/storageKey. Prefer the newer folder move stamp; if neither
+  // side stamped a move, keep base (server) so a portal move is not undone by Push.
+  if (bt !== at) {
+    if (bt > at) return b;
+    if (at > bt) return a;
+  }
+  if (a && b) return a;
+  return b || a;
+}
+
 function mergePlanViewLegacyPlans(baseList, incomingList) {
   const byId = new Map();
   const take = (doc) => {
@@ -1234,6 +1269,8 @@ function mergePlanViewLegacyPlans(baseList, incomingList) {
       merged.pieces = mergePlanViewAnnotationList(other.pieces, richer.pieces);
     }
     if (!merged.storageKey && other.storageKey) merged.storageKey = other.storageKey;
+    // prev is base when both sides exist (base list applied first).
+    merged.folderId = mergePlanViewLegacyFolderId(prev, doc);
     byId.set(id, merged);
   };
   for (const doc of Array.isArray(baseList) ? baseList : []) take(doc);

@@ -1,10 +1,10 @@
 {
-  "title": "Plan View multi-user shared highlight merge",
-  "description": "Plan View highlights now union-merge across users on the same tenant instead of overwriting each other. GET returns the caller's row merged with a shared __shared__ row; PUT merges the save into both so every user's marks accumulate. Desktop restore stays local; this ships the live API behavior on BASE/SaaS.\n\nWho is affected: anyone using PipeSync Plan View with more than one account on the same company/tenant.",
+  "title": "Plan View PDF upload keep + folder move identity",
+  "description": "Desktop Upload PDFs / Push was writing plan library rows with a valid Wasabi storageKey but empty pieces; the server sanitize step dropped those rows, so push looked successful while the PDF never appeared in Plan View. Persist now keeps whole-PDF archives (synthesizes a single piece from storageKey). Folder moves keep the same storageKey/id and use folderUpdatedAt so a later Push does not undo a server-side move.\n\nWho is affected: anyone uploading or pushing PDFs into PipeSync Plan View from Desktop or the web library.",
   "changeLog": [
-    "GET /pipesync/plan-view: user payload ∪ __shared__ (union by annotation id, prefer richer/pdf-vp1)",
-    "PUT /pipesync/plan-view: merge into user row and __shared__ (no blind replace)",
-    "Shared collaborative row username: __shared__"
+    "Sanitize legacyPlans: keep docs with archive storageKey even when pieces[] is empty (synthesize one piece)",
+    "Union-merge folderId by folderUpdatedAt (else prefer server) so portal moves survive local Push",
+    "Web Plan View folder moves stamp folderUpdatedAt"
   ],
-  "updatedAt": "2026-09-15T17:45:00.000Z"
+  "updatedAt": "2026-09-15T20:30:00.000Z"
 }
