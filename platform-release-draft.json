@@ -1,10 +1,13 @@
 {
-  "title": "PipeShare BASE login default (pipeshare.live)",
-  "description": "On https://pipeshare.live, sign-in now defaults to the PipeShare client portal instead of PipeSync. Explicit ?product=pipesync deep links still open PipeSync. SaaS tenant hosts are unchanged.\n\nWho is affected: anyone signing in at pipeshare.live / www.pipeshare.live without a product query param.",
+  "title": "Video↔Project↔DB3+META binding (PipeChart / PACP / Inspected by)",
+  "description": "PipeShare now keeps project DB3 and companion META DB3 linked by stable file IDs so clicking a video resolves the right project files for PipeChart, PACP codes, and Inspected by. Plan Sync import and auto-highlight require both DB3 files. Shared Base Jobs/ + Uploaded by are unchanged.\n\nWho is affected: crews using PipeShare pipe charts / PACP tables, and Plan Sync auto-highlight / WinCan import on BASE and SaaS.",
   "changeLog": [
-    "resolveLoginProduct: default product=pipeshare on pipeshare.live / www.pipeshare.live",
-    "login.js host check aligned with React login bundle",
-    "login.html cache-bust ?v=20260914pipeshareBase"
+    "Reject META *_Meta.db3 as primary; prefer bound META companion for Inspected by",
+    "Durable video→project→DB3+META resolver + inspection pipeline v26 cache keys",
+    "Portal inspection-bindings bindingType=meta (GET returns meta map)",
+    "Backend /imports/wincan/preview accepts metaFile; Plan Sync requireMeta=1",
+    "Plan Sync auto-highlight gated on group.db3Pair (project + META)",
+    "Pipe-chart modules + META filter aligned from PIPELINK; cache-bust 20260914db3MetaBind"
   ],
-  "updatedAt": "2026-09-14T16:40:00.000Z"
+  "updatedAt": "2026-09-14T17:45:00.000Z"
 }

@@ -2549,8 +2549,14 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     const t = String(raw || '')
       .trim()
       .toLowerCase();
-    if (t === 'primary' || t === 'override') return t;
+    if (t === 'primary' || t === 'override' || t === 'meta') return t;
     return '';
+  }
+
+  function isMetaDb3FileName(name) {
+    const n = String(name || '').trim();
+    if (!/\.db3$/i.test(n)) return false;
+    return /(?:^|[._\-\s])meta\.db3$/i.test(n);
   }
 
   function normalizeInspectionBindingFolderPath(raw) {
@@ -2570,8 +2576,28 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         updated_by_username TEXT NOT NULL DEFAULT '',
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (client_id, job_id, folder_path, binding_type),
-        CHECK (binding_type IN ('primary', 'override'))
+        CHECK (binding_type IN ('primary', 'override', 'meta'))
       )
+    `);
+    // Existing installs may still have the older CHECK (primary|override only).
+    await dbPool.query(`
+      DO $$
+      BEGIN
+        ALTER TABLE portal_inspection_bindings DROP CONSTRAINT IF EXISTS portal_inspection_bindings_binding_type_check;
+      EXCEPTION WHEN undefined_table THEN
+        NULL;
+      END $$;
+    `);
+    await dbPool.query(`
+      DO $$
+      BEGIN
+        ALTER TABLE portal_inspection_bindings
+          ADD CONSTRAINT portal_inspection_bindings_binding_type_check
+          CHECK (binding_type IN ('primary', 'override', 'meta'));
+      EXCEPTION
+        WHEN duplicate_object THEN NULL;
+        WHEN undefined_table THEN NULL;
+      END $$;
     `);
     await dbPool.query(
       `CREATE INDEX IF NOT EXISTS idx_portal_inspection_bindings_scope
@@ -2940,6 +2966,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const rows = await listPortalInspectionBindings(uploadMetaPool, clientId, jobId);
       const primary = {};
       const override = {};
+      const meta = {};
       const adminBindings = userIsPortalAdmin(req.user);
       for (const row of rows) {
         const folderPath = String(row.folder_path || '').trim();
@@ -2960,9 +2987,10 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         const db3FileId = String(row.db3_file_id || '').trim();
         if (!type || !db3FileId) continue;
         if (type === 'primary') primary[folderPath] = db3FileId;
-        else override[folderPath] = db3FileId;
+        else if (type === 'override') override[folderPath] = db3FileId;
+        else if (type === 'meta') meta[folderPath] = db3FileId;
       }
-      return res.json({ primary, override });
+      return res.json({ primary, override, meta });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(500).json({ error: msg });

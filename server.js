@@ -5538,9 +5538,60 @@ function resolveDb3NodeKeyByRef(db, nodeTable, rawRef) {
   return '';
 }
 
-async function parseDb3(buffer) {
+function enrichDb3ImportedOperatorPreferMeta(primaryDb, primaryTables, metaDb, metaTables, imported) {
+  let out = imported && typeof imported === 'object' ? { ...imported } : {};
+  if (metaDb && Array.isArray(metaTables) && metaTables.length) {
+    out = enrichDb3ImportedOperatorFromWcmeta(metaDb, metaTables, out);
+  }
+  const have =
+    db3ValueLooksLikeOperatorDisplayName(cleanString(out.HP_INSPECTOR_DISPLAY)) ||
+    db3ValueLooksLikeOperatorDisplayName(cleanString(out.HP_INSPECTOR_RAW));
+  if (!have) {
+    out = enrichDb3ImportedOperatorFromWcmeta(primaryDb, primaryTables, out);
+  }
+  return out;
+}
+
+async function parseDb3(buffer, metaBuffer = null) {
   const SQL = await sqlJsPromise;
   const db = new SQL.Database(new Uint8Array(buffer));
+  /** @type {any} */
+  let metaDb = null;
+  /** @type {string[]} */
+  let metaTables = [];
+  let metaWarning = '';
+  if (metaBuffer && metaBuffer.length) {
+    try {
+      metaDb = new SQL.Database(new Uint8Array(metaBuffer));
+      metaTables = sqliteTableList(metaDb);
+    } catch {
+      metaDb = null;
+      metaTables = [];
+      metaWarning = 'META DB3 could not be opened. Mapping from the project DB3 only.';
+    }
+  } else {
+    metaWarning =
+      'META DB3 was not provided. Inspected by / operator names may be missing until you upload *_Meta.db3.';
+  }
+  const closeMeta = () => {
+    try {
+      metaDb?.close();
+    } catch {
+      /* ignore */
+    }
+    metaDb = null;
+  };
+  const finishRows = (rows) => {
+    closeMeta();
+    if (metaWarning) {
+      try {
+        Object.defineProperty(rows, 'metaWarning', { value: metaWarning, enumerable: false });
+      } catch {
+        /* ignore */
+      }
+    }
+    return rows;
+  };
   const tables = sqliteTableList(db);
   const preferredSection = pickSqliteTable(tables, 'SECTION');
   let sectionT = preferredSection;
@@ -5583,6 +5634,7 @@ async function parseDb3(buffer) {
   }
   if (!sectionT) {
     db.close();
+    closeMeta();
     const preview = tables.slice(0, 40).join(', ') || '(none)';
     const hint = explainMissingSectionDb3(tables);
     throw new Error(
@@ -5743,7 +5795,7 @@ async function parseDb3(buffer) {
           imported = mergeSecinspRowIntoDb3Imported(db, sectionT, secinspRuntimeTable, mapped.reference, imported);
           imported = mergeSecinspBySectionObjKeyColumn(db, secinspRuntimeTable, mapped.reference, imported);
         }
-        imported = enrichDb3ImportedOperatorFromWcmeta(db, tables, imported);
+        imported = enrichDb3ImportedOperatorPreferMeta(db, tables, metaDb, metaTables, imported);
         const inspector = db3InspectorIdentityFromImported(imported);
         if (inspector) {
           imported.HP_INSPECTOR_RAW = inspector.raw;
@@ -5767,7 +5819,7 @@ async function parseDb3(buffer) {
         usesSectionExtras: !!extraFrag.sql
       });
       db.close();
-      return rows;
+      return finishRows(rows);
     } catch (e) {
       lastErr = e instanceof Error ? e.message : String(e);
       if (isDb3FromClauseOverflowError(e)) {
@@ -5835,7 +5887,7 @@ async function parseDb3(buffer) {
           imported = mergeSecinspRowIntoDb3Imported(db, sectionT, secinspRuntimeTable, mapped.reference, imported);
           imported = mergeSecinspBySectionObjKeyColumn(db, secinspRuntimeTable, mapped.reference, imported);
         }
-        imported = enrichDb3ImportedOperatorFromWcmeta(db, tables, imported);
+        imported = enrichDb3ImportedOperatorPreferMeta(db, tables, metaDb, metaTables, imported);
         const inspector = db3InspectorIdentityFromImported(imported);
         if (inspector) {
           imported.HP_INSPECTOR_RAW = inspector.raw;
@@ -5857,7 +5909,7 @@ async function parseDb3(buffer) {
         usesSectionExtras: !!extraFrag.sql
       });
       db.close();
-      return rows;
+      return finishRows(rows);
     } catch (fallbackErr) {
       lastErr = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
       if (isDb3FromClauseOverflowError(fallbackErr)) {
@@ -5912,7 +5964,7 @@ async function parseDb3(buffer) {
               imported = mergeSecinspRowIntoDb3Imported(db, sectionT, secinspRuntimeTable, mapped.reference, imported);
               imported = mergeSecinspBySectionObjKeyColumn(db, secinspRuntimeTable, mapped.reference, imported);
             }
-            imported = enrichDb3ImportedOperatorFromWcmeta(db, tables, imported);
+            imported = enrichDb3ImportedOperatorPreferMeta(db, tables, metaDb, metaTables, imported);
             const inspector = db3InspectorIdentityFromImported(imported);
             if (inspector) {
               imported.HP_INSPECTOR_RAW = inspector.raw;
@@ -5934,7 +5986,7 @@ async function parseDb3(buffer) {
             usesSectionExtras: false
           });
           db.close();
-          return rows;
+          return finishRows(rows);
         } catch (bareErr) {
           lastErr = bareErr instanceof Error ? bareErr.message : String(bareErr);
           console.warn('[db3-preview][variant-fallback-error]', {
@@ -5957,6 +6009,7 @@ async function parseDb3(buffer) {
     }
   }
   db.close();
+  closeMeta();
   throw new Error(
     lastErr ||
       'Could not read SECTION rows from this DB3 (unsupported WinCan schema or missing OBJ_Key / length columns).'
@@ -10057,15 +10110,35 @@ app.delete('/jobsite-assets/:id', requireAuth, requireAdmin, async (req, res) =>
   }
 });
 
-app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('file'), async (req, res) => {
+app.post(
+  '/imports/wincan/preview',
+  requireAuth,
+  requireMike,
+  upload.fields([
+    { name: 'file', maxCount: 1 },
+    { name: 'metaFile', maxCount: 1 }
+  ]),
+  async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ success: false, error: 'Upload a DB3 file.' });
-    const name = req.file.originalname.toLowerCase();
+    const primaryFile = Array.isArray(req.files?.file) ? req.files.file[0] : req.file;
+    const metaUpload = Array.isArray(req.files?.metaFile) ? req.files.metaFile[0] : null;
+    if (!primaryFile) return res.status(400).json({ success: false, error: 'Upload a DB3 file.' });
+    const name = String(primaryFile.originalname || '').toLowerCase();
     if (!name.endsWith('.db3') && !name.endsWith('.sqlite') && !name.endsWith('.db')) {
       return res.status(400).json({ success: false, error: 'This build supports DB3/SQLite project imports. Screenshot/PDF OCR fallback is not enabled in this bundle yet.' });
     }
+    const requireMeta =
+      String(req.body?.requireMeta || '').trim() === '1' ||
+      String(req.body?.requireMeta || '').toLowerCase() === 'true';
+    if (requireMeta && !metaUpload?.buffer?.length) {
+      return res.status(400).json({
+        success: false,
+        error: 'Plan Sync requires both the project DB3 and the companion META DB3 (*_Meta.db3).'
+      });
+    }
 
-    const rows = await parseDb3(req.file.buffer);
+    const rows = await parseDb3(primaryFile.buffer, metaUpload?.buffer || null);
+    const metaWarning = rows?.metaWarning || (!metaUpload?.buffer?.length ? 'META DB3 was not provided. Inspected by may be blank.' : '');
     const scope = resolveWincanImportScope(req.body, rows);
     let { targetClient, targetCity, targetJobsite, targetSystem } = scope;
     let existingRecords = [];
@@ -10132,7 +10205,14 @@ app.post('/imports/wincan/preview', requireAuth, requireMike, upload.single('fil
       });
     }
 
-    res.json({ success: true, sourceKind: 'DB3', defaultJobsite: cleanString(previewRows[0]?.project || 'NOT SET'), rows: previewRows, updateMode });
+    res.json({
+      success: true,
+      sourceKind: 'DB3',
+      defaultJobsite: cleanString(previewRows[0]?.project || 'NOT SET'),
+      rows: previewRows,
+      updateMode,
+      metaWarning: metaWarning || undefined
+    });
   } catch (error) {
     console.error('IMPORT PREVIEW ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
