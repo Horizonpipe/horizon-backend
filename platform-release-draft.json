@@ -1,10 +1,10 @@
 {
-  "title": "Restore PipeShare login splash video logo",
-  "description": "Recent deploys left login using the old CSS PIPE+SHARE wordmark because the zero-seam splash video and poster were never on the GITHUBS deploy tree (404 on live). Restores assets/pipeshare-login-zero-seam.mp4 + poster.png, switches the React login mark back to the video with poster/PNG fallback, and cache-busts login-main.js.\n\nWho is affected: anyone opening the PipeShare login page on BASE (pipeshare.live) and SaaS after peer apply.",
+  "title": "Kill old PipeShare splash cloud+pipe logo",
+  "description": "Portal intro splash was showing the old cloud+pipe / AUTOMATED PIPELINE MANAGEMENT mark because the zero-seam video path resolved under /client-portal/assets (404) and fell back to brand-pipeshare-transparent.png. Fixes video/poster to ../assets/, replaces those PNGs with the zero-seam poster, and hard cache-busts the portal.\n\nWho is affected: anyone opening PipeShare client portal splash on BASE/SaaS.",
   "changeLog": [
-    "Add pipeshare-login-zero-seam.mp4 and poster.png to frontend assets",
-    "Login splash uses zero-seam video again (poster/PNG fallback)",
-    "Cache-bust login-main.js?v=20260915logoVideoRestore"
+    "Portal splash video/poster paths: ../assets/pipeshare-login-zero-seam.*",
+    "Replace brand-pipeshare-transparent.png (and siblings) with zero-seam poster",
+    "Cache-bust 20260915killOldSplash"
   ],
-  "updatedAt": "2026-09-15T17:20:00.000Z"
+  "updatedAt": "2026-09-15T17:25:00.000Z"
 }
