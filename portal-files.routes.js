@@ -3011,7 +3011,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const bindingType = normalizeInspectionBindingType(body.bindingType || body.type || '');
       if (!bindingType) {
-        return res.status(400).json({ error: 'bindingType must be primary or override' });
+        return res.status(400).json({ error: 'bindingType must be primary, override, or meta' });
       }
       let folderPath = '';
       try {
