@@ -1,11 +1,10 @@
 {
-  "title": "Hotfix: portal/login asset cache-bust (v0.0.61 regression)",
-  "description": "Restores PipeShare login and client portal on BASE/SaaS after a bad cache-bust rewrite in v0.0.61 turned ?v= into $1… so theme CSS/JS 404'd and the portal showed \"Client portal script did not load\". Paths are corrected and cache-busted again.\n\nWho is affected: anyone opening pipeshare.live (or SaaS peer) login or client portal.",
+  "title": "Hotfix: export copyJobRemoteItemsBatch (portal boot)",
+  "description": "Client portal failed to load after v0.0.61/62 because file-host-app.js imported copyJobRemoteItemsBatch from portal-files-api.js but that export was never shipped on the GITHUBS deploy tree (PIPELINK had it). Adds the export plus a per-item fallback when POST /api/files/copy-batch is missing.\n\nWho is affected: anyone opening the PipeShare client portal on BASE/SaaS.",
   "changeLog": [
-    "Fix client-portal/index.html + mobile.html: $120260914db3MetaBind → ?v=20260915portalAssetFix",
-    "Bump portal runtime version + file-explorer addon cache-bust",
-    "login.html default product pipeshare + cache-bust for BASE branding",
-    "No functional change to Video↔DB3+META binding from v0.0.61"
+    "Export copyJobRemoteItemsBatch in portal-files-api.js (from PIPELINK)",
+    "Fallback to per-item copyOnly moves when /copy-batch is absent",
+    "Cache-bust 20260915copyBatchExport"
   ],
-  "updatedAt": "2026-09-15T17:05:00.000Z"
+  "updatedAt": "2026-09-15T17:10:00.000Z"
 }
