@@ -1129,6 +1129,190 @@ function attachMergedPlanSyncToPayload(existingPayload, sanitizedPayload) {
   return { ...sanitizedPayload, planSync: merged };
 }
 
+/** Collaborative Plan View row — accumulates highlights from every user on the tenant. */
+const PIPESYNC_PLAN_VIEW_SHARED_USERNAME = '__shared__';
+const PLAN_VIEW_COORD_SPACE_PDF_VP1 = 'pdf-vp1';
+
+function planViewAnnotationId(row) {
+  return String(row?.id || '').trim();
+}
+
+function planViewAnnotationRichness(item) {
+  if (!item || typeof item !== 'object') return 0;
+  let score = 0;
+  try {
+    score += JSON.stringify(item).length;
+  } catch {
+    score += 1;
+  }
+  if (String(item.coordSpace || '') === PLAN_VIEW_COORD_SPACE_PDF_VP1) score += 5000;
+  const hasNorms = (...vals) => vals.every((v) => Number.isFinite(Number(v)));
+  if (hasNorms(item.nrx, item.nry) || hasNorms(item.nrx1, item.nry1, item.nrx2, item.nry2)) score += 2000;
+  if (Number(item.basisW) > 0 && Number(item.basisH) > 0) score += 800;
+  const t =
+    Date.parse(String(item.updatedAt || item.updated_at || item.savedAt || item.modifiedAt || '')) || 0;
+  if (t) score += Math.min(Math.floor(t / 1e8), 2000);
+  if (String(item.name || item.label || '').trim()) score += 50;
+  return score;
+}
+
+/** Union by stable id — keep both users' marks; same id keeps richer / pdf-vp1 stamp. */
+function mergePlanViewAnnotationList(baseList, incomingList) {
+  const byId = new Map();
+  const noId = [];
+  const seenNoId = new Set();
+  const take = (row) => {
+    if (!row || typeof row !== 'object') return;
+    const id = planViewAnnotationId(row);
+    if (id) {
+      const prev = byId.get(id);
+      if (!prev || planViewAnnotationRichness(row) >= planViewAnnotationRichness(prev)) byId.set(id, row);
+      return;
+    }
+    let key = '';
+    try {
+      key = JSON.stringify(row);
+    } catch {
+      key = String(Math.random());
+    }
+    if (seenNoId.has(key)) return;
+    seenNoId.add(key);
+    noId.push(row);
+  };
+  for (const row of Array.isArray(baseList) ? baseList : []) take(row);
+  for (const row of Array.isArray(incomingList) ? incomingList : []) take(row);
+  return [...byId.values(), ...noId];
+}
+
+function mergePlanViewWorkspaceRow(baseWs, incomingWs) {
+  const a = baseWs && typeof baseWs === 'object' ? baseWs : {};
+  const b = incomingWs && typeof incomingWs === 'object' ? incomingWs : {};
+  const out = { ...a, ...b };
+  out.id = planViewAnnotationId(b) || planViewAnnotationId(a);
+  out.lines = mergePlanViewAnnotationList(a.lines, b.lines);
+  out.structureNodes = mergePlanViewAnnotationList(a.structureNodes, b.structureNodes);
+  const aPages = Array.isArray(a.pages) ? a.pages : [];
+  const bPages = Array.isArray(b.pages) ? b.pages : [];
+  if (aPages.length && bPages.length) out.pages = mergePlanViewAnnotationList(aPages, bPages);
+  else out.pages = bPages.length ? bPages : aPages;
+  return out;
+}
+
+function mergePlanViewMapWorkspaces(baseList, incomingList) {
+  const byId = new Map();
+  for (const ws of Array.isArray(baseList) ? baseList : []) {
+    const id = planViewAnnotationId(ws) || `anon-${byId.size}`;
+    byId.set(id, ws && typeof ws === 'object' ? { ...ws, id: planViewAnnotationId(ws) || id } : ws);
+  }
+  for (const ws of Array.isArray(incomingList) ? incomingList : []) {
+    if (!ws || typeof ws !== 'object') continue;
+    const id = planViewAnnotationId(ws) || `anon-${byId.size}`;
+    const prev = byId.get(id);
+    byId.set(id, prev ? mergePlanViewWorkspaceRow(prev, { ...ws, id }) : { ...ws, id });
+  }
+  return [...byId.values()];
+}
+
+function mergePlanViewLegacyPlans(baseList, incomingList) {
+  const byId = new Map();
+  const take = (doc) => {
+    if (!doc || typeof doc !== 'object') return;
+    const id = planViewAnnotationId(doc);
+    if (!id) return;
+    const prev = byId.get(id);
+    if (!prev) {
+      byId.set(id, doc);
+      return;
+    }
+    const aPieces = Array.isArray(prev.pieces) ? prev.pieces.length : 0;
+    const bPieces = Array.isArray(doc.pieces) ? doc.pieces.length : 0;
+    const richer =
+      planViewAnnotationRichness(doc) >= planViewAnnotationRichness(prev) || bPieces > aPieces ? doc : prev;
+    const other = richer === doc ? prev : doc;
+    const merged = { ...other, ...richer };
+    if (Array.isArray(other.pieces) || Array.isArray(richer.pieces)) {
+      merged.pieces = mergePlanViewAnnotationList(other.pieces, richer.pieces);
+    }
+    if (!merged.storageKey && other.storageKey) merged.storageKey = other.storageKey;
+    byId.set(id, merged);
+  };
+  for (const doc of Array.isArray(baseList) ? baseList : []) take(doc);
+  for (const doc of Array.isArray(incomingList) ? incomingList : []) take(doc);
+  return [...byId.values()];
+}
+
+function mergePlanViewBoard(baseBoard, incomingBoard) {
+  if (!incomingBoard || typeof incomingBoard !== 'object') {
+    return baseBoard && typeof baseBoard === 'object' ? JSON.parse(JSON.stringify(baseBoard)) : {};
+  }
+  if (!baseBoard || typeof baseBoard !== 'object') {
+    return JSON.parse(JSON.stringify(incomingBoard));
+  }
+  const base = JSON.parse(JSON.stringify(baseBoard));
+  const inc = JSON.parse(JSON.stringify(incomingBoard));
+  const out = { ...base, ...inc };
+  out.lines = mergePlanViewAnnotationList(base.lines, inc.lines);
+  out.structureNodes = mergePlanViewAnnotationList(base.structureNodes, inc.structureNodes);
+  out.bookmarks = mergePlanViewAnnotationList(base.bookmarks, inc.bookmarks);
+  out.mapWorkspaces = mergePlanViewMapWorkspaces(base.mapWorkspaces, inc.mapWorkspaces);
+  out.legacyPlans = mergePlanViewLegacyPlans(base.legacyPlans, inc.legacyPlans);
+  out.planLibraryFolders = mergePlanViewAnnotationList(base.planLibraryFolders, inc.planLibraryFolders);
+  const basePages = Array.isArray(base.pages) ? base.pages : [];
+  const incPages = Array.isArray(inc.pages) ? inc.pages : [];
+  if (basePages.length && incPages.length) out.pages = mergePlanViewAnnotationList(basePages, incPages);
+  else out.pages = incPages.length ? incPages : basePages;
+  return out;
+}
+
+function planViewBoardFromPayload(payload, key) {
+  if (!payload || typeof payload !== 'object') return null;
+  if (key === 'pdfMap') {
+    if (payload.pdfMap && typeof payload.pdfMap === 'object') return payload.pdfMap;
+    if (payload.pdfMapView && typeof payload.pdfMapView === 'object') return payload.pdfMapView;
+    return null;
+  }
+  if (payload.imagePlan && typeof payload.imagePlan === 'object') return payload.imagePlan;
+  if (payload.planView && typeof payload.planView === 'object') return payload.planView;
+  return null;
+}
+
+/** Union-merge two full plan-view payloads (never blind-replace annotations). */
+function mergePlanViewPayloads(basePayload, incomingPayload) {
+  if (!incomingPayload || typeof incomingPayload !== 'object') {
+    return basePayload && typeof basePayload === 'object'
+      ? JSON.parse(JSON.stringify(basePayload))
+      : { v: 2, imagePlan: {}, pdfMap: {} };
+  }
+  if (!basePayload || typeof basePayload !== 'object') {
+    return JSON.parse(JSON.stringify(incomingPayload));
+  }
+  const base = JSON.parse(JSON.stringify(basePayload));
+  const inc = JSON.parse(JSON.stringify(incomingPayload));
+  const out = { ...base, ...inc, v: 2 };
+  out.pdfMap = mergePlanViewBoard(planViewBoardFromPayload(base, 'pdfMap') || {}, planViewBoardFromPayload(inc, 'pdfMap') || {});
+  out.imagePlan = mergePlanViewBoard(
+    planViewBoardFromPayload(base, 'imagePlan') || {},
+    planViewBoardFromPayload(inc, 'imagePlan') || {}
+  );
+  delete out.pdfMapView;
+  delete out.planView;
+  const mergedPs = mergePlanSyncForPersist(base.planSync, inc.planSync);
+  if (mergedPs) out.planSync = mergedPs;
+  else delete out.planSync;
+  return out;
+}
+
+function findPlanViewRow(rows, username) {
+  const un = String(username || '').toLowerCase();
+  if (!un) return -1;
+  return (Array.isArray(rows) ? rows : []).findIndex((r) => String(r?.username || '').toLowerCase() === un);
+}
+
+function attachMergedPlanViewPayload(existingPayload, sanitizedPayload) {
+  const withSync = attachMergedPlanSyncToPayload(existingPayload, sanitizedPayload);
+  return mergePlanViewPayloads(existingPayload, withSync);
+}
+
 let wasabiStateSnapshotBusy = false;
 let wasabiStateSnapshotTimer = null;
 let wasabiStateLastQueuedAt = 0;
@@ -8716,13 +8900,29 @@ app.get('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, 
     }
     const tables = await loadSnapshotTablesForRequest(req, false);
     const rows = Array.isArray(tables[PIPESYNC_PLAN_VIEW_TABLE]) ? tables[PIPESYNC_PLAN_VIEW_TABLE] : [];
-    const row = rows.find((r) => String(r?.username || '').toLowerCase() === un);
-    let payload = row && row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload) ? row.payload : null;
+    const userIdx = findPlanViewRow(rows, un);
+    const sharedIdx = findPlanViewRow(rows, PIPESYNC_PLAN_VIEW_SHARED_USERNAME);
+    const userRow = userIdx >= 0 ? rows[userIdx] : null;
+    const sharedRow = sharedIdx >= 0 ? rows[sharedIdx] : null;
+    const userPayload =
+      userRow && userRow.payload && typeof userRow.payload === 'object' && !Array.isArray(userRow.payload)
+        ? userRow.payload
+        : null;
+    const sharedPayload =
+      sharedRow && sharedRow.payload && typeof sharedRow.payload === 'object' && !Array.isArray(sharedRow.payload)
+        ? sharedRow.payload
+        : null;
+    // Union user + shared so Day Start / library load includes every crew's marks.
+    let payload =
+      userPayload || sharedPayload
+        ? mergePlanViewPayloads(sharedPayload, userPayload || { v: 2, imagePlan: {}, pdfMap: {} })
+        : null;
     if (payload) payload = await hydratePlanViewPayloadForResponse(payload, req);
+    const updatedAt = [userRow?.updated_at, sharedRow?.updated_at].filter(Boolean).sort().reverse()[0] || null;
     return res.json({
       success: true,
       payload,
-      updated_at: row?.updated_at || null
+      updated_at: updatedAt
     });
   } catch (error) {
     console.error('GET PIPESYNC PLAN VIEW:', error);
@@ -8754,17 +8954,43 @@ app.put('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, 
     const now = nowIso();
     await runWasabiStateWriteForRequest(req, `pipesync-plan-view:${un}`, async (data) => {
       const rows = ensureSnapshotTable(data, PIPESYNC_PLAN_VIEW_TABLE);
-      const idx = rows.findIndex((r) => String(r?.username || '').toLowerCase() === un);
-      const prevPayload = idx >= 0 && rows[idx]?.payload && typeof rows[idx].payload === 'object' ? rows[idx].payload : null;
-      const mergedPayload = attachMergedPlanSyncToPayload(prevPayload, sanitized);
-      const row = { username: un, payload: mergedPayload, updated_at: now };
-      if (idx >= 0) rows[idx] = row;
-      else rows.push(row);
+      const idx = findPlanViewRow(rows, un);
+      const sharedIdx = findPlanViewRow(rows, PIPESYNC_PLAN_VIEW_SHARED_USERNAME);
+      const prevPayload =
+        idx >= 0 && rows[idx]?.payload && typeof rows[idx].payload === 'object' ? rows[idx].payload : null;
+      const prevShared =
+        sharedIdx >= 0 && rows[sharedIdx]?.payload && typeof rows[sharedIdx].payload === 'object'
+          ? rows[sharedIdx].payload
+          : null;
+      // Union-merge with this user's prior row AND the shared collaborative row so
+      // Person B uploading first cannot be wiped when Person A pushes later (and vice versa).
+      const mergedPayload = attachMergedPlanViewPayload(
+        mergePlanViewPayloads(prevShared, prevPayload),
+        sanitized
+      );
+      const mergedJson = JSON.stringify(mergedPayload);
+      if (mergedJson.length > PIPESYNC_PLAN_VIEW_MAX_BYTES) {
+        throw new Error('Merged plan view data exceeds the maximum save size.');
+      }
+      const userRow = { username: un, payload: mergedPayload, updated_at: now };
+      if (idx >= 0) rows[idx] = userRow;
+      else rows.push(userRow);
+      const sharedRow = {
+        username: PIPESYNC_PLAN_VIEW_SHARED_USERNAME,
+        payload: mergedPayload,
+        updated_at: now
+      };
+      if (sharedIdx >= 0) rows[sharedIdx] = sharedRow;
+      else rows.push(sharedRow);
     });
-    return res.json({ success: true, updated_at: now });
+    return res.json({ success: true, updated_at: now, merged: true });
   } catch (error) {
     console.error('PUT PIPESYNC PLAN VIEW:', error);
-    return res.status(500).json({ success: false, error: error.message });
+    const msg = error instanceof Error ? error.message : String(error);
+    if (/exceeds the maximum save size/i.test(msg)) {
+      return res.status(413).json({ success: false, error: msg });
+    }
+    return res.status(500).json({ success: false, error: msg });
   }
 });
 
