@@ -1,10 +1,10 @@
 {
-  "title": "Hotfix: export copyJobRemoteItemsBatch (portal boot)",
-  "description": "Client portal failed to load after v0.0.61/62 because file-host-app.js imported copyJobRemoteItemsBatch from portal-files-api.js but that export was never shipped on the GITHUBS deploy tree (PIPELINK had it). Adds the export plus a per-item fallback when POST /api/files/copy-batch is missing.\n\nWho is affected: anyone opening the PipeShare client portal on BASE/SaaS.",
+  "title": "Restore PipeShare login splash video logo",
+  "description": "Recent deploys left login using the old CSS PIPE+SHARE wordmark because the zero-seam splash video and poster were never on the GITHUBS deploy tree (404 on live). Restores assets/pipeshare-login-zero-seam.mp4 + poster.png, switches the React login mark back to the video with poster/PNG fallback, and cache-busts login-main.js.\n\nWho is affected: anyone opening the PipeShare login page on BASE (pipeshare.live) and SaaS after peer apply.",
   "changeLog": [
-    "Export copyJobRemoteItemsBatch in portal-files-api.js (from PIPELINK)",
-    "Fallback to per-item copyOnly moves when /copy-batch is absent",
-    "Cache-bust 20260915copyBatchExport"
+    "Add pipeshare-login-zero-seam.mp4 and poster.png to frontend assets",
+    "Login splash uses zero-seam video again (poster/PNG fallback)",
+    "Cache-bust login-main.js?v=20260915logoVideoRestore"
   ],
-  "updatedAt": "2026-09-15T17:10:00.000Z"
+  "updatedAt": "2026-09-15T17:20:00.000Z"
 }
