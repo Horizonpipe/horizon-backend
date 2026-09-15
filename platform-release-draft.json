@@ -1,10 +1,10 @@
 {
-  "title": "Kill old PipeShare splash cloud+pipe logo",
-  "description": "Portal intro splash was showing the old cloud+pipe / AUTOMATED PIPELINE MANAGEMENT mark because the zero-seam video path resolved under /client-portal/assets (404) and fell back to brand-pipeshare-transparent.png. Fixes video/poster to ../assets/, replaces those PNGs with the zero-seam poster, and hard cache-busts the portal.\n\nWho is affected: anyone opening PipeShare client portal splash on BASE/SaaS.",
+  "title": "Plan View multi-user shared highlight merge",
+  "description": "Plan View highlights now union-merge across users on the same tenant instead of overwriting each other. GET returns the caller's row merged with a shared __shared__ row; PUT merges the save into both so every user's marks accumulate. Desktop restore stays local; this ships the live API behavior on BASE/SaaS.\n\nWho is affected: anyone using PipeSync Plan View with more than one account on the same company/tenant.",
   "changeLog": [
-    "Portal splash video/poster paths: ../assets/pipeshare-login-zero-seam.*",
-    "Replace brand-pipeshare-transparent.png (and siblings) with zero-seam poster",
-    "Cache-bust 20260915killOldSplash"
+    "GET /pipesync/plan-view: user payload ∪ __shared__ (union by annotation id, prefer richer/pdf-vp1)",
+    "PUT /pipesync/plan-view: merge into user row and __shared__ (no blind replace)",
+    "Shared collaborative row username: __shared__"
   ],
-  "updatedAt": "2026-09-15T17:25:00.000Z"
+  "updatedAt": "2026-09-15T17:45:00.000Z"
 }
