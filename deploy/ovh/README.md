@@ -215,13 +215,25 @@ dig +short techpipe.pipeshare.net A    # 40.160.72.39
 curl -sS -o /dev/null -w '%{http_code}\n' https://techpipe.pipeshare.net/
 ```
 
-For **all future tenants** without adding each name to certbot, issue a **wildcard** cert (DNS-01 TXT challenge in GoDaddy when certbot prompts):
+For **all future tenants** without adding each name to certbot, issue a **wildcard** cert via DNS-01 (GoDaddy API hook — already on OVH):
 
 ```bash
-sudo certbot certonly --manual --preferred-challenges dns \
-  -d '*.pipeshare.net' -d pipeshare.net \
-  --cert-name pipeshare.live --expand
+sudo bash /opt/horizon/horizon-backend/deploy/ovh/issue-pipeshare-net-wildcard-cert.sh
+sudo bash /opt/horizon/horizon-backend/deploy/ovh/apply-saas-tenant-nginx-ssl.sh
+sudo nginx -t && sudo systemctl reload nginx
 ```
+
+**Do not** put `{tenant}.pipeshare.net` on the apex `pipeshare.live` webroot certificate. That broke auto-renew (HTTP-01 404 on tenants) and expired BASE TLS in Sep 2026. Apex = `pipeshare.live` / `www` / `pipeshare.net` / `www` only. Tenants = `*.pipeshare.net` wildcard lineage.
+
+**Permanent auto-renew (idempotent):**
+
+```bash
+sudo bash /opt/horizon/horizon-backend/deploy/ovh/install-cert-auto-renew.sh
+# force re-issue apex now:
+sudo bash /opt/horizon/horizon-backend/deploy/ovh/install-cert-auto-renew.sh --force-apex-renew
+```
+
+This enables `certbot.timer`, installs an nginx reload deploy hook, ensures tenant ACME is served, and dry-runs apex renew.
 
 *(GoDaddy may label the host column "Name" or "@". Use `@` for the apex/root domain.)*
 

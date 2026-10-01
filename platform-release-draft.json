@@ -1,10 +1,12 @@
 {
-  "title": "Plan View PDF upload keep + folder move identity",
-  "description": "Desktop Upload PDFs / Push was writing plan library rows with a valid Wasabi storageKey but empty pieces; the server sanitize step dropped those rows, so push looked successful while the PDF never appeared in Plan View. Persist now keeps whole-PDF archives (synthesizes a single piece from storageKey). Folder moves keep the same storageKey/id and use folderUpdatedAt so a later Push does not undo a server-side move.\n\nWho is affected: anyone uploading or pushing PDFs into PipeSync Plan View from Desktop or the web library.",
+  "title": "TLS cert renewed — permanent auto-renew restored",
+  "description": "pipeshare.live HTTPS was expired (since Sep 26), which broke the desktop app and browser with certificate errors and blocked portal script loads.\n\nThe apex certificate was reissued (valid through Dec 30). Auto-renew was failing because techpipe.pipeshare.net was stuck on the webroot cert while tenant HTTP did not serve ACME challenges. Apex cert is apex-only again; tenants use the separate *.pipeshare.net wildcard. certbot.timer, nginx reload hook, and tenant ACME vhost are installed for good.\n\nWho is affected: everyone on pipeshare.live / pipeshare.net / desktop PipeShare.",
   "changeLog": [
-    "Sanitize legacyPlans: keep docs with archive storageKey even when pieces[] is empty (synthesize one piece)",
-    "Union-merge folderId by folderUpdatedAt (else prefer server) so portal moves survive local Push",
-    "Web Plan View folder moves stamp folderUpdatedAt"
+    "Renewed expired pipeshare.live TLS certificate (valid to 2026-12-30).",
+    "Removed tenant SAN from apex webroot cert so certbot renew succeeds.",
+    "Enabled certbot.timer + nginx reload deploy hook.",
+    "Installed tenant ACME vhost; tenants use *.pipeshare.net wildcard cert.",
+    "Added deploy/ovh/install-cert-auto-renew.sh for permanent re-runs."
   ],
-  "updatedAt": "2026-09-15T20:30:00.000Z"
+  "updatedAt": "2026-10-01T12:30:00.000Z"
 }
