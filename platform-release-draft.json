@@ -1,11 +1,12 @@
 ﻿{
-  "title": "Server-side DB3 inspection ingest (Desktop stops local open)",
-  "description": "Desktop Auto Sync no longer opens WinCan .db3 files on the field PC to push inspection rows. Java still uploads .db3 like any other project file under Shared Base Jobs/… After the file lands, the server downloads it from storage and ingests/compare rows into PipeSync (existing AutoSync PSR ingest).\n\nThis removes the noisy “DB3 skipped (not on disk)” / local SQLite open failures while keeping dual WinCan watch folders and full folder upload working.\n\nWho is affected: Desktop Auto Sync users on private server and SaaS after Desktop update + backend deploy. PipeShare browsing of uploaded projects is unchanged; video inspection still uses the cloud .db3.",
+  "title": "PIPESHARE Desktop download page upgrade",
+  "description": "The public Windows download page at pipeshare.live/download-desktop.html is rebuilt as a brand-first marketing page: PIPESHARE hero, interactive module demos (PipeShare, PipeSync, Plan View, AUTOSYNC), feature highlights for full project upload / DB3 ingest / offline field work / auto-update, and generated demo screenshots.\n\nDownload buttons and the latest.yml update-feed wiring are unchanged. Setup still auto-updates from /desktop-updates/; Portable remains a one-shot .exe.\n\nWho is affected: Anyone using the BASE download URL (pipeshare.live). SaaS push is not required for this static page unless you also serve it from pipeshare.net the same way.",
   "changeLog": [
-    "Desktop: local DB3 row open/poll disabled by default (server ingest after upload).",
-    "Backend: post-upload hook also fires for single-part PUT via /upload/object-landed (and register-sha256).",
-    "Java AutoSync: notifies server after single-part DB3/file PUT; logs “DB3 uploaded — server will ingest…”.",
-    "Status UI: DB3 rows show as “Server after upload” instead of a local active path."
+    "Upgrade download-desktop.html with PIPESHARE brand hero and clear Windows CTA.",
+    "Add interactive tab demos for PipeShare, PipeSync, Plan View, and AUTOSYNC.",
+    "Ship demo screenshots under download-desktop-assets/.",
+    "Feature copy covers full project upload, DB3 ingest, Plan View, PipeSync, offline/field, auto-update.",
+    "Keep Setup + Portable links and latest.yml version detection working."
   ],
-  "updatedAt": "2026-10-05T17:10:00.000Z"
+  "updatedAt": "2026-10-05T18:45:00.000Z"
 }
