@@ -841,6 +841,31 @@ function basenameRel(rel) {
   return i === -1 ? n : n.slice(i + 1);
 }
 
+/**
+ * AutoSync nests WinCan DB3 under `…/DB/{user}/file.db3`. Older uploads may still live at flat
+ * `…/DB/file.db3`. When HeadObject misses the nested key, check-paths retries the flat twin so
+ * other PCs do not treat existing DB3s as missing.
+ * @param {string} pathRel
+ * @returns {string|null}
+ */
+function legacyFlatWinCanDb3RelPath(pathRel) {
+  let n;
+  try {
+    n = normalizeRelPath(pathRel || '');
+  } catch {
+    return null;
+  }
+  if (!n || !/\.db3$/i.test(n)) return null;
+  const parts = n.split('/');
+  if (parts.length < 3) return null;
+  const fileName = parts[parts.length - 1];
+  const userSeg = parts[parts.length - 2];
+  const dbSeg = parts[parts.length - 3];
+  if (!dbSeg || dbSeg.toUpperCase() !== 'DB') return null;
+  if (!userSeg || /\.db3$/i.test(userSeg)) return null;
+  return [...parts.slice(0, -2), fileName].join('/');
+}
+
 /** Safe single path segment / zip archive entry (client-side ZIP manifest). */
 function safeZipSegment(seg) {
   return String(seg || '')
@@ -2146,7 +2171,7 @@ function registerPortalShareLinkRoutes(app, { pool: poolOption, query, requireAu
   app.use('/api/files', r);
 }
 
-function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, requireAdmin }) {
+function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, requireAdmin, onPortalObjectUploaded }) {
   const dbQuery =
     typeof query === 'function'
       ? query
@@ -2402,6 +2427,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     return { partSize, partCount };
   }
 
+  function notifyPortalObjectUploaded(payload) {
+    if (typeof onPortalObjectUploaded !== 'function') return;
+    try {
+      onPortalObjectUploaded(payload);
+    } catch (error) {
+      console.warn('[portal-files] onPortalObjectUploaded failed:', error?.message || error);
+    }
+  }
+
   const r = express.Router();
   r.use(requireAuth);
   r.use(tenantStorageMiddleware(tenantContextPool));
@@ -2461,6 +2495,29 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         meta.userId
       ]
     );
+  }
+
+  /**
+   * Track copy/cut lineage so Pipe chart / billable tools can find the source job folder + DB3.
+   * Table already exists in production (`portal_ufid_copy_lineage`).
+   */
+  async function upsertPortalCopyLineage(copyKey, sourceKey) {
+    const copyObjectKey = String(copyKey || '').trim();
+    const sourceObjectKey = String(sourceKey || '').trim();
+    if (!copyObjectKey || !sourceObjectKey || copyObjectKey === sourceObjectKey) return;
+    try {
+      await uploadMetaPool.query(
+        `INSERT INTO portal_ufid_copy_lineage
+           (copy_object_key, source_object_key, source_ufid, copy_ufid, copy_prefix, created_at)
+         VALUES ($1, $2, '', '', '', NOW())
+         ON CONFLICT (copy_object_key) DO UPDATE SET
+           source_object_key = EXCLUDED.source_object_key,
+           created_at = NOW()`,
+        [copyObjectKey, sourceObjectKey]
+      );
+    } catch (e) {
+      console.warn('[portal-files] copy lineage upsert failed', e instanceof Error ? e.message : e);
+    }
   }
 
   /**
@@ -3182,25 +3239,75 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         work.push({ pathRel, key, expected });
       }
 
+      const headObjectMeta = async (key) => {
+        const head = await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: key }));
+        const cl = Number(head.ContentLength ?? 0);
+        const lm = head.LastModified ? new Date(head.LastModified).getTime() : null;
+        const lastModified =
+          head.LastModified instanceof Date
+            ? head.LastModified.toISOString()
+            : head.LastModified
+              ? new Date(head.LastModified).toISOString()
+              : null;
+        return { cl, lm, lastModified };
+      };
+
       const headOne = async (w) => {
-        try {
-          const head = await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: w.key }));
-          const cl = Number(head.ContentLength ?? 0);
-          if (Number.isFinite(w.expected) && w.expected >= 0 && cl !== w.expected) {
-            return { kind: 'mismatch', pathRel: w.pathRel, expectedSize: w.expected, actualSize: cl };
+        const finish = (meta) => {
+          if (Number.isFinite(w.expected) && w.expected >= 0 && meta.cl !== w.expected) {
+            return {
+              kind: 'mismatch',
+              pathRel: w.pathRel,
+              expectedSize: w.expected,
+              actualSize: meta.cl,
+              lastModifiedMs: Number.isFinite(meta.lm) ? meta.lm : null,
+              lastModified: meta.lastModified
+            };
           }
-          return { kind: 'present', pathRel: w.pathRel, size: cl };
+          return {
+            kind: 'present',
+            pathRel: w.pathRel,
+            size: meta.cl,
+            lastModifiedMs: Number.isFinite(meta.lm) ? meta.lm : null,
+            lastModified: meta.lastModified
+          };
+        };
+        try {
+          return finish(await headObjectMeta(w.key));
         } catch (e) {
           const code = e?.$metadata?.httpStatusCode;
           const name = String(e?.name || '');
-          if (code === 404 || name === 'NotFound' || String(e?.Code || '') === '404') {
-            return {
-              kind: 'missing',
-              pathRel: w.pathRel,
-              expectedSize: Number.isFinite(w.expected) ? w.expected : null
-            };
+          const is404 = code === 404 || name === 'NotFound' || String(e?.Code || '') === '404';
+          if (!is404) throw e;
+          const flatRel = legacyFlatWinCanDb3RelPath(w.pathRel);
+          if (flatRel && flatRel !== w.pathRel) {
+            try {
+              if (!pathGate.check(flatRel)) {
+                return {
+                  kind: 'missing',
+                  pathRel: w.pathRel,
+                  expectedSize: Number.isFinite(w.expected) ? w.expected : null
+                };
+              }
+              return finish(await headObjectMeta(pref + flatRel));
+            } catch (e2) {
+              const code2 = e2?.$metadata?.httpStatusCode;
+              const name2 = String(e2?.name || '');
+              if (code2 === 404 || name2 === 'NotFound' || String(e2?.Code || '') === '404') {
+                return {
+                  kind: 'missing',
+                  pathRel: w.pathRel,
+                  expectedSize: Number.isFinite(w.expected) ? w.expected : null
+                };
+              }
+              throw e2;
+            }
           }
-          throw e;
+          return {
+            kind: 'missing',
+            pathRel: w.pathRel,
+            expectedSize: Number.isFinite(w.expected) ? w.expected : null
+          };
         }
       };
 
@@ -3209,14 +3316,22 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const missing = [];
       const sizeMismatch = [];
       for (const r of rowResults) {
-        if (r.kind === 'present') present.push({ path: r.pathRel, size: r.size });
-        else if (r.kind === 'missing') {
+        if (r.kind === 'present') {
+          present.push({
+            path: r.pathRel,
+            size: r.size,
+            lastModifiedMs: r.lastModifiedMs ?? null,
+            lastModified: r.lastModified ?? null
+          });
+        } else if (r.kind === 'missing') {
           missing.push({ path: r.pathRel, expectedSize: r.expectedSize });
         } else {
           sizeMismatch.push({
             path: r.pathRel,
             expectedSize: r.expectedSize,
-            actualSize: r.actualSize
+            actualSize: r.actualSize,
+            lastModifiedMs: r.lastModifiedMs ?? null,
+            lastModified: r.lastModified ?? null
           });
         }
       }
@@ -4075,6 +4190,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
             MetadataDirective: 'COPY'
           })
         );
+        if (copyOnly || crossScope) {
+          await upsertPortalCopyLineage(newKey, oldKey);
+        }
         if (!copyOnly) {
           await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key: oldKey }));
           if (crossScope) {
@@ -4556,6 +4674,17 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       const pref = jobPrefix(parsed.clientId, parsed.jobId, storageRoot(req));
       const rel = key.slice(pref.length);
+      notifyPortalObjectUploaded({
+        key,
+        name: path.basename(key),
+        clientId: parsed.clientId,
+        jobId: parsed.jobId,
+        size,
+        path: rel,
+        user: req.user,
+        s3: portalS3(),
+        bucket: portalBucket()
+      });
       return res.status(201).json({
         id: keyToId(key),
         key,
@@ -4596,6 +4725,68 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       } catch (e) {
         console.warn('[portal-files] upsertPortalObjectUploadedBy (register-sha256):', e?.message || e);
       }
+      // Single-part presigned PUT never hits multipart/complete — still fire post-upload hooks (DB3 PSR ingest).
+      const pref = jobPrefix(parsed.clientId, parsed.jobId, storageRoot(req));
+      const rel = key.startsWith(pref) ? key.slice(pref.length) : path.basename(key);
+      notifyPortalObjectUploaded({
+        key,
+        name: path.basename(key),
+        clientId: parsed.clientId,
+        jobId: parsed.jobId,
+        size: 0,
+        path: rel,
+        user: req.user,
+        s3: portalS3(),
+        bucket: portalBucket()
+      });
+      return res.status(204).end();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(400).json({ error: msg });
+    }
+  });
+
+  /**
+   * JSON: { key } — after a successful single-part presigned PUT (no multipart/complete).
+   * Fires the same post-upload hook used by multipart/resumable complete (AutoSync DB3 → PSR ingest).
+   */
+  r.post('/upload/object-landed', express.json({ limit: '64kb' }), async (req, res) => {
+    try {
+      const key = String(req.body?.key || '').trim();
+      if (!isPortalClientsObjectKey(key)) {
+        return res.status(400).json({ error: 'key is required' });
+      }
+      const parsed = parseJobFromObjectKey(key);
+      if (!parsed) return res.status(400).json({ error: 'Invalid key' });
+      if (!(await assertPortalJobAccessForRequest(aclPool, req, parsed.clientId, parsed.jobId))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (!(await assertWritablePresignPath(req, parsed.clientId, parsed.jobId, key))) {
+        return res.status(403).json({ error: 'Forbidden for this path' });
+      }
+      try {
+        await upsertPortalObjectUploadedBy(key, parsed.clientId, parsed.jobId, req.user);
+      } catch (e) {
+        console.warn('[portal-files] upsertPortalObjectUploadedBy (object-landed):', e?.message || e);
+      }
+      const pref = jobPrefix(parsed.clientId, parsed.jobId, storageRoot(req));
+      const rel = key.startsWith(pref) ? key.slice(pref.length) : path.basename(key);
+      let size = 0;
+      const clientSize = Number(req.body?.fileSize);
+      if (Number.isFinite(clientSize) && clientSize >= 0) {
+        size = Math.floor(clientSize);
+      }
+      notifyPortalObjectUploaded({
+        key,
+        name: path.basename(key),
+        clientId: parsed.clientId,
+        jobId: parsed.jobId,
+        size,
+        path: rel,
+        user: req.user,
+        s3: portalS3(),
+        bucket: portalBucket()
+      });
       return res.status(204).end();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -5286,13 +5477,25 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         [sessionId, actualFileSha256]
       );
       const pref = jobPrefix(String(sessionRow.client_id), String(sessionRow.job_id), storageRoot(req));
+      const relPath = String(sessionRow.object_key).slice(pref.length);
+      notifyPortalObjectUploaded({
+        key: sessionRow.object_key,
+        name: path.basename(sessionRow.object_key),
+        clientId: sessionRow.client_id,
+        jobId: sessionRow.job_id,
+        size: Number(sessionRow.file_size || 0),
+        path: relPath,
+        user: req.user,
+        s3: portalS3(),
+        bucket: portalBucket()
+      });
       return res.status(201).json({
         id: keyToId(sessionRow.object_key),
         key: sessionRow.object_key,
         name: path.basename(sessionRow.object_key),
         size: Number(sessionRow.file_size || 0),
-        path: String(sessionRow.object_key).slice(pref.length),
-        parentPath: parentRelPath(String(sessionRow.object_key).slice(pref.length))
+        path: relPath,
+        parentPath: parentRelPath(relPath)
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

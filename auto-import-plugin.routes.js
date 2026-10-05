@@ -5,6 +5,10 @@ const path = require('path');
 const crypto = require('crypto');
 const multer = require('multer');
 const initSqlJs = require('sql.js');
+const {
+  extractCustomerFromDb3,
+  resolveCityForAutosyncPsr
+} = require('./lib/autosync-psr-ingest');
 
 function createAutoImportPlugin(options = {}) {
   const {
@@ -18,6 +22,14 @@ function createAutoImportPlugin(options = {}) {
     buildVersion,
     /** Load a normalized planner record (same shape as {@code fetchRecordById}) for segment matching during DB3 sync. */
     fetchPlannerRecord,
+    /** Optional: list known PipeSync cities for AutoSync city matching. */
+    listKnownPlannerCities,
+    /** Optional: find planner records by client/city/jobsite. */
+    findPlannerRecordsByScope,
+    /** Optional: create a planner record when AutoSync has no target jobsite yet. */
+    createPlannerRecord,
+    /** Optional: normalize jobsite names the same way PipeSync does. */
+    normalizeJobsiteName,
     uid = () => crypto.randomUUID(),
     nowIso = () => new Date().toISOString(),
     uploadDir = path.join(process.cwd(), 'uploads', 'auto-import-plugin'),
@@ -263,7 +275,8 @@ function createAutoImportPlugin(options = {}) {
     try {
       const rawPid = projectId == null ? '' : String(projectId).trim();
       const pid = !rawPid || rawPid === '__global__' ? null : clean(rawPid);
-      await runPostgresAutoImportSql(
+      // Use Wasabi-primary adapter (pool.query), not direct Postgres — projects may exist only in snapshot.
+      await pool.query(
         `INSERT INTO auto_import_logs (id, project_id, source, level, message, payload)
          VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
         [
@@ -418,9 +431,50 @@ function createAutoImportPlugin(options = {}) {
     };
   }
 
+  /**
+   * Desktop AUTOSYNC sends Windows absolute DB3 paths. Those files are not on this Linux host —
+   * never try to open them here (was flooding 500s → nginx 502 / broken uploads).
+   */
+  function isClientLocalDb3Path(filePath) {
+    const p = String(filePath || '').trim();
+    if (!p) return false;
+    if (/^[A-Za-z]:[\\/]/.test(p)) return true;
+    if (p.startsWith('\\\\')) return true;
+    return false;
+  }
+
+  function normalizeDb3SourcePath(filePath) {
+    const p = String(filePath || '').trim();
+    if (!p) return '';
+    if (isClientLocalDb3Path(p)) {
+      return p.replace(/\//g, '\\');
+    }
+    try {
+      return path.resolve(p);
+    } catch {
+      return p;
+    }
+  }
+
   async function parseDb3(filePath) {
+    const abs = String(filePath || '').trim();
+    if (!abs) throw new Error('DB3 path is empty.');
+    if (isClientLocalDb3Path(abs)) {
+      const err = new Error(
+        'DB3 path is on the crew PC, not this server. Send rows from Desktop Auto Sync (registerOnly discover + sync with rows).'
+      );
+      err.status = 400;
+      throw err;
+    }
+    try {
+      await fsp.access(abs);
+    } catch {
+      const err = new Error(`DB3 not readable on server: ${abs}`);
+      err.status = 400;
+      throw err;
+    }
     const SQL = await initSqlJs({ locateFile: (file) => require.resolve(`sql.js/dist/${file}`) });
-    const buffer = await fsp.readFile(filePath);
+    const buffer = await fsp.readFile(abs);
     const db = new SQL.Database(buffer);
     const tablesResult = db.exec("SELECT name FROM sqlite_master WHERE type='table'");
     const tables = new Set((tablesResult[0]?.values || []).map((row) => row[0]));
@@ -466,8 +520,10 @@ function createAutoImportPlugin(options = {}) {
   }
 
   async function ensureProject({ db3Path, displayName = '' }) {
-    const sourceKey = sha(path.resolve(db3Path));
+    const normalizedPath = normalizeDb3SourcePath(db3Path);
+    const sourceKey = sha(normalizedPath.toLowerCase());
     const existing = await pool.query('SELECT * FROM auto_import_projects WHERE source_key = $1 LIMIT 1', [sourceKey]);
+    let project;
     if (existing.rows[0]) {
       const updated = await pool.query(`
         UPDATE auto_import_projects
@@ -477,17 +533,64 @@ function createAutoImportPlugin(options = {}) {
             updated_at = NOW()
         WHERE source_key = $1
         RETURNING *
-      `, [sourceKey, displayName || path.basename(db3Path), path.resolve(db3Path)]);
-      return updated.rows[0];
+      `, [sourceKey, displayName || path.basename(normalizedPath), normalizedPath]);
+      project = updated.rows[0];
+    } else {
+      const inserted = await pool.query(`
+        INSERT INTO auto_import_projects (
+          id, source_key, display_name, db3_path, status, last_seen_at, metadata
+        ) VALUES ($1,$2,$3,$4,'idle',NOW(),'{}'::jsonb)
+        RETURNING *
+      `, [uid(), sourceKey, displayName || path.basename(normalizedPath), normalizedPath]);
+      project = inserted.rows[0];
     }
-
-    const inserted = await pool.query(`
-      INSERT INTO auto_import_projects (
-        id, source_key, display_name, db3_path, status, last_seen_at, metadata
-      ) VALUES ($1,$2,$3,$4,'idle',NOW(),'{}'::jsonb)
-      RETURNING *
-    `, [uid(), sourceKey, displayName || path.basename(db3Path), path.resolve(db3Path)]);
-    return inserted.rows[0];
+    // Wasabi-primary writes never land in Postgres; mirror so log FK + monitor stay valid.
+    if (project && directPgQuery) {
+      try {
+        await runPostgresAutoImportSql(
+          `INSERT INTO auto_import_projects (
+             id, source_key, display_name, db3_path, status, detection_mode,
+             detected_job_client, detected_job_city, detected_jobsite,
+             last_seen_at, last_scan_at, last_switch_at, last_error, metadata, created_at, updated_at
+           ) VALUES (
+             $1,$2,$3,$4,COALESCE($5,'idle'),COALESCE($6,'auto'),
+             COALESCE($7,''),COALESCE($8,''),COALESCE($9,''),
+             $10,$11,$12,COALESCE($13,''),COALESCE($14::jsonb,'{}'::jsonb),
+             COALESCE($15,NOW()),COALESCE($16,NOW())
+           )
+           ON CONFLICT (id) DO UPDATE SET
+             source_key = EXCLUDED.source_key,
+             display_name = EXCLUDED.display_name,
+             db3_path = EXCLUDED.db3_path,
+             status = EXCLUDED.status,
+             last_seen_at = EXCLUDED.last_seen_at,
+             last_scan_at = COALESCE(EXCLUDED.last_scan_at, auto_import_projects.last_scan_at),
+             metadata = EXCLUDED.metadata,
+             updated_at = EXCLUDED.updated_at`,
+          [
+            project.id,
+            project.source_key,
+            project.display_name,
+            project.db3_path,
+            project.status || 'idle',
+            project.detection_mode || 'auto',
+            project.detected_job_client || '',
+            project.detected_job_city || '',
+            project.detected_jobsite || '',
+            project.last_seen_at || nowIso(),
+            project.last_scan_at || null,
+            project.last_switch_at || null,
+            project.last_error || '',
+            JSON.stringify(project.metadata && typeof project.metadata === 'object' ? project.metadata : {}),
+            project.created_at || nowIso(),
+            project.updated_at || nowIso()
+          ]
+        );
+      } catch (e) {
+        logger.warn?.('AUTO IMPORT PROJECT PG MIRROR FAILED:', e?.message || e);
+      }
+    }
+    return project;
   }
 
   async function upsertBinding(projectId, body, username) {
@@ -499,6 +602,7 @@ function createAutoImportPlugin(options = {}) {
     if (!client || !city || !jobsite) throw new Error('Client, city, and jobsite are required.');
 
     const existing = await pool.query('SELECT id FROM auto_import_bindings WHERE project_id = $1 LIMIT 1', [projectId]);
+    let binding;
     if (existing.rows[0]) {
       const updated = await pool.query(`
         UPDATE auto_import_bindings
@@ -512,35 +616,177 @@ function createAutoImportPlugin(options = {}) {
         WHERE project_id = $1
         RETURNING *
       `, [projectId, client, city, jobsite, systemType, pinned, username || 'System']);
-      return updated.rows[0];
+      binding = updated.rows[0];
+    } else {
+      const inserted = await pool.query(`
+        INSERT INTO auto_import_bindings (id, project_id, client, city, jobsite, system_type, pinned, created_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        RETURNING *
+      `, [uid(), projectId, client, city, jobsite, systemType, pinned, username || 'System']);
+      binding = inserted.rows[0];
     }
+    if (binding && directPgQuery) {
+      try {
+        await runPostgresAutoImportSql(
+          `INSERT INTO auto_import_bindings (
+             id, project_id, client, city, jobsite, system_type, pinned, created_by, created_at, updated_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9,NOW()),COALESCE($10,NOW()))
+           ON CONFLICT (project_id) DO UPDATE SET
+             client = EXCLUDED.client,
+             city = EXCLUDED.city,
+             jobsite = EXCLUDED.jobsite,
+             system_type = EXCLUDED.system_type,
+             pinned = EXCLUDED.pinned,
+             updated_at = EXCLUDED.updated_at`,
+          [
+            binding.id,
+            binding.project_id,
+            binding.client,
+            binding.city,
+            binding.jobsite,
+            binding.system_type || 'storm',
+            !!binding.pinned,
+            binding.created_by || username || 'System',
+            binding.created_at || nowIso(),
+            binding.updated_at || nowIso()
+          ]
+        );
+      } catch (e) {
+        logger.warn?.('AUTO IMPORT BINDING PG MIRROR FAILED:', e?.message || e);
+      }
+    }
+    return binding;
+  }
 
-    const inserted = await pool.query(`
-      INSERT INTO auto_import_bindings (id, project_id, client, city, jobsite, system_type, pinned, created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-      RETURNING *
-    `, [uid(), projectId, client, city, jobsite, systemType, pinned, username || 'System']);
-    return inserted.rows[0];
+  /**
+   * Desktop AutoSync often registers a project before anyone binds it in the UI.
+   * Infer client/city/jobsite from DB3 rows (same rules as PSR ingest) and create binding + planner target.
+   * @returns {{ binding: object, plannerRecord: object|null }}
+   */
+  async function ensureAutoBindingFromRows(project, rows, username) {
+    const list = Array.isArray(rows) ? rows : [];
+    const sample = list[0] || {};
+    const projectName =
+      clean(sample.projectName || sample.project || project?.display_name || path.basename(String(project?.db3_path || ''), '.db3')) ||
+      'NOT SET';
+    let customer = '';
+    for (const row of list) {
+      customer = extractCustomerFromDb3(row?.db3Imported, projectName);
+      if (customer) break;
+    }
+    if (!customer) customer = extractCustomerFromDb3(sample?.db3Imported, projectName);
+    if (!customer) {
+      throw new Error(
+        'Bind this DB3 project to a client/city/jobsite before syncing (could not infer Customer from DB3).'
+      );
+    }
+    let knownCities = [];
+    if (typeof listKnownPlannerCities === 'function') {
+      try {
+        knownCities = await listKnownPlannerCities();
+      } catch {
+        knownCities = [];
+      }
+    }
+    const cityInfo = resolveCityForAutosyncPsr(projectName, sample.city || project?.detected_job_city || '', knownCities);
+    const city = clean(cityInfo?.city || sample.city || project?.detected_job_city) || 'NOT SET';
+    const street = clean(sample.street || '');
+    const jobsite =
+      typeof normalizeJobsiteName === 'function'
+        ? clean(normalizeJobsiteName(projectName, street)) || clean(projectName)
+        : clean(projectName);
+    const binding = await upsertBinding(
+      project.id,
+      { client: customer, city, jobsite, systemType: 'storm', pinned: false },
+      username || 'AutoSync'
+    );
+    let plannerRecord = null;
+    if (typeof findPlannerRecordsByScope === 'function') {
+      try {
+        const matches = await findPlannerRecordsByScope(customer, city, jobsite, { latestOnly: true });
+        plannerRecord = matches?.[0] || null;
+      } catch {
+        plannerRecord = null;
+      }
+    }
+    if (!plannerRecord && typeof createPlannerRecord === 'function') {
+      plannerRecord = await createPlannerRecord(
+        {
+          record_date: new Date().toISOString().slice(0, 10),
+          client: customer,
+          city,
+          street,
+          jobsite,
+          status: '',
+          saved_by: username || 'AutoSync',
+          systems: { storm: [], sanitary: [] }
+        },
+        { user: { displayName: username || 'AutoSync', username: 'autosync' } }
+      );
+    }
+    await logEvent(project.id, 'server', 'info', 'Auto-bound Desktop AutoSync project from DB3 fields.', {
+      client: customer,
+      city,
+      jobsite,
+      plannerId: plannerRecord?.id || null
+    });
+    return { binding, plannerRecord };
   }
 
   async function syncProjectRows(project, rows, username) {
-    const bindingResult = await pool.query('SELECT * FROM auto_import_bindings WHERE project_id = $1 LIMIT 1', [project.id]);
-    const binding = bindingResult.rows[0];
+    let bindingResult = await pool.query('SELECT * FROM auto_import_bindings WHERE project_id = $1 LIMIT 1', [project.id]);
+    let binding = bindingResult.rows[0];
+    let plannerRecord = null;
+    if (!binding) {
+      const auto = await ensureAutoBindingFromRows(project, rows, username);
+      binding = auto?.binding || null;
+      plannerRecord = auto?.plannerRecord || null;
+    }
     if (!binding) throw new Error('Bind this DB3 project to a client/city/jobsite before syncing.');
 
-    const targetJobsiteResult = await pool.query(
-      `SELECT id FROM planner_records
-       WHERE LOWER(client) = LOWER($1) AND LOWER(city) = LOWER($2) AND LOWER(jobsite) = LOWER($3)
-       ORDER BY updated_at DESC
-       LIMIT 1`,
-      [binding.client, binding.city, binding.jobsite]
-    );
-    if (!targetJobsiteResult.rows[0]) {
+    if (!plannerRecord && typeof findPlannerRecordsByScope === 'function') {
+      try {
+        const matches = await findPlannerRecordsByScope(binding.client, binding.city, binding.jobsite, {
+          latestOnly: true
+        });
+        plannerRecord = matches?.[0] || null;
+      } catch {
+        plannerRecord = null;
+      }
+    }
+
+    let targetJobsiteId = plannerRecord?.id ? String(plannerRecord.id) : '';
+    if (!targetJobsiteId) {
+      const targetJobsiteResult = await pool.query(
+        `SELECT id FROM planner_records
+         WHERE LOWER(client) = LOWER($1) AND LOWER(city) = LOWER($2) AND LOWER(jobsite) = LOWER($3)
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+        [binding.client, binding.city, binding.jobsite]
+      );
+      targetJobsiteId = targetJobsiteResult.rows[0]?.id ? String(targetJobsiteResult.rows[0].id) : '';
+    }
+    if (!targetJobsiteId && typeof createPlannerRecord === 'function') {
+      plannerRecord = await createPlannerRecord(
+        {
+          record_date: new Date().toISOString().slice(0, 10),
+          client: binding.client,
+          city: binding.city,
+          street: '',
+          jobsite: binding.jobsite,
+          status: '',
+          saved_by: username || 'AutoSync',
+          systems: { storm: [], sanitary: [] }
+        },
+        { user: { displayName: username || 'AutoSync', username: 'autosync' } }
+      );
+      targetJobsiteId = plannerRecord?.id ? String(plannerRecord.id) : '';
+    }
+    if (!targetJobsiteId) {
       throw new Error(
         'Selected target jobsite was not found. Create a planner record with the same client, city, and jobsite first.'
       );
     }
-    const targetJobsiteId = targetJobsiteResult.rows[0].id;
 
     let changed = 0;
     let inserted = 0;
@@ -567,14 +813,21 @@ function createAutoImportPlugin(options = {}) {
         continue;
       }
 
-      const record = await fetchPlannerRecord(String(targetJobsiteId));
+      const record =
+        plannerRecord && String(plannerRecord.id) === String(targetJobsiteId)
+          ? plannerRecord
+          : await fetchPlannerRecord(String(targetJobsiteId));
       if (!record || !record.systems) {
         throw new Error(`Planner record not found for jobsite id ${targetJobsiteId}`);
       }
+      // Keep in-memory record fresh across segment writes in this sync pass.
+      plannerRecord = record;
       const segments = record.systems[systemKey] || [];
       const existing = findExistingSegment(segments, row);
       const payload = buildPayloadForRow(project, binding, row, existing, username || 'System');
-      await writeSegment(targetJobsiteId, payload, username || 'System');
+      await writeSegment(targetJobsiteId, payload, username || 'System', record);
+      // Prefer the record writeSegment just persisted when available.
+      if (record && record.systems) plannerRecord = record;
       changed += 1;
 
       if (cache) updated += 1;
@@ -873,31 +1126,47 @@ function createAutoImportPlugin(options = {}) {
     }
   });
 
-  router.post('/discover', requireMike, express.json(), async (req, res, next) => {
+  router.post('/discover', requireMike, express.json({ limit: '12mb' }), async (req, res, next) => {
     try {
       const db3Path = clean(req.body.db3Path);
       if (!db3Path) return res.status(400).json({ error: 'db3Path is required.' });
-      const rows = await parseDb3(db3Path);
+      // Desktop Auto Sync: register the project from a client-side path; rows come later via /sync.
+      const registerOnly =
+        Boolean(req.body.registerOnly) ||
+        isClientLocalDb3Path(db3Path) ||
+        (Array.isArray(req.body.rows) && req.body.rows.length > 0);
+      let rows = Array.isArray(req.body.rows) ? req.body.rows : [];
+      if (!registerOnly) {
+        rows = await parseDb3(db3Path);
+      }
       const project = await ensureProject({ db3Path, displayName: clean(req.body.displayName) });
       const sample = rows[0] || {};
       await pool.query(`
         UPDATE auto_import_projects
-        SET detected_job_city = $2,
-            detected_jobsite = $3,
+        SET detected_job_city = COALESCE(NULLIF($2, ''), detected_job_city),
+            detected_jobsite = COALESCE(NULLIF($3, ''), detected_jobsite),
             metadata = $4::jsonb,
-            last_scan_at = NOW(),
-            status = 'discovered',
+            last_scan_at = CASE WHEN $5::int > 0 THEN NOW() ELSE last_scan_at END,
+            status = CASE WHEN $5::int > 0 THEN 'discovered' ELSE status END,
             updated_at = NOW()
         WHERE id = $1
       `, [
         project.id,
         clean(sample.city),
         clean(sample.projectName || sample.street || project.display_name),
-        JSON.stringify({ sampleRowCount: rows.length, source: 'manual-discover' })
+        JSON.stringify({
+          sampleRowCount: rows.length,
+          source: registerOnly ? 'desktop-register' : 'manual-discover',
+          clientPath: isClientLocalDb3Path(db3Path)
+        }),
+        rows.length
       ]);
-      await logEvent(project.id, 'web', 'info', 'Preview discovered from DB3 path.', {
+      await logEvent(project.id, 'web', 'info', registerOnly
+        ? 'Project registered from Desktop Auto Sync (client DB3 path).'
+        : 'Preview discovered from DB3 path.', {
         db3Path,
-        rowCount: rows.length
+        rowCount: rows.length,
+        registerOnly: Boolean(registerOnly)
       });
       res.json({ success: true, project: { ...project, rowCount: rows.length }, rows: rows.slice(0, 50) });
     } catch (error) {
@@ -1005,8 +1274,13 @@ function createAutoImportPlugin(options = {}) {
       const explicitPath = clean(req.body.db3Path);
       const filePath = req.file?.path || explicitPath;
       if (!filePath) return res.status(400).json({ error: 'DB3 file or db3Path is required.' });
+      if (!req.file?.path && isClientLocalDb3Path(explicitPath)) {
+        return res.status(400).json({
+          error: 'Upload the .db3 file (multipart) for preview — client PC paths are not readable on the server.'
+        });
+      }
       const rows = await parseDb3(filePath);
-      const project = await ensureProject({ db3Path: filePath, displayName: clean(req.body.displayName) || path.basename(filePath) });
+      const project = await ensureProject({ db3Path: explicitPath || filePath, displayName: clean(req.body.displayName) || path.basename(filePath) });
       res.json({ success: true, project, rows: rows.slice(0, 500), totalRows: rows.length });
     } catch (error) {
       next(error);
@@ -1018,9 +1292,15 @@ function createAutoImportPlugin(options = {}) {
       const projectResult = await pool.query('SELECT * FROM auto_import_projects WHERE id = $1 LIMIT 1', [req.params.projectId]);
       const project = projectResult.rows[0];
       if (!project) return res.status(404).json({ error: 'Project not found.' });
-      const rows = Array.isArray(req.body.rows) && req.body.rows.length
-        ? req.body.rows
-        : await parseDb3(project.db3_path);
+      let rows = Array.isArray(req.body.rows) && req.body.rows.length ? req.body.rows : null;
+      if (!rows) {
+        if (isClientLocalDb3Path(project.db3_path)) {
+          return res.status(400).json({
+            error: 'Sync requires rows[] for Desktop Auto Sync projects (DB3 lives on the crew PC).'
+          });
+        }
+        rows = await parseDb3(project.db3_path);
+      }
       await logEvent(project.id, 'web', 'info', 'Sync started.', {
         requestedBy: req.user?.username || 'System',
         rowCount: rows.length,

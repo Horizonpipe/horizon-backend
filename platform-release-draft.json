@@ -1,10 +1,11 @@
 ﻿{
-  "title": "PIPESHARE landing About + brand visuals",
-  "description": "pipeshare.net homepage keeps the existing business/customer sign-in and brochure cards, and adds a short About section plus stylized industrial brand images (hero pipe visual, AutoSync feature art, About banner). Copy covers what PIPESHARE is, who it is for, and the problems it solves.\n\nWho is affected: visitors on pipeshare.net (and the same marketing path on pipeshare.live). Login cards and auth flow are unchanged.",
+  "title": "Server-side DB3 inspection ingest (Desktop stops local open)",
+  "description": "Desktop Auto Sync no longer opens WinCan .db3 files on the field PC to push inspection rows. Java still uploads .db3 like any other project file under Shared Base Jobs/… After the file lands, the server downloads it from storage and ingests/compare rows into PipeSync (existing AutoSync PSR ingest).\n\nThis removes the noisy “DB3 skipped (not on disk)” / local SQLite open failures while keeping dual WinCan watch folders and full folder upload working.\n\nWho is affected: Desktop Auto Sync users on private server and SaaS after Desktop update + backend deploy. PipeShare browsing of uploaded projects is unchanged; video inspection still uses the cloud .db3.",
   "changeLog": [
-    "Added About section and brand images on the SaaS marketing landing.",
-    "Header About / Sign in jump links; login cards unchanged.",
-    "Hero, AutoSync, and About visuals under marketing/pipeshare/assets/."
+    "Desktop: local DB3 row open/poll disabled by default (server ingest after upload).",
+    "Backend: post-upload hook also fires for single-part PUT via /upload/object-landed (and register-sha256).",
+    "Java AutoSync: notifies server after single-part DB3/file PUT; logs “DB3 uploaded — server will ingest…”.",
+    "Status UI: DB3 rows show as “Server after upload” instead of a local active path."
   ],
-  "updatedAt": "2026-10-05T16:00:00.000Z"
+  "updatedAt": "2026-10-05T17:10:00.000Z"
 }

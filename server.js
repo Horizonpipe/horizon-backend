@@ -13,6 +13,14 @@ const { Pool } = require('pg');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { ensureOutlookSchema, registerOutlookRoutes } = require('./outlook');
 const { registerPortalFilesRoutes } = require('./portal-files.routes');
+const {
+  evaluateSectionReviewStatus,
+  extractCustomerFromDb3,
+  resolveCityForAutosyncPsr,
+  fetchSectionObservationOpcodes,
+  isPrimaryWinCanDb3Name,
+  guessMetaObjectKey
+} = require('./lib/autosync-psr-ingest');
 const { registerCompanyPermissionsRoutes } = require('./company-permissions.routes');
 const {
   nextDb3DuplicateReference,
@@ -751,6 +759,30 @@ async function hydrateJobsiteAssetsResponseRows(assets) {
   );
 }
 
+/** Parallel Wasabi GET-presign pool (serial hydrate was a major Day Start / library latency gate). */
+const PLAN_VIEW_HYDRATE_CONCURRENCY = Math.max(
+  4,
+  Math.min(24, Number(process.env.HP_PLAN_VIEW_HYDRATE_CONCURRENCY) || 12)
+);
+
+async function mapPool(items, concurrency, mapper) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return [];
+  const limit = Math.max(1, Math.min(Number(concurrency) || PLAN_VIEW_HYDRATE_CONCURRENCY, list.length));
+  const out = new Array(list.length);
+  let cursor = 0;
+  async function worker() {
+    while (true) {
+      const i = cursor;
+      cursor += 1;
+      if (i >= list.length) return;
+      out[i] = await mapper(list[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: limit }, () => worker()));
+  return out;
+}
+
 async function hydratePlanBoardPageRow(p, planStorage) {
   if (!p || typeof p !== 'object') return p;
   const copy = { ...p };
@@ -816,33 +848,30 @@ async function hydratePlanBoardLegacyPlanRow(d, planStorage) {
     }
   }
   if (Array.isArray(copy.pieces)) {
-    const pieces = [];
-    for (const p of copy.pieces) {
-      if (!p || typeof p !== 'object') continue;
-      pieces.push(await hydratePlanBoardLegacyPieceRow(p, planStorage));
-    }
-    copy.pieces = pieces;
+    const pieceRows = copy.pieces.filter((p) => p && typeof p === 'object');
+    copy.pieces = await mapPool(pieceRows, PLAN_VIEW_HYDRATE_CONCURRENCY, (p) =>
+      hydratePlanBoardLegacyPieceRow(p, planStorage)
+    );
   }
   return copy;
 }
 
 async function hydratePlanBoardWorkspacePages(workspaces, planStorage) {
   if (!Array.isArray(workspaces)) return workspaces;
-  const out = [];
-  for (const w of workspaces) {
-    if (!w || typeof w !== 'object') continue;
-    const wCopy = { ...w };
-    if (Array.isArray(wCopy.pages)) {
-      const wp = [];
-      for (const p of wCopy.pages) {
-        if (!p || typeof p !== 'object') continue;
-        wp.push(await hydratePlanBoardPageRow(p, planStorage));
+  return mapPool(
+    workspaces.filter((w) => w && typeof w === 'object'),
+    Math.min(8, PLAN_VIEW_HYDRATE_CONCURRENCY),
+    async (w) => {
+      const wCopy = { ...w };
+      if (Array.isArray(wCopy.pages)) {
+        const pages = wCopy.pages.filter((p) => p && typeof p === 'object');
+        wCopy.pages = await mapPool(pages, PLAN_VIEW_HYDRATE_CONCURRENCY, (p) =>
+          hydratePlanBoardPageRow(p, planStorage)
+        );
       }
-      wCopy.pages = wp;
+      return wCopy;
     }
-    out.push(wCopy);
-  }
-  return out;
+  );
 }
 
 async function hydratePlanBoardBranch(branch, planStorage) {
@@ -850,11 +879,9 @@ async function hydratePlanBoardBranch(branch, planStorage) {
   if (!adminAttachmentsWasabiConfigured() && !(planStorage?.client && planStorage?.bucket)) return branch;
   const next = { ...branch };
   if (Array.isArray(branch.pages)) {
-    const pages = [];
-    for (const p of branch.pages) {
-      pages.push(await hydratePlanBoardPageRow(p, planStorage));
-    }
-    next.pages = pages;
+    next.pages = await mapPool(branch.pages, PLAN_VIEW_HYDRATE_CONCURRENCY, (p) =>
+      hydratePlanBoardPageRow(p, planStorage)
+    );
   } else if (!Array.isArray(next.pages)) {
     next.pages = [];
   }
@@ -862,12 +889,10 @@ async function hydratePlanBoardBranch(branch, planStorage) {
     next.mapWorkspaces = await hydratePlanBoardWorkspacePages(branch.mapWorkspaces, planStorage);
   }
   if (Array.isArray(branch.legacyPlans)) {
-    const legacyPlans = [];
-    for (const d of branch.legacyPlans) {
-      if (!d || typeof d !== 'object') continue;
-      legacyPlans.push(await hydratePlanBoardLegacyPlanRow(d, planStorage));
-    }
-    next.legacyPlans = legacyPlans;
+    const legacy = branch.legacyPlans.filter((d) => d && typeof d === 'object');
+    next.legacyPlans = await mapPool(legacy, Math.min(8, PLAN_VIEW_HYDRATE_CONCURRENCY), (d) =>
+      hydratePlanBoardLegacyPlanRow(d, planStorage)
+    );
   }
   return next;
 }
@@ -876,8 +901,10 @@ async function hydratePlanViewPayloadForResponse(payload, req) {
   if (!payload || typeof payload !== 'object') return payload;
   const planStorage = req ? await planViewWasabiForRequest(req) : null;
   if (payload.v === 2 && payload.imagePlan && payload.pdfMap) {
-    const imagePlan = await hydratePlanBoardBranch(payload.imagePlan, planStorage);
-    const pdfMap = await hydratePlanBoardBranch(payload.pdfMap, planStorage);
+    const [imagePlan, pdfMap] = await Promise.all([
+      hydratePlanBoardBranch(payload.imagePlan, planStorage),
+      hydratePlanBoardBranch(payload.pdfMap, planStorage)
+    ]);
     return { ...payload, v: 2, imagePlan, pdfMap };
   }
   return hydratePlanBoardBranch(payload, planStorage);
@@ -1365,6 +1392,60 @@ let wasabiLatestStateCache = null;
 let wasabiLatestStateCacheAt = 0;
 let wasabiLatestStateCacheEtag = null;
 let wasabiStateWriteQueue = Promise.resolve();
+const WASABI_STATE_LOCK_PATH = String(
+  process.env.WASABI_STATE_LOCK_PATH || path.join('/tmp', 'horizon-wasabi-state.write.lock')
+).trim();
+const WASABI_STATE_WRITE_MAX_ATTEMPTS = Math.max(
+  6,
+  Math.min(40, Number(process.env.WASABI_STATE_WRITE_MAX_ATTEMPTS || 20))
+);
+const WASABI_STATE_LOCK_TIMEOUT_MS = Math.max(
+  5000,
+  Math.min(180000, Number(process.env.WASABI_STATE_LOCK_TIMEOUT_MS || 90000))
+);
+
+/**
+ * Cross-PM2-worker lock so only one process mutates Wasabi latest.json at a time.
+ * In-process queue alone is not enough with cluster mode (4 workers → constant 412s).
+ */
+async function withWasabiStateFileLock(fn) {
+  const started = Date.now();
+  let handle = null;
+  while (!handle) {
+    try {
+      handle = await fs.promises.open(WASABI_STATE_LOCK_PATH, 'wx');
+      await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`);
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+      try {
+        const st = await fs.promises.stat(WASABI_STATE_LOCK_PATH);
+        // Stale lock (crashed worker) — reclaim after 90s.
+        if (Date.now() - st.mtimeMs > 90000) {
+          await fs.promises.unlink(WASABI_STATE_LOCK_PATH).catch(() => {});
+          continue;
+        }
+      } catch {
+        /* lock disappeared — retry open */
+      }
+      if (Date.now() - started >= WASABI_STATE_LOCK_TIMEOUT_MS) {
+        const timeout = new Error('WASABI_STATE_LOCK_TIMEOUT');
+        timeout.code = 'WASABI_STATE_LOCK_TIMEOUT';
+        throw timeout;
+      }
+      await new Promise((r) => setTimeout(r, 40 + Math.floor(Math.random() * 120)));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    try {
+      await handle.close();
+    } catch {
+      /* ignore */
+    }
+    await fs.promises.unlink(WASABI_STATE_LOCK_PATH).catch(() => {});
+  }
+}
 let wasabiAutoImportHandledByWasabi = 0;
 let wasabiAutoImportFallbackToPostgres = 0;
 let wasabiAutoImportLastErrorAt = 0;
@@ -1628,33 +1709,36 @@ async function runWasabiStateWrite(reason, mutator) {
   if (!wasabiStateClient || !WASABI_STATE_BUCKET) {
     throw new Error('Wasabi state client is not configured');
   }
-  const task = async () => {
-    let lastErr = null;
-    for (let attempt = 0; attempt < 6; attempt++) {
-      const loaded = await loadWasabiLatestStateSnapshotWithMeta(true);
-      const snapshot = loaded?.snapshot || {};
-      const etag = loaded?.etag || null;
-      const next = snapshotStateShape(snapshot);
-      await mutator(next.data);
-      next.generatedAt = nowIso();
-      next.reason = String(reason || 'mutation');
-      try {
-        // IfMatch prevents PM2 workers / snapshot jobs from clobbering a newer latest.json.
-        await putWasabiStateObject(next, etag ? { ifMatch: etag } : {});
-        return next;
-      } catch (err) {
-        if (err?.code === 'WASABI_STATE_PRECONDITION_FAILED' || wasabiStatePreconditionError(err)) {
+  const task = async () =>
+    withWasabiStateFileLock(async () => {
+      // Cross-worker file lock already serializes writers — do not use If-Match here.
+      // If-Match + multi-worker retries held the lock too long (LOCK_TIMEOUT) and still 412'd.
+      let lastErr = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const loaded = await loadWasabiLatestStateSnapshotWithMeta(true);
+          const snapshot = loaded?.snapshot || {};
+          const next = snapshotStateShape(snapshot);
+          await mutator(next.data);
+          next.generatedAt = nowIso();
+          next.reason = String(reason || 'mutation');
+          await putWasabiStateObject(next, {});
+          return next;
+        } catch (err) {
           lastErr = err;
-          wasabiLatestStateCache = null;
-          wasabiLatestStateCacheAt = 0;
-          wasabiLatestStateCacheEtag = null;
-          continue;
+          // Transient network / decode issues only — brief pause, still under lock.
+          if (attempt < 2) {
+            await new Promise((r) => setTimeout(r, 40 + attempt * 60));
+            wasabiLatestStateCache = null;
+            wasabiLatestStateCacheAt = 0;
+            wasabiLatestStateCacheEtag = null;
+            continue;
+          }
+          throw err;
         }
-        throw err;
       }
-    }
-    throw lastErr || new Error(`Wasabi state write conflict after retries (${reason})`);
-  };
+      throw lastErr || new Error(`Wasabi state write failed (${reason})`);
+    });
   const run = wasabiStateWriteQueue.then(task, task);
   wasabiStateWriteQueue = run.catch(() => {});
   return run;
@@ -1666,6 +1750,17 @@ async function tryWasabiStateWrite(reason, mutator) {
     await runWasabiStateWrite(reason, mutator);
     return true;
   } catch (error) {
+    const isConflict =
+      error?.code === 'WASABI_STATE_PRECONDITION_FAILED' ||
+      error?.code === 'WASABI_STATE_LOCK_TIMEOUT' ||
+      wasabiStatePreconditionError(error);
+    if (isConflict) {
+      // Never bubble precondition/lock races as UNHANDLED 500s — callers retry or soft-fail.
+      console.warn(
+        `[wasabi-write] ${reason} conflict after retries (${error?.code || error?.message || error}); soft-fail`
+      );
+      return false;
+    }
     if (WASABI_WRITES_PRIMARY_STRICT) throw error;
     console.warn(`[wasabi-write] ${reason} failed, falling back to postgres:`, error?.message || error);
     return false;
@@ -2005,29 +2100,33 @@ async function runWasabiStateSnapshot() {
         scope: { clientId: 'portal-users', jobId: '3' },
         data
       };
-      // Re-check latest under the write lock; if a mutation landed while we built PG tables,
-      // prefer that planner/app-data so we never clobber a fresher import.
-      try {
-        const fresh = await loadWasabiLatestStateSnapshotWithMeta(true);
-        const freshData = readWasabiSnapshotDataTables(fresh?.snapshot || {}, { strict: false });
-        for (const tableName of preserveFromLatest) {
-          if (Array.isArray(freshData[tableName])) {
-            data[tableName] = cloneSnapshotRows(freshData[tableName]);
+      // Cross-worker file lock serializes writers — put without If-Match (avoids 412 storms).
+      await withWasabiStateFileLock(async () => {
+        try {
+          const fresh = await loadWasabiLatestStateSnapshotWithMeta(true);
+          const freshData = readWasabiSnapshotDataTables(fresh?.snapshot || {}, { strict: false });
+          for (const tableName of preserveFromLatest) {
+            if (Array.isArray(freshData[tableName])) {
+              data[tableName] = cloneSnapshotRows(freshData[tableName]);
+            }
           }
+          if (Array.isArray(freshData[PIPESYNC_PLAN_VIEW_TABLE])) {
+            data[PIPESYNC_PLAN_VIEW_TABLE] = cloneSnapshotRows(freshData[PIPESYNC_PLAN_VIEW_TABLE]);
+          }
+          if (Array.isArray(freshData[PIPESYNC_PRICING_STATE_TABLE])) {
+            data[PIPESYNC_PRICING_STATE_TABLE] = cloneSnapshotRows(freshData[PIPESYNC_PRICING_STATE_TABLE]);
+          }
+        } catch {
+          // keep assembled data
         }
-        if (Array.isArray(freshData[PIPESYNC_PLAN_VIEW_TABLE])) {
-          data[PIPESYNC_PLAN_VIEW_TABLE] = cloneSnapshotRows(freshData[PIPESYNC_PLAN_VIEW_TABLE]);
-        }
-        if (Array.isArray(freshData[PIPESYNC_PRICING_STATE_TABLE])) {
-          data[PIPESYNC_PRICING_STATE_TABLE] = cloneSnapshotRows(freshData[PIPESYNC_PRICING_STATE_TABLE]);
-        }
-        previousEtag = fresh?.etag || previousEtag;
-      } catch {
-        // keep assembled data
-      }
-      await putWasabiStateObject(next, previousEtag ? { ifMatch: previousEtag } : {});
+        await putWasabiStateObject(next, {});
+      });
     } catch (err) {
-      if (err?.code === 'WASABI_STATE_PRECONDITION_FAILED' || wasabiStatePreconditionError(err)) {
+      if (
+        err?.code === 'WASABI_STATE_PRECONDITION_FAILED' ||
+        err?.code === 'WASABI_STATE_LOCK_TIMEOUT' ||
+        wasabiStatePreconditionError(err)
+      ) {
         console.warn('[wasabi-state] snapshot skipped due to concurrent write (safe)');
         return;
       }
@@ -4092,10 +4191,23 @@ function parseJsonObject(value, fallback = {}) {
 function normalizeStatus(status) {
   const value = String(status || '').trim().toLowerCase();
   if (['complete', 'video complete'].includes(value)) return 'complete';
+  if (
+    ['needs-reviewed', 'needs reviewed', 'needs review', 'review needed', 'msa', 'incomplete run'].includes(
+      value
+    )
+  ) {
+    return 'needs-reviewed';
+  }
   if (['failed', 'video failed'].includes(value)) return 'failed';
   if (['rerun', 'rerun queue', 'needs rerun'].includes(value)) return 'rerun';
   if (['rerun-videoed', 'revideoed', 'rerun videoed'].includes(value)) return 'rerun-videoed';
   if (['rerun-failed', 'rerun failed'].includes(value)) return 'rerun-failed';
+  if (['needs-quicklock', 'needs quicklock', 'needs ql', 'quicklock needed'].includes(value)) {
+    return 'needs-quicklock';
+  }
+  if (['quicklock-installed', 'quicklock installed', 'ql installed'].includes(value)) {
+    return 'quicklock-installed';
+  }
   if (['could-not-locate', 'could not locate', 'ni', 'not installed'].includes(value)) return 'could-not-locate';
   if (['jetted', 'vac/jetted'].includes(value)) return 'jetted';
   return 'neutral';
@@ -4105,10 +4217,13 @@ function statusLabel(status) {
   const normalized = normalizeStatus(status);
   switch (normalized) {
     case 'complete': return 'Complete';
+    case 'needs-reviewed': return 'Needs Reviewed';
     case 'failed': return 'Failed';
     case 'rerun': return 'Rerun Queue';
     case 'rerun-videoed': return 'Revideoed';
     case 'rerun-failed': return 'Rerun Failed';
+    case 'needs-quicklock': return 'Needs Quicklock';
+    case 'quicklock-installed': return 'Quicklock Installed';
     case 'could-not-locate': return 'Not Installed';
     case 'jetted': return 'Jetted';
     default: return 'Unmarked';
@@ -5274,15 +5389,58 @@ function db3InspectorDisplay(value) {
     .replace(/\b\w/g, (m) => m.toUpperCase());
 }
 
+/** sql.js may return WinCan UNIQUEIDENTIFIER as string or 16-byte Uint8Array. */
+function db3NormalizeSqlId(value) {
+  if (value == null || value === '') return '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  const asBytes =
+    value instanceof Uint8Array
+      ? value
+      : typeof Buffer !== 'undefined' && Buffer.isBuffer?.(value)
+        ? new Uint8Array(value)
+        : typeof value === 'object' &&
+            value &&
+            typeof value.length === 'number' &&
+            value.length === 16 &&
+            typeof value[0] === 'number'
+          ? Uint8Array.from(/** @type {ArrayLike<number>} */ (value))
+          : null;
+  if (asBytes && asBytes.length === 16) {
+    const h = [...asBytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`.toLowerCase();
+  }
+  const s = String(value).trim();
+  if (!s || s === '[object Object]' || s === '[object Uint8Array]') return '';
+  return s;
+}
+
+function db3GuidHex(value) {
+  const hex = String(value || '')
+    .trim()
+    .replace(/[^0-9a-f]/gi, '')
+    .toLowerCase();
+  return hex.length === 32 ? hex : '';
+}
+
+function db3ValueLooksLikeGuidToken(value) {
+  return Boolean(db3GuidHex(value));
+}
+
 function db3ValueLooksLikeOperatorDisplayName(value) {
   const s = cleanString(value);
   if (!s) return false;
   if (/^\d+$/.test(s)) return false;
-  return /[A-Za-z]/.test(s);
+  if (db3ValueLooksLikeGuidToken(s)) return false;
+  if (!/[A-Za-z]/.test(s)) return false;
+  // Reject comma-joined byte dumps from String(Uint8Array).
+  if (/^\d+(,\d+){8,}$/.test(s)) return false;
+  return true;
 }
 
 /**
- * Resolve WinCan Operator display name from SECINSP FK (INS_Operator_REF / OP_Key → WCMETA.OPERATOR.OP_PK).
+ * Resolve WinCan "Inspected By" from SECINSP.INS_Operator_REF → companion META OPERATOR
+ * (OP_Key / OP_PK → OP_Name1 / OP_Name / …). Prefer Meta DB3; primary is fallback.
  * @param {any} db
  * @param {string[]} tables
  * @param {Record<string, string>} imported
@@ -5305,7 +5463,7 @@ function enrichDb3ImportedOperatorFromWcmeta(db, tables, imported) {
     const ku = String(k).toUpperCase();
     const hit = Object.keys(out).find((key) => String(key).toUpperCase() === ku);
     const v = hit ? out[hit] : '';
-    const s = typeof v === 'number' && Number.isFinite(v) ? String(v) : cleanString(v);
+    const s = db3NormalizeSqlId(v);
     if (s) {
       bindVal = s;
       break;
@@ -5313,54 +5471,117 @@ function enrichDb3ImportedOperatorFromWcmeta(db, tables, imported) {
   }
   if (!bindVal) return out;
 
+  // Some WinCan exports store the operator display name directly on the REF field.
+  if (db3ValueLooksLikeOperatorDisplayName(bindVal)) {
+    const resolved = db3InspectorDisplay(bindVal);
+    out.HP_INSPECTOR_RAW = resolved;
+    out.HP_INSPECTOR_DISPLAY = resolved;
+    out.HP_INSPECTOR_KEY = db3InspectorAliasKey(resolved);
+    out.OPERATOR_NAME = resolved.slice(0, 4000);
+    return out;
+  }
+
   const cols = sqlitePragmaColumns(db, operatorTable);
   if (!cols.length) return out;
   const colNames = cols.map((c) => c.name);
   const colSet = new Set(colNames.map((n) => String(n).toUpperCase()));
-  const pkCol =
-    colNames.find((n) => String(n).toUpperCase() === 'OP_PK') ||
-    colNames.find((n) => String(n).toUpperCase() === 'OPERATOR_PK') ||
-    colNames.find((n) => /_PK$/i.test(String(n))) ||
-    'OP_PK';
-  const nameCandidates = ['OP_Name', 'OP_NAME', 'OP_Key', 'OP_KEY', 'NAME', 'OPERATOR_NAME', 'OPERATOR'];
-  let nameCol = '';
+
+  /** Lookup columns: WinCan Meta typically keys OPERATOR by OP_Key (GUID); OP_PK is fallback. */
+  const keyColCandidates = ['OP_Key', 'OP_KEY', 'OP_PK', 'OPERATOR_PK', 'OPERATOR_KEY', 'OBJ_PK', 'OBJ_ID'];
+  /** @type {string[]} */
+  const keyCols = [];
+  for (const want of keyColCandidates) {
+    const hit = colNames.find((n) => String(n).toUpperCase() === want.toUpperCase());
+    if (hit && !keyCols.includes(hit)) keyCols.push(hit);
+  }
+  if (!keyCols.length) {
+    const pkish = colNames.find((n) => /_PK$/i.test(String(n)) || /_KEY$/i.test(String(n)));
+    if (pkish) keyCols.push(pkish);
+  }
+  if (!keyCols.length) return out;
+
+  const nameCandidates = [
+    'OP_Name1',
+    'OP_NAME1',
+    'OP_Name',
+    'OP_NAME',
+    'OP_DisplayName',
+    'OP_DISPLAYNAME',
+    'OP_Description',
+    'OP_DESCRIPTION',
+    'NAME',
+    'OPERATOR_NAME',
+    'OPERATOR'
+  ];
+  /** @type {string[]} */
+  const nameCols = [];
   for (const want of nameCandidates) {
     const hit = colNames.find((n) => String(n).toUpperCase() === want.toUpperCase());
-    if (hit) {
-      nameCol = hit;
-      break;
-    }
+    if (hit && !nameCols.includes(hit)) nameCols.push(hit);
   }
-  if (!nameCol) {
-    nameCol = colNames.find((n) => /NAME|LABEL|DESCRIPTION/i.test(String(n))) || '';
+  if (!nameCols.length) {
+    const fuzzy = colNames.find((n) => /NAME|LABEL|DESCRIPTION/i.test(String(n)));
+    if (fuzzy) nameCols.push(fuzzy);
   }
-  if (!nameCol || !colSet.has(String(pkCol).toUpperCase())) return out;
+  if (!nameCols.length) return out;
 
   const OT = sqlIdentQuoted(operatorTable);
-  let stmt;
-  try {
-    stmt = db.prepare(
-      `SELECT ${sqlIdentQuoted(nameCol)} AS operator_name FROM ${OT} WHERE ${sqlIdentQuoted(pkCol)} = ? LIMIT 1`
-    );
-    stmt.bind([bindVal]);
-    if (stmt.step()) {
+  const selectList = nameCols.map((c) => sqlIdentQuoted(c)).join(', ');
+  const hex = db3GuidHex(bindVal);
+
+  const tryLookup = (sql, params) => {
+    let stmt;
+    try {
+      stmt = db.prepare(sql);
+      stmt.bind(params);
+      if (!stmt.step()) {
+        stmt.free();
+        return '';
+      }
       const row = stmt.getAsObject();
-      const resolved = db3InspectorDisplay(row.operator_name);
-      if (db3ValueLooksLikeOperatorDisplayName(resolved)) {
-        out.HP_INSPECTOR_RAW = resolved;
-        out.HP_INSPECTOR_DISPLAY = resolved;
-        out.HP_INSPECTOR_KEY = db3InspectorAliasKey(resolved);
-        out.OPERATOR_NAME = resolved.slice(0, 4000);
+      stmt.free();
+      for (const col of nameCols) {
+        const resolved = db3InspectorDisplay(row[col]);
+        if (db3ValueLooksLikeOperatorDisplayName(resolved)) return resolved;
+      }
+      // Also accept first aliased/unknown property that looks like a name.
+      for (const v of Object.values(row)) {
+        const resolved = db3InspectorDisplay(v);
+        if (db3ValueLooksLikeOperatorDisplayName(resolved)) return resolved;
+      }
+    } catch {
+      try {
+        stmt?.free();
+      } catch {
+        /* ignore */
       }
     }
-  } catch {
-    /* non-fatal */
-  } finally {
-    try {
-      stmt?.free();
-    } catch {
-      /* ignore */
+    return '';
+  };
+
+  let resolvedName = '';
+  for (const keyCol of keyCols) {
+    if (!colSet.has(String(keyCol).toUpperCase())) continue;
+    const KC = sqlIdentQuoted(keyCol);
+    resolvedName = tryLookup(
+      `SELECT ${selectList} FROM ${OT} WHERE ${KC} = ? LIMIT 1`,
+      [bindVal]
+    );
+    if (resolvedName) break;
+    if (hex) {
+      resolvedName = tryLookup(
+        `SELECT ${selectList} FROM ${OT} WHERE lower(hex(${KC})) = ? LIMIT 1`,
+        [hex]
+      );
+      if (resolvedName) break;
     }
+  }
+
+  if (db3ValueLooksLikeOperatorDisplayName(resolvedName)) {
+    out.HP_INSPECTOR_RAW = resolvedName;
+    out.HP_INSPECTOR_DISPLAY = resolvedName;
+    out.HP_INSPECTOR_KEY = db3InspectorAliasKey(resolvedName);
+    out.OPERATOR_NAME = resolvedName.slice(0, 4000);
   }
   return out;
 }
@@ -5474,7 +5695,10 @@ function extractDb3ImportedFromRow(raw, aliasNames) {
     if (v == null || v === '') continue;
     const col = aliasNames[i];
     const key = String(col).toUpperCase();
-    const str = typeof v === 'number' && Number.isFinite(v) ? String(v) : String(v).trim();
+    const str =
+      typeof v === 'number' && Number.isFinite(v)
+        ? String(v)
+        : db3NormalizeSqlId(v) || (typeof v === 'string' ? v.trim() : '');
     if (!str) continue;
     out[key] = str.slice(0, 4000);
   }
@@ -5573,7 +5797,11 @@ function mergeSecinspRowIntoDb3Imported(db, sectionTable, secinspTable, referenc
       if (v == null || v === '') continue;
       const ku = String(k).toUpperCase();
       if (out[ku] && String(out[ku]).trim() !== '') continue;
-      const str = typeof v === 'number' && Number.isFinite(v) ? String(v) : String(v).trim();
+      // Preserve GUID/BLOB FKs (INS_Operator_REF) so Meta OPERATOR lookup can join later.
+      const str =
+        typeof v === 'number' && Number.isFinite(v)
+          ? String(v)
+          : db3NormalizeSqlId(v) || (typeof v === 'string' ? v.trim() : '');
       if (!str) continue;
       out[ku] = str.slice(0, 4000);
     }
@@ -5712,6 +5940,40 @@ function mapDb3SectionRow(row, projectName) {
     shape: shapeLabel(row.shape_code, row.size1, row.size2),
     dia
   };
+}
+
+/**
+ * Attach observation opcodes + AutoSync review status (MSA / ending access codes) onto parsed DB3 rows.
+ * Must run before the sql.js Database is closed.
+ */
+function attachObservationReviewToDb3Rows(db, tableCtx, rows) {
+  if (!db || !Array.isArray(rows) || !rows.length) return rows;
+  const secobsTable =
+    pickSqliteTable(sqliteTableList(db), 'SECOBS') ||
+    (sqliteTableList(db).find((t) => String(t).toUpperCase() === 'SECOBS') || '');
+  if (!secobsTable) {
+    for (const row of rows) {
+      if (!row || typeof row !== 'object') continue;
+      row.observationOpcodes = [];
+      row.suggestedStatus = 'complete';
+      row.reviewReasons = [];
+    }
+    return rows;
+  }
+  const ctx = {
+    sectionTable: tableCtx?.sectionTable || 'SECTION',
+    secinspTable: tableCtx?.secinspTable || 'SECINSP',
+    secobsTable
+  };
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const opcodes = fetchSectionObservationOpcodes(db, ctx, row.reference);
+    const review = evaluateSectionReviewStatus(opcodes);
+    row.observationOpcodes = opcodes;
+    row.suggestedStatus = review.status;
+    row.reviewReasons = review.reasons;
+  }
+  return rows;
 }
 
 function isDb3FromClauseOverflowError(error) {
@@ -6039,6 +6301,10 @@ async function parseDb3(buffer, metaBuffer = null) {
         hasSecinspTable: !!secinspRuntimeTable,
         usesSectionExtras: !!extraFrag.sql
       });
+      attachObservationReviewToDb3Rows(db, {
+        sectionTable: sectionT,
+        secinspTable: secinspRuntimeTable || 'SECINSP'
+      }, rows);
       db.close();
       return finishRows(rows);
     } catch (e) {
@@ -6129,6 +6395,10 @@ async function parseDb3(buffer, metaBuffer = null) {
         hasSecinspTable: !!secinspRuntimeTable,
         usesSectionExtras: !!extraFrag.sql
       });
+      attachObservationReviewToDb3Rows(db, {
+        sectionTable: sectionT,
+        secinspTable: secinspRuntimeTable || 'SECINSP'
+      }, rows);
       db.close();
       return finishRows(rows);
     } catch (fallbackErr) {
@@ -6206,6 +6476,10 @@ async function parseDb3(buffer, metaBuffer = null) {
             hasSecinspTable: !!secinspRuntimeTable,
             usesSectionExtras: false
           });
+          attachObservationReviewToDb3Rows(db, {
+            sectionTable: sectionT,
+            secinspTable: secinspRuntimeTable || 'SECINSP'
+          }, rows);
           db.close();
           return finishRows(rows);
         } catch (bareErr) {
@@ -8954,12 +9228,26 @@ app.get('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, 
       userPayload || sharedPayload
         ? mergePlanViewPayloads(sharedPayload, userPayload || { v: 2, imagePlan: {}, pdfMap: {} })
         : null;
-    if (payload) payload = await hydratePlanViewPayloadForResponse(payload, req);
+    // Desktop Day Start/End only needs storageKeys — skip expensive serial Wasabi hydrate.
+    // Browser viewer still defaults to hydrate on. Pass hydrate=0 or light=1 for metadata-only.
+    const hydrateRaw = String(req.query?.hydrate ?? '1').trim().toLowerCase();
+    const lightRaw = String(req.query?.light || '').trim().toLowerCase();
+    const wantHydrate = !(
+      hydrateRaw === '0' ||
+      hydrateRaw === 'false' ||
+      hydrateRaw === 'no' ||
+      hydrateRaw === 'off' ||
+      lightRaw === '1' ||
+      lightRaw === 'true' ||
+      lightRaw === 'yes'
+    );
+    if (payload && wantHydrate) payload = await hydratePlanViewPayloadForResponse(payload, req);
     const updatedAt = [userRow?.updated_at, sharedRow?.updated_at].filter(Boolean).sort().reverse()[0] || null;
     return res.json({
       success: true,
       payload,
-      updated_at: updatedAt
+      updated_at: updatedAt,
+      hydrated: Boolean(payload && wantHydrate)
     });
   } catch (error) {
     console.error('GET PIPESYNC PLAN VIEW:', error);
@@ -9160,6 +9448,64 @@ app.post(
       return res.json({ success: true, url: typeof url === 'string' ? url : '' });
     } catch (error) {
       console.error('PIPESYNC PLAN VIEW READ URL:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+);
+
+/** Batch presign GET URLs for Day Start / desktop cache (avoids N round-trips). */
+app.post(
+  '/pipesync/plan-view/read-urls',
+  requireAuth,
+  requirePsrViewerAccess,
+  express.json({ limit: '512kb' }),
+  async (req, res) => {
+    try {
+      const planStorage = await planViewWasabiForRequest(req);
+      if (!planStorage.configured) {
+        return res.status(503).json({ success: false, error: 'Wasabi object storage is not configured' });
+      }
+      const { client: planS3, bucket: planBucket, rootPrefix } = planStorage;
+      const raw = Array.isArray(req.body?.storageKeys)
+        ? req.body.storageKeys
+        : Array.isArray(req.body?.keys)
+          ? req.body.keys
+          : [];
+      const keys = [
+        ...new Set(
+          raw
+            .map((k) => cleanString(k))
+            .filter((k) => k && isPersistablePlanPdfStorageKey(k, rootPrefix))
+        )
+      ].slice(0, 500);
+      if (!keys.length) {
+        return res.status(400).json({ success: false, error: 'Provide storageKeys: string[].' });
+      }
+      const urls = {};
+      const errors = {};
+      await mapPool(keys, PLAN_VIEW_HYDRATE_CONCURRENCY, async (storageKey) => {
+        try {
+          assertKeyWithinTenantRoot(storageKey, rootPrefix);
+          const { url } = await presignAdminAttachmentGet(
+            planS3,
+            planBucket,
+            storageKey,
+            ADMIN_ATTACHMENT_VIEW_TTL_SECONDS
+          );
+          urls[storageKey] = typeof url === 'string' ? url : '';
+        } catch (error) {
+          errors[storageKey] = error instanceof Error ? error.message : String(error);
+          urls[storageKey] = '';
+        }
+      });
+      return res.json({
+        success: true,
+        urls,
+        errors: Object.keys(errors).length ? errors : undefined,
+        count: keys.length
+      });
+    } catch (error) {
+      console.error('PIPESYNC PLAN VIEW READ URLS:', error);
       return res.status(500).json({ success: false, error: error.message });
     }
   }
@@ -9492,7 +9838,7 @@ async function fetchRecordById(id) {
 async function persistRecord(record) {
   let savedRow = null;
   const jobsiteWrite = persistedPlannerJobsiteForWrite(record);
-  const wasabiWrote = await tryWasabiStateWrite('persist-record', async (data) => {
+  const mutator = async (data) => {
     const rows = ensureSnapshotTable(data, 'planner_records');
     const idx = rows.findIndex((row) => String(row.id || '') === String(record.id || ''));
     const now = nowIso();
@@ -9527,10 +9873,20 @@ async function persistRecord(record) {
       };
       rows[idx] = savedRow;
     }
-  });
+  };
+  let wasabiWrote = false;
+  for (let attempt = 0; attempt < 4 && !wasabiWrote; attempt++) {
+    savedRow = null;
+    wasabiWrote = await tryWasabiStateWrite('persist-record', mutator);
+    if (!wasabiWrote && attempt < 3) {
+      await new Promise((r) => setTimeout(r, 100 + attempt * 150));
+    }
+  }
   if (PLANNER_STORE_WASABI_ONLY) {
     if (wasabiWrote && savedRow) return normalizeRecordRow(savedRow);
-    throw new Error('Planner data is stored only in Wasabi; persist write failed. Check WASABI_WRITES_PRIMARY_ENABLED and bucket credentials.');
+    throw new Error(
+      'Planner data is stored only in Wasabi; persist write failed after retries. Check Wasabi contention / credentials.'
+    );
   }
   /**
    * Hybrid mode: GET /records uses Postgres whenever WASABI_RECORDS_PRIMARY_ENABLED is off (the default).
@@ -9610,28 +9966,40 @@ async function createPlannerRecord(record, req) {
       created_at: now,
       updated_at: now
     };
-    rows.push(createdRow);
+    // Idempotent under write retries — don't duplicate the same id.
+    const existingIdx = rows.findIndex((row) => String(row.id || '') === String(id));
+    if (existingIdx >= 0) rows[existingIdx] = createdRow;
+    else rows.push(createdRow);
     const uid = String(req?.user?.id || '').trim();
     if (uid && isTenantBoundUser(req?.user)) {
       const scopes = ensureSnapshotTable(data, 'user_psr_scopes');
-      scopes.push({
-        user_id: uid,
-        client: createdRow.client,
-        city: createdRow.city,
-        jobsite: createdRow.jobsite,
-        psr_record_id: id,
-        created_at: now
-      });
+      if (!scopes.some((s) => String(s?.psr_record_id || '') === String(id))) {
+        scopes.push({
+          user_id: uid,
+          client: createdRow.client,
+          city: createdRow.city,
+          jobsite: createdRow.jobsite,
+          psr_record_id: id,
+          created_at: now
+        });
+      }
     }
   };
   const tenantScope = req ? await resolveTenantWasabiStateScope(pool, req) : null;
   if (tenantScope || (req && isTenantBoundUser(req?.user))) {
     await runWasabiStateWriteForRequest(req, 'create-planner-record', writeMutator);
   } else {
-    const wasabiWrote = await tryWasabiStateWrite('create-planner-record', writeMutator);
+    let wasabiWrote = false;
+    for (let attempt = 0; attempt < 4 && !wasabiWrote; attempt++) {
+      createdRow = null;
+      wasabiWrote = await tryWasabiStateWrite('create-planner-record', writeMutator);
+      if (!wasabiWrote && attempt < 3) {
+        await new Promise((r) => setTimeout(r, 120 + attempt * 180));
+      }
+    }
     if (PLANNER_STORE_WASABI_ONLY && !wasabiWrote) {
       throw new Error(
-        'Planner data is stored only in Wasabi; create failed. Enable WASABI_WRITES_PRIMARY_ENABLED=1 and configure Wasabi bucket keys.'
+        'Planner data is stored only in Wasabi; create failed after write retries. Check Wasabi contention / credentials.'
       );
     }
   }
@@ -10896,19 +11264,35 @@ async function runAutoImportWasabiQuery(text, params = []) {
       outRows = [row];
       return;
     }
-    if (sql.startsWith('update auto_import_projects set detected_job_city = $2')) {
+    if (sql.startsWith('update auto_import_projects set detected_job_city =')) {
+      // Supports both:
+      //   SET detected_job_city = $2, detected_jobsite = $3, metadata = $4 ... (legacy discover)
+      //   SET detected_job_city = COALESCE(NULLIF($2,''), …), … CASE WHEN $5::int > 0 … (desktop registerOnly)
       const id = String(params[0] || '');
       const idx = projects.findIndex((row) => String(row.id || '') === id);
       if (idx >= 0) {
-        projects[idx] = {
+        const cityIn = cleanString(params[1]);
+        const jobsiteIn = cleanString(params[2]);
+        const preserveBlanks = sql.includes('coalesce(nullif($2');
+        const rowCountRaw = params.length >= 5 ? Number(params[4]) : NaN;
+        const hasScanRows = Number.isFinite(rowCountRaw) ? rowCountRaw > 0 : !preserveBlanks;
+        const next = {
           ...projects[idx],
-          detected_job_city: cleanString(params[1]),
-          detected_jobsite: cleanString(params[2]),
-          metadata: safeJsonParse(params[3], {}),
-          last_scan_at: now,
-          status: 'discovered',
+          metadata: safeJsonParse(params[3], projects[idx].metadata || {}),
           updated_at: now
         };
+        if (preserveBlanks) {
+          if (cityIn) next.detected_job_city = cityIn;
+          if (jobsiteIn) next.detected_jobsite = jobsiteIn;
+        } else {
+          next.detected_job_city = cityIn;
+          next.detected_jobsite = jobsiteIn;
+        }
+        if (hasScanRows) {
+          next.last_scan_at = now;
+          next.status = 'discovered';
+        }
+        projects[idx] = next;
       }
       outRows = [];
       return;
@@ -12245,7 +12629,270 @@ registerOutlookRoutes(app, {
   currentToken,
   corsOrigins: CORS_ORIGINS
 });
-registerPortalFilesRoutes(app, { pool, query: queryPortalDataWithWasabiFallback, requireAuth, requireAdmin });
+
+const AUTOSYNC_PSR_INGEST_ENABLED = String(process.env.HP_AUTOSYNC_PSR_INGEST || '1').trim() !== '0';
+
+async function bufferFromS3Body(body) {
+  if (!body) return Buffer.alloc(0);
+  if (Buffer.isBuffer(body)) return body;
+  if (typeof body.transformToByteArray === 'function') {
+    return Buffer.from(await body.transformToByteArray());
+  }
+  const chunks = [];
+  for await (const chunk of body) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+async function listKnownPlannerCities() {
+  try {
+    const snapshot = await loadWasabiLatestStateSnapshot(true);
+    if (snapshot?.data) {
+      const rows = snapshotRows(snapshot, 'planner_records');
+      const cities = [
+        ...new Set(rows.map((r) => cleanString(r?.city)).filter(Boolean))
+      ];
+      if (cities.length) return cities;
+    }
+  } catch (error) {
+    console.warn('[autosync-psr] city list snapshot failed:', error?.message || error);
+  }
+  if (PLANNER_STORE_WASABI_ONLY) return [];
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT city FROM planner_records WHERE city IS NOT NULL AND TRIM(city) <> ''`
+    );
+    return result.rows.map((r) => cleanString(r.city)).filter(Boolean);
+  } catch (error) {
+    console.warn('[autosync-psr] city list query failed:', error?.message || error);
+    return [];
+  }
+}
+
+/**
+ * After AutoSync uploads a primary .db3: parse sections, place under Customer/City/Job, upsert PSR rows.
+ * Status = complete unless MSA or missing ending access (ACB/AMH/ADP/AEP/EOP) → needs-reviewed.
+ */
+async function ingestAutosyncDb3ToPsr({
+  objectKey = '',
+  buffer,
+  metaBuffer = null,
+  savedBy = 'AutoSync'
+} = {}) {
+  if (!AUTOSYNC_PSR_INGEST_ENABLED) return { ok: true, skipped: true, reason: 'disabled' };
+  if (!buffer || !buffer.length) return { ok: false, error: 'empty-db3' };
+  if (objectKey && !isPrimaryWinCanDb3Name(objectKey)) {
+    return { ok: true, skipped: true, reason: 'meta-or-non-db3' };
+  }
+
+  const rows = await parseDb3(buffer, metaBuffer);
+  if (!Array.isArray(rows) || !rows.length) {
+    return { ok: true, added: 0, updated: 0, reason: 'no-sections' };
+  }
+
+  const projectName = cleanString(rows[0]?.project || '') || path.basename(String(objectKey || ''), '.db3') || 'NOT SET';
+  let customer = '';
+  for (const row of rows) {
+    customer = extractCustomerFromDb3(row?.db3Imported, projectName);
+    if (customer) break;
+  }
+  if (!customer) {
+    console.warn('[autosync-psr] no customer field; skipping placement', { projectName, objectKey });
+    return { ok: false, error: 'missing-customer', projectName };
+  }
+
+  const knownCities = await listKnownPlannerCities();
+  const cityInfo = resolveCityForAutosyncPsr(projectName, rows[0]?.city || '', knownCities);
+  const targetCity = cityInfo.city || 'NOT SET';
+  const targetJobsite = normalizeJobsiteName(projectName);
+  const targetSystem = 'storm';
+  const actor = cleanString(savedBy) || 'AutoSync';
+
+  let record;
+  const existingMatches = await findPlannerRecordsByScope(customer, targetCity, targetJobsite, {
+    latestOnly: true
+  });
+  if (existingMatches.length) {
+    record = existingMatches[0];
+  } else {
+    record = await createPlannerRecord(
+      {
+        record_date: new Date().toISOString().slice(0, 10),
+        client: customer,
+        city: targetCity,
+        street: cleanString(rows[0]?.street || ''),
+        jobsite: targetJobsite,
+        status: '',
+        saved_by: actor,
+        systems: { storm: [], sanitary: [] }
+      },
+      { user: { displayName: actor, username: 'autosync' } }
+    );
+  }
+  ensureImportTargetSystemBranch(record, targetSystem);
+  const branch = Array.isArray(record.systems[targetSystem]) ? record.systems[targetSystem] : [];
+  record.systems[targetSystem] = branch;
+
+  let added = 0;
+  let updated = 0;
+  for (const row of rows) {
+    if (!row?.reference) continue;
+    const refLower = String(row.reference).trim().toLowerCase();
+    const reviewStatus = normalizeStatus(row.suggestedStatus || 'complete');
+    const reviewNote =
+      Array.isArray(row.reviewReasons) && row.reviewReasons.length
+        ? ` Auto-review: ${row.reviewReasons.join('; ')}.`
+        : '';
+    const identity = buildDb3DeterministicIdentity(row);
+    const existingIdx = branch.findIndex(
+      (seg) => String(seg?.reference || '').trim().toLowerCase() === refLower
+    );
+    if (existingIdx >= 0) {
+      const prev = branch[existingIdx];
+      const versions = Array.isArray(prev.versions) ? [...prev.versions] : [];
+      const latest = versions[0] && typeof versions[0] === 'object' ? { ...versions[0] } : null;
+      if (latest) {
+        latest.status = reviewStatus;
+        latest.notes = cleanString(`${latest.notes || ''}${reviewNote}`.trim()) || latest.notes;
+        versions[0] = latest;
+      } else {
+        versions.unshift(
+          defaultVersion(actor, {
+            status: reviewStatus,
+            recordedDate: record.record_date,
+            notes: `Updated from AutoSync DB3.${reviewNote}`
+          })
+        );
+      }
+      branch[existingIdx] = normalizeSegment(
+        {
+          ...prev,
+          reference: row.reference,
+          upstream: row.upstream,
+          downstream: row.downstream,
+          dia: row.dia,
+          material: row.material,
+          shape: row.shape,
+          length: row.length,
+          footage: row.length,
+          street: row.street || prev.street,
+          system: targetSystem,
+          db3Imported: row.db3Imported || prev.db3Imported,
+          db3DedupeKey: row.db3DedupeKey || identity.dedupeKey || prev.db3DedupeKey,
+          db3RowHash: row.db3RowHash || identity.dedupeHash || prev.db3RowHash,
+          versions
+        },
+        actor
+      );
+      updated += 1;
+      continue;
+    }
+
+    branch.push(
+      normalizeSegment(
+        {
+          id: crypto.randomUUID(),
+          reference: row.reference,
+          upstream: row.upstream,
+          downstream: row.downstream,
+          dia: row.dia,
+          material: row.material,
+          shape: row.shape,
+          length: row.length,
+          footage: row.length,
+          street: row.street,
+          system: targetSystem,
+          db3Imported: row.db3Imported,
+          db3DedupeKey: identity.dedupeKey,
+          db3RowHash: identity.dedupeHash,
+          versions: [
+            defaultVersion(actor, {
+              status: reviewStatus,
+              recordedDate: record.record_date,
+              notes: `Imported from AutoSync DB3.${reviewNote}`
+            })
+          ]
+        },
+        actor
+      )
+    );
+    added += 1;
+  }
+
+  record.saved_by = actor;
+  await persistRecord(record);
+  console.warn('[autosync-psr] ingest complete', {
+    objectKey,
+    customer,
+    city: targetCity,
+    citySource: cityInfo.source,
+    jobsite: targetJobsite,
+    added,
+    updated,
+    sections: rows.length
+  });
+  return {
+    ok: true,
+    recordId: record.id,
+    customer,
+    city: targetCity,
+    jobsite: targetJobsite,
+    added,
+    updated,
+    sections: rows.length
+  };
+}
+
+async function maybeIngestAutosyncDb3FromPortalUpload(ctx = {}) {
+  if (!AUTOSYNC_PSR_INGEST_ENABLED) return;
+  const key = cleanString(ctx.key || ctx.objectKey || '');
+  const name = cleanString(ctx.name || path.basename(key));
+  if (!isPrimaryWinCanDb3Name(key || name)) return;
+  const s3 = ctx.s3;
+  const bucket = cleanString(ctx.bucket || '');
+  if (!s3 || !bucket || !key) {
+    console.warn('[autosync-psr] missing s3/bucket/key for ingest');
+    return;
+  }
+  const relPath = cleanString(ctx.path || '');
+  console.warn('[autosync-psr] ingest queued after portal upload', {
+    key,
+    path: relPath || null,
+    size: Number(ctx.size) || 0
+  });
+  try {
+    const primaryObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    const buffer = await bufferFromS3Body(primaryObj.Body);
+    let metaBuffer = null;
+    const metaKey = guessMetaObjectKey(key);
+    if (metaKey) {
+      try {
+        const metaObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: metaKey }));
+        metaBuffer = await bufferFromS3Body(metaObj.Body);
+      } catch {
+        metaBuffer = null;
+      }
+    }
+    const savedBy =
+      cleanString(ctx.user?.displayName || ctx.user?.username || '') || 'AutoSync';
+    await ingestAutosyncDb3ToPsr({ objectKey: key, buffer, metaBuffer, savedBy });
+  } catch (error) {
+    console.error('[autosync-psr] ingest failed:', error?.message || error);
+  }
+}
+
+registerPortalFilesRoutes(app, {
+  pool,
+  query: queryPortalDataWithWasabiFallback,
+  requireAuth,
+  requireAdmin,
+  onPortalObjectUploaded: (ctx) => {
+    setImmediate(() => {
+      void maybeIngestAutosyncDb3FromPortalUpload(ctx);
+    });
+  }
+});
 registerCompanyPermissionsRoutes(app, {
   pool,
   requireAuth,
@@ -12328,8 +12975,14 @@ const autoImportPlugin = createAutoImportPlugin({
   requireDesktopHeartbeat: requireDataAutoSyncDesktopHeartbeatAccess,
   requireAuth,
   fetchPlannerRecord: fetchRecordById,
-  writeSegment: async (jobsiteId, payload, savedBy) => {
-    const record = await fetchRecordById(String(jobsiteId));
+  listKnownPlannerCities,
+  findPlannerRecordsByScope,
+  createPlannerRecord,
+  normalizeJobsiteName,
+  writeSegment: async (jobsiteId, payload, savedBy, preloadedRecord = null) => {
+    let record =
+      (preloadedRecord && String(preloadedRecord.id) === String(jobsiteId) ? preloadedRecord : null) ||
+      (await fetchRecordById(String(jobsiteId)));
     if (!record) throw new Error(`Planner record not found for jobsite id ${jobsiteId}`);
     const system = cleanString(payload.system || 'storm').toLowerCase() === 'sanitary' ? 'sanitary' : 'storm';
     const segment = normalizeSegment(
@@ -12348,6 +13001,7 @@ const autoImportPlugin = createAutoImportPlugin({
       },
       savedBy || 'System'
     );
+    record.systems = record.systems && typeof record.systems === 'object' ? record.systems : { storm: [], sanitary: [] };
     record.systems[system] = Array.isArray(record.systems[system]) ? record.systems[system] : [];
     const refLower = String(segment.reference || '').toLowerCase();
     record.systems[system] = record.systems[system].filter(
@@ -12365,8 +13019,14 @@ app.use((error, req, res, next) => {
   if (error && /CORS blocked/.test(error.message || '')) {
     return res.status(403).json({ success: false, error: error.message });
   }
-  console.error('UNHANDLED ERROR:', error);
-  res.status(500).json({ success: false, error: error.message || 'Server error' });
+  const status = Number(error?.status || error?.statusCode || 500);
+  const safeStatus = status >= 400 && status < 600 ? status : 500;
+  if (safeStatus >= 500) {
+    console.error('UNHANDLED ERROR:', error);
+  } else {
+    console.warn('REQUEST ERROR:', safeStatus, error?.message || error);
+  }
+  res.status(safeStatus).json({ success: false, error: error.message || 'Server error' });
 });
 
 let shutdownInProgress = false;
