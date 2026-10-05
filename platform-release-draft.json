@@ -1,12 +1,10 @@
-{
-  "title": "TLS cert renewed — permanent auto-renew restored",
-  "description": "pipeshare.live HTTPS was expired (since Sep 26), which broke the desktop app and browser with certificate errors and blocked portal script loads.\n\nThe apex certificate was reissued (valid through Dec 30). Auto-renew was failing because techpipe.pipeshare.net was stuck on the webroot cert while tenant HTTP did not serve ACME challenges. Apex cert is apex-only again; tenants use the separate *.pipeshare.net wildcard. certbot.timer, nginx reload hook, and tenant ACME vhost are installed for good.\n\nWho is affected: everyone on pipeshare.live / pipeshare.net / desktop PipeShare.",
+﻿{
+  "title": "PIPESHARE landing About + brand visuals",
+  "description": "pipeshare.net homepage keeps the existing business/customer sign-in and brochure cards, and adds a short About section plus stylized industrial brand images (hero pipe visual, AutoSync feature art, About banner). Copy covers what PIPESHARE is, who it is for, and the problems it solves.\n\nWho is affected: visitors on pipeshare.net (and the same marketing path on pipeshare.live). Login cards and auth flow are unchanged.",
   "changeLog": [
-    "Renewed expired pipeshare.live TLS certificate (valid to 2026-12-30).",
-    "Removed tenant SAN from apex webroot cert so certbot renew succeeds.",
-    "Enabled certbot.timer + nginx reload deploy hook.",
-    "Installed tenant ACME vhost; tenants use *.pipeshare.net wildcard cert.",
-    "Added deploy/ovh/install-cert-auto-renew.sh for permanent re-runs."
+    "Added About section and brand images on the SaaS marketing landing.",
+    "Header About / Sign in jump links; login cards unchanged.",
+    "Hero, AutoSync, and About visuals under marketing/pipeshare/assets/."
   ],
-  "updatedAt": "2026-10-01T12:30:00.000Z"
+  "updatedAt": "2026-10-05T16:00:00.000Z"
 }
