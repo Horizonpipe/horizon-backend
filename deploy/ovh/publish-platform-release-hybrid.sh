@@ -12,5 +12,6 @@ PUBLISH_EXIT=$?
 cp "$STASH" "$ENV"
 rm -f "$STASH"
 chmod 600 "$ENV"
-pm2 reload horizon-backend --update-env
+# Never bare `pm2` here — that spawns /root/.pm2 and steals :3000 from ubuntu.
+sudo -u ubuntu bash -lc 'cd /opt/horizon/horizon-backend && pm2 restart horizon-backend --update-env'
 exit "$PUBLISH_EXIT"
