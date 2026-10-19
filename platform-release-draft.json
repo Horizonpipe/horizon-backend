@@ -1,12 +1,12 @@
 ﻿{
-  "title": "PIPESHARE Desktop download page upgrade",
-  "description": "The public Windows download page at pipeshare.live/download-desktop.html is rebuilt as a brand-first marketing page: PIPESHARE hero, interactive module demos (PipeShare, PipeSync, Plan View, AUTOSYNC), feature highlights for full project upload / DB3 ingest / offline field work / auto-update, and generated demo screenshots.\n\nDownload buttons and the latest.yml update-feed wiring are unchanged. Setup still auto-updates from /desktop-updates/; Portable remains a one-shot .exe.\n\nWho is affected: Anyone using the BASE download URL (pipeshare.live). SaaS push is not required for this static page unless you also serve it from pipeshare.net the same way.",
+  "title": "Faster PipeShare folders and video playback",
+  "description": "Opening a job in PipeShare was waiting on a full Wasabi folder listing plus database lookups before anything was drawn, and large folders could sit there for a long time. Videos were stored as a generic file type, so the browser often downloaded a big chunk of the file before it would play or seek.\n\nFolder lists now paint the first page (one level, up to 1000 names) and load the rest in the background. Repeat opens reuse a short server cache. Video links tell Wasabi to answer as video/mp4 (or the real type) with range support, so playback can start and seek without pulling the whole file through the portal. The same code serves pipeshare.live and pipeshare.net.\n\nWho is affected: PipeShare in the browser on the private server and SaaS. Desktop Auto Sync upload behavior is unchanged. Very large videos can still take a moment to show the first frame when the movie index is at the end of the file; seeking uses byte ranges instead of a full download.",
   "changeLog": [
-    "Upgrade download-desktop.html with PIPESHARE brand hero and clear Windows CTA.",
-    "Add interactive tab demos for PipeShare, PipeSync, Plan View, and AUTOSYNC.",
-    "Ship demo screenshots under download-desktop-assets/.",
-    "Feature copy covers full project upload, DB3 ingest, Plan View, PipeSync, offline/field, auto-update.",
-    "Keep Setup + Portable links and latest.yml version detection working."
+    "PipeShare draws the first folder page immediately and loads further pages in the background.",
+    "Shallow folder listings are cached briefly on the server so reopening a folder is quick.",
+    "Video and PDF links are presigned with the real content type and inline playback so the browser can range-request.",
+    "Wasabi buckets expose range headers for direct browser playback.",
+    "Nginx no longer buffers proxied file downloads, and API responses get larger memory buffers."
   ],
-  "updatedAt": "2026-10-05T18:45:00.000Z"
+  "updatedAt": "2026-10-19T17:30:00.000Z"
 }

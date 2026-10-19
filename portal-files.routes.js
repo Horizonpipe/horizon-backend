@@ -128,30 +128,6 @@ function bypassPathGrantsForLenientPortalClient(user, userGrants) {
   return !userGrants.length;
 }
 
-// #region agent log
-const HP_DEBUG_LOG_PATH =
-  process.env.HP_DEBUG_LOG_PATH ||
-  path.join('C:', 'HorizonDev', 'wincan_auto_import_exe_project', 'debug-c52723.log');
-function hpAgentDebugLog(location, message, data, hypothesisId) {
-  try {
-    fs.appendFileSync(
-      HP_DEBUG_LOG_PATH,
-      `${JSON.stringify({
-        sessionId: 'c52723',
-        location,
-        message,
-        data,
-        hypothesisId,
-        timestamp: Date.now(),
-        runId: 'pre-fix'
-      })}\n`
-    );
-  } catch {
-    /* ignore debug log failures */
-  }
-}
-// #endregion
-
 function clampIntEnv(name, fallback, min, max) {
   const raw = Number(process.env[name]);
   if (!Number.isFinite(raw)) return fallback;
@@ -707,6 +683,42 @@ function contentTypeFromFilename(name) {
 }
 
 /**
+ * Presigned GET that tells the browser the real media type.
+ * Many uploads are stored as application/octet-stream; without an override the
+ * video element will not issue Range requests and buffers the whole object.
+ * Range stays unsigned, so seeking still returns 206 from Wasabi.
+ * @param {string} bucket
+ * @param {string} key
+ */
+function presignedPortalGetCommand(bucket, key) {
+  const filename = path.basename(key);
+  const guessed = contentTypeFromFilename(filename);
+  /** @type {import('@aws-sdk/client-s3').GetObjectCommandInput} */
+  const input = { Bucket: bucket, Key: key };
+  if (guessed && guessed !== 'application/octet-stream') {
+    input.ResponseContentType = guessed;
+    const playable =
+      /^video\//i.test(guessed) || guessed === 'application/pdf' || guessed.startsWith('image/');
+    if (playable) {
+      const safe = String(filename || 'file').replace(/["\\\r\n]/g, '_');
+      input.ResponseContentDisposition = `inline; filename="${safe}"`;
+      input.ResponseCacheControl = 'private, max-age=3600';
+    }
+  }
+  return new GetObjectCommand(input);
+}
+
+/**
+ * @param {import('@aws-sdk/client-s3').S3Client} s3
+ * @param {string} bucket
+ * @param {string} key
+ * @param {number} expiresIn
+ */
+function presignPortalGetUrl(s3, bucket, key, expiresIn) {
+  return getSignedUrl(s3, presignedPortalGetCommand(bucket, key), { expiresIn });
+}
+
+/**
  * Parse Range: bytes=… for progressive video/audio (browser sends many ranged GETs).
  * @param {string | undefined} rangeHeader
  * @param {number} fileSize
@@ -936,25 +948,72 @@ async function listAllKeys(s3, bucket, prefix) {
   return keys;
 }
 
+/** Short shared listing cache (unfiltered). Grant checks still run per user on the way out. */
+const SHALLOW_TREE_CACHE_MS = clampIntEnv('PORTAL_SHALLOW_TREE_CACHE_MS', 20000, 0, 120000);
+const SHALLOW_TREE_CACHE_MAX = 240;
+/** @type {Map<string, { exp: number, value: { folders: unknown[], files: unknown[], truncated: boolean, cursor: string } }>} */
+const shallowTreeCache = new Map();
+
+function shallowTreeCacheKey(bucket, listPrefix, limit, cursor) {
+  return `${bucket}\0${listPrefix}\0${limit || 0}\0${cursor || ''}`;
+}
+
+function cloneShallowListing(value) {
+  return {
+    folders: Array.isArray(value?.folders) ? value.folders.slice() : [],
+    files: Array.isArray(value?.files) ? value.files.map((f) => ({ ...f })) : [],
+    truncated: value?.truncated === true,
+    cursor: typeof value?.cursor === 'string' ? value.cursor : ''
+  };
+}
+
+function readShallowTreeCache(key) {
+  if (SHALLOW_TREE_CACHE_MS <= 0) return null;
+  const hit = shallowTreeCache.get(key);
+  if (!hit) return null;
+  if (hit.exp <= Date.now()) {
+    shallowTreeCache.delete(key);
+    return null;
+  }
+  return cloneShallowListing(hit.value);
+}
+
+function writeShallowTreeCache(key, value) {
+  if (SHALLOW_TREE_CACHE_MS <= 0) return;
+  if (shallowTreeCache.size >= SHALLOW_TREE_CACHE_MAX) {
+    const first = shallowTreeCache.keys().next().value;
+    if (first) shallowTreeCache.delete(first);
+  }
+  shallowTreeCache.set(key, { exp: Date.now() + SHALLOW_TREE_CACHE_MS, value });
+}
+
 /**
  * Fast one-level listing (ShareFile-style Children): Delimiter '/' so Wasabi returns
  * immediate child folders + files only — not the whole subtree.
- * @returns {Promise<{ folders: Array<Record<string, unknown>>, files: Array<Record<string, unknown>> }>}
+ * When maxItems is set, return after one page so the explorer can paint, then continue with cursor.
+ * @param {{ maxItems?: number, cursor?: string }} [opts]
+ * @returns {Promise<{ folders: Array<Record<string, unknown>>, files: Array<Record<string, unknown>>, truncated: boolean, cursor: string }>}
  */
-async function listShallowTreeUnderPrefix(s3, bucket, jobPref, listPrefix) {
+async function listShallowTreeUnderPrefix(s3, bucket, jobPref, listPrefix, opts = {}) {
   const jobP = String(jobPref || '');
   const listP = String(listPrefix || jobP);
+  const maxItems = Number(opts.maxItems);
+  const hasLimit = Number.isFinite(maxItems) && maxItems >= 1;
+  const pageSize = hasLimit ? Math.max(1, Math.min(1000, Math.floor(maxItems))) : 1000;
   /** @type {Map<string, { path: string, parentPath: string, name: string, lastModified: string | null }>} */
   const folderByPath = new Map();
   /** @type {Map<string, Record<string, unknown>>} */
   const fileById = new Map();
-  let pageToken;
+  let pageToken = opts.cursor ? String(opts.cursor) : undefined;
+  let truncated = false;
+  let cursorOut = '';
   do {
     const resp = await s3.send(
       new ListObjectsV2Command({
         Bucket: bucket,
         Prefix: listP,
         Delimiter: '/',
+        MaxKeys: pageSize,
         ContinuationToken: pageToken
       })
     );
@@ -1013,6 +1072,11 @@ async function listShallowTreeUnderPrefix(s3, bucket, jobPref, listPrefix) {
       });
     }
     pageToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+    if (hasLimit) {
+      truncated = Boolean(pageToken);
+      cursorOut = pageToken || '';
+      break;
+    }
   } while (pageToken);
 
   const folders = [...folderByPath.values()].sort((a, b) =>
@@ -1021,7 +1085,7 @@ async function listShallowTreeUnderPrefix(s3, bucket, jobPref, listPrefix) {
   const files = [...fileById.values()].sort((a, b) =>
     String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' })
   );
-  return { folders, files };
+  return { folders, files, truncated, cursor: cursorOut };
 }
 
 /**
@@ -2570,22 +2634,29 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   async function mergeUploadedByIntoTree(clientId, jobId, tree) {
     const files = tree && Array.isArray(tree.files) ? tree.files : [];
     if (!files.length) return;
+    const keys = files.map((f) => String(f.key || '')).filter(Boolean);
+    if (!keys.length) return;
     try {
       await ensurePortalObjectUploadedBySchema(uploadMetaPool);
-      const r = await uploadMetaPool.query(
-        `SELECT object_key, username, display_name, user_id
-         FROM portal_object_uploaded_by WHERE client_id = $1 AND job_id = $2`,
-        [String(clientId), String(jobId)]
-      );
       const byKey = new Map();
-      for (const row of r.rows || []) {
-        const k = String(row.object_key || '');
-        if (!k) continue;
-        byKey.set(k, {
-          username: String(row.username || '').trim(),
-          displayName: String(row.display_name || '').trim(),
-          userId: String(row.user_id || '').trim()
-        });
+      const chunkSize = 1500;
+      for (let i = 0; i < keys.length; i += chunkSize) {
+        const slice = keys.slice(i, i + chunkSize);
+        const r = await uploadMetaPool.query(
+          `SELECT object_key, username, display_name, user_id
+           FROM portal_object_uploaded_by
+           WHERE client_id = $1 AND job_id = $2 AND object_key = ANY($3::text[])`,
+          [String(clientId), String(jobId), slice]
+        );
+        for (const row of r.rows || []) {
+          const k = String(row.object_key || '');
+          if (!k) continue;
+          byKey.set(k, {
+            username: String(row.username || '').trim(),
+            displayName: String(row.display_name || '').trim(),
+            userId: String(row.user_id || '').trim()
+          });
+        }
       }
       for (const f of files) {
         const key = String(f.key || '');
@@ -2880,21 +2951,79 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         shallowRaw === '1' || shallowRaw === 'true' || shallowRaw === 'yes' || shallowRaw === 'on';
       const permEditorTree =
         readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
+      const freshRaw = String(req.query.fresh ?? '').trim().toLowerCase();
+      const freshList =
+        freshRaw === '1' || freshRaw === 'true' || freshRaw === 'yes' || freshRaw === 'on';
+      const limitRaw = Number(req.query.limit);
+      const shallowLimit =
+        shallow && !permEditorTree && Number.isFinite(limitRaw) && limitRaw > 0
+          ? Math.max(1, Math.min(1000, Math.floor(limitRaw)))
+          : 0;
+      const shallowCursor =
+        shallow && !permEditorTree ? String(req.query.cursor || '').trim() : '';
+      const listStarted = Date.now();
       /** @type {{ folders: unknown[], files: unknown[] }} */
       let tree;
       /** @type {unknown[]} */
       let keys = [];
-      if (shallow && !permEditorTree) {
-        tree = await listShallowTreeUnderPrefix(portalS3(), portalBucket(), prefix, listPrefix);
-        keys = Array.isArray(tree.files) ? tree.files : [];
-      } else {
+      let listingTruncated = false;
+      let listingCursor = '';
+      const listTask = (async () => {
+        if (shallow && !permEditorTree) {
+          const cacheKey = shallowTreeCacheKey(portalBucket(), listPrefix, shallowLimit, shallowCursor);
+          if (!freshList) {
+            const cached = readShallowTreeCache(cacheKey);
+            if (cached) return cached;
+          }
+          const listedTree = await listShallowTreeUnderPrefix(
+            portalS3(),
+            portalBucket(),
+            prefix,
+            listPrefix,
+            { maxItems: shallowLimit, cursor: shallowCursor }
+          );
+          writeShallowTreeCache(cacheKey, listedTree);
+          return cloneShallowListing(listedTree);
+        }
         const maxList =
           permEditorTree || hasPathScope
             ? PORTAL_TREE_MAX_OBJECTS
             : Math.min(PORTAL_TREE_MAX_OBJECTS, PORTAL_TREE_MAX_OBJECTS_ROOT);
         const listed = await listAllKeysCapped(portalS3(), portalBucket(), listPrefix, maxList);
-        keys = listed.keys;
         if (listed.truncated) {
+          const err = new Error('File catalog for this folder exceeds the configured maximum object count');
+          err.code = 'TREE_LISTING_TOO_LARGE';
+          err.maxList = maxList;
+          throw err;
+        }
+        return {
+          tree: buildTreeFromKeys(prefix, listed.keys),
+          keys: listed.keys,
+          truncated: false,
+          cursor: ''
+        };
+      })();
+      let jobHasPathGrantsTree = false;
+      try {
+        const [listedResult, hasGrants] = await Promise.all([
+          listTask,
+          portalOrCompanyJobHasPathGrants(aclPool, req.user, clientId, jobId)
+        ]);
+        jobHasPathGrantsTree = hasGrants;
+        if (listedResult.tree) {
+          tree = listedResult.tree;
+          keys = listedResult.keys;
+          listingTruncated = false;
+          listingCursor = '';
+        } else {
+          tree = listedResult;
+          keys = Array.isArray(listedResult.files) ? listedResult.files : [];
+          listingTruncated = listedResult.truncated === true;
+          listingCursor = typeof listedResult.cursor === 'string' ? listedResult.cursor : '';
+        }
+      } catch (listErr) {
+        if (listErr && listErr.code === 'TREE_LISTING_TOO_LARGE') {
+          const maxList = listErr.maxList;
           return res.status(413).json({
             error: 'File catalog for this folder exceeds the configured maximum object count',
             code: 'TREE_LISTING_TOO_LARGE',
@@ -2905,25 +3034,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
               : 'Add ?pathPrefix=<portal-relative-folder> to list one subtree (Horizon File Explorer sends this when you open a folder), or raise PORTAL_TREE_MAX_OBJECTS_ROOT / PORTAL_TREE_MAX_OBJECTS.'
           });
         }
-        tree = buildTreeFromKeys(prefix, listed.keys);
+        throw listErr;
       }
-      const treeBeforeFilter = {
-        folders: Array.isArray(tree?.folders) ? tree.folders.length : 0,
-        files: Array.isArray(tree?.files) ? tree.files.length : 0
-      };
+      const listMs = Date.now() - listStarted;
       const treePortalMode = readPortalMode(req, req.query);
       const isDataAutoSyncTreeList = treePortalMode === DATA_AUTO_SYNC_MODE;
-      const jobHasPathGrantsTree = await portalOrCompanyJobHasPathGrants(aclPool, req.user, clientId, jobId);
       /** @type {Array<{ path_prefix: string, recursive: boolean, access_mode: string }>} */
       let treeUserGrants = [];
-      let appliedPathGrantFilter = false;
-      let jobHasDirectUserFolderGrantsFlag = false;
-      try {
-        const { jobHasDirectUserFolderGrants } = require('./user-grants.service');
-        jobHasDirectUserFolderGrantsFlag = await jobHasDirectUserFolderGrants(aclPool, clientId, jobId);
-      } catch {
-        /* ignore */
-      }
       if (jobHasPathGrantsTree && !permEditorTree && !userIsPortalAdmin(req.user)) {
         treeUserGrants = await loadCombinedUserPathGrants(aclPool, clientId, jobId, req.user);
         if (!bypassPathGrantsForLenientPortalClient(req.user, treeUserGrants)) {
@@ -2938,14 +3055,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
               const sharedOnly = filterTreeToDasVisiblePrefixes(unfilteredTree, '');
               tree = mergeTreeUnion(tree, sharedOnly);
             }
-            appliedPathGrantFilter = true;
           } else if (isDataAutoSyncTreeList) {
             const userRoot = dataAutosyncPortalUserFolderPrefix(req.user);
             tree = filterTreeToDasVisiblePrefixes(tree, userRoot);
-            appliedPathGrantFilter = true;
           } else {
             tree = filterTreeByPathGrants(tree, treeUserGrants, true);
-            appliedPathGrantFilter = true;
           }
         }
       } else if (
@@ -2957,39 +3071,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         // No path-grant rows: still limit DAS explorers to Shared Base + legacy user folder.
         const userRoot = dataAutosyncPortalUserFolderPrefix(req.user);
         tree = filterTreeToDasVisiblePrefixes(tree, userRoot);
-        appliedPathGrantFilter = true;
       }
-      // #region agent log
-      hpAgentDebugLog(
-        'portal-files.routes.js:GET/tree',
-        'portal tree grant filter',
-        {
-          clientId: String(clientId || ''),
-          jobId: String(jobId || ''),
-          pathPrefix: String(subtreeRaw || ''),
-          s3KeyCount: keys.length,
-          treeBeforeFilter,
-          treeAfterFilter: {
-            folders: Array.isArray(tree?.folders) ? tree.folders.length : 0,
-            files: Array.isArray(tree?.files) ? tree.files.length : 0
-          },
-          sampleFolderPaths: (tree?.folders || []).slice(0, 8).map((f) => String(f.path || '')),
-          jobHasPathGrantsTree,
-          jobHasDirectUserFolderGrants: jobHasDirectUserFolderGrantsFlag,
-          userGrantCount: treeUserGrants.length,
-          grantPrefixes: treeUserGrants.slice(0, 8).map((g) => ({
-            path: String(g.path_prefix || ''),
-            recursive: g.recursive !== false,
-            accessMode: normalizeGrantAccessMode(g.access_mode)
-          })),
-          appliedPathGrantFilter,
-          permEditorTree,
-          isPortalAdmin: userIsPortalAdmin(req.user),
-          userIdSuffix: String(req.user?.id || '').slice(-6)
-        },
-        'A'
-      );
-      // #endregion
       const forceHashes = String(req.query.includeHashes ?? '').trim() === '1';
       // Shallow folder browsing does not need full-job SHA merge (2 PG queries) — skip unless asked.
       const skipHashMerge =
@@ -3002,8 +3084,14 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!permEditorTree) {
         tree = filterHiddenPortalTreeForTenantClient(tree, clientId);
       }
-      res.set('Cache-Control', 'private, max-age=60, stale-while-revalidate=120');
-      return res.json(tree);
+      res.set('Cache-Control', 'private, max-age=20, stale-while-revalidate=40');
+      res.set('Server-Timing', `list;dur=${listMs}`);
+      return res.json({
+        folders: Array.isArray(tree?.folders) ? tree.folders : [],
+        files: Array.isArray(tree?.files) ? tree.files : [],
+        truncated: listingTruncated,
+        ...(listingTruncated && listingCursor ? { cursor: listingCursor } : {})
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return res.status(400).json({ error: msg });
@@ -3882,9 +3970,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
         throw he;
       }
-      const url = await getSignedUrl(portalS3(), new GetObjectCommand({ Bucket: portalBucket(), Key: auth.Key }), {
-        expiresIn: PORTAL_PRESIGN_TTL_SECONDS
-      });
+      const url = await presignPortalGetUrl(portalS3(), portalBucket(), auth.Key, PORTAL_PRESIGN_TTL_SECONDS);
       return res.json({ url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
     } catch (e) {
       const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
@@ -4468,11 +4554,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       );
       const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const rel = built.key.slice(pref.length);
-      try {
-        await upsertPortalObjectUploadedBy(built.key, clientId, jobId, req.user);
-      } catch (metaErr) {
+      // Do not hold the presign response on metadata upsert — under 20 Desktop workers this
+      // stampeded Postgres and prolonged worker time while nginx saw premature upstream closes.
+      void upsertPortalObjectUploadedBy(built.key, clientId, jobId, req.user).catch((metaErr) => {
         console.warn('[portal-files] upload/presign uploadedBy:', metaErr?.message || metaErr);
-      }
+      });
       return res.json({
         url,
         expiresIn: PORTAL_PRESIGN_TTL_SECONDS,
@@ -4485,7 +4571,13 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      return res.status(400).json({ error: msg });
+      const transient =
+        /timeout|ETIMEDOUT|ECONNRESET|EAI_AGAIN|ENOTFOUND|Throttl|SlowDown|Service Unavailable|503|502|TooManyRequests/i.test(
+          msg
+        );
+      console.warn('[portal-files] upload/presign:', msg);
+      // 503 so Desktop gateway retry/backoff treats Wasabi/signing blips as retryable (not hard 400).
+      return res.status(transient ? 503 : 500).json({ error: msg });
     }
   });
 
@@ -5867,9 +5959,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!auth.ok) return res.status(auth.status).json(auth.body);
       // Skip HeadObject — auth already validated the key; browser 404s if missing.
       // Saves one Wasabi RTT on every video open / scrub-presign refresh.
-      const url = await getSignedUrl(portalS3(), new GetObjectCommand({ Bucket: portalBucket(), Key: auth.Key }), {
-        expiresIn: PORTAL_PRESIGN_TTL_SECONDS
-      });
+      const url = await presignPortalGetUrl(portalS3(), portalBucket(), auth.Key, PORTAL_PRESIGN_TTL_SECONDS);
       res.set('Cache-Control', 'private, max-age=300');
       return res.json({ url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
     } catch (e) {
@@ -6020,9 +6110,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
             });
             continue;
           }
-          const url = await getSignedUrl(portalS3(), new GetObjectCommand({ Bucket: portalBucket(), Key: auth.Key }), {
-            expiresIn: PORTAL_PRESIGN_TTL_SECONDS
-          });
+          const url = await presignPortalGetUrl(portalS3(), portalBucket(), auth.Key, PORTAL_PRESIGN_TTL_SECONDS);
           items.push({ id: fileId, url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
         } catch (e) {
           failures.push({
@@ -6266,9 +6354,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         }
         throw he;
       }
-      const url = await getSignedUrl(portalS3(), new GetObjectCommand({ Bucket: portalBucket(), Key: auth.Key }), {
-        expiresIn: PORTAL_PRESIGN_TTL_SECONDS
-      });
+      const url = await presignPortalGetUrl(portalS3(), portalBucket(), auth.Key, PORTAL_PRESIGN_TTL_SECONDS);
       return res.json({ url, expiresIn: PORTAL_PRESIGN_TTL_SECONDS });
     } catch (e) {
       const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
