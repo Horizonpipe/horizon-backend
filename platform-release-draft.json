@@ -1,10 +1,12 @@
-﻿{
-  "title": "Pipe charts for Jobs folder uploads",
-  "description": "Pipe charts in PipeShare draw inspection observations from the WinCan database that belongs to the same project as the video. Desktop AutoSync stores that database under Jobs/{project}/DB/{person}/, while the video sits in a Videos folder next to it. The website only loads the folder you have open, so it never saw those databases and the chart stayed empty. Older jobs that keep the database directly in DB/ or beside the video still worked.\n\nOpening a video now also lists that project's DB folder and each person's folder inside it, then uses the database found there. The chart still stays inside the current client and job. Video playback range requests are unchanged.\n\nWho is affected: PipeShare in the browser on pipeshare.live and pipeshare.net. Hard-refresh, open the Jobs project, and play a video to see the pipe chart.",
+{
+  "title": "PipeShare video starts on a light preview",
+  "description": "Inspection videos were one big file, so playback waited on that file even after range requests worked. PipeShare now builds a short preview next to the original and plays the preview first, then steps up to the full picture as the buffer fills.\n\nNew uploads are prepared on the server with ffmpeg. An older video is prepared the first time someone presses play. Until that preview exists, the player keeps using the current Wasabi range link, so nothing goes blank. Video bytes still come from Wasabi. The original inspection file is kept. The same code runs on pipeshare.live and pipeshare.net.\n\nWho is affected: PipeShare in the browser on the private server and SaaS. Desktop Auto Sync uploads are unchanged. The first play of a large video can sit on the original file for a few minutes while the preview is built. Very large files (over about 4 GB) stay on range playback.",
   "changeLog": [
-    "Pipe charts find WinCan databases stored under Jobs/{project}/DB/{person}/.",
-    "The same project folder match still works when the database sits directly in DB/ or beside the video.",
-    "A video name with a WinCan id suffix still matches the inspection inside that database.",
-    "Charts do not search other clients or other jobs for a database."
-  ]
+    "PipeShare stores a two-step HLS preview beside each video and keeps the original file.",
+    "The player starts on the light preview and steps up to the full file as the buffer allows.",
+    "If the preview is not ready, playback uses the existing presigned MP4 range link.",
+    "New uploads are queued for a preview. Older videos are queued the first time they are played.",
+    "Preview bytes are presigned from Wasabi. The portal only sends the small playlist."
+  ],
+  "updatedAt": "2026-10-19T17:45:00.000Z"
 }

@@ -61,6 +61,14 @@ const {
   filterHiddenPortalTreeForTenantClient
 } = require('./lib/portal-hidden-tree-paths');
 const {
+  isPortalHlsSidecarRelPath,
+  schedulePortalVideoHls,
+  getPortalVideoHlsStatus,
+  loadRewrittenHlsPlaylist,
+  scheduleDeletePortalVideoHls,
+  isHlsPlaylistName
+} = require('./lib/portal-video-hls');
+const {
   loadEffectivePathGrantsForUser,
   jobHasAnyEffectivePathGrants,
   migrateLegacyScopeAuthorityForUserJob,
@@ -1021,7 +1029,7 @@ async function listShallowTreeUnderPrefix(s3, bucket, jobPref, listPrefix, opts 
       const full = String(cp.Prefix || '');
       if (!full.startsWith(jobP)) continue;
       let rel = full.slice(jobP.length).replace(/\/+$/, '');
-      if (!rel) continue;
+      if (!rel || isPortalHlsSidecarRelPath(rel)) continue;
       const parentPath = parentRelPath(rel);
       folderByPath.set(rel, {
         path: rel,
@@ -1037,7 +1045,7 @@ async function listShallowTreeUnderPrefix(s3, bucket, jobPref, listPrefix, opts 
       if (!r || isFolderMarkerKey(r)) {
         if (r && isFolderMarkerKey(r)) {
           const folderRel = markerRelToFolderRel(r);
-          if (folderRel) {
+          if (folderRel && !isPortalHlsSidecarRelPath(folderRel)) {
             const iso = obj.LastModified ? obj.LastModified.toISOString() : null;
             const prev = folderByPath.get(folderRel);
             if (!prev) {
@@ -1055,6 +1063,7 @@ async function listShallowTreeUnderPrefix(s3, bucket, jobPref, listPrefix, opts 
         continue;
       }
       // Only direct children (Delimiter already excludes nested keys from Contents).
+      if (isPortalHlsSidecarRelPath(r)) continue;
       const slash = r.lastIndexOf('/');
       const parentPath = slash === -1 ? '' : r.slice(0, slash);
       const name = slash === -1 ? r : r.slice(slash + 1);
@@ -1149,11 +1158,11 @@ function buildTreeFromKeys(jobPref, entries) {
   for (const { Key: key, Size: size, LastModified: lm, ETag: etag } of entries) {
     if (!key.startsWith(jobPref)) continue;
     const r = rel(key);
-    if (!r) continue;
+    if (!r || isPortalHlsSidecarRelPath(r)) continue;
 
     if (isFolderMarkerKey(r)) {
       const folderRel = markerRelToFolderRel(r);
-      if (folderRel !== null && folderRel !== '') {
+      if (folderRel !== null && folderRel !== '' && !isPortalHlsSidecarRelPath(folderRel)) {
         folderSet.add(folderRel);
         const iso = lm ? lm.toISOString() : null;
         const prev = folderMeta.get(folderRel);
@@ -2492,6 +2501,15 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
   }
 
   function notifyPortalObjectUploaded(payload) {
+    if (payload && payload.s3 && payload.bucket && payload.key) {
+      void schedulePortalVideoHls({
+        s3: payload.s3,
+        bucket: payload.bucket,
+        key: payload.key
+      }).catch((error) => {
+        console.warn('[portal-hls] schedule failed:', error?.message || error);
+      });
+    }
     if (typeof onPortalObjectUploaded !== 'function') return;
     try {
       onPortalObjectUploaded(payload);
@@ -5972,6 +5990,71 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     }
   });
 
+  function portalPublicOrigin(req) {
+    const proto = String(req.get('x-forwarded-proto') || req.protocol || 'https')
+      .split(',')[0]
+      .trim() || 'https';
+    const host = String(req.get('x-forwarded-host') || req.get('host') || '')
+      .split(',')[0]
+      .trim();
+    return host ? `${proto}://${host}` : '';
+  }
+
+  /** Ladder status. `preparing` means the original MP4 range URL should play until this is `ready`. */
+  r.get('/hls-status/:id', async (req, res) => {
+    try {
+      const auth = await portalAuthDownloadKey(req, req.params.id);
+      if (!auth.ok) return res.status(auth.status).json(auth.body);
+      const status = await getPortalVideoHlsStatus({
+        s3: portalS3(),
+        bucket: portalBucket(),
+        key: auth.Key,
+        fileId: String(req.params.id || '')
+      });
+      res.set('Cache-Control', 'no-store');
+      return res.json(status);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
+  /**
+   * HLS playlist only (tiny). Segment bytes are presigned Wasabi URLs inside the playlist.
+   * master.m3u8 variant links stay on this API so each playlist can be signed again.
+   */
+  r.get('/hls/:id/:name', async (req, res) => {
+    try {
+      const name = String(req.params.name || '');
+      if (!isHlsPlaylistName(name)) return res.status(404).json({ error: 'Not found' });
+      const auth = await portalAuthDownloadKey(req, req.params.id);
+      if (!auth.ok) return res.status(auth.status).json(auth.body);
+      const origin = portalPublicOrigin(req);
+      const fileId = encodeURIComponent(String(req.params.id || ''));
+      const token = String(req.query.access_token || '').trim();
+      const body = await loadRewrittenHlsPlaylist({
+        s3: portalS3(),
+        bucket: portalBucket(),
+        sourceKey: auth.Key,
+        name,
+        variantBaseUrl: `${origin}/api/files/hls/${fileId}`,
+        accessToken: token,
+        expiresIn: PORTAL_PRESIGN_TTL_SECONDS
+      });
+      res.set('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+      res.set('Cache-Control', 'no-store');
+      return res.send(body);
+    } catch (e) {
+      const status = e && e.status ? e.status : 0;
+      const name = e && typeof e === 'object' && 'name' in e ? e.name : '';
+      if (status === 404 || name === 'NoSuchKey' || name === 'NotFound' || e?.$metadata?.httpStatusCode === 404) {
+        return res.status(404).json({ error: 'Preview is not ready' });
+      }
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(500).json({ error: msg });
+    }
+  });
+
   /**
    * JSON manifest for browser-built folder ZIPs: each file is downloaded with `GET /presign/:id`
    * or `POST /presign-batch` (bytes go Wasabi → browser only; this route returns metadata + sizes only).
@@ -6172,6 +6255,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         name: path.basename(Key)
       });
       await portalS3().send(new DeleteObjectCommand({ Bucket: portalBucket(), Key }));
+      scheduleDeletePortalVideoHls(portalS3(), portalBucket(), Key);
       invalidatePortalDlCachesForFile(req.params.id, Key);
       return res.status(204).send();
     } catch (e) {

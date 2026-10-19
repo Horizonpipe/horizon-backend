@@ -81,6 +81,18 @@ if [[ ! -s "$BACKEND/.env" ]] || ! grep -q '^DATABASE_URL=' "$BACKEND/.env" 2>/d
   exit 1
 fi
 
+ensure_ffmpeg() {
+  if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+    echo "[github-deploy] ffmpeg present"
+    return 0
+  fi
+  echo "[github-deploy] installing ffmpeg (PipeShare video preview ladder)"
+  apt-get update -qq
+  apt-get install -y ffmpeg
+}
+
+ensure_ffmpeg
+
 # Orphan root PM2 god (/root/.pm2) steals :3000 from ubuntu PM2 — remove before restart.
 if [[ -x "$BACKEND/deploy/ovh/deduplicate-pm2.sh" ]]; then
   bash "$BACKEND/deploy/ovh/deduplicate-pm2.sh"
