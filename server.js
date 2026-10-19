@@ -2556,7 +2556,10 @@ function normalizeRoles(value) {
       portalUpload: value.portalUpload === true || value.portal_upload === true,
       portalDownload: value.portalDownload === true || value.portal_download === true,
       portalEdit: value.portalEdit === true || value.portal_edit === true,
-      portalDelete: value.portalDelete === true || value.portal_delete === true
+      portalDelete: value.portalDelete === true || value.portal_delete === true,
+      ...(Object.prototype.hasOwnProperty.call(value, 'reportsView')
+        ? { reportsView: value.reportsView === true }
+        : {})
     };
   }
   if (typeof value === 'string') {
@@ -7690,7 +7693,7 @@ app.get('/users', requireAuth, async (req, res) => {
       });
     }
 
-    let sql = `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup
+    let sql = `SELECT id, username, display_name, email, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup
        FROM users`;
     const params = [];
     if (scope.mode === 'tenant') {
@@ -8390,9 +8393,13 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
   if (accountType === ACCOUNT_TYPES.CUSTOMER) employeeRole = null;
   const isAdmin = employeeRole === EMPLOYEE_ROLES.ADMIN || employeeRole === EMPLOYEE_ROLES.SUPERADMIN;
   const roles = legacyRolesForAccountModel({ accountType, employeeRole }, normalizeRoles(req.body?.roles));
+  const email = cleanString(req.body?.email).toLowerCase();
 
   if (!username) {
     return res.status(400).json({ success: false, error: 'Username is required' });
+  }
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ success: false, error: 'Email is not valid' });
   }
 
   let insertedPgId = null;
@@ -8420,12 +8427,22 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
       }
     }
 
+    if (email) {
+      const emailTaken = await pool.query(
+        `SELECT 1 FROM users WHERE email IS NOT NULL AND BTRIM(email) <> '' AND LOWER(TRIM(email)) = $1 LIMIT 1`,
+        [email]
+      );
+      if (emailTaken.rowCount) {
+        return res.status(409).json({ success: false, error: 'Email already exists' });
+      }
+    }
+
     const result = await pool.query(
       `INSERT INTO users (
-         username, display_name, password, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup
+         username, display_name, password, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, self_signup, email, email_verified
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, true, $8, $9, $10, false)
-       RETURNING id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, self_signup`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, true, $8, $9, $10, false, $11, true)
+       RETURNING id, username, display_name, email, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, self_signup`,
       [
         username,
         displayName,
@@ -8436,7 +8453,8 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
         JSON.stringify(roles),
         req.tenantScope?.mode === 'tenant' ? req.tenantScope.portalClientId : null,
         req.tenantScope?.mode === 'tenant' ? req.tenantScope.portalJobId || '1' : null,
-        false
+        false,
+        email || null
       ]
     );
     insertedPgId = result.rows[0].id;
@@ -8482,6 +8500,7 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
           autosync_master_granted: false,
           self_signup: false,
           portal_permissions_access: false,
+          email: email || null,
           email_verified: true,
           created_at: nowIso(),
           updated_at: nowIso()
@@ -8571,6 +8590,11 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
   const hasCompanyRolePayload =
     Object.prototype.hasOwnProperty.call(req.body || {}, 'companyRoleKey') ||
     Object.prototype.hasOwnProperty.call(req.body || {}, 'roleKey');
+  const hasEmailPayload = Object.prototype.hasOwnProperty.call(req.body || {}, 'email');
+  const nextEmailInput = hasEmailPayload ? cleanString(req.body?.email).toLowerCase() : '';
+  if (hasEmailPayload && nextEmailInput && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(nextEmailInput)) {
+    return res.status(400).json({ success: false, error: 'Email is not valid' });
+  }
 
   try {
     let current = null;
@@ -8881,6 +8905,25 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
     }
 
     const pgRow = await persistUserUpdateToPostgres();
+    if (hasEmailPayload) {
+      const nextEmail = nextEmailInput;
+      if (nextEmail) {
+        const emailTaken = await pool.query(
+          `SELECT 1 FROM users WHERE id <> $1 AND email IS NOT NULL AND BTRIM(email) <> '' AND LOWER(TRIM(email)) = $2 LIMIT 1`,
+          [id, nextEmail]
+        );
+        if (emailTaken.rowCount) {
+          return res.status(409).json({ success: false, error: 'Email already exists' });
+        }
+      }
+      const emailWrite = await pool.query(
+        `UPDATE users SET email = $1, email_verified = true, updated_at = NOW()
+         WHERE id = $2
+         RETURNING email`,
+        [nextEmail || null, id]
+      );
+      pgRow.email = emailWrite.rows[0]?.email || null;
+    }
     const updatedResult = { rows: [pgRow] };
 
     if (hasCompanyPayload) {

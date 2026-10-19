@@ -63,11 +63,48 @@ function normalizeLegacyRoles(value) {
     portalUpload: false,
     portalDownload: false,
     portalEdit: false,
-    portalDelete: false
+    portalDelete: false,
+    reportsView: false
   };
   if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
   for (const key of Object.keys(out)) out[key] = value[key] === true;
   return out;
+}
+
+/** Module flags a customer account may keep when an admin assigns them. Operator roles stay off. */
+const CUSTOMER_MODULE_ROLE_KEYS = [
+  'email',
+  'psrPlanner',
+  'psrViewer',
+  'psrDataEntry',
+  'dataAutoSyncEmployee',
+  'pricingView',
+  'footageView',
+  'jobsiteContactsView',
+  'portalUpload',
+  'portalDownload',
+  'portalEdit',
+  'portalDelete'
+];
+
+/**
+ * Daily Reports stayed open for existing accounts. Persist the flag only after an admin sets it.
+ * @param {object} roles
+ * @param {object} raw
+ * @param {{ forceOn?: boolean }} [opts]
+ */
+function applyReportsViewFlag(roles, raw, opts = {}) {
+  const next = { ...roles };
+  if (opts.forceOn) {
+    next.reportsView = true;
+    return next;
+  }
+  if (raw && typeof raw === 'object' && !Array.isArray(raw) && Object.prototype.hasOwnProperty.call(raw, 'reportsView')) {
+    next.reportsView = raw.reportsView === true;
+    return next;
+  }
+  delete next.reportsView;
+  return next;
 }
 
 function looksLikeMike(userLike) {
@@ -184,14 +221,20 @@ function legacyRolesForAccountModel(model, legacyRolesInput = null) {
     portalUpload: false,
     portalDownload: false,
     portalEdit: false,
-    portalDelete: false
+    portalDelete: false,
+    reportsView: false
   };
+  const raw = legacyRolesInput && typeof legacyRolesInput === 'object' && !Array.isArray(legacyRolesInput) ? legacyRolesInput : {};
 
-  if (model.accountType === ACCOUNT_TYPES.CUSTOMER) return out;
+  if (model.accountType === ACCOUNT_TYPES.CUSTOMER) {
+    const customer = { ...out };
+    for (const key of CUSTOMER_MODULE_ROLE_KEYS) customer[key] = legacy[key] === true;
+    return applyReportsViewFlag(customer, raw);
+  }
   const role = normalizeEmployeeRole(model.employeeRole);
   if (role === EMPLOYEE_ROLES.SUPERADMIN || role === EMPLOYEE_ROLES.ADMIN) {
     for (const key of Object.keys(out)) out[key] = true;
-    return out;
+    return applyReportsViewFlag(out, raw, { forceOn: true });
   }
   if (role === EMPLOYEE_ROLES.CAMERA_OPERATOR) {
     out.camera = true;
@@ -202,16 +245,16 @@ function legacyRolesForAccountModel(model, legacyRolesInput = null) {
     out.portalDownload = true;
     out.portalEdit = true;
     out.portalDelete = true;
-    return { ...out, ...legacy };
+    return applyReportsViewFlag({ ...out, ...legacy }, raw);
   }
   if (role === EMPLOYEE_ROLES.VAC_OPERATOR || role === EMPLOYEE_ROLES.SIMPLE_VAC) {
     out.vac = true;
     out.psrViewer = true;
     out.psrDataEntry = true;
     if (role === EMPLOYEE_ROLES.SIMPLE_VAC) out.simpleVac = true;
-    return { ...out, ...legacy };
+    return applyReportsViewFlag({ ...out, ...legacy }, raw);
   }
-  return { ...out, ...legacy };
+  return applyReportsViewFlag({ ...out, ...legacy }, raw);
 }
 
 /** Global Horizon super-admin (platform operator — not a SaaS workspace purchaser). */
@@ -290,7 +333,8 @@ function resolveCapabilities(user) {
     portalUpload: !!roles.portalUpload,
     portalDownload: !!roles.portalDownload,
     portalEdit: !!roles.portalEdit,
-    portalDelete: !!roles.portalDelete
+    portalDelete: !!roles.portalDelete,
+    reportsView: !Object.prototype.hasOwnProperty.call(roles, 'reportsView') || roles.reportsView === true
   };
 }
 

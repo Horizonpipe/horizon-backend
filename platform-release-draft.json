@@ -1,12 +1,10 @@
 {
-  "title": "Video stays forward and remarks match the frame",
-  "description": "Two playback problems were still there after 0.0.72, and the quality label never left Original.\n\nThe 15-second replay was not the quality switch from 0.0.72. The picture froze for about a second, then the playhead jumped back to the last keyframe. On the original file those keyframes are often about 15 seconds apart, so that stretch played again. The player was also deleting the buffer behind the playhead, including the keyframe the decoder still needed. Because the ladder was not what was on screen, the label stayed on Original and there was no lighter step to drop to when the buffer ran dry.\n\nPlayback now measures the connection and starts on the highest step that speed can sustain. At 5× on a typical 80 Mbps link that is Inspection (about 5 Mbps), not the original. If the buffer is about to run out, the next piece steps down (Preview, Inspection, or Full) without rewinding. When the buffer is healthy again, it can step back up. The label shows the step. The playhead is not sent backward unless you scrub.\n\nPipe-chart remarks use the time stored on the observation. The highlighted remark is the one whose time matches the frame you are on, within a fraction of a second. Clicking a remark, or dragging the pipe to that footage, seeks that frame. Footage numbers are the distances stored with the remark.\n\nWho is affected: PipeShare in the browser on pipeshare.live and pipeshare.net. Hard-refresh, then close the video and open it again. A video that does not have a ladder yet still plays the original file until Preview and Inspection are ready, then switches without going back to the start.",
+  "title": "Admins can assign module access that sticks",
+  "description": "The desktop Admin tab uses the same user list as the web portal. Saving module access for a customer account used to clear those flags, and Daily Reports could not be turned off.\n\nAn admin can leave PipeShare, PipeSync, Plan View, Footage, Pricing, Reports, AUTOSYNC, jobsite contacts, and email on or off for that person. Reports stays on for existing accounts until an admin turns it off. A new account can store an email address.\n\nWho is affected: admins on the private server and on SaaS. A tenant admin still only sees users in their own client. The person whose access changed should sign in again before the new modules apply.",
   "changeLog": [
-    "A freeze no longer replays the last 15 seconds. The playhead stays forward unless you scrub.",
-    "Quality is automatic. The label shows Preview, Inspection, or Full, and steps down when the buffer is about to run dry.",
-    "At 5× on an 80 Mbps connection playback stays on Inspection, not the original file.",
-    "Opening a video uses the ladder when it exists, and switches onto it when the ladder finishes without restarting at zero.",
-    "The graph highlights the remark whose recorded time matches the frame, and a click or pipe drag seeks that frame.",
-    "Footage on the graph is the distance stored for that remark."
+    "Customer accounts keep the modules an admin assigns.",
+    "Daily Reports can be turned off. Existing accounts keep it until an admin changes it.",
+    "Creating a user can store an email address.",
+    "A tenant admin still only manages users in their own client."
   ]
 }
