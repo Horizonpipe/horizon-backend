@@ -1,12 +1,13 @@
 {
-  "title": "PipeShare video starts on a light preview",
-  "description": "Inspection videos were one big file, so playback waited on that file even after range requests worked. PipeShare now builds a short preview next to the original and plays the preview first, then steps up to the full picture as the buffer fills.\n\nNew uploads are prepared on the server with ffmpeg. An older video is prepared the first time someone presses play. Until that preview exists, the player keeps using the current Wasabi range link, so nothing goes blank. Video bytes still come from Wasabi. The original inspection file is kept. The same code runs on pipeshare.live and pipeshare.net.\n\nWho is affected: PipeShare in the browser on the private server and SaaS. Desktop Auto Sync uploads are unchanged. The first play of a large video can sit on the original file for a few minutes while the preview is built. Very large files (over about 4 GB) stay on range playback.",
+  "title": "Smoother fast playback for inspection video",
+  "description": "Playing an inspection video at 5× was stalling on a normal home connection (about 80 Mbps). Five times speed needs five times the video's bitrate. The player was stepping up to the original file, and a typical WinCan recording is 8–25 Mbps, so 5× needs 40–125 Mbps. That is more than the connection can hold, and the buffer was only a few seconds of real time, so playback kept stopping to refill.\n\nPipeShare now keeps a middle quality as well as the light preview and the original. The middle step is about 5 Mbps at 720p (or the source size when the file is already smaller), in short 2 second pieces. At 5× that is about 25 Mbps, which fits in an 80 Mbps link with room to spare. The original file is still there and is still copied rather than re-encoded. The player only moves up to it when the connection can feed it at the speed you picked. When you set 5× it stays on, or drops to, a step that fits instead of stalling on the original.\n\nVideos that already have the older two-step preview keep playing, and the server builds the middle step in the background the next time they are opened. Until that exists, 5× stays on the light preview so it does not stutter. Videos that are not prepared yet still play from the Wasabi range link, and at 1.5× or faster the browser buffers further ahead. Video bytes still come straight from Wasabi. The same behavior is on pipeshare.live and pipeshare.net.\n\nWho is affected: PipeShare playback in the browser. A very high bitrate original still cannot play smoothly at 5× on an 80 Mbps connection — 25 Mbps times 5 is 125 Mbps — so that top step stays off until you slow down or the connection is faster.",
   "changeLog": [
-    "PipeShare stores a two-step HLS preview beside each video and keeps the original file.",
-    "The player starts on the light preview and steps up to the full file as the buffer allows.",
-    "If the preview is not ready, playback uses the existing presigned MP4 range link.",
-    "New uploads are queued for a preview. Older videos are queued the first time they are played.",
-    "Preview bytes are presigned from Wasabi. The portal only sends the small playlist."
+    "Inspection videos get a middle HLS step around 5 Mbps so 5× playback fits a typical 80 Mbps connection.",
+    "Preview stays near 2 Mbps at 360p. The original file is still copied and is used only when speed and bandwidth allow.",
+    "Segments are about 2 seconds so a stall at high speed refills quickly.",
+    "The player grows its forward buffer as the speed goes up and caps the ladder using bandwidth divided by playback speed.",
+    "Older previews keep playing and are rebuilt with the middle step in the background.",
+    "Videos that are not prepared yet still use the Wasabi range link, with a larger ahead buffer at high speed."
   ],
-  "updatedAt": "2026-10-19T17:45:00.000Z"
+  "updatedAt": "2026-10-19T18:30:00.000Z"
 }
