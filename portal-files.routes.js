@@ -71,6 +71,7 @@ const {
 const {
   loadEffectivePathGrantsForUser,
   jobHasAnyEffectivePathGrants,
+  listPrefixAllowedByGrants,
   migrateLegacyScopeAuthorityForUserJob,
   recordTrashBinEntry,
   loadUserCompanyMembership,
@@ -2953,6 +2954,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       const prefix = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       let listPrefix = prefix;
       const subtreeRaw = String(req.query.pathPrefix ?? req.query.prefix ?? '').trim();
+      let subtreeRel = '';
       if (subtreeRaw) {
         let rel;
         try {
@@ -2961,7 +2963,23 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           const m = err instanceof Error ? err.message : String(err);
           return res.status(400).json({ error: m });
         }
+        subtreeRel = rel;
         if (rel) listPrefix = `${prefix}${rel}/`;
+      }
+      const permEditorTreeEarly =
+        readPermissionsEditorQuery(req) && userCanManagePortalExtras(req.user);
+      if (subtreeRel && !permEditorTreeEarly && !userIsPortalAdmin(req.user)) {
+        const jobHasGrants = await portalOrCompanyJobHasPathGrants(aclPool, req.user, clientId, jobId);
+        if (jobHasGrants) {
+          const prefixGrants = await loadCombinedUserPathGrants(aclPool, clientId, jobId, req.user);
+          if (
+            prefixGrants.length &&
+            !bypassPathGrantsForLenientPortalClient(req.user, prefixGrants) &&
+            !listPrefixAllowedByGrants(subtreeRel, prefixGrants)
+          ) {
+            return res.json({ folders: [], files: [], truncated: false });
+          }
+        }
       }
       const hasPathScope = Boolean(subtreeRaw);
       const shallowRaw = String(req.query.shallow ?? '').trim().toLowerCase();

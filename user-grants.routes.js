@@ -5,7 +5,10 @@ const {
   serializeUserFolderGrantRow,
   loadUserFolderGrantsForScope,
   saveUserFolderGrantsForScope,
-  syncPsrScopeForUserGrant
+  syncPsrScopeForUserGrant,
+  listFolderGrantsForUser,
+  addFolderGrantForUser,
+  removeFolderGrantForUser
 } = require('./user-grants.service');
 
 function cleanString(v) {
@@ -46,7 +49,7 @@ function parseScopeFromBody(body) {
   };
 }
 
-function registerUserGrantsRoutes(app, { pool, requireAuth, requireAdminPanelAccess }) {
+function registerUserGrantsRoutes(app, { pool, requireAuth, requireAdminPanelAccess, requireAdminPanelOrTenantUserManagement, assertUserIdInTenantScope }) {
   function jsonError(res, status, message) {
     return res.status(status).json({ success: false, error: message });
   }
@@ -87,6 +90,92 @@ function registerUserGrantsRoutes(app, { pool, requireAuth, requireAdminPanelAcc
     } catch (error) {
       console.error('[user-folder-grants] put error:', error);
       return jsonError(res, 500, error.message);
+    }
+  });
+
+  const requireUserAdmin = requireAdminPanelOrTenantUserManagement || requireAdminPanelAccess;
+
+  function grantScopeAllowed(req, clientId, jobId) {
+    const scope = req.tenantScope;
+    if (!scope || scope.mode !== 'tenant') return true;
+    if (String(clientId) !== String(scope.portalClientId || '')) return false;
+    const tenantJob = String(scope.portalJobId || '').trim();
+    if (tenantJob && String(jobId) !== tenantJob) return false;
+    return true;
+  }
+
+  app.get('/users/:id/folder-grants', requireAuth, requireUserAdmin, async (req, res) => {
+    try {
+      const userId = cleanString(req.params.id);
+      const clientId = cleanString(req.query?.clientId ?? req.query?.client_id);
+      const jobId = cleanString(req.query?.jobId ?? req.query?.job_id);
+      if (!userId) return jsonError(res, 400, 'User id is required');
+      if (!clientId || !jobId) return jsonError(res, 400, 'Choose a client workspace before sharing folders.');
+      if (!grantScopeAllowed(req, clientId, jobId)) {
+        return jsonError(res, 403, 'That folder is outside your workspace.');
+      }
+      if (typeof assertUserIdInTenantScope === 'function') {
+        const allowed = await assertUserIdInTenantScope(pool, userId, req.tenantScope);
+        if (!allowed) return jsonError(res, 403, 'That user is outside your workspace.');
+      }
+      const grants = await listFolderGrantsForUser(pool, userId, clientId, jobId);
+      return res.json({ success: true, grants });
+    } catch (error) {
+      console.error('[user-folder-grants] list user error:', error);
+      return jsonError(res, error.status || 500, error.message || 'Could not load folder shares.');
+    }
+  });
+
+  app.post('/users/:id/folder-grants', requireAuth, requireUserAdmin, async (req, res) => {
+    try {
+      const userId = cleanString(req.params.id);
+      const clientId = cleanString(req.body?.clientId ?? req.body?.client_id);
+      const jobId = cleanString(req.body?.jobId ?? req.body?.job_id);
+      const pathPrefix = normalizeRelPath(req.body?.pathPrefix ?? req.body?.path ?? '');
+      if (!userId) return jsonError(res, 400, 'User id is required');
+      if (!clientId || !jobId) return jsonError(res, 400, 'Choose a client workspace before sharing folders.');
+      if (!pathPrefix) return jsonError(res, 400, 'Pick a folder to share.');
+      if (!grantScopeAllowed(req, clientId, jobId)) {
+        return jsonError(res, 403, 'That folder is outside your workspace.');
+      }
+      if (typeof assertUserIdInTenantScope === 'function') {
+        const allowed = await assertUserIdInTenantScope(pool, userId, req.tenantScope);
+        if (!allowed) return jsonError(res, 403, 'That user is outside your workspace.');
+      }
+      const grant = await addFolderGrantForUser(pool, userId, clientId, jobId, pathPrefix);
+      return res.status(201).json({
+        success: true,
+        grant,
+        message: 'Folder shared. They can see that folder and everything inside it.'
+      });
+    } catch (error) {
+      console.error('[user-folder-grants] add user error:', error);
+      return jsonError(res, error.status || 500, error.message || 'Could not share that folder.');
+    }
+  });
+
+  app.delete('/users/:id/folder-grants/:grantId', requireAuth, requireUserAdmin, async (req, res) => {
+    try {
+      const userId = cleanString(req.params.id);
+      const grantId = cleanString(req.params.grantId);
+      if (!userId || !grantId) return jsonError(res, 400, 'Folder share id is required');
+      if (typeof assertUserIdInTenantScope === 'function') {
+        const allowed = await assertUserIdInTenantScope(pool, userId, req.tenantScope);
+        if (!allowed) return jsonError(res, 403, 'That user is outside your workspace.');
+      }
+      const existing = await pool.query(
+        `SELECT client_id, job_id FROM user_folder_grants WHERE id = $1 AND user_id = $2 AND app = 'pipeshare' LIMIT 1`,
+        [grantId, userId]
+      );
+      if (!existing.rowCount) return jsonError(res, 404, 'That folder share is already gone.');
+      if (!grantScopeAllowed(req, existing.rows[0].client_id, existing.rows[0].job_id)) {
+        return jsonError(res, 403, 'That folder is outside your workspace.');
+      }
+      await removeFolderGrantForUser(pool, userId, grantId);
+      return res.json({ success: true, message: 'Folder share removed.' });
+    } catch (error) {
+      console.error('[user-folder-grants] delete user error:', error);
+      return jsonError(res, error.status || 500, error.message || 'Could not remove that folder share.');
     }
   });
 

@@ -1,10 +1,11 @@
 {
-  "title": "Admins can assign module access that sticks",
-  "description": "The desktop Admin tab uses the same user list as the web portal. Saving module access for a customer account used to clear those flags, and Daily Reports could not be turned off.\n\nAn admin can leave PipeShare, PipeSync, Plan View, Footage, Pricing, Reports, AUTOSYNC, jobsite contacts, and email on or off for that person. Reports stays on for existing accounts until an admin turns it off. A new account can store an email address.\n\nWho is affected: admins on the private server and on SaaS. A tenant admin still only sees users in their own client. The person whose access changed should sign in again before the new modules apply.",
+  "title": "Share a folder without opening the rest of the client",
+  "description": "An admin can now give one person a folder in their own client. That share includes the folder and everything inside it.\n\nIf the folder sits inside other folders the person was not given, they can still open it. The folders above it only appear as the path to get there. They do not see the other files in those folders, and they do not see folders next to the one that was shared. Asking the server for a path they were not given does not list or download those files.\n\nPeople with no folder shares still see the client the way they do today. Admins and workspace owners still see the whole client. A workspace owner cannot share a folder from another client.\n\nWho is affected: PipeShare on the private server and on SaaS, in the browser and in the desktop app. Install desktop 0.3.23 to pick folders from the Admin tab. The person whose folders changed should sign in again.",
   "changeLog": [
-    "Customer accounts keep the modules an admin assigns.",
-    "Daily Reports can be turned off. Existing accounts keep it until an admin changes it.",
-    "Creating a user can store an email address.",
-    "A tenant admin still only manages users in their own client."
+    "An admin can share a folder with one user. The share includes every folder inside it.",
+    "A nested share does not reveal parent files or folders that were not shared.",
+    "The server blocks list, download, and preview outside those folders.",
+    "Users with no folder shares keep the access they already had.",
+    "A workspace owner can only share folders in their own client."
   ]
 }

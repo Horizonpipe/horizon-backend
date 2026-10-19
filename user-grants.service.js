@@ -83,6 +83,70 @@ async function loadDirectUserFolderGrantsForUser(pool, userId, clientId, jobId) 
     .filter((g) => g.access_mode !== 'off');
 }
 
+async function listFolderGrantsForUser(pool, userId, clientId, jobId) {
+  const r = await pool.query(
+    `SELECT g.id, g.user_id, g.app, g.client_id, g.job_id, g.path_prefix, g.psr_scope_level, g.psr_city,
+            g.recursive, g.enabled, g.can_view, g.can_edit, g.can_delete, g.can_upload, g.can_download,
+            u.username, u.display_name
+     FROM user_folder_grants g
+     LEFT JOIN users u ON CAST(u.id AS text) = g.user_id
+     WHERE g.user_id = $1 AND g.app = 'pipeshare' AND g.client_id = $2
+       AND ($3 = '' OR g.job_id = $3)
+       AND g.psr_scope_level = ''
+     ORDER BY g.path_prefix ASC`,
+    [String(userId), String(clientId), String(jobId || '')]
+  );
+  return r.rows.map(serializeUserFolderGrantRow);
+}
+
+async function addFolderGrantForUser(pool, userId, clientId, jobId, pathPrefix) {
+  const path = normalizeRelPath(pathPrefix);
+  if (!path) {
+    const err = new Error('Pick a folder to share.');
+    err.status = 400;
+    throw err;
+  }
+  const r = await pool.query(
+    `INSERT INTO user_folder_grants
+      (user_id, app, client_id, job_id, path_prefix, psr_scope_level, psr_city, recursive,
+       enabled, can_view, can_edit, can_delete, can_upload, can_download)
+     VALUES ($1, 'pipeshare', $2, $3, $4, '', '', true, true, true, true, true, true, true)
+     ON CONFLICT (user_id, app, client_id, job_id, path_prefix, psr_scope_level, psr_city)
+     DO UPDATE SET
+       recursive = true,
+       enabled = true,
+       can_view = true,
+       can_edit = true,
+       can_delete = true,
+       can_upload = true,
+       can_download = true,
+       updated_at = NOW()
+     RETURNING id, user_id, app, client_id, job_id, path_prefix, psr_scope_level, psr_city,
+               recursive, enabled, can_view, can_edit, can_delete, can_upload, can_download`,
+    [String(userId), String(clientId), String(jobId), path]
+  );
+  const row = r.rows[0];
+  const userRes = await pool.query(
+    `SELECT username, display_name FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
+    [String(userId)]
+  );
+  return serializeUserFolderGrantRow({
+    ...row,
+    username: userRes.rows[0]?.username,
+    display_name: userRes.rows[0]?.display_name
+  });
+}
+
+async function removeFolderGrantForUser(pool, userId, grantId) {
+  const r = await pool.query(
+    `DELETE FROM user_folder_grants
+     WHERE id = $1 AND user_id = $2 AND app = 'pipeshare'
+     RETURNING id`,
+    [String(grantId), String(userId)]
+  );
+  return r.rowCount > 0;
+}
+
 async function jobHasDirectUserFolderGrants(pool, clientId, jobId) {
   const r = await pool.query(
     `SELECT 1 FROM user_folder_grants
@@ -182,6 +246,9 @@ module.exports = {
   serializeUserFolderGrantRow,
   loadUserFolderGrantsForScope,
   loadDirectUserFolderGrantsForUser,
+  listFolderGrantsForUser,
+  addFolderGrantForUser,
+  removeFolderGrantForUser,
   jobHasDirectUserFolderGrants,
   saveUserFolderGrantsForScope,
   syncPsrScopeForUserGrant

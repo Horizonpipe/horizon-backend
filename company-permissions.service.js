@@ -150,38 +150,9 @@ async function loadEffectivePathGrantsForUser(pool, user, clientId, jobId, loadU
   void loadUserPathGrantsFn;
   if (!user?.id) return [];
 
-  const { loadDirectUserFolderGrantsForUser, jobHasDirectUserFolderGrants } = require('./user-grants.service');
+  const { loadDirectUserFolderGrantsForUser } = require('./user-grants.service');
   const directGrants = await loadDirectUserFolderGrantsForUser(pool, user.id, clientId, jobId);
   if (directGrants.length) return directGrants;
-  if (await jobHasDirectUserFolderGrants(pool, clientId, jobId)) {
-    // #region agent log
-    try {
-      const fs = require('fs');
-      const path = require('path');
-      const logPath =
-        process.env.HP_DEBUG_LOG_PATH ||
-        path.join('C:', 'HorizonDev', 'wincan_auto_import_exe_project', '.cursor', 'debug-2099e1.log');
-      fs.appendFileSync(
-        logPath,
-        `${JSON.stringify({
-          sessionId: '2099e1',
-          location: 'company-permissions.service.js:loadEffectivePathGrantsForUser',
-          message: 'direct user_folder_grants exist for job but user has none — returning empty grants',
-          hypothesisId: 'A',
-          data: {
-            clientId: String(clientId || ''),
-            jobId: String(jobId || ''),
-            userIdSuffix: String(user.id || '').slice(-6)
-          },
-          timestamp: Date.now()
-        })}\n`
-      );
-    } catch {
-      /* ignore debug log failures */
-    }
-    // #endregion
-    return [];
-  }
 
   const membership = await loadUserCompanyMembership(pool, user.id);
   if (!membership) return [];
@@ -210,9 +181,10 @@ async function loadEffectivePathGrantsForUser(pool, user, clientId, jobId, loadU
 
 async function jobHasAnyEffectivePathGrants(pool, user, clientId, jobId, portalJobHasPathGrantsFn) {
   void portalJobHasPathGrantsFn;
-  const { jobHasDirectUserFolderGrants } = require('./user-grants.service');
-  if (await jobHasDirectUserFolderGrants(pool, clientId, jobId)) return true;
   if (!user?.id) return false;
+  const { loadDirectUserFolderGrantsForUser } = require('./user-grants.service');
+  const direct = await loadDirectUserFolderGrantsForUser(pool, user.id, clientId, jobId);
+  if (direct.length) return true;
   const membership = await loadUserCompanyMembership(pool, user.id);
   if (!membership) return false;
   if (await companyJobHasFolderGrants(pool, membership.companyId, clientId, jobId, membership.roleKey)) return true;
@@ -352,6 +324,27 @@ async function migrateLegacyScopeAuthorityForUserJob(pool, user, clientId, jobId
   return true;
 }
 
+/**
+ * A list prefix is allowed when it is the granted folder, inside it, or a parent
+ * needed to reach it. A sibling folder is not allowed.
+ * Empty prefix is the job root (the tree filter then hides everything except the path down).
+ * @param {string} relPath
+ * @param {Array<{ path_prefix?: string, access_mode?: string }>} grants
+ */
+function listPrefixAllowedByGrants(relPath, grants) {
+  const rp = normalizeRelPath(relPath);
+  if (!rp) return true;
+  const rows = Array.isArray(grants) ? grants : [];
+  for (const grant of rows) {
+    const mode = String(grant?.access_mode || 'full').trim().toLowerCase();
+    if (mode === 'off' || mode === 'none') continue;
+    const prefix = normalizeRelPath(grant?.path_prefix || '');
+    if (!prefix) return true;
+    if (rp === prefix || rp.startsWith(`${prefix}/`) || prefix.startsWith(`${rp}/`)) return true;
+  }
+  return false;
+}
+
 function buildSkeletonPath(clientId, jobId, relPath) {
   const parts = [String(clientId || '').trim(), String(jobId || '').trim()]
     .concat(normalizeRelPath(relPath).split('/').filter(Boolean))
@@ -397,5 +390,6 @@ module.exports = {
   migrateLegacyScopeAuthorityForUserJob,
   buildSkeletonPath,
   recordTrashBinEntry,
-  mergePortalGrantRows
+  mergePortalGrantRows,
+  listPrefixAllowedByGrants
 };

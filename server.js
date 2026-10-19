@@ -12942,7 +12942,13 @@ registerCompanyPermissionsRoutes(app, {
   requireAdminPanelAccess,
   requireAdminPanelOrTenantUserManagement
 });
-registerUserGrantsRoutes(app, { pool, requireAuth, requireAdminPanelAccess });
+registerUserGrantsRoutes(app, {
+  pool,
+  requireAuth,
+  requireAdminPanelAccess,
+  requireAdminPanelOrTenantUserManagement,
+  assertUserIdInTenantScope
+});
 registerSignupRoutes(app, {
   pool,
   query: querySignupDataWithWasabiFallback,
