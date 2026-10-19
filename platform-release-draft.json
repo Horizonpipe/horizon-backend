@@ -1,12 +1,10 @@
 ﻿{
-  "title": "Faster PipeShare folders and video playback",
-  "description": "Opening a job in PipeShare was waiting on a full Wasabi folder listing plus database lookups before anything was drawn, and large folders could sit there for a long time. Videos were stored as a generic file type, so the browser often downloaded a big chunk of the file before it would play or seek.\n\nFolder lists now paint the first page (one level, up to 1000 names) and load the rest in the background. Repeat opens reuse a short server cache. Video links tell Wasabi to answer as video/mp4 (or the real type) with range support, so playback can start and seek without pulling the whole file through the portal. The same code serves pipeshare.live and pipeshare.net.\n\nWho is affected: PipeShare in the browser on the private server and SaaS. Desktop Auto Sync upload behavior is unchanged. Very large videos can still take a moment to show the first frame when the movie index is at the end of the file; seeking uses byte ranges instead of a full download.",
+  "title": "Pipe charts for Jobs folder uploads",
+  "description": "Pipe charts in PipeShare draw inspection observations from the WinCan database that belongs to the same project as the video. Desktop AutoSync stores that database under Jobs/{project}/DB/{person}/, while the video sits in a Videos folder next to it. The website only loads the folder you have open, so it never saw those databases and the chart stayed empty. Older jobs that keep the database directly in DB/ or beside the video still worked.\n\nOpening a video now also lists that project's DB folder and each person's folder inside it, then uses the database found there. The chart still stays inside the current client and job. Video playback range requests are unchanged.\n\nWho is affected: PipeShare in the browser on pipeshare.live and pipeshare.net. Hard-refresh, open the Jobs project, and play a video to see the pipe chart.",
   "changeLog": [
-    "PipeShare draws the first folder page immediately and loads further pages in the background.",
-    "Shallow folder listings are cached briefly on the server so reopening a folder is quick.",
-    "Video and PDF links are presigned with the real content type and inline playback so the browser can range-request.",
-    "Wasabi buckets expose range headers for direct browser playback.",
-    "Nginx no longer buffers proxied file downloads, and API responses get larger memory buffers."
-  ],
-  "updatedAt": "2026-10-19T17:30:00.000Z"
+    "Pipe charts find WinCan databases stored under Jobs/{project}/DB/{person}/.",
+    "The same project folder match still works when the database sits directly in DB/ or beside the video.",
+    "A video name with a WinCan id suffix still matches the inspection inside that database.",
+    "Charts do not search other clients or other jobs for a database."
+  ]
 }
