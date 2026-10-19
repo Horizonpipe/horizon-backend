@@ -39,6 +39,7 @@ const {
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { Upload } = require('@aws-sdk/lib-storage');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
+const { withWasabiSlot, WasabiBusyError } = require('./lib/wasabi-call-gate');
 const { canManagePortalExtras, looksLikeMike } = require('./capabilities');
 const {
   resolveStorageBackend,
@@ -103,8 +104,8 @@ const PORTAL_FOLDER_DELETE_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_DELETE_CONCU
 const PORTAL_FOLDER_COPY_CONCURRENCY = clampIntEnv('PORTAL_FOLDER_COPY_CONCURRENCY', 16, 1, 48);
 /** Max items per {@code POST /check-paths} (JSON body stays well under express 4mb). */
 const PORTAL_CHECK_PATHS_MAX = clampIntEnv('PORTAL_CHECK_PATHS_MAX', 800, 50, 2000);
-/** Parallel S3 HeadObject calls per check-paths request (Wasabi handles many concurrent small reads). */
-const PORTAL_CHECK_PATHS_HEAD_CONCURRENCY = clampIntEnv('PORTAL_CHECK_PATHS_HEAD_CONCURRENCY', 32, 1, 64);
+/** Parallel S3 HeadObject calls per check-paths request. Shares the process Wasabi gate. */
+const PORTAL_CHECK_PATHS_HEAD_CONCURRENCY = clampIntEnv('PORTAL_CHECK_PATHS_HEAD_CONCURRENCY', 8, 1, 24);
 /** Max SHA-256 digests per {@code POST /find-hashes-paths} (Data Auto Sync bulk dedupe; JSON body limit). */
 const PORTAL_FIND_HASHES_BULK_MAX = clampIntEnv('PORTAL_FIND_HASHES_BULK_MAX', 120, 8, 200);
 
@@ -3364,7 +3365,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
 
       const headObjectMeta = async (key) => {
-        const head = await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: key }));
+        const head = await withWasabiSlot(() =>
+          portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: key }))
+        );
         const cl = Number(head.ContentLength ?? 0);
         const lm = head.LastModified ? new Date(head.LastModified).getTime() : null;
         const lastModified =
@@ -3461,7 +3464,19 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       return res.json({ success: true, present, missing, sizeMismatch });
     } catch (e) {
+      if (e instanceof WasabiBusyError || e?.code === 'WASABI_BUSY') {
+        res.set('Retry-After', String(e.retryAfterSec || 2));
+        return res.status(503).json({ error: e.message || 'Storage is busy. Retry shortly.' });
+      }
       const msg = e instanceof Error ? e.message : String(e);
+      const transient =
+        /timeout|ETIMEDOUT|ECONNRESET|EAI_AGAIN|ENOTFOUND|Throttl|SlowDown|Service Unavailable|TooManyRequests/i.test(
+          msg
+        );
+      if (transient) {
+        res.set('Retry-After', '2');
+        return res.status(503).json({ error: msg });
+      }
       return res.status(500).json({ error: msg });
     }
   });
@@ -4612,6 +4627,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           msg
         );
       console.warn('[portal-files] upload/presign:', msg);
+      if (transient) res.set('Retry-After', '2');
       // 503 so Desktop gateway retry/backoff treats Wasabi/signing blips as retryable (not hard 400).
       return res.status(transient ? 503 : 500).json({ error: msg });
     }
@@ -4641,22 +4657,22 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
           ? String(body.contentType).trim().slice(0, 256)
           : 'application/octet-stream';
       const { partSize, partCount } = multipartUploadLayoutHorizon(fileSize);
-      const created = await portalS3().send(
-        new CreateMultipartUploadCommand({
-          Bucket: portalBucket(),
-          Key: built.key,
-          ContentType: ct
-        })
+      const created = await withWasabiSlot(() =>
+        portalS3().send(
+          new CreateMultipartUploadCommand({
+            Bucket: portalBucket(),
+            Key: built.key,
+            ContentType: ct
+          })
+        )
       );
       const uploadId = created.UploadId;
       if (!uploadId) return res.status(500).json({ error: 'Failed to start multipart upload' });
       const pref = jobPrefix(String(clientId), String(jobId), storageRoot(req));
       const rel = built.key.slice(pref.length);
-      try {
-        await upsertPortalObjectUploadedBy(built.key, clientId, jobId, req.user);
-      } catch (metaErr) {
+      void upsertPortalObjectUploadedBy(built.key, clientId, jobId, req.user).catch((metaErr) => {
         console.warn('[portal-files] multipart/init uploadedBy:', metaErr?.message || metaErr);
-      }
+      });
       return res.json({
         uploadId,
         key: built.key,
@@ -4671,7 +4687,19 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         parentPath: parentRelPath(rel)
       });
     } catch (e) {
+      if (e instanceof WasabiBusyError || e?.code === 'WASABI_BUSY') {
+        res.set('Retry-After', String(e.retryAfterSec || 2));
+        return res.status(503).json({ error: e.message || 'Storage is busy. Retry shortly.' });
+      }
       const msg = e instanceof Error ? e.message : String(e);
+      const transient =
+        /timeout|ETIMEDOUT|ECONNRESET|EAI_AGAIN|ENOTFOUND|Throttl|SlowDown|Service Unavailable|TooManyRequests/i.test(
+          msg
+        );
+      if (transient) {
+        res.set('Retry-After', '2');
+        return res.status(503).json({ error: msg });
+      }
       return res.status(400).json({ error: msg });
     }
   });
@@ -4707,7 +4735,11 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       nums.sort((a, b) => a - b);
       if (nums.length === 0) return res.status(400).json({ error: 'No valid part numbers' });
       const parts = [];
-      for (const pn of nums) {
+      for (let i = 0; i < nums.length; i += 1) {
+        if (i > 0 && i % 32 === 0) {
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+        const pn = nums[i];
         const url = await getSignedUrl(portalS3(),
           new UploadPartCommand({
             Bucket: portalBucket(),
@@ -4756,32 +4788,32 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         return res.status(400).json({ error: 'Each part must include partNumber and etag' });
       }
       try {
-        await portalS3().send(
-          new CompleteMultipartUploadCommand({
-            Bucket: portalBucket(),
-            Key: key,
-            UploadId: uid,
-            MultipartUpload: { Parts: s3Parts }
-          })
+        await withWasabiSlot(() =>
+          portalS3().send(
+            new CompleteMultipartUploadCommand({
+              Bucket: portalBucket(),
+              Key: key,
+              UploadId: uid,
+              MultipartUpload: { Parts: s3Parts }
+            })
+          )
         );
       } catch (completeErr) {
-        const headProbe = await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: key })).catch(() => null);
+        const headProbe = await withWasabiSlot(() =>
+          portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: key })).catch(() => null)
+        );
         const len = headProbe ? Number(headProbe.ContentLength || 0) : 0;
         if (!headProbe || !Number.isFinite(len) || len <= 0) {
           throw completeErr;
         }
         /* Idempotent retry: object already finalized from a prior successful CompleteMultipartUpload. */
       }
-      try {
-        await upsertPortalObjectSha256FromClient(key, parsed.clientId, parsed.jobId, req.body?.sha256);
-      } catch (e) {
+      void upsertPortalObjectSha256FromClient(key, parsed.clientId, parsed.jobId, req.body?.sha256).catch((e) => {
         console.warn('[portal-files] upsertPortalObjectSha256FromClient (multipart complete):', e?.message || e);
-      }
-      try {
-        await upsertPortalObjectUploadedBy(key, parsed.clientId, parsed.jobId, req.user);
-      } catch (e) {
+      });
+      void upsertPortalObjectUploadedBy(key, parsed.clientId, parsed.jobId, req.user).catch((e) => {
         console.warn('[portal-files] upsertPortalObjectUploadedBy (multipart complete):', e?.message || e);
-      }
+      });
       let size = 0;
       const clientSize = Number(req.body?.fileSize);
       if (
@@ -4794,7 +4826,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         size = clientSize;
       } else {
         try {
-          const head = await portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: key }));
+          const head = await withWasabiSlot(() =>
+            portalS3().send(new HeadObjectCommand({ Bucket: portalBucket(), Key: key }))
+          );
           size = Number(head.ContentLength || 0);
         } catch {
           /* ignore */
@@ -4822,7 +4856,19 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
         parentPath: parentRelPath(rel)
       });
     } catch (e) {
+      if (e instanceof WasabiBusyError || e?.code === 'WASABI_BUSY') {
+        res.set('Retry-After', String(e.retryAfterSec || 2));
+        return res.status(503).json({ error: e.message || 'Storage is busy. Retry shortly.' });
+      }
       const msg = e instanceof Error ? e.message : String(e);
+      const transient =
+        /timeout|ETIMEDOUT|ECONNRESET|EAI_AGAIN|ENOTFOUND|Throttl|SlowDown|Service Unavailable|TooManyRequests/i.test(
+          msg
+        );
+      if (transient) {
+        res.set('Retry-After', '2');
+        return res.status(503).json({ error: msg });
+      }
       return res.status(400).json({ error: msg });
     }
   });
@@ -4892,11 +4938,9 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       if (!(await assertWritablePresignPath(req, parsed.clientId, parsed.jobId, key))) {
         return res.status(403).json({ error: 'Forbidden for this path' });
       }
-      try {
-        await upsertPortalObjectUploadedBy(key, parsed.clientId, parsed.jobId, req.user);
-      } catch (e) {
+      void upsertPortalObjectUploadedBy(key, parsed.clientId, parsed.jobId, req.user).catch((e) => {
         console.warn('[portal-files] upsertPortalObjectUploadedBy (object-landed):', e?.message || e);
-      }
+      });
       const pref = jobPrefix(parsed.clientId, parsed.jobId, storageRoot(req));
       const rel = key.startsWith(pref) ? key.slice(pref.length) : path.basename(key);
       let size = 0;

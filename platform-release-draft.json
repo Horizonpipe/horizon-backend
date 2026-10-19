@@ -1,11 +1,12 @@
 {
-  "title": "Share a folder without opening the rest of the client",
-  "description": "An admin can now give one person a folder in their own client. That share includes the folder and everything inside it.\n\nIf the folder sits inside other folders the person was not given, they can still open it. The folders above it only appear as the path to get there. They do not see the other files in those folders, and they do not see folders next to the one that was shared. Asking the server for a path they were not given does not list or download those files.\n\nPeople with no folder shares still see the client the way they do today. Admins and workspace owners still see the whole client. A workspace owner cannot share a folder from another client.\n\nWho is affected: PipeShare on the private server and on SaaS, in the browser and in the desktop app. Install desktop 0.3.23 to pick folders from the Admin tab. The person whose folders changed should sign in again.",
+  "title": "AutoSync uploads and heartbeats stay up when many people upload",
+  "description": "Desktop AutoSync was getting random 502 errors while files uploaded, and the heartbeat was timing out at the same time.\n\nNginx was treating a short Node restart as if the whole site was down. After one refused connection it stopped trying for about ten seconds, so presign, complete, and heartbeat all came back as 502. Heartbeats were also waiting on the same busy workers. Each sign-in check could sit on a Wasabi lock for up to a minute and a half, and a DB3 import could freeze the worker that was supposed to answer the heartbeat.\n\nPresign and complete now finish without waiting on that import. The import still runs, one at a time, off to the side. If Wasabi is too busy the server answers 503 with a retry hint instead of letting nginx turn it into a 502. The heartbeat answers as soon as the sign-in is known and saves the last-seen time right after.\n\nWho is affected: Desktop AutoSync on the private server and on SaaS. You do not need a new desktop build. The apps you already have will retry, and the server now answers fast enough for about 100 people uploading at once.\n\nThis update also includes the folder share from the previous save: an admin can give one person a folder, including everything inside it, without opening the rest of that client. A nested share does not show parent files or neighboring folders. People with no folder shares are unchanged. Install desktop 0.3.23 only if you want to pick those folders from the Admin tab.",
   "changeLog": [
-    "An admin can share a folder with one user. The share includes every folder inside it.",
-    "A nested share does not reveal parent files or folders that were not shared.",
-    "The server blocks list, download, and preview outside those folders.",
-    "Users with no folder shares keep the access they already had.",
-    "A workspace owner can only share folders in their own client."
+    "Presign, part links, and complete no longer wait on DB3 import or a Wasabi state lock.",
+    "DB3 import runs one at a time in the background so it does not freeze uploads or heartbeats.",
+    "Wasabi calls wait in a short line and return 503 when the line is full, instead of hanging into a 502.",
+    "Heartbeat answers immediately after the sign-in check and records last-seen without blocking the desktop.",
+    "Nginx no longer black-holes the site for ten seconds after a brief Node restart.",
+    "An admin can share one folder, including everything inside it, without opening the rest of the client."
   ]
 }

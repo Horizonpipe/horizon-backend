@@ -110,6 +110,8 @@ function createAutoImportPlugin(options = {}) {
     Math.min(300_000, Number(process.env.AUTO_IMPORT_HEARTBEAT_MIN_WRITE_MS ?? 10_000))
   );
   const lastHeartbeatWriteMs = new Map();
+  /** Latest heartbeat per user key, so a slow Postgres write does not look offline on this worker. */
+  const heartbeatMemory = new Map();
 
   function rememberMonitorSnapshot(cacheKey, body) {
     if (MONITOR_SNAPSHOT_CACHE_MS <= 0) return;
@@ -896,7 +898,17 @@ function createAutoImportPlugin(options = {}) {
        LIMIT 1`,
       [keys]
     );
-    return r.rows[0] || null;
+    let rec = r.rows[0] || null;
+    for (const key of keys) {
+      const mem = heartbeatMemory.get(key);
+      const at = mem ? Number(mem.atMs) : NaN;
+      if (!Number.isFinite(at)) continue;
+      const pgAt = rec ? Number(rec.at_ms) : 0;
+      if (!rec || at >= pgAt) {
+        rec = { at_ms: at, state: mem.state, source: mem.source, detail: mem.detail };
+      }
+    }
+    return rec;
   }
 
   function summarizeHeartbeat(rec, nowMs) {
@@ -1035,24 +1047,53 @@ function createAutoImportPlugin(options = {}) {
     });
   });
 
-  router.post('/desktop-heartbeat', desktopHeartbeatGate, express.json(), async (req, res) => {
+  router.post('/desktop-heartbeat', desktopHeartbeatGate, express.json({ limit: '8kb' }), (req, res) => {
     const keys = heartbeatKeys(req);
     const nowMs = Date.now();
     const state = clean(req.body?.state || 'connected').toLowerCase() || 'connected';
     let source = clean(req.body?.source || 'desktop') || 'desktop';
     if (String(source).toLowerCase() === 'java-desktop') source = 'desktop';
-    const detail = clean(req.body?.detail || req.body?.message || '');
+    const detail = clean(req.body?.detail || req.body?.message || '').slice(0, 500);
     const username = clean(req.user?.username || '');
     const displayName = clean(req.user?.displayName || '');
+    const row = { atMs: nowMs, state, source, detail, username, displayName };
+    for (const key of keys) heartbeatMemory.set(key, row);
+    if (heartbeatMemory.size > 5000) {
+      let n = 0;
+      for (const k of heartbeatMemory.keys()) {
+        heartbeatMemory.delete(k);
+        if (++n >= 1000) break;
+      }
+    }
+    res.json({
+      success: true,
+      connected: true,
+      state,
+      lastSeenAt: new Date(nowMs).toISOString()
+    });
+    void persistDesktopHeartbeat(keys, row);
+  });
+
+  async function persistDesktopHeartbeat(keys, row) {
+    const due = [];
+    for (const key of keys) {
+      if (HEARTBEAT_MIN_WRITE_MS > 0) {
+        const prev = lastHeartbeatWriteMs.get(key) || 0;
+        if (row.atMs - prev < HEARTBEAT_MIN_WRITE_MS) continue;
+      }
+      lastHeartbeatWriteMs.set(key, row.atMs);
+      due.push(key);
+    }
+    if (lastHeartbeatWriteMs.size > 5000) {
+      let n = 0;
+      for (const k of lastHeartbeatWriteMs.keys()) {
+        lastHeartbeatWriteMs.delete(k);
+        if (++n >= 1000) break;
+      }
+    }
+    if (!due.length) return;
     try {
-      for (const key of keys) {
-        if (HEARTBEAT_MIN_WRITE_MS > 0) {
-          const prev = lastHeartbeatWriteMs.get(key) || 0;
-          if (nowMs - prev < HEARTBEAT_MIN_WRITE_MS) {
-            continue;
-          }
-          lastHeartbeatWriteMs.set(key, nowMs);
-        }
+      for (const key of due) {
         await runPostgresAutoImportSql(
           `INSERT INTO auto_import_desktop_heartbeats (user_key, at_ms, state, source, detail, username, display_name, updated_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
@@ -1064,16 +1105,8 @@ function createAutoImportPlugin(options = {}) {
              username = EXCLUDED.username,
              display_name = EXCLUDED.display_name,
              updated_at = NOW()`,
-          [key, nowMs, state, source, detail, username, displayName]
+          [key, row.atMs, row.state, row.source, row.detail, row.username, row.displayName]
         );
-      }
-      if (lastHeartbeatWriteMs.size > 5000) {
-        const drop = Math.ceil(lastHeartbeatWriteMs.size / 2);
-        let n = 0;
-        for (const k of lastHeartbeatWriteMs.keys()) {
-          lastHeartbeatWriteMs.delete(k);
-          if (++n >= drop) break;
-        }
       }
     } catch (error) {
       logger.error?.(
@@ -1082,15 +1115,8 @@ function createAutoImportPlugin(options = {}) {
         error?.message || error,
         error?.detail || ''
       );
-      return res.status(500).json({ success: false, error: 'Heartbeat persistence failed.' });
     }
-    res.json({
-      success: true,
-      connected: true,
-      state,
-      lastSeenAt: new Date(nowMs).toISOString()
-    });
-  });
+  }
 
   router.get('/desktop-heartbeat', desktopHeartbeatGate, async (req, res) => {
     const keys = heartbeatKeys(req);

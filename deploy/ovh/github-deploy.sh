@@ -106,4 +106,9 @@ fi
 echo "[github-deploy] pm2 restart"
 run_as_deploy_user bash -lc "cd '$BACKEND' && pm2 restart deploy/ovh/ecosystem.config.cjs --update-env && pm2 save"
 
+if [[ -f "$BACKEND/deploy/ovh/tune-nginx-upload-capacity.sh" ]]; then
+  echo "[github-deploy] nginx upload/heartbeat tuning"
+  bash "$BACKEND/deploy/ovh/tune-nginx-upload-capacity.sh"
+fi
+
 echo "[github-deploy] done $(date -u +%Y-%m-%dT%H:%M:%SZ)"
