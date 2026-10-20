@@ -1,14 +1,10 @@
 {
-  "title": "Crew schedule and daily reports",
-  "description": "PipeSync now has a job schedule built for inspection work. A client holds the jobs. Each job keeps the city, the map pin, the plans, the contacts, and the crew assignment in one place.\n\nManagers and admins use Schedule Planner, Crew Hub, and Contact Book. Crew members see Schedule and Daily Reports for the jobs assigned to their crew. Customers see only their own job, including the map pin, the plans, the daily report notes that are meant for them, and a chat wall with the office. They do not see the planner or anyone else's jobs.\n\nDaily reports save on the computer every few minutes, and they save to the server when you hit Save or automatically once an hour. A problem clip can pull a video that is already in PipeShare, jump to a remark on a small pipe drawing, and keep the clip to 30 seconds. Plan PDFs open in the existing plan viewer or map viewer, and those edits still save through Plan Sync.\n\nWho is affected: the private server and SaaS, after this version is pushed. The phone camera and gallery are not built. Add photo and Add video are hooks for a later mobile app. Use Add image on the computer.\n\nTexts do not actually send. There is no texting service connected. The notice is saved (who, when, message, and map link). If the person's phone matches an email on their login, or the phone field is an email address, that email is sent with the existing mail setup. Otherwise the notice stays in the queue and is marked held.",
+  "title": "Daily reports and the production log are separate",
+  "description": "Daily Reports and the older production log were sharing one tab, so the footage log sat on top of the new job reports.\n\nDaily Reports now shows only the assigned job for that day: time logs, images, problems, who was notified, and the plan PDF. The older footage log, including manager notes tied to a calendar day, moved to its own Production log tab next to Daily Reports. Admins still see that log. Crew members and customers do not.\n\nWho is affected: the private server and SaaS after this version is pushed. Schedule, Planner, Crew Hub, Contacts, and My job are unchanged. The desktop app gets the same split in its own installer.",
   "changeLog": [
-    "Daily Reports lists jobs after they are assigned to a crew, and each day can be opened again from the calendar.",
-    "Schedule shows assigned jobs. Managers see every crew. Crew members see their own crew.",
-    "Schedule Planner creates clients and jobs, stores a Google Maps pin, and puts plan PDFs in a Plan Sync folder named for the client.",
-    "Contact Book is the source for names and phones. Crew Hub builds the crews used on the calendar.",
-    "Customers get a My job tab with details, the pin, plans, reviewable daily report notes, and a chat wall.",
-    "Problem clips use a PipeShare video, a small pipe drawing, and a 30-second maximum.",
-    "Text messages are saved but not sent. Email is used when an address is already on file.",
-    "Phone camera and gallery are left as a hook for a later mobile app."
+    "Daily Reports shows only the assigned-job report for the day you pick.",
+    "The older footage production log moved to its own Production log tab.",
+    "Admins still see the production log. It no longer covers Daily Reports.",
+    "Schedule, Planner, Crew Hub, Contacts, and My job stay where they were."
   ]
 }
