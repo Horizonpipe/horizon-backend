@@ -1408,6 +1408,22 @@ const WASABI_STATE_LOCK_TIMEOUT_MS = Math.max(
  * Cross-PM2-worker lock so only one process mutates Wasabi latest.json at a time.
  * In-process queue alone is not enough with cluster mode (4 workers → constant 412s).
  */
+function wasabiLockHolderIsGone() {
+  try {
+    const text = fs.readFileSync(WASABI_STATE_LOCK_PATH, 'utf8');
+    const pid = Number(String(text).split(/\r?\n/)[0]);
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (err) {
+      return err?.code === 'ESRCH';
+    }
+  } catch {
+    return false;
+  }
+}
+
 async function withWasabiStateFileLock(fn) {
   const started = Date.now();
   let handle = null;
@@ -1419,8 +1435,9 @@ async function withWasabiStateFileLock(fn) {
       if (err?.code !== 'EEXIST') throw err;
       try {
         const st = await fs.promises.stat(WASABI_STATE_LOCK_PATH);
-        // Stale lock (crashed worker) — reclaim after 90s.
-        if (Date.now() - st.mtimeMs > 90000) {
+        const holderGone = wasabiLockHolderIsGone();
+        // Stale lock: owner already exited (PM2 restart) or the file is older than 90s.
+        if (holderGone || Date.now() - st.mtimeMs > 90000) {
           await fs.promises.unlink(WASABI_STATE_LOCK_PATH).catch(() => {});
           continue;
         }
@@ -11949,7 +11966,31 @@ process.on('SIGTERM', () => {
 ensureSchema()
   .then(async () => {
     await autoImportPlugin.initSchema();
+
+    const FRONTEND_STATIC_DIR = process.env.FRONTEND_STATIC_DIR
+      ? path.resolve(process.env.FRONTEND_STATIC_DIR)
+      : path.resolve(__dirname, '../horizon-frontend');
+    if (fs.existsSync(FRONTEND_STATIC_DIR)) {
+      app.use(
+        express.static(FRONTEND_STATIC_DIR, { index: ['index.html'], fallthrough: true, extensions: ['html'] })
+      );
+      console.log(`[frontend] static files (PipeShare, PipeSync, login, cPanel) from ${FRONTEND_STATIC_DIR}`);
+    } else {
+      console.warn(
+        `[frontend] static dir not found (${FRONTEND_STATIC_DIR}); PipeShare/PipeSync links will 404 until horizon-frontend is cloned beside horizon-backend`
+      );
+    }
+
+    const httpServer = app.listen(PORT, () => {
+      logDeploymentProfileAtStartup();
+      console.log(`Horizon backend listening on port ${PORT}`);
+    });
+    // Longer than nginx keepalive (65s) so a reused connection is not closed under a new request (502).
+    httpServer.keepAliveTimeout = 70000;
+    httpServer.headersTimeout = 75000;
+
     if (wasabiStateClient && WASABI_STATE_BUCKET) {
+      void (async () => {
       await runWasabiStateSnapshot();
       if (PLANNER_STORE_WASABI_ONLY || WASABI_APP_DATA_STORE_WASABI_ONLY) {
         if (!WASABI_WRITES_PRIMARY_ENABLED) {
@@ -12004,31 +12045,12 @@ ensureSchema()
       void loadWasabiLatestStateSnapshot(true).catch((error) => {
         console.warn('[wasabi-state] boot snapshot preload failed:', error?.message || error);
       });
+      })().catch((error) => {
+        console.warn('[wasabi-state] boot snapshot failed:', error?.message || error);
+      });
     } else {
       console.warn('[wasabi-state] snapshots disabled: configure WASABI_* and WASABI_BUCKET');
     }
-
-    const FRONTEND_STATIC_DIR = process.env.FRONTEND_STATIC_DIR
-      ? path.resolve(process.env.FRONTEND_STATIC_DIR)
-      : path.resolve(__dirname, '../horizon-frontend');
-    if (fs.existsSync(FRONTEND_STATIC_DIR)) {
-      app.use(
-        express.static(FRONTEND_STATIC_DIR, { index: ['index.html'], fallthrough: true, extensions: ['html'] })
-      );
-      console.log(`[frontend] static files (PipeShare, PipeSync, login, cPanel) from ${FRONTEND_STATIC_DIR}`);
-    } else {
-      console.warn(
-        `[frontend] static dir not found (${FRONTEND_STATIC_DIR}); PipeShare/PipeSync links will 404 until horizon-frontend is cloned beside horizon-backend`
-      );
-    }
-
-    const httpServer = app.listen(PORT, () => {
-      logDeploymentProfileAtStartup();
-      console.log(`Horizon backend listening on port ${PORT}`);
-    });
-    // Longer than nginx keepalive (65s) so a reused connection is not closed under a new request (502).
-    httpServer.keepAliveTimeout = 70000;
-    httpServer.headersTimeout = 75000;
   })
   .catch((error) => {
     console.error('BOOT ERROR:', error);

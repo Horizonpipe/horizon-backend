@@ -7,6 +7,7 @@
     "Wasabi calls wait in a short line and return 503 when the line is full, instead of hanging into a 502.",
     "Heartbeat answers immediately after the sign-in check and records last-seen without blocking the desktop.",
     "Nginx no longer black-holes the site for ten seconds after a brief Node restart.",
+    "The API starts accepting requests before the Wasabi state snapshot, and a lock left by a dead process is dropped right away.",
     "An admin can share one folder, including everything inside it, without opening the rest of the client."
   ]
 }
