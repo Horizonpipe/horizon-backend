@@ -1,13 +1,12 @@
 {
-  "title": "AutoSync uploads and heartbeats stay up when many people upload",
-  "description": "Desktop AutoSync was getting random 502 errors while files uploaded, and the heartbeat was timing out at the same time.\n\nNginx was treating a short Node restart as if the whole site was down. After one refused connection it stopped trying for about ten seconds, so presign, complete, and heartbeat all came back as 502. Heartbeats were also waiting on the same busy workers. Each sign-in check could sit on a Wasabi lock for up to a minute and a half, and a DB3 import could freeze the worker that was supposed to answer the heartbeat.\n\nPresign and complete now finish without waiting on that import. The import still runs, one at a time, off to the side. If Wasabi is too busy the server answers 503 with a retry hint instead of letting nginx turn it into a 502. The heartbeat answers as soon as the sign-in is known and saves the last-seen time right after.\n\nWho is affected: Desktop AutoSync on the private server and on SaaS. You do not need a new desktop build. The apps you already have will retry, and the server now answers fast enough for about 100 people uploading at once.\n\nThis update also includes the folder share from the previous save: an admin can give one person a folder, including everything inside it, without opening the rest of that client. A nested share does not show parent files or neighboring folders. People with no folder shares are unchanged. Install desktop 0.3.23 only if you want to pick those folders from the Admin tab.",
+  "title": "Larger text when the portal feels too small",
+  "description": "PipeShare and PipeSync now have a Text size control in the site menu, under your name and the theme picker. The choices are Small, Medium, Large, and Extra large. Medium is the size the site uses today.\n\nPicking a size changes the text, buttons, and spacing right away. The choice is remembered in that browser, so it is still there after a refresh. The video picture and the pipe drawing stay put.\n\nWho is affected: the website on the private server and on SaaS. The desktop app people already installed does not have this control yet. Desktop 0.3.23 is unchanged.\n\nThis release also keeps the upload and heartbeat fixes already saved: presign and complete no longer wait on a DB3 import, heartbeats answer without sitting in that line, and nginx no longer treats a short restart as a ten-second outage. Folder sharing from the previous save is included too: an admin can give one person a folder, including everything inside it, without opening the rest of that client.",
   "changeLog": [
-    "Presign, part links, and complete no longer wait on DB3 import or a Wasabi state lock.",
-    "DB3 import runs one at a time in the background so it does not freeze uploads or heartbeats.",
-    "Wasabi calls wait in a short line and return 503 when the line is full, instead of hanging into a 502.",
-    "Heartbeat answers immediately after the sign-in check and records last-seen without blocking the desktop.",
-    "Nginx no longer black-holes the site for ten seconds after a brief Node restart.",
-    "The API starts accepting requests before the Wasabi state snapshot, and a lock left by a dead process is dropped right away.",
+    "The site menu has a Text size control: Small, Medium, Large, and Extra large.",
+    "Medium matches today's size. Larger steps grow the shell, menus, and file list together.",
+    "The choice applies immediately and is remembered in the browser.",
+    "The video frame and pipe drawing keep their layout.",
+    "Presign, complete, and heartbeat stay responsive when many people upload.",
     "An admin can share one folder, including everything inside it, without opening the rest of the client."
   ]
 }
