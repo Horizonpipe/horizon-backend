@@ -40,6 +40,7 @@ const {
 } = require('./lib/platform-release-storage');
 const { registerOvhOpsWebhook, registerOvhOpsRoutes } = require('./ovh-ops.routes');
 const { registerCustomerSupportRoutes } = require('./customer-support.routes');
+const { registerJobScheduleRoutes } = require('./job-schedule.routes');
 const { startMetricsCollector, isOvhOpsEnabled } = require('./ovh-ops.service');
 const { loadUserCompanyMembership, normalizeAppFeatures } = require('./company-permissions.service');
 const {
@@ -11855,6 +11856,7 @@ registerCustomerSupportRoutes(app, {
   readSession,
   currentToken
 });
+registerJobScheduleRoutes(app, { pool, requireAuth });
 if (isOvhOpsEnabled()) {
   startMetricsCollector();
   console.log('[ovh-ops] metrics collector started');

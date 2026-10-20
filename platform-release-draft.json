@@ -1,12 +1,14 @@
 {
-  "title": "Larger text when the portal feels too small",
-  "description": "PipeShare and PipeSync now have a Text size control in the site menu, under your name and the theme picker. The choices are Small, Medium, Large, and Extra large. Medium is the size the site uses today.\n\nPicking a size changes the text, buttons, and spacing right away. The choice is remembered in that browser, so it is still there after a refresh. The video picture and the pipe drawing stay put.\n\nWho is affected: the website on the private server and on SaaS. The desktop app people already installed does not have this control yet. Desktop 0.3.23 is unchanged.\n\nThis release also keeps the upload and heartbeat fixes already saved: presign and complete no longer wait on a DB3 import, heartbeats answer without sitting in that line, and nginx no longer treats a short restart as a ten-second outage. Folder sharing from the previous save is included too: an admin can give one person a folder, including everything inside it, without opening the rest of that client.",
+  "title": "Crew schedule and daily reports",
+  "description": "PipeSync now has a job schedule built for inspection work. A client holds the jobs. Each job keeps the city, the map pin, the plans, the contacts, and the crew assignment in one place.\n\nManagers and admins use Schedule Planner, Crew Hub, and Contact Book. Crew members see Schedule and Daily Reports for the jobs assigned to their crew. Customers see only their own job, including the map pin, the plans, the daily report notes that are meant for them, and a chat wall with the office. They do not see the planner or anyone else's jobs.\n\nDaily reports save on the computer every few minutes, and they save to the server when you hit Save or automatically once an hour. A problem clip can pull a video that is already in PipeShare, jump to a remark on a small pipe drawing, and keep the clip to 30 seconds. Plan PDFs open in the existing plan viewer or map viewer, and those edits still save through Plan Sync.\n\nWho is affected: the private server and SaaS, after this version is pushed. The phone camera and gallery are not built. Add photo and Add video are hooks for a later mobile app. Use Add image on the computer.\n\nTexts do not actually send. There is no texting service connected. The notice is saved (who, when, message, and map link). If the person's phone matches an email on their login, or the phone field is an email address, that email is sent with the existing mail setup. Otherwise the notice stays in the queue and is marked held.",
   "changeLog": [
-    "The site menu has a Text size control: Small, Medium, Large, and Extra large.",
-    "Medium matches today's size. Larger steps grow the shell, menus, and file list together.",
-    "The choice applies immediately and is remembered in the browser.",
-    "The video frame and pipe drawing keep their layout.",
-    "Presign, complete, and heartbeat stay responsive when many people upload.",
-    "An admin can share one folder, including everything inside it, without opening the rest of the client."
+    "Daily Reports lists jobs after they are assigned to a crew, and each day can be opened again from the calendar.",
+    "Schedule shows assigned jobs. Managers see every crew. Crew members see their own crew.",
+    "Schedule Planner creates clients and jobs, stores a Google Maps pin, and puts plan PDFs in a Plan Sync folder named for the client.",
+    "Contact Book is the source for names and phones. Crew Hub builds the crews used on the calendar.",
+    "Customers get a My job tab with details, the pin, plans, reviewable daily report notes, and a chat wall.",
+    "Problem clips use a PipeShare video, a small pipe drawing, and a 30-second maximum.",
+    "Text messages are saved but not sent. Email is used when an address is already on file.",
+    "Phone camera and gallery are left as a hook for a later mobile app."
   ]
 }
