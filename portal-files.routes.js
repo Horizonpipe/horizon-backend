@@ -46,6 +46,7 @@ const {
   resolveStorageBackendForProcess
 } = require('./lib/portal-storage-backend');
 const { isValidPipesyncPlanPageStorageKey } = require('./admin-attachments-wasabi');
+const { mergeWincanProblems, tenantKey: jobScheduleTenantKey } = require('./lib/job-schedule-store');
 const {
   resolveTenantStorageContext,
   fullJobPrefix,
@@ -2502,7 +2503,62 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
     return { partSize, partCount };
   }
 
+  const wincanIndexAt = new Map();
+
+  function isWincanProblemsPath(rel) {
+    return /(?:^|\/)Misc\/Docu\/Problems\/problems\.json$/i.test(String(rel || '').replace(/\\/g, '/'));
+  }
+
+  function projectRootFromProblemsPath(rel) {
+    return String(rel || '')
+      .replace(/\\/g, '/')
+      .replace(/\/?Misc\/Docu\/Problems\/problems\.json$/i, '')
+      .replace(/\/+$/, '');
+  }
+
+  async function readPortalObjectText(key) {
+    const obj = await portalS3().send(new GetObjectCommand({ Bucket: portalBucket(), Key: key }));
+    if (!obj?.Body) return '';
+    if (typeof obj.Body.transformToString === 'function') return obj.Body.transformToString();
+    const chunks = [];
+    for await (const chunk of obj.Body) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    return Buffer.concat(chunks).toString('utf8');
+  }
+
+  function scheduleWincanProblemIndex({ key, path: relPath, user, req, files }) {
+    const rel = String(relPath || '').replace(/\\/g, '/');
+    if (!key || !isWincanProblemsPath(rel)) return;
+    const now = Date.now();
+    if (now - (wincanIndexAt.get(key) || 0) < 60000) return;
+    wincanIndexAt.set(key, now);
+    const fileIndex = new Map();
+    for (const file of Array.isArray(files) ? files : []) {
+      const filePath = String(file?.path || '').replace(/\\/g, '/');
+      if (file?.id && filePath) fileIndex.set(filePath.toLowerCase(), String(file.id));
+    }
+    void (async () => {
+      try {
+        const text = await readPortalObjectText(key);
+        const doc = JSON.parse(text);
+        await mergeWincanProblems(pool, jobScheduleTenantKey(user, req), doc, {
+          projectRoot: projectRootFromProblemsPath(rel),
+          fileIndex
+        });
+      } catch (error) {
+        wincanIndexAt.delete(key);
+        console.warn('[portal-files] WinCan problems index:', error?.message || error);
+      }
+    })();
+  }
+
   function notifyPortalObjectUploaded(payload) {
+    scheduleWincanProblemIndex({
+      key: payload?.key,
+      path: payload?.path || '',
+      user: payload?.user,
+      req: null,
+      files: []
+    });
     if (payload && payload.s3 && payload.bucket && payload.key) {
       void schedulePortalVideoHls({
         s3: payload.s3,
@@ -3123,6 +3179,16 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       }
       res.set('Cache-Control', 'private, max-age=20, stale-while-revalidate=40');
       res.set('Server-Timing', `list;dur=${listMs}`);
+      for (const file of Array.isArray(tree?.files) ? tree.files : []) {
+        if (!isWincanProblemsPath(file?.path)) continue;
+        scheduleWincanProblemIndex({
+          key: file.key || (file.id ? idToKey(file.id) : ''),
+          path: file.path,
+          user: req.user,
+          req,
+          files: tree.files
+        });
+      }
       return res.json({
         folders: Array.isArray(tree?.folders) ? tree.folders : [],
         files: Array.isArray(tree?.files) ? tree.files : [],

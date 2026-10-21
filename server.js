@@ -58,6 +58,7 @@ const {
   resolveHostingTier,
   HOSTING_TIERS
 } = require('./capabilities');
+const { canManageUserAccounts, canGrantAccountClearance } = require('./lib/account-admin');
 const {
   resolveDeploymentProfile,
   getPublicDeploymentConfig,
@@ -2844,6 +2845,7 @@ function normalizeUser(row, context = {}) {
     company: row.company || undefined,
     title: row.title || undefined,
     phone: row.phone || undefined,
+    accountAdminClearance: row.account_admin_clearance === true || row.accountAdminClearance === true,
     emailVerified: row.email_verified !== false,
     tenantPurchaser: isTenantPurchaser,
     subscriptionStatus: context.subscriptionStatus || undefined,
@@ -4716,7 +4718,7 @@ async function readFreshUserFromPostgresById(userId, options = {}) {
   const ownerCtx = await getSaasOwnerSessionContext(pool, id);
   const result = await pool.query(
     `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id,
-            portal_permissions_access, portal_files_access_granted, autosync_master_granted, self_signup, email, first_name, last_name, company, title, phone, email_verified,
+            portal_permissions_access, portal_files_access_granted, autosync_master_granted, self_signup, email, first_name, last_name, company, title, phone, account_admin_clearance, email_verified,
             product_tutorials_seen, portal_workspace_layouts, user_prefs
      FROM users
      WHERE CAST(id AS text) = $1
@@ -5347,6 +5349,7 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS company TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS title TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS account_admin_clearance BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_access_granted BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS autosync_master_granted BOOLEAN NOT NULL DEFAULT false`,
@@ -6490,7 +6493,7 @@ app.get('/users', requireAuth, async (req, res) => {
       });
     }
 
-    let sql = `SELECT id, username, display_name, email, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup
+    let sql = `SELECT id, username, display_name, email, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup, phone, title, account_admin_clearance
        FROM users`;
     const params = [];
     if (scope.mode === 'tenant') {
@@ -7363,6 +7366,9 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
   const legacyIsAdmin = req.body?.isAdmin === undefined ? null : !!req.body.isAdmin;
   const legacyRolesInput = req.body?.roles === undefined ? null : normalizeRoles(req.body.roles);
   const password = cleanString(req.body?.password || '');
+  if (password && !canManageUserAccounts(req.user)) {
+    return res.status(403).json({ success: false, error: 'You do not have clearance to change a password.' });
+  }
   const hasPortalScopeInPayload =
     Object.prototype.hasOwnProperty.call(req.body || {}, 'portalFilesClientId') ||
     Object.prototype.hasOwnProperty.call(req.body || {}, 'portalFilesJobId');
@@ -7798,6 +7804,144 @@ app.post('/users/:id/elevate-horizon-admin', requireAuth, requireAdminPanelAcces
   }
 });
 
+async function assertAccountActor(req, res, id) {
+  if (!canManageUserAccounts(req.user)) {
+    res.status(403).json({ success: false, error: 'You do not have clearance to edit accounts.' });
+    return false;
+  }
+  if (req.tenantScope?.mode === 'tenant') {
+    const allowed = await assertUserIdInTenantScope(pool, id, req.tenantScope);
+    if (!allowed) {
+      res.status(403).json({ success: false, error: 'User is outside your workspace' });
+      return false;
+    }
+  }
+  return true;
+}
+
+app.put('/users/:id/account', requireAuth, requireAdminPanelOrTenantUserManagement, async (req, res) => {
+  const id = cleanString(req.params.id);
+  if (!id) return res.status(400).json({ success: false, error: 'User id is required' });
+  if (!(await assertAccountActor(req, res, id))) return;
+  const username = cleanString(req.body?.username);
+  const displayName = cleanString(req.body?.displayName || req.body?.name);
+  const phone = cleanString(req.body?.phone).slice(0, 40);
+  const title = cleanString(req.body?.title).slice(0, 80);
+  if (!username) return res.status(400).json({ success: false, error: 'Username is required' });
+  try {
+    const currentResult = await pool.query(
+      `SELECT id, username, display_name, is_admin, account_type, employee_role, phone, title, portal_files_client_id, account_admin_clearance
+       FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
+      [id]
+    );
+    if (!currentResult.rows.length) return res.status(404).json({ success: false, error: 'User not found' });
+    const current = currentResult.rows[0];
+    const taken = await pool.query(
+      `SELECT id FROM users
+       WHERE LOWER(TRIM(username)) = LOWER(TRIM($1))
+         AND CAST(id AS text) <> $2
+         AND COALESCE(NULLIF(BTRIM(portal_files_client_id), ''), '__global__')
+           = COALESCE(NULLIF(BTRIM($3), ''), '__global__')
+       LIMIT 1`,
+      [username, id, current.portal_files_client_id || '']
+    );
+    if (taken.rows.length) return res.status(409).json({ success: false, error: 'Username already exists' });
+    const currentRole = String(current.employee_role || '').toLowerCase();
+    let nextType = normalizeAccountType(req.body?.accountType || current.account_type);
+    let nextRole = current.employee_role || null;
+    let nextIsAdmin = current.is_admin === true;
+    if (currentRole !== 'superadmin') {
+      if (nextType === 'customer') {
+        nextRole = null;
+        nextIsAdmin = false;
+      } else {
+        const requested = normalizeEmployeeRole(req.body?.employeeRole || '');
+        nextRole = requested && requested !== 'superadmin' ? requested : current.employee_role || 'camera_operator';
+        nextIsAdmin = nextRole === 'admin';
+      }
+    } else {
+      nextType = 'employee';
+      nextRole = 'superadmin';
+      nextIsAdmin = true;
+    }
+    let nextClearance = current.account_admin_clearance === true;
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'accountAdminClearance')) {
+      const requestedClearance = req.body.accountAdminClearance === true;
+      if (requestedClearance !== nextClearance && !canGrantAccountClearance(req.user)) {
+        return res.status(403).json({ success: false, error: 'Only a Super admin or the company Owner can grant account clearance.' });
+      }
+      nextClearance = requestedClearance;
+    }
+    const updated = await pool.query(
+      `UPDATE users
+       SET username = $2,
+           display_name = $3,
+           phone = $4,
+           title = $5,
+           account_type = $6,
+           employee_role = $7,
+           is_admin = $8,
+           account_admin_clearance = $9,
+           updated_at = NOW()
+       WHERE CAST(id AS text) = $1
+       RETURNING id, username, display_name, email, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup, phone, title, account_admin_clearance`,
+      [id, username, displayName || username, phone || null, title || null, nextType, nextRole, nextIsAdmin, nextClearance]
+    );
+    await tryWasabiStateWrite('account-edit', async (data) => {
+      const users = ensureSnapshotTable(data, 'users');
+      const idx = users.findIndex((row) => String(row.id || '') === id);
+      if (idx < 0) return;
+      users[idx] = {
+        ...users[idx],
+        username,
+        display_name: displayName || username,
+        phone: phone || null,
+        title: title || null,
+        account_type: nextType,
+        employee_role: nextRole,
+        is_admin: nextIsAdmin,
+        account_admin_clearance: nextClearance,
+        updated_at: nowIso()
+      };
+    });
+    return res.json({ success: true, user: normalizeUser(updated.rows[0]) });
+  } catch (error) {
+    console.error('ACCOUNT EDIT ERROR:', error);
+    if (error.code === '23505') return res.status(409).json({ success: false, error: 'Username already exists' });
+    return res.status(500).json({ success: false, error: error.message || 'Account edit failed' });
+  }
+});
+
+app.post('/users/:id/password', requireAuth, requireAdminPanelOrTenantUserManagement, async (req, res) => {
+  const id = cleanString(req.params.id);
+  if (!id) return res.status(400).json({ success: false, error: 'User id is required' });
+  if (!(await assertAccountActor(req, res, id))) return;
+  const password = cleanString(req.body?.password || '');
+  if (password.length < 4) return res.status(400).json({ success: false, error: 'Type a new password.' });
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    const updated = await pool.query(
+      `UPDATE users SET password = $2, must_change_password = false, updated_at = NOW()
+       WHERE CAST(id AS text) = $1 RETURNING id`,
+      [id, hash]
+    );
+    if (!updated.rowCount) return res.status(404).json({ success: false, error: 'User not found' });
+    await tryWasabiStateWrite('account-password', async (data) => {
+      const users = ensureSnapshotTable(data, 'users');
+      const idx = users.findIndex((row) => String(row.id || '') === id);
+      if (idx < 0) return;
+      users[idx] = { ...users[idx], password: hash, must_change_password: false, updated_at: nowIso() };
+    });
+    if (String(req.user?.id || '') !== id) {
+      await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [id]);
+    }
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('ACCOUNT PASSWORD ERROR:', error);
+    return res.status(500).json({ success: false, error: error.message || 'Password change failed' });
+  }
+});
+
 app.delete('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, async (req, res) => {
   const id = cleanString(req.params.id);
   if (!id) {
@@ -7808,6 +7952,9 @@ app.delete('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, a
     if (!allowed) {
       return res.status(403).json({ success: false, error: 'User is outside your workspace' });
     }
+  }
+  if (!canManageUserAccounts(req.user)) {
+    return res.status(403).json({ success: false, error: 'You do not have clearance to delete an account.' });
   }
   if (String(req.user?.id || '') === id) {
     return res.status(400).json({ success: false, error: 'You cannot delete your own account.' });
