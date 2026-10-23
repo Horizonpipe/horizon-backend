@@ -1,12 +1,16 @@
 'use strict';
 
 const { normalizeRelPath } = require('./company-permissions.service');
+const { canAccessAdminPanel } = require('./capabilities');
+const { canGrantPathAccess } = require('./lib/account-admin');
+const { resolveActorTenantScope } = require('./lib/saas-tenant-scope');
 const {
   serializeUserFolderGrantRow,
   loadUserFolderGrantsForScope,
   saveUserFolderGrantsForScope,
   syncPsrScopeForUserGrant,
   listFolderGrantsForUser,
+  listShareAccounts,
   addFolderGrantForUser,
   removeFolderGrantForUser
 } = require('./user-grants.service');
@@ -95,6 +99,31 @@ function registerUserGrantsRoutes(app, { pool, requireAuth, requireAdminPanelAcc
 
   const requireUserAdmin = requireAdminPanelOrTenantUserManagement || requireAdminPanelAccess;
 
+  function requestHost(req) {
+    return String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
+  }
+
+  function actorIsCustomer(user) {
+    return cleanString(user?.accountType || user?.account_type).toLowerCase() === 'customer';
+  }
+
+  async function requireFolderShareActor(req, res, next) {
+    try {
+      if (!req.user) return jsonError(res, 401, 'Authentication required');
+      if (actorIsCustomer(req.user)) return jsonError(res, 403, 'A customer cannot grant access.');
+      if (!canGrantPathAccess(req.user)) return requireUserAdmin(req, res, next);
+      if (!req.tenantScope) {
+        const scope = await resolveActorTenantScope(pool, req.user, { requestHost: requestHost(req) });
+        req.tenantScope = scope && scope.mode === 'tenant' ? scope : { mode: 'platform' };
+      }
+      req.folderShareCompanyOnly = canAccessAdminPanel(req.user) !== true;
+      return next();
+    } catch (error) {
+      console.error('[user-folder-grants] share auth error:', error);
+      return jsonError(res, 500, error.message || 'Could not check who can share.');
+    }
+  }
+
   function grantScopeAllowed(req, clientId, jobId) {
     const scope = req.tenantScope;
     if (!scope || scope.mode !== 'tenant') return true;
@@ -126,15 +155,30 @@ function registerUserGrantsRoutes(app, { pool, requireAuth, requireAdminPanelAcc
     }
   });
 
-  app.post('/users/:id/folder-grants', requireAuth, requireUserAdmin, async (req, res) => {
+  app.get('/company/share-accounts', requireAuth, requireFolderShareActor, async (req, res) => {
+    try {
+      const accounts = await listShareAccounts(pool, req.user.id, req.tenantScope);
+      return res.json({ success: true, accounts });
+    } catch (error) {
+      console.error('[user-folder-grants] share accounts error:', error);
+      return jsonError(res, 500, error.message || 'Could not load people for this company.');
+    }
+  });
+
+  app.post('/users/:id/folder-grants', requireAuth, requireFolderShareActor, async (req, res) => {
     try {
       const userId = cleanString(req.params.id);
       const clientId = cleanString(req.body?.clientId ?? req.body?.client_id);
       const jobId = cleanString(req.body?.jobId ?? req.body?.job_id);
       const pathPrefix = normalizeRelPath(req.body?.pathPrefix ?? req.body?.path ?? '');
+      const accessMode = cleanString(req.body?.accessMode ?? req.body?.access_mode).toLowerCase();
+      const recursive = !(req.body?.recursive === false || req.body?.recursive === 'false' || req.body?.recursive === 0);
       if (!userId) return jsonError(res, 400, 'User id is required');
       if (!clientId || !jobId) return jsonError(res, 400, 'Choose a client workspace before sharing folders.');
       if (!pathPrefix) return jsonError(res, 400, 'Pick a folder to share.');
+      if (accessMode && accessMode !== 'view' && accessMode !== 'view_download' && accessMode !== 'full') {
+        return jsonError(res, 400, 'Choose view only, view and download, or full access.');
+      }
       if (!grantScopeAllowed(req, clientId, jobId)) {
         return jsonError(res, 403, 'That folder is outside your workspace.');
       }
@@ -142,11 +186,25 @@ function registerUserGrantsRoutes(app, { pool, requireAuth, requireAdminPanelAcc
         const allowed = await assertUserIdInTenantScope(pool, userId, req.tenantScope);
         if (!allowed) return jsonError(res, 403, 'That user is outside your workspace.');
       }
-      const grant = await addFolderGrantForUser(pool, userId, clientId, jobId, pathPrefix);
+      if (req.folderShareCompanyOnly === true) {
+        const companyAccounts = await listShareAccounts(pool, req.user.id, req.tenantScope);
+        if (!companyAccounts.some((account) => account.id === userId)) {
+          return jsonError(res, 403, 'That person is not in this company.');
+        }
+      }
+      const grantOptions = {};
+      if (accessMode) grantOptions.accessMode = accessMode;
+      if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'recursive')) grantOptions.recursive = recursive;
+      const grant = await addFolderGrantForUser(pool, userId, clientId, jobId, pathPrefix, grantOptions);
+      const leveled = Boolean(accessMode);
+      const fileGrant = grant.recursive === false;
+      let message = 'Folder shared. They can see that folder and everything inside it.';
+      if (leveled && fileGrant) message = 'File shared. They can open that file at the access you chose.';
+      else if (leveled) message = 'Folder shared. They can open that folder, and the files inside it, at the access you chose.';
       return res.status(201).json({
         success: true,
         grant,
-        message: 'Folder shared. They can see that folder and everything inside it.'
+        message
       });
     } catch (error) {
       console.error('[user-folder-grants] add user error:', error);
