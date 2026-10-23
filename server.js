@@ -41,6 +41,8 @@ const {
 const { registerOvhOpsWebhook, registerOvhOpsRoutes } = require('./ovh-ops.routes');
 const { registerCustomerSupportRoutes } = require('./customer-support.routes');
 const { registerJobScheduleRoutes } = require('./job-schedule.routes');
+const { registerSmsRoutes } = require('./sms.routes');
+const { ensureOperationalSmsSchema, ensureTwilioInboundWebhook } = require('./lib/operational-sms');
 const { startMetricsCollector, isOvhOpsEnabled } = require('./ovh-ops.service');
 const { loadUserCompanyMembership, normalizeAppFeatures } = require('./company-permissions.service');
 const {
@@ -2869,6 +2871,8 @@ function normalizeUser(row, context = {}) {
     company: row.company || undefined,
     title: row.title || undefined,
     phone: row.phone || undefined,
+    smsConsent: row.sms_consent === true || row.smsConsent === true,
+    smsOptedOut: !!(row.sms_opted_out_at || row.smsOptedOutAt),
     accountAdminClearance: row.account_admin_clearance === true || row.accountAdminClearance === true,
     emailVerified: row.email_verified !== false,
     tenantPurchaser: isTenantPurchaser,
@@ -4743,6 +4747,7 @@ async function readFreshUserFromPostgresById(userId, options = {}) {
   const result = await pool.query(
     `SELECT id, username, display_name, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id,
             portal_permissions_access, portal_files_access_granted, autosync_master_granted, self_signup, email, first_name, last_name, company, title, phone, account_admin_clearance, email_verified,
+            sms_consent, sms_consent_at, sms_opted_out_at,
             product_tutorials_seen, portal_workspace_layouts, user_prefs
      FROM users
      WHERE CAST(id AS text) = $1
@@ -5390,9 +5395,13 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS self_signup BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS product_tutorials_seen JSONB NOT NULL DEFAULT '{}'::jsonb`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_workspace_layouts JSONB NOT NULL DEFAULT '{}'::jsonb`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS user_prefs JSONB NOT NULL DEFAULT '{}'::jsonb`
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS user_prefs JSONB NOT NULL DEFAULT '{}'::jsonb`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS sms_consent BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS sms_consent_at TIMESTAMPTZ`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS sms_opted_out_at TIMESTAMPTZ`
   ];
   for (const query of userAlters) await pool.query(query);
+  await ensureOperationalSmsSchema(pool);
   await pool.query(`
     DO $$ BEGIN
       ALTER TABLE users DROP CONSTRAINT IF EXISTS users_username_key;
@@ -12282,6 +12291,7 @@ registerCustomerSupportRoutes(app, {
   currentToken
 });
 registerJobScheduleRoutes(app, { pool, requireAuth });
+registerSmsRoutes(app, { pool });
 if (isOvhOpsEnabled()) {
   startMetricsCollector();
   console.log('[ovh-ops] metrics collector started');
@@ -12411,6 +12421,9 @@ ensureSchema()
     const httpServer = app.listen(PORT, () => {
       logDeploymentProfileAtStartup();
       console.log(`Horizon backend listening on port ${PORT}`);
+      void ensureTwilioInboundWebhook(pool).catch((error) => {
+        console.warn('[sms] inbound webhook was not updated:', error?.message || error);
+      });
     });
     // Longer than nginx keepalive (65s) so a reused connection is not closed under a new request (502).
     httpServer.keepAliveTimeout = 70000;

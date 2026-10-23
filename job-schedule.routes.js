@@ -9,6 +9,7 @@ const {
   pipeScopesForUser,
   processDue
 } = require('./lib/job-schedule-store');
+const { smsSender } = require('./lib/operational-sms');
 
 function mailer() {
   const url = String(process.env.SMTP_URL || '').trim();
@@ -49,13 +50,14 @@ function mailApi() {
 
 /**
  * Job schedule, crews, contact book, and daily-report bodies.
- * Texts are stored. They are emailed when SMTP and an address exist.
- * There is no SMS provider in this repo, so phone-only notices stay queued then held.
+ * Email still goes out when SMTP and an address exist.
+ * Operational texts go only to an employee account with a phone and SMS consent, and never after STOP.
  */
 function registerJobScheduleRoutes(app, { pool, requireAuth }) {
   const mail = mailApi();
+  const sms = smsSender();
   const timer = setInterval(() => {
-    processDue(pool, mail).catch((err) => {
+    processDue(pool, mail, sms).catch((err) => {
       console.warn('[job-schedule] notify', err?.message || err);
     });
   }, 60_000);
@@ -63,7 +65,7 @@ function registerJobScheduleRoutes(app, { pool, requireAuth }) {
 
   app.get('/api/job-schedule/bootstrap', requireAuth, async (req, res) => {
     try {
-      const bundle = await loadBundle(pool, req.user, tenantKey(req.user, req), mail);
+      const bundle = await loadBundle(pool, req.user, tenantKey(req.user, req), mail, sms);
       return res.json(bundle);
     } catch (err) {
       console.error('[job-schedule] bootstrap', err);
@@ -90,7 +92,7 @@ function registerJobScheduleRoutes(app, { pool, requireAuth }) {
 
   app.post('/api/job-schedule/action', requireAuth, async (req, res) => {
     try {
-      const bundle = await applyAction(pool, req.user, tenantKey(req.user, req), req.body || {}, mail);
+      const bundle = await applyAction(pool, req.user, tenantKey(req.user, req), req.body || {}, mail, sms);
       return res.json(bundle);
     } catch (err) {
       const status = Number(err?.status) || 500;

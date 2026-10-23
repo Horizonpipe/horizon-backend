@@ -23,7 +23,10 @@ function pickAccountSettings(user) {
     title: user.title || '',
     phone: user.phone || '',
     emailVerified: user.emailVerified !== false,
-    mustChangePassword: user.mustChangePassword === true
+    mustChangePassword: user.mustChangePassword === true,
+    accountType: user.accountType || 'employee',
+    smsConsent: user.smsConsent === true,
+    smsOptedOut: user.smsOptedOut === true
   };
 }
 
@@ -87,7 +90,8 @@ function registerAccountRoutes(app, deps) {
 
     try {
       const currentResult = await pool.query(
-        `SELECT id, username, display_name, email, first_name, last_name, company, title, phone, email_verified
+        `SELECT id, username, display_name, email, first_name, last_name, company, title, phone, email_verified,
+                account_type, sms_consent, sms_consent_at
          FROM users
          WHERE CAST(id AS text) = $1
          LIMIT 1`,
@@ -125,6 +129,17 @@ function registerAccountRoutes(app, deps) {
         `${nextFirst} ${nextLast}`.trim() ||
         cleanString(current.display_name) ||
         cleanString(current.username);
+      const isCustomer = String(current.account_type || 'employee').toLowerCase() === 'customer';
+      const hasSmsConsent = Object.prototype.hasOwnProperty.call(req.body || {}, 'smsConsent');
+      const touchSms = isCustomer || hasSmsConsent;
+      const nextSmsConsent = isCustomer ? false : hasSmsConsent ? req.body.smsConsent === true : current.sms_consent === true;
+      const nextSmsConsentAt = !touchSms
+        ? current.sms_consent_at || null
+        : nextSmsConsent
+          ? current.sms_consent === true && current.sms_consent_at
+            ? current.sms_consent_at
+            : nowIso()
+          : null;
 
       const wasabiWrote = await tryWasabiStateWrite('update-account-settings', async (data) => {
         const users = ensureSnapshotTable(data, 'users');
@@ -140,36 +155,45 @@ function registerAccountRoutes(app, deps) {
           phone: nextPhone || null,
           display_name: nextDisplayName,
           email_verified: emailChanged ? true : users[idx].email_verified !== false,
+          sms_consent: nextSmsConsent,
+          sms_consent_at: nextSmsConsentAt,
           updated_at: nowIso()
         };
       });
 
-      if (!wasabiWrote) {
-        await pool.query(
-          `UPDATE users
-           SET email = $2,
-               first_name = $3,
-               last_name = $4,
-               company = $5,
-               title = $6,
-               phone = $7,
-               display_name = $8,
-               email_verified = CASE WHEN $9 THEN true ELSE email_verified END,
-               updated_at = NOW()
-           WHERE CAST(id AS text) = $1`,
-          [
-            userId,
-            nextEmail,
-            nextFirst || null,
-            nextLast || null,
-            nextCompany || null,
-            nextTitle || null,
-            nextPhone || null,
-            nextDisplayName,
-            emailChanged
-          ]
-        );
-      }
+      await pool.query(
+        `UPDATE users
+         SET email = $2,
+             first_name = $3,
+             last_name = $4,
+             company = $5,
+             title = $6,
+             phone = $7,
+             display_name = $8,
+             email_verified = CASE WHEN $9 THEN true ELSE email_verified END,
+             sms_consent = CASE WHEN $11 THEN $10 ELSE sms_consent END,
+             sms_consent_at = CASE
+               WHEN NOT $11 THEN sms_consent_at
+               WHEN $10 IS NOT TRUE THEN NULL
+               WHEN sms_consent IS TRUE AND sms_consent_at IS NOT NULL THEN sms_consent_at
+               ELSE NOW()
+             END,
+             updated_at = NOW()
+         WHERE CAST(id AS text) = $1`,
+        [
+          userId,
+          nextEmail,
+          nextFirst || null,
+          nextLast || null,
+          nextCompany || null,
+          nextTitle || null,
+          nextPhone || null,
+          nextDisplayName,
+          emailChanged,
+          nextSmsConsent,
+          touchSms
+        ]
+      );
 
       const fresh = await readFreshUserFromPostgresById(userId);
       if (!fresh) {
