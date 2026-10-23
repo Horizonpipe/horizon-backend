@@ -6,7 +6,8 @@ const DEFAULT_APP_FEATURES = {
   pipeshare: true,
   pipesync: true,
   autosync: false,
-  planview: true
+  planview: true,
+  planCrewProvision: false
 };
 
 function normalizeRelPath(raw) {
@@ -391,5 +392,6 @@ module.exports = {
   buildSkeletonPath,
   recordTrashBinEntry,
   mergePortalGrantRows,
-  listPrefixAllowedByGrants
+  listPrefixAllowedByGrants,
+  accessModeToCompanyFlags
 };

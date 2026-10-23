@@ -46,6 +46,33 @@ function buildPipesyncPlanPageStorageKey(fileName, rootPrefix = '') {
   return `${resolveAppDataPrefix(PIPESYNC_PLAN_PAGE_STORAGE_PREFIX, rootPrefix)}${id}/${sanitizeAdminAttachmentFilename(fileName)}`;
 }
 
+/** Readable folder label for Client / County / City. Strips only path-breaking characters. */
+function sanitizePlanFolderSegment(name) {
+  const cleaned = String(name || '')
+    .replace(/[\u0000-\u001f]/g, '')
+    .replace(/[\\/:*?"<>|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\.+$/, '')
+    .slice(0, 80);
+  if (!cleaned || cleaned === '.' || cleaned === '..' || cleaned.includes('..')) return '';
+  return cleaned;
+}
+
+/**
+ * One original PDF under the plan store: plan-pages/{Client}/{County}/{City}/{file}.
+ * Existing uuid keys stay valid. This does not create a second library.
+ */
+function buildPipesyncPlanFolderStorageKey(fileName, client, county, city, rootPrefix = '') {
+  const segments = [client, county, city].map(sanitizePlanFolderSegment);
+  if (segments.some((seg) => !seg)) {
+    throw new Error('Client, county, and city are required');
+  }
+  const file = sanitizeAdminAttachmentFilename(fileName);
+  if (!file || file === '.' || file === '..') throw new Error('fileName is required');
+  return `${resolveAppDataPrefix(PIPESYNC_PLAN_PAGE_STORAGE_PREFIX, rootPrefix)}${segments.join('/')}/${file}`;
+}
+
 function isValidPipesyncPlanPageStorageKey(key, rootPrefix = '') {
   if (typeof key !== 'string') return false;
   if (key.length >= 4096 || key.includes('..')) return false;
@@ -219,6 +246,8 @@ module.exports = {
   sanitizeAdminAttachmentFilename,
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,
+  sanitizePlanFolderSegment,
+  buildPipesyncPlanFolderStorageKey,
   buildPipesyncPlanWorkspaceSaveStorageKey,
   isValidPipesyncPlanPageStorageKey,
   isValidPipesyncPlanWorkspaceSaveStorageKey,

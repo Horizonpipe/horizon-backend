@@ -72,6 +72,7 @@ const { resolveStorageBackend } = require('./lib/portal-storage-backend');
 const {
   buildAdminAttachmentStorageKey,
   buildPipesyncPlanPageStorageKey,
+  buildPipesyncPlanFolderStorageKey,
   buildPipesyncPlanWorkspaceSaveStorageKey,
   isAllowedAdminAttachmentContentType,
   isValidPipesyncPlanPageStorageKey,
@@ -85,6 +86,11 @@ const {
   normalizeAdminFilesForPersist,
   hydrateAdminReportOrAssetRows
 } = require('./admin-attachments-wasabi');
+const {
+  planAccessForRequest,
+  restrictPlanViewPayload,
+  userMayReadPlanStorageKey
+} = require('./lib/plan-crew-access');
 const {
   resolveTenantStorageContext,
   assertKeyWithinTenantRoot
@@ -8496,6 +8502,10 @@ app.get('/pipesync/plan-view', requireAuth, requirePsrViewerAccess, async (req, 
       lightRaw === 'true' ||
       lightRaw === 'yes'
     );
+    if (payload) {
+      const access = await planAccessForRequest(pool, req);
+      payload = restrictPlanViewPayload(payload, access);
+    }
     if (payload && wantHydrate) payload = await hydratePlanViewPayloadForResponse(payload, req);
     const updatedAt = [userRow?.updated_at, sharedRow?.updated_at].filter(Boolean).sort().reverse()[0] || null;
     return res.json({
@@ -8616,10 +8626,25 @@ app.post(
       if (!isAllowedAdminAttachmentContentType(contentType, 'pipesync-plan-view')) {
         return res.status(400).json({ success: false, error: 'Only images and PDF files are allowed for plan view.' });
       }
-      const storageKey =
-        reuseKey && isValidPipesyncPlanPageStorageKey(reuseKey, rootPrefix)
-          ? reuseKey
-          : buildPipesyncPlanPageStorageKey(fileName, rootPrefix);
+      const placeClient = cleanString(req.body?.client);
+      const placeCounty = cleanString(req.body?.county);
+      const placeCity = cleanString(req.body?.city);
+      let storageKey = '';
+      if (reuseKey && isValidPipesyncPlanPageStorageKey(reuseKey, rootPrefix)) {
+        storageKey = reuseKey;
+      } else if (placeClient && placeCounty && placeCity) {
+        try {
+          storageKey = buildPipesyncPlanFolderStorageKey(fileName, placeClient, placeCounty, placeCity, rootPrefix);
+        } catch (err) {
+          return res.status(400).json({
+            success: false,
+            error: err instanceof Error ? err.message : 'Client, county, and city are required'
+          });
+        }
+      } else {
+        // Installed desktop builds that predate the folder path still upload one whole PDF.
+        storageKey = buildPipesyncPlanPageStorageKey(fileName, rootPrefix);
+      }
       const signed = await presignAdminAttachmentPut(
         planS3,
         planBucket,
@@ -8714,6 +8739,11 @@ app.post(
       } catch {
         return res.status(403).json({ success: false, error: 'Forbidden' });
       }
+      const access = await planAccessForRequest(pool, req);
+      const library = await loadMergedPlanViewPayloadForAccess(req);
+      if (!userMayReadPlanStorageKey(library, access, storageKey)) {
+        return res.status(403).json({ success: false, error: 'This plan is not on your crew list.' });
+      }
       const { url } = await presignAdminAttachmentGet(
         planS3,
         planBucket,
@@ -8758,8 +8788,15 @@ app.post(
       }
       const urls = {};
       const errors = {};
+      const access = await planAccessForRequest(pool, req);
+      const library = await loadMergedPlanViewPayloadForAccess(req);
       await mapPool(keys, PLAN_VIEW_HYDRATE_CONCURRENCY, async (storageKey) => {
         try {
+          if (!userMayReadPlanStorageKey(library, access, storageKey)) {
+            errors[storageKey] = 'This plan is not on your crew list.';
+            urls[storageKey] = '';
+            return;
+          }
           assertKeyWithinTenantRoot(storageKey, rootPrefix);
           const { url } = await presignAdminAttachmentGet(
             planS3,
