@@ -71,16 +71,14 @@ function normalizeLegacyRoles(value) {
   return out;
 }
 
-/** Module flags a customer account may keep when an admin assigns them. Operator roles stay off. */
+/**
+ * Module flags a customer account may keep.
+ * Planner, crew (line-employee autosync), and jobsite contacts stay off.
+ */
 const CUSTOMER_MODULE_ROLE_KEYS = [
   'email',
-  'psrPlanner',
-  'psrViewer',
-  'psrDataEntry',
-  'dataAutoSyncEmployee',
   'pricingView',
   'footageView',
-  'jobsiteContactsView',
   'portalUpload',
   'portalDownload',
   'portalEdit',
@@ -205,7 +203,9 @@ function deriveAccountModel(userLike) {
 }
 
 function legacyRolesForAccountModel(model, legacyRolesInput = null) {
-  const legacy = normalizeLegacyRoles(legacyRolesInput || {});
+  const hasExplicitRoles =
+    !!legacyRolesInput && typeof legacyRolesInput === 'object' && !Array.isArray(legacyRolesInput);
+  const legacy = normalizeLegacyRoles(hasExplicitRoles ? legacyRolesInput : {});
   const out = {
     camera: false,
     vac: false,
@@ -229,6 +229,14 @@ function legacyRolesForAccountModel(model, legacyRolesInput = null) {
   if (model.accountType === ACCOUNT_TYPES.CUSTOMER) {
     const customer = { ...out };
     for (const key of CUSTOMER_MODULE_ROLE_KEYS) customer[key] = legacy[key] === true;
+    customer.camera = false;
+    customer.vac = false;
+    customer.simpleVac = false;
+    customer.psrPlanner = false;
+    customer.psrViewer = false;
+    customer.psrDataEntry = false;
+    customer.dataAutoSyncEmployee = false;
+    customer.jobsiteContactsView = false;
     return applyReportsViewFlag(customer, raw);
   }
   const role = normalizeEmployeeRole(model.employeeRole);
@@ -245,16 +253,16 @@ function legacyRolesForAccountModel(model, legacyRolesInput = null) {
     out.portalDownload = true;
     out.portalEdit = true;
     out.portalDelete = true;
-    return applyReportsViewFlag({ ...out, ...legacy }, raw);
+    return applyReportsViewFlag(hasExplicitRoles ? { ...out, ...legacy } : out, raw);
   }
   if (role === EMPLOYEE_ROLES.VAC_OPERATOR || role === EMPLOYEE_ROLES.SIMPLE_VAC) {
     out.vac = true;
     out.psrViewer = true;
     out.psrDataEntry = true;
     if (role === EMPLOYEE_ROLES.SIMPLE_VAC) out.simpleVac = true;
-    return applyReportsViewFlag({ ...out, ...legacy }, raw);
+    return applyReportsViewFlag(hasExplicitRoles ? { ...out, ...legacy } : out, raw);
   }
-  return applyReportsViewFlag({ ...out, ...legacy }, raw);
+  return applyReportsViewFlag(hasExplicitRoles ? { ...out, ...legacy } : out, raw);
 }
 
 /** Global Horizon super-admin (platform operator — not a SaaS workspace purchaser). */

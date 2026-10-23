@@ -2652,7 +2652,22 @@ function portalPermissionsWhitelistHas(username) {
 
 function enforcePortalScopePolicyForUser(user, portalScopes) {
   if (!user || (user.portalFilesAccessGranted !== true && user.autosyncMasterGranted !== true)) return [];
-  return dedupePortalScopes(portalScopes);
+  const scopes = dedupePortalScopes(portalScopes);
+  const model = deriveAccountModel({
+    accountType: user.accountType,
+    employeeRole: user.employeeRole,
+    isAdmin: user.isAdmin,
+    roles: user.roles,
+    username: user.username,
+    displayName: user.displayName,
+    selfSignup: user.selfSignup
+  });
+  if (model.accountType !== ACCOUNT_TYPES.CUSTOMER) return scopes;
+  return scopes.filter((row) => {
+    const client = String(row.clientId || '').trim().toLowerCase();
+    const job = String(row.jobId || '').trim();
+    return !(client === 'portal-users' && job === '2');
+  });
 }
 
 function parseProductTutorialsSeen(row) {
@@ -2804,12 +2819,21 @@ function normalizeUser(row, context = {}) {
 
   let portalFilesClientId;
   let portalFilesJobId;
-  if (!portalScopeDefaultsOk) {
+  const customerOnEmployeeFolder =
+    accountModel.accountType === ACCOUNT_TYPES.CUSTOMER &&
+    explicitClient.toLowerCase() === 'portal-users' &&
+    explicitJob === '2';
+  const explicitClientForUser = customerOnEmployeeFolder ? 'portal-users' : explicitClient;
+  const explicitJobForUser = customerOnEmployeeFolder ? '8' : explicitJob;
+  if (hasExplicitScope && !selfSignup) {
+    portalFilesClientId = explicitClientForUser;
+    portalFilesJobId = explicitJobForUser;
+  } else if (!portalScopeDefaultsOk) {
     portalFilesClientId = undefined;
     portalFilesJobId = undefined;
   } else if (hasExplicitScope) {
-    portalFilesClientId = explicitClient;
-    portalFilesJobId = explicitJob;
+    portalFilesClientId = explicitClientForUser;
+    portalFilesJobId = explicitJobForUser;
   } else if (selfSignup) {
     // Self-signup users must be explicitly scoped by admin before any portal file visibility.
     portalFilesClientId = undefined;
@@ -5122,8 +5146,16 @@ function requireAnyRole(roleKeys, message = 'Access denied for this feature') {
 function customerHasAssignedPsrScopes(user) {
   return normalizeAccountType(user?.accountType) === ACCOUNT_TYPES.CUSTOMER && Array.isArray(user?.psrScopes) && user.psrScopes.length > 0;
 }
+function customerBlockedFromOperatorTool(req, res) {
+  const model = deriveAccountModel(req.user || {});
+  if (model.accountType !== ACCOUNT_TYPES.CUSTOMER) return false;
+  res.status(403).json({ success: false, error: 'Customer accounts do not include this tool.' });
+  return true;
+}
+
 const requirePlannerAccess = (req, res, next) => {
   if (!req.user) return res.status(401).json({ success: false, error: 'Authentication required' });
+  if (customerBlockedFromOperatorTool(req, res)) return;
   if (isAdminUser(req.user)) return next();
   if (customerHasAssignedPsrScopes(req.user)) return next();
   const allowed = ['psrPlanner', 'psrViewer', 'psrDataEntry', 'camera', 'vac', 'simpleVac', 'pricingView', 'footageView'].some((k) =>
@@ -5134,6 +5166,7 @@ const requirePlannerAccess = (req, res, next) => {
 };
 const requirePsrViewerAccess = (req, res, next) => {
   if (!req.user) return res.status(401).json({ success: false, error: 'Authentication required' });
+  if (customerBlockedFromOperatorTool(req, res)) return;
   if (isAdminUser(req.user)) return next();
   if (customerHasAssignedPsrScopes(req.user)) return next();
   const allowed = ['psrViewer', 'psrDataEntry', 'psrPlanner', 'camera', 'vac', 'simpleVac', 'pricingView', 'footageView'].some((k) =>
@@ -5144,6 +5177,7 @@ const requirePsrViewerAccess = (req, res, next) => {
 };
 const requirePsrDataEntryAccess = (req, res, next) => {
   if (!req.user) return res.status(401).json({ success: false, error: 'Authentication required' });
+  if (customerBlockedFromOperatorTool(req, res)) return;
   if (isAdminUser(req.user)) return next();
   if (customerHasAssignedPsrScopes(req.user)) return next();
   const allowed = ['psrDataEntry', 'psrPlanner', 'camera', 'vac', 'simpleVac'].some((k) => userRoleEnabled(req.user, k));
@@ -7155,6 +7189,139 @@ app.post('/change-password', requireAuth, async (req, res) => {
   }
 });
 
+const BASE_PORTAL_CLIENT_ID = 'portal-users';
+const BASE_EMPLOYEE_PORTAL_JOB_ID = '2';
+const BASE_CUSTOMER_PORTAL_JOB_ID = '8';
+
+function companyRoleKeyForAccount(accountType, employeeRole) {
+  if (normalizeAccountType(accountType) === ACCOUNT_TYPES.CUSTOMER) return 'customer';
+  const role = normalizeEmployeeRole(employeeRole);
+  if (role === EMPLOYEE_ROLES.ADMIN || role === EMPLOYEE_ROLES.SUPERADMIN) return 'admin';
+  return 'employee';
+}
+
+/** Base file pair: employees use portal-users/2, customers use portal-users/8. */
+function basePortalWorkspaceForAccount(accountType, employeeRole) {
+  const customer = normalizeAccountType(accountType) === ACCOUNT_TYPES.CUSTOMER;
+  return {
+    clientId: BASE_PORTAL_CLIENT_ID,
+    jobId: customer ? BASE_CUSTOMER_PORTAL_JOB_ID : BASE_EMPLOYEE_PORTAL_JOB_ID,
+    companyRoleKey: companyRoleKeyForAccount(accountType, employeeRole)
+  };
+}
+
+function resolveStoredPortalWorkspace({
+  accountType,
+  employeeRole,
+  clientId,
+  jobId,
+  previousAccountType,
+  tenantScope
+}) {
+  const companyRoleKey = companyRoleKeyForAccount(accountType, employeeRole);
+  if (tenantScope?.mode === 'tenant' && cleanString(tenantScope.portalClientId)) {
+    return {
+      clientId: cleanString(clientId) || cleanString(tenantScope.portalClientId),
+      jobId: cleanString(jobId) || cleanString(tenantScope.portalJobId) || '1',
+      companyRoleKey
+    };
+  }
+  const want = basePortalWorkspaceForAccount(accountType, employeeRole);
+  const client = cleanString(clientId);
+  const job = cleanString(jobId);
+  if (!client || !job) return want;
+  const previous = previousAccountType ? normalizeAccountType(previousAccountType) : '';
+  const next = normalizeAccountType(accountType);
+  const typeChanged = previous && previous !== next;
+  if (
+    client.toLowerCase() === BASE_PORTAL_CLIENT_ID &&
+    (job === BASE_EMPLOYEE_PORTAL_JOB_ID || job === BASE_CUSTOMER_PORTAL_JOB_ID) &&
+    (typeChanged || (next === ACCOUNT_TYPES.CUSTOMER && job === BASE_EMPLOYEE_PORTAL_JOB_ID))
+  ) {
+    return want;
+  }
+  return { clientId: client, jobId: job, companyRoleKey };
+}
+
+async function resolveActorCompanyId(actorUserId) {
+  const membership = actorUserId ? await loadUserCompanyMembership(pool, actorUserId) : null;
+  if (membership?.companyId) return membership.companyId;
+  const named = await pool.query(
+    `SELECT id FROM companies
+     WHERE lower(name) = 'horizon pipe' OR lower(slug) = 'horizon-pipe'
+     LIMIT 1`
+  );
+  if (named.rows[0]?.id) return named.rows[0].id;
+  const anyCompany = await pool.query(`SELECT id FROM companies ORDER BY created_at ASC NULLS LAST LIMIT 1`);
+  return anyCompany.rows[0]?.id || null;
+}
+
+async function ensureUserCompanyMembership(userId, companyId, roleKey) {
+  const id = cleanString(userId);
+  const company = cleanString(companyId);
+  if (!id || !company) return;
+  const role = ['admin', 'employee', 'customer'].includes(String(roleKey || '')) ? roleKey : 'employee';
+  const existing = await pool.query(`SELECT 1 FROM user_company_membership WHERE user_id = $1 LIMIT 1`, [id]);
+  if (existing.rows.length) return;
+  await pool.query(
+    `INSERT INTO user_company_membership (user_id, company_id, role_key, override_folder_grants)
+     VALUES ($1, $2, $3, '[]'::jsonb)
+     ON CONFLICT (user_id) DO NOTHING`,
+    [id, company, role]
+  );
+}
+
+async function ensureUserPortalScope(userId, clientId, jobId, accountType) {
+  const id = cleanString(userId);
+  const client = cleanString(clientId);
+  const job = cleanString(jobId);
+  if (!id || !client || !job) return;
+  if (
+    normalizeAccountType(accountType) === ACCOUNT_TYPES.CUSTOMER &&
+    client.toLowerCase() === BASE_PORTAL_CLIENT_ID
+  ) {
+    await pool.query(
+      `DELETE FROM user_portal_scopes
+       WHERE user_id = $1 AND lower(BTRIM(client_id)) = 'portal-users' AND BTRIM(job_id) = '2'`,
+      [id]
+    );
+  }
+  await pool.query(
+    `INSERT INTO user_portal_scopes (user_id, client_id, job_id)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id, client_id, job_id) DO NOTHING`,
+    [id, client, job]
+  );
+}
+
+function upsertSnapshotPortalScope(data, userId, clientId, jobId, accountType) {
+  const id = cleanString(userId);
+  const client = cleanString(clientId);
+  const job = cleanString(jobId);
+  if (!id || !client || !job) return;
+  let scopes = ensureSnapshotTable(data, 'user_portal_scopes');
+  if (normalizeAccountType(accountType) === ACCOUNT_TYPES.CUSTOMER) {
+    data.user_portal_scopes = scopes.filter(
+      (row) =>
+        !(
+          String(row.user_id || '') === id &&
+          String(row.client_id || '').trim().toLowerCase() === BASE_PORTAL_CLIENT_ID &&
+          String(row.job_id || '').trim() === BASE_EMPLOYEE_PORTAL_JOB_ID
+        )
+    );
+    scopes = ensureSnapshotTable(data, 'user_portal_scopes');
+  }
+  const exists = scopes.some(
+    (row) =>
+      String(row.user_id || '') === id &&
+      String(row.client_id || '').trim() === client &&
+      String(row.job_id || '').trim() === job
+  );
+  if (!exists) {
+    scopes.push({ user_id: id, client_id: client, job_id: job, created_at: nowIso() });
+  }
+}
+
 app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, async (req, res) => {
   const username = cleanString(req.body?.username);
   const displayName = cleanString(req.body?.displayName || username);
@@ -7193,7 +7360,18 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
   }
   if (accountType === ACCOUNT_TYPES.CUSTOMER) employeeRole = null;
   const isAdmin = employeeRole === EMPLOYEE_ROLES.ADMIN || employeeRole === EMPLOYEE_ROLES.SUPERADMIN;
-  const roles = legacyRolesForAccountModel({ accountType, employeeRole }, normalizeRoles(req.body?.roles));
+  const roles = legacyRolesForAccountModel(
+    { accountType, employeeRole },
+    Object.prototype.hasOwnProperty.call(req.body || {}, 'roles') ? req.body.roles : null
+  );
+  const workspace = resolveStoredPortalWorkspace({
+    accountType,
+    employeeRole,
+    clientId: '',
+    jobId: '',
+    previousAccountType: '',
+    tenantScope: req.tenantScope
+  });
   const email = cleanString(req.body?.email).toLowerCase();
 
   if (!username) {
@@ -7252,23 +7430,23 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
         accountType,
         employeeRole,
         JSON.stringify(roles),
-        req.tenantScope?.mode === 'tenant' ? req.tenantScope.portalClientId : null,
-        req.tenantScope?.mode === 'tenant' ? req.tenantScope.portalJobId || '1' : null,
-        false,
+        workspace.clientId,
+        workspace.jobId,
+        true,
         email || null
       ]
     );
     insertedPgId = result.rows[0].id;
+    result.rows[0].portal_files_client_id = workspace.clientId;
+    result.rows[0].portal_files_job_id = workspace.jobId;
+    result.rows[0].portal_files_access_granted = true;
 
+    await ensureUserPortalScope(insertedPgId, workspace.clientId, workspace.jobId, accountType);
     if (req.tenantScope?.mode === 'tenant') {
-      await pool.query(
-        `INSERT INTO user_company_membership (user_id, company_id, role_key, override_folder_grants)
-         VALUES ($1, $2, 'employee', '[]'::jsonb)
-         ON CONFLICT (user_id) DO UPDATE
-         SET company_id = EXCLUDED.company_id,
-             updated_at = NOW()`,
-        [String(insertedPgId), req.tenantScope.companyId]
-      );
+      await ensureUserCompanyMembership(insertedPgId, req.tenantScope.companyId, workspace.companyRoleKey);
+    } else if (accountType !== ACCOUNT_TYPES.CUSTOMER) {
+      const companyId = await resolveActorCompanyId(req.user?.id);
+      await ensureUserCompanyMembership(insertedPgId, companyId, workspace.companyRoleKey);
     }
 
     /**
@@ -7295,9 +7473,9 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
           employee_role: employeeRole,
           roles: normalizeRoles(roles),
           must_change_password: true,
-          portal_files_client_id: null,
-          portal_files_job_id: null,
-          portal_files_access_granted: false,
+          portal_files_client_id: workspace.clientId,
+          portal_files_job_id: workspace.jobId,
+          portal_files_access_granted: true,
           autosync_master_granted: false,
           self_signup: false,
           portal_permissions_access: false,
@@ -7306,6 +7484,7 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
           created_at: nowIso(),
           updated_at: nowIso()
         });
+        upsertSnapshotPortalScope(data, insertedPgId, workspace.clientId, workspace.jobId, accountType);
       });
       if (!wrote) {
         console.warn(
@@ -7337,6 +7516,8 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
     });
   } catch (error) {
     if (insertedPgId) {
+      await pool.query('DELETE FROM user_portal_scopes WHERE user_id = $1', [String(insertedPgId)]).catch(() => {});
+      await pool.query('DELETE FROM user_company_membership WHERE user_id = $1', [String(insertedPgId)]).catch(() => {});
       await pool.query('DELETE FROM users WHERE id = $1', [insertedPgId]).catch(() => {});
     }
     console.error('CREATE USER ERROR:', error);
@@ -7581,9 +7762,21 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
 
     const nextPortalPermissionsAccess =
       nextIsAdmin && (hasPortalPermissionsPayload ? !!req.body.portalPermissionsAccess : true);
-    if (nextPortalFilesAccessGranted !== true && !nextAutosyncMasterGranted) {
-      nextPortalFilesClientId = null;
-      nextPortalFilesJobId = null;
+    const keepLockedSignup =
+      nextSelfSignup === true && nextPortalFilesAccessGranted !== true && !nextAutosyncMasterGranted;
+    if (!keepLockedSignup) {
+      const hadWorkspace = !!(cleanString(current.portal_files_client_id) && cleanString(current.portal_files_job_id));
+      const aligned = resolveStoredPortalWorkspace({
+        accountType: nextAccountType,
+        employeeRole: nextEmployeeRole,
+        clientId: nextPortalFilesClientId,
+        jobId: nextPortalFilesJobId,
+        previousAccountType: current.account_type,
+        tenantScope: req.tenantScope
+      });
+      nextPortalFilesClientId = aligned.clientId;
+      nextPortalFilesJobId = aligned.jobId;
+      if (!hadWorkspace && !hasAccessPayload) nextPortalFilesAccessGranted = true;
     }
 
     const passwordHash = password ? await bcrypt.hash(password, 10) : null;
@@ -7705,6 +7898,9 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
 
         const sessions = ensureSnapshotTable(data, 'auth_sessions');
         data.auth_sessions = sessions.filter((row) => String(row.user_id || '') !== String(id || ''));
+        if (!keepLockedSignup) {
+          upsertSnapshotPortalScope(data, id, nextPortalFilesClientId, nextPortalFilesJobId, nextAccountType);
+        }
       });
     }
 
@@ -7729,6 +7925,26 @@ app.put('/users/:id', requireAuth, requireAdminPanelOrTenantUserManagement, asyn
       pgRow.email = emailWrite.rows[0]?.email || null;
     }
     const updatedResult = { rows: [pgRow] };
+
+    if (!keepLockedSignup && nextPortalFilesClientId && nextPortalFilesJobId) {
+      await ensureUserPortalScope(id, nextPortalFilesClientId, nextPortalFilesJobId, nextAccountType);
+    }
+    const becamePlatformCustomer =
+      !hasCompanyPayload &&
+      req.tenantScope?.mode !== 'tenant' &&
+      normalizeAccountType(current.account_type) !== ACCOUNT_TYPES.CUSTOMER &&
+      nextAccountType === ACCOUNT_TYPES.CUSTOMER;
+    if (becamePlatformCustomer) {
+      await pool.query('DELETE FROM user_company_membership WHERE user_id = $1', [String(id)]);
+    } else if (
+      !hasCompanyPayload &&
+      !keepLockedSignup &&
+      (nextAccountType !== ACCOUNT_TYPES.CUSTOMER || req.tenantScope?.mode === 'tenant')
+    ) {
+      const companyId =
+        req.tenantScope?.mode === 'tenant' ? req.tenantScope.companyId : await resolveActorCompanyId(req.user?.id);
+      await ensureUserCompanyMembership(id, companyId, companyRoleKeyForAccount(nextAccountType, nextEmployeeRole));
+    }
 
     if (hasCompanyPayload) {
       const companyId = cleanString(req.body?.companyId);
@@ -7830,7 +8046,7 @@ app.put('/users/:id/account', requireAuth, requireAdminPanelOrTenantUserManageme
   if (!username) return res.status(400).json({ success: false, error: 'Username is required' });
   try {
     const currentResult = await pool.query(
-      `SELECT id, username, display_name, is_admin, account_type, employee_role, phone, title, portal_files_client_id, account_admin_clearance
+      `SELECT id, username, display_name, is_admin, account_type, employee_role, phone, title, portal_files_client_id, portal_files_job_id, portal_files_access_granted, account_admin_clearance
        FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
       [id]
     );
@@ -7872,6 +8088,15 @@ app.put('/users/:id/account', requireAuth, requireAdminPanelOrTenantUserManageme
       }
       nextClearance = requestedClearance;
     }
+    const aligned = resolveStoredPortalWorkspace({
+      accountType: nextType,
+      employeeRole: nextRole,
+      clientId: current.portal_files_client_id,
+      jobId: current.portal_files_job_id,
+      previousAccountType: current.account_type,
+      tenantScope: req.tenantScope
+    });
+    const hadWorkspace = !!(cleanString(current.portal_files_client_id) && cleanString(current.portal_files_job_id));
     const updated = await pool.query(
       `UPDATE users
        SET username = $2,
@@ -7882,11 +8107,39 @@ app.put('/users/:id/account', requireAuth, requireAdminPanelOrTenantUserManageme
            employee_role = $7,
            is_admin = $8,
            account_admin_clearance = $9,
+           portal_files_client_id = $10,
+           portal_files_job_id = $11,
+           portal_files_access_granted = CASE WHEN $12::boolean THEN true ELSE portal_files_access_granted END,
            updated_at = NOW()
        WHERE CAST(id AS text) = $1
        RETURNING id, username, display_name, email, is_admin, account_type, employee_role, roles, must_change_password, portal_files_client_id, portal_files_job_id, portal_files_access_granted, autosync_master_granted, portal_permissions_access, self_signup, phone, title, account_admin_clearance`,
-      [id, username, displayName || username, phone || null, title || null, nextType, nextRole, nextIsAdmin, nextClearance]
+      [
+        id,
+        username,
+        displayName || username,
+        phone || null,
+        title || null,
+        nextType,
+        nextRole,
+        nextIsAdmin,
+        nextClearance,
+        aligned.clientId,
+        aligned.jobId,
+        !hadWorkspace
+      ]
     );
+    await ensureUserPortalScope(id, aligned.clientId, aligned.jobId, nextType);
+    const becamePlatformCustomer =
+      req.tenantScope?.mode !== 'tenant' &&
+      normalizeAccountType(current.account_type) !== ACCOUNT_TYPES.CUSTOMER &&
+      nextType === ACCOUNT_TYPES.CUSTOMER;
+    if (becamePlatformCustomer) {
+      await pool.query('DELETE FROM user_company_membership WHERE user_id = $1', [String(id)]);
+    } else if (nextType !== ACCOUNT_TYPES.CUSTOMER || req.tenantScope?.mode === 'tenant') {
+      const companyId =
+        req.tenantScope?.mode === 'tenant' ? req.tenantScope.companyId : await resolveActorCompanyId(req.user?.id);
+      await ensureUserCompanyMembership(id, companyId, aligned.companyRoleKey);
+    }
     await tryWasabiStateWrite('account-edit', async (data) => {
       const users = ensureSnapshotTable(data, 'users');
       const idx = users.findIndex((row) => String(row.id || '') === id);
@@ -7901,10 +8154,15 @@ app.put('/users/:id/account', requireAuth, requireAdminPanelOrTenantUserManageme
         employee_role: nextRole,
         is_admin: nextIsAdmin,
         account_admin_clearance: nextClearance,
+        portal_files_client_id: aligned.clientId,
+        portal_files_job_id: aligned.jobId,
+        portal_files_access_granted: !hadWorkspace ? true : users[idx].portal_files_access_granted === true,
         updated_at: nowIso()
       };
+      upsertSnapshotPortalScope(data, id, aligned.clientId, aligned.jobId, nextType);
     });
-    return res.json({ success: true, user: normalizeUser(updated.rows[0]) });
+    const user = await attachScopesToUser(normalizeUser(updated.rows[0]));
+    return res.json({ success: true, user });
   } catch (error) {
     console.error('ACCOUNT EDIT ERROR:', error);
     if (error.code === '23505') return res.status(409).json({ success: false, error: 'Username already exists' });
@@ -8404,6 +8662,26 @@ app.post(
     }
   }
 );
+
+async function loadMergedPlanViewPayloadForAccess(req) {
+  const tables = await loadSnapshotTablesForRequest(req, false);
+  const rows = Array.isArray(tables[PIPESYNC_PLAN_VIEW_TABLE]) ? tables[PIPESYNC_PLAN_VIEW_TABLE] : [];
+  const un = pipesyncPlanViewUsernameKey(req.user);
+  const userIdx = findPlanViewRow(rows, un);
+  const sharedIdx = findPlanViewRow(rows, PIPESYNC_PLAN_VIEW_SHARED_USERNAME);
+  const userRow = userIdx >= 0 ? rows[userIdx] : null;
+  const sharedRow = sharedIdx >= 0 ? rows[sharedIdx] : null;
+  const userPayload =
+    userRow && userRow.payload && typeof userRow.payload === 'object' && !Array.isArray(userRow.payload)
+      ? userRow.payload
+      : null;
+  const sharedPayload =
+    sharedRow && sharedRow.payload && typeof sharedRow.payload === 'object' && !Array.isArray(sharedRow.payload)
+      ? sharedRow.payload
+      : null;
+  if (!userPayload && !sharedPayload) return null;
+  return mergePlanViewPayloads(sharedPayload, userPayload || { v: 2, imagePlan: {}, pdfMap: {} });
+}
 
 /** Presign GET for an existing plan-board PDF (or image) object when the client has storageKey but no view URL. */
 app.post(
