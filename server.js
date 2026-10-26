@@ -733,9 +733,24 @@ if (String(process.env.WASABI_STATE_INCLUDE_HEAVY_TABLES || '0').trim() !== '1')
   for (const tableName of WASABI_STATE_HEAVY_TABLES) WASABI_STATE_EXCLUDE_TABLES.add(tableName);
 }
 function isClusterBackgroundLeader() {
-  const inst = process.env.NODE_APP_INSTANCE;
-  if (inst === undefined || inst === null || String(inst).trim() === '') return true;
-  return String(inst) === '0';
+  const direct = process.env.NODE_APP_INSTANCE;
+  if (direct !== undefined && direct !== null && String(direct).trim() !== '') {
+    return String(direct) === '0';
+  }
+  // PM2 cluster stores NODE_APP_INSTANCE inside the pm2_env JSON, not as its own variable.
+  try {
+    const raw = process.env.pm2_env;
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      const inst = parsed && parsed.NODE_APP_INSTANCE;
+      if (inst !== undefined && inst !== null && String(inst).trim() !== '') {
+        return String(inst) === '0';
+      }
+    }
+  } catch {
+    /* pm2_env is optional */
+  }
+  return true;
 }
 const wasabiStateClient = createWasabiStateClient();
 
