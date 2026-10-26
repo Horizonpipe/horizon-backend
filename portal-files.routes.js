@@ -2569,6 +2569,7 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
       files: []
     });
     if (payload && payload.s3 && payload.bucket && payload.key) {
+      // Does not queue ffmpeg. The player uses the presigned original.
       void schedulePortalVideoHls({
         s3: payload.s3,
         bucket: payload.bucket,
