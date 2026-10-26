@@ -233,6 +233,7 @@ function createAutoImportPlugin(options = {}) {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_auto_import_logs_project_created ON auto_import_logs(project_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_auto_import_logs_global_created ON auto_import_logs (created_at DESC) WHERE project_id IS NULL;
 
       CREATE TABLE IF NOT EXISTS auto_import_desktop_heartbeats (
         user_key TEXT PRIMARY KEY,
@@ -953,7 +954,7 @@ function createAutoImportPlugin(options = {}) {
           `SELECT id, project_id, source, level, message, created_at
            FROM auto_import_logs
            WHERE project_id IS NULL
-           ORDER BY created_at DESC NULLS LAST
+           ORDER BY created_at DESC
            LIMIT 40`
         )
       ]);

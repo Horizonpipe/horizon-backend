@@ -451,6 +451,11 @@ async function ensurePortalResumeSchema(pool) {
         `CREATE INDEX IF NOT EXISTS idx_portal_upload_sessions_scope
          ON portal_upload_sessions (client_id, job_id, status, updated_at DESC)`
       );
+      await pool.query(
+        `CREATE INDEX IF NOT EXISTS idx_portal_upload_sessions_sha
+         ON portal_upload_sessions (client_id, job_id, lower(btrim(sha256)))
+         WHERE status = 'completed' AND sha256 IS NOT NULL`
+      );
       await pool.query(`
         CREATE TABLE IF NOT EXISTS portal_upload_session_parts (
           session_id UUID NOT NULL REFERENCES portal_upload_sessions(id) ON DELETE CASCADE,
@@ -491,6 +496,10 @@ async function ensurePortalObjectSha256Schema(pool) {
       `);
       await pool.query(
         `CREATE INDEX IF NOT EXISTS idx_portal_object_sha256_scope ON portal_object_sha256 (client_id, job_id)`
+      );
+      await pool.query(
+        `CREATE INDEX IF NOT EXISTS idx_portal_object_sha256_hash
+         ON portal_object_sha256 (client_id, job_id, lower(sha256))`
       );
     })().catch((e) => {
       portalObjectSha256SchemaReady = null;
@@ -2666,33 +2675,38 @@ function registerPortalFilesRoutes(app, { pool: poolOption, query, requireAuth, 
    */
   async function mergeCompletedUploadSha256IntoTree(clientId, jobId, tree) {
     const files = tree && Array.isArray(tree.files) ? tree.files : [];
+    const keys = files.map((f) => String(f.key || '')).filter(Boolean);
+    if (!keys.length) return;
     try {
       await ensurePortalResumeSchema(uploadMetaPool);
       await ensurePortalObjectSha256Schema(uploadMetaPool);
-      const r = await uploadMetaPool.query(
-        `SELECT DISTINCT ON (object_key) object_key, sha256
-         FROM portal_upload_sessions
-         WHERE client_id = $1 AND job_id = $2 AND status = 'completed'
-           AND sha256 IS NOT NULL AND btrim(sha256) <> ''
-         ORDER BY object_key, completed_at DESC NULLS LAST, updated_at DESC`,
-        [String(clientId), String(jobId)]
-      );
-      const rows = r.rows || [];
-      const rObj = await uploadMetaPool.query(
-        `SELECT object_key, sha256 FROM portal_object_sha256 WHERE client_id = $1 AND job_id = $2`,
-        [String(clientId), String(jobId)]
-      );
-      const objRows = rObj.rows || [];
       const byKey = new Map();
-      for (const row of rows) {
-        const k = String(row.object_key || '');
-        const h = normalizeSha256Hex(row.sha256);
-        if (k && h.length === 64) byKey.set(k, h);
-      }
-      for (const row of objRows) {
-        const k = String(row.object_key || '');
-        const h = normalizeSha256Hex(row.sha256);
-        if (k && h.length === 64) byKey.set(k, h);
+      const chunkSize = 1500;
+      for (let i = 0; i < keys.length; i += chunkSize) {
+        const slice = keys.slice(i, i + chunkSize);
+        const r = await uploadMetaPool.query(
+          `SELECT DISTINCT ON (object_key) object_key, sha256
+           FROM portal_upload_sessions
+           WHERE client_id = $1 AND job_id = $2 AND status = 'completed'
+             AND object_key = ANY($3::text[])
+             AND sha256 IS NOT NULL AND btrim(sha256) <> ''
+           ORDER BY object_key, completed_at DESC NULLS LAST, updated_at DESC`,
+          [String(clientId), String(jobId), slice]
+        );
+        for (const row of r.rows || []) {
+          const k = String(row.object_key || '');
+          const h = normalizeSha256Hex(row.sha256);
+          if (k && h.length === 64) byKey.set(k, h);
+        }
+        const rObj = await uploadMetaPool.query(
+          `SELECT object_key, sha256 FROM portal_object_sha256 WHERE object_key = ANY($1::text[])`,
+          [slice]
+        );
+        for (const row of rObj.rows || []) {
+          const k = String(row.object_key || '');
+          const h = normalizeSha256Hex(row.sha256);
+          if (k && h.length === 64) byKey.set(k, h);
+        }
       }
       for (const f of files) {
         const key = String(f.key || '');

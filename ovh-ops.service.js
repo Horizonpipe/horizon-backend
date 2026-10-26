@@ -293,12 +293,33 @@ function tailFile(filePath, lines = 200) {
   if (!filePath || !fs.existsSync(filePath)) {
     return { path: filePath, lines: [], error: 'log file not found' };
   }
+  const want = Math.max(1, Math.min(2000, Number(lines) || 200));
+  let fd;
   try {
-    const raw = fs.readFileSync(filePath, 'utf8');
-    const rows = raw.split('\n').filter((l) => l.length > 0);
-    return { path: filePath, lines: rows.slice(-lines) };
+    const stat = fs.statSync(filePath);
+    const maxBytes = 512 * 1024;
+    const start = Math.max(0, stat.size - maxBytes);
+    fd = fs.openSync(filePath, 'r');
+    const len = stat.size - start;
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, start);
+    let text = buf.toString('utf8');
+    if (start > 0) {
+      const nl = text.indexOf('\n');
+      if (nl >= 0) text = text.slice(nl + 1);
+    }
+    const rows = text.split('\n').filter((l) => l.length > 0);
+    return { path: filePath, lines: rows.slice(-want) };
   } catch (err) {
     return { path: filePath, lines: [], error: err?.message || String(err) };
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
   }
 }
 
@@ -311,13 +332,15 @@ async function resolveLogPath(source) {
     return null;
   }
   const home = process.env.HOME || '/home/ubuntu';
+  const horizonOut = '/var/log/horizon/pm2-out.log';
+  const horizonErr = '/var/log/horizon/pm2-error.log';
   if (key === 'pm2-out' || key === 'out') {
-    return path.join(home, '.pm2/logs', `${PM2_NAME}-out.log`);
+    return fs.existsSync(horizonOut) ? horizonOut : path.join(home, '.pm2/logs', `${PM2_NAME}-out.log`);
   }
   if (key === 'pm2-err' || key === 'err') {
-    return path.join(home, '.pm2/logs', `${PM2_NAME}-error.log`);
+    return fs.existsSync(horizonErr) ? horizonErr : path.join(home, '.pm2/logs', `${PM2_NAME}-error.log`);
   }
-  return path.join(home, '.pm2/logs', `${PM2_NAME}-out.log`);
+  return fs.existsSync(horizonOut) ? horizonOut : path.join(home, '.pm2/logs', `${PM2_NAME}-out.log`);
 }
 
 function runShellScript(scriptPath, args = [], label = 'job') {

@@ -712,12 +712,31 @@ const WASABI_SIGNUP_PRIMARY_MAX_SNAPSHOT_AGE_MS = Math.max(
 );
 const WASABI_STATE_INCLUDE_ALL_TABLES =
   String(process.env.WASABI_STATE_INCLUDE_ALL_TABLES || '1').trim().toLowerCase() !== '0';
+/**
+ * Postgres-only file metadata. Nothing reads these from latest.json, but a full-table
+ * snapshot copies them into every worker (uploaded-by is tens of MB, ufid registry too).
+ * Set WASABI_STATE_INCLUDE_HEAVY_TABLES=1 to put them back in the snapshot.
+ */
+const WASABI_STATE_HEAVY_TABLES = [
+  'portal_object_uploaded_by',
+  'portal_ufid_registry',
+  'portal_ufid_counters',
+  'portal_ufid_copy_lineage'
+];
 const WASABI_STATE_EXCLUDE_TABLES = new Set(
   String(process.env.WASABI_STATE_EXCLUDE_TABLES || '')
     .split(',')
     .map((v) => String(v || '').trim())
     .filter(Boolean)
 );
+if (String(process.env.WASABI_STATE_INCLUDE_HEAVY_TABLES || '0').trim() !== '1') {
+  for (const tableName of WASABI_STATE_HEAVY_TABLES) WASABI_STATE_EXCLUDE_TABLES.add(tableName);
+}
+function isClusterBackgroundLeader() {
+  const inst = process.env.NODE_APP_INSTANCE;
+  if (inst === undefined || inst === null || String(inst).trim() === '') return true;
+  return String(inst) === '0';
+}
 const wasabiStateClient = createWasabiStateClient();
 
 const ADMIN_ATTACHMENT_MAX_BYTES = Math.max(
@@ -4946,6 +4965,19 @@ async function revokeSessionToken(token, reason = '') {
   }
 }
 
+const authWarnAt = new Map();
+function warnAuthLimited(code, message) {
+  const now = Date.now();
+  const prev = authWarnAt.get(code) || 0;
+  if (now - prev < 60000) return;
+  authWarnAt.set(code, now);
+  if (authWarnAt.size > 40) {
+    const oldest = authWarnAt.keys().next().value;
+    if (oldest) authWarnAt.delete(oldest);
+  }
+  console.warn(message);
+}
+
 async function readSession(token) {
   if (!token) return null;
   let wasabiPrimaryIssue = '';
@@ -4959,7 +4991,7 @@ async function readSession(token) {
         const sessionHit = await readSessionFromWasabiSnapshot(token, snapshot);
         if (sessionHit) {
           if (!fresh) {
-            console.warn('[auth] using stale Wasabi snapshot for session resolution');
+            warnAuthLimited('stale-snapshot', '[auth] using stale Wasabi snapshot for session resolution');
           }
           let freshUser = null;
           let pgRefreshError = null;
@@ -4987,7 +5019,8 @@ async function readSession(token) {
       wasabiPrimaryIssue = `snapshot_error:${error?.message || error}`;
     }
     if (WASABI_AUTH_PRIMARY_STRICT && wasabiPrimaryIssue) {
-      console.warn(
+      warnAuthLimited(
+        `primary-miss:${wasabiPrimaryIssue}`,
         `[auth] strict Wasabi primary miss (${wasabiPrimaryIssue}); falling back to Postgres lookup for session token`
       );
     }
@@ -4996,7 +5029,10 @@ async function readSession(token) {
     const sessionHit = await readSessionFromPostgres(token);
     if (sessionHit) {
       if (triedWasabiPrimary && wasabiPrimaryIssue) {
-        console.warn(`[auth] session resolved via Postgres fallback after Wasabi primary ${wasabiPrimaryIssue}`);
+        warnAuthLimited(
+          `pg-fallback:${wasabiPrimaryIssue}`,
+          `[auth] session resolved via Postgres fallback after Wasabi primary ${wasabiPrimaryIssue}`
+        );
       }
       return sessionHit.user;
     }
@@ -12329,7 +12365,7 @@ registerCustomerSupportRoutes(app, {
 });
 registerJobScheduleRoutes(app, { pool, requireAuth });
 registerSmsRoutes(app, { pool });
-if (isOvhOpsEnabled()) {
+if (isOvhOpsEnabled() && isClusterBackgroundLeader()) {
   startMetricsCollector();
   console.log('[ovh-ops] metrics collector started');
 }
@@ -12468,7 +12504,9 @@ ensureSchema()
 
     if (wasabiStateClient && WASABI_STATE_BUCKET) {
       void (async () => {
-      await runWasabiStateSnapshot();
+      if (isClusterBackgroundLeader()) {
+        await runWasabiStateSnapshot();
+      }
       if (PLANNER_STORE_WASABI_ONLY || WASABI_APP_DATA_STORE_WASABI_ONLY) {
         if (!WASABI_WRITES_PRIMARY_ENABLED) {
           console.error(
@@ -12494,7 +12532,7 @@ ensureSchema()
         }
       }
       try {
-        const readiness = evaluateWasabiRuntimeReadiness(await loadWasabiLatestStateSnapshot(true));
+        const readiness = evaluateWasabiRuntimeReadiness(await loadWasabiLatestStateSnapshot(false));
         if (WASABI_ALL_READS_PRIMARY_ENABLED && !readiness.readyForAllReadsPrimary) {
           console.warn(
             `[wasabi-readiness] all-reads-primary enabled but not ready; missingTables=${readiness.missingRequiredTables.join(',') || 'none'}`
@@ -12507,9 +12545,11 @@ ensureSchema()
       } catch (error) {
         console.warn('[wasabi-readiness] boot readiness check failed:', error?.message || error);
       }
-      setInterval(() => {
-        void runWasabiStateSnapshot();
-      }, WASABI_STATE_SNAPSHOT_MS);
+      if (isClusterBackgroundLeader()) {
+        setInterval(() => {
+          void runWasabiStateSnapshot();
+        }, WASABI_STATE_SNAPSHOT_MS);
+      }
       setInterval(() => {
         void flushWasabiSqlMirrorQueue();
       }, WASABI_SQL_MIRROR_FLUSH_MS);
@@ -12519,7 +12559,7 @@ ensureSchema()
       console.log(
         `[wasabi-sql-mirror] enabled=${WASABI_SQL_MIRROR_ENABLED ? 'yes' : 'no'} prefix=${WASABI_SQL_MIRROR_PREFIX} flush=${WASABI_SQL_MIRROR_FLUSH_MS}ms buffer=${WASABI_SQL_MIRROR_MAX_BUFFER} skipTables=${Array.from(WASABI_SQL_MIRROR_SKIP_TABLE_SET).sort().join(',') || '(none)'}`
       );
-      void loadWasabiLatestStateSnapshot(true).catch((error) => {
+      void loadWasabiLatestStateSnapshot(false).catch((error) => {
         console.warn('[wasabi-state] boot snapshot preload failed:', error?.message || error);
       });
       })().catch((error) => {
