@@ -16,7 +16,10 @@ const {
   extractCustomerFromDb3,
   resolveCityForAutosyncPsr,
   isPrimaryWinCanDb3Name,
-  guessMetaObjectKey
+  guessMetaObjectKey,
+  matchExistingClient,
+  systemFromPipeUse,
+  OFFICE_REVIEW_STATUSES
 } = require('./lib/autosync-psr-ingest');
 const { parseDb3OffThread } = require('./lib/db3-parse-offthread');
 const { withWasabiSlot } = require('./lib/wasabi-call-gate');
@@ -30,6 +33,8 @@ const {
 const { registerUserGrantsRoutes } = require('./user-grants.routes');
 const { createAutoImportPlugin } = require('./auto-import-plugin.routes');
 const { registerSignupRoutes } = require('./signup.routes');
+const { registerCustomerAccessRoutes } = require('./customer-access.routes');
+const { matchExistingCompany, normalizeCompanyRole, assignMatchedCompany } = require('./lib/customer-access');
 const { registerAccountRoutes } = require('./account.routes');
 const { registerSaasTenantRoutes } = require('./saas-tenant.routes');
 const { registerSaasBillingWebhook, registerSaasBillingRoutes } = require('./saas-billing.routes');
@@ -4421,6 +4426,16 @@ function normalizeStatus(status) {
   }
   if (['could-not-locate', 'could not locate', 'ni', 'not installed'].includes(value)) return 'could-not-locate';
   if (['jetted', 'vac/jetted'].includes(value)) return 'jetted';
+  if (
+    ['repairs-pending', 'reviewed, repairs pending', 'reviewed repairs pending'].includes(value)
+  ) {
+    return 'repairs-pending';
+  }
+  if (
+    ['repairs-complete', 'reviewed, repairs complete', 'reviewed repairs complete'].includes(value)
+  ) {
+    return 'repairs-complete';
+  }
   return 'neutral';
 }
 
@@ -4437,6 +4452,8 @@ function statusLabel(status) {
     case 'quicklock-installed': return 'Quicklock Installed';
     case 'could-not-locate': return 'Not Installed';
     case 'jetted': return 'Jetted';
+    case 'repairs-pending': return 'Reviewed, Repairs pending';
+    case 'repairs-complete': return 'Reviewed, Repairs Complete';
     default: return 'Unmarked';
   }
 }
@@ -5568,6 +5585,7 @@ async function ensureSchema() {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS title TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS account_admin_clearance BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS access_clearance JSONB NOT NULL DEFAULT '{}'::jsonb`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_files_access_granted BOOLEAN NOT NULL DEFAULT false`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS autosync_master_granted BOOLEAN NOT NULL DEFAULT false`,
@@ -7661,11 +7679,19 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
     result.rows[0].portal_files_access_granted = true;
 
     await ensureUserPortalScope(insertedPgId, workspace.clientId, workspace.jobId, accountType);
+    let companyNotice = '';
     if (req.tenantScope?.mode === 'tenant') {
       await ensureUserCompanyMembership(insertedPgId, req.tenantScope.companyId, workspace.companyRoleKey);
     } else if (accountType !== ACCOUNT_TYPES.CUSTOMER) {
       const companyId = await resolveActorCompanyId(req.user?.id);
       await ensureUserCompanyMembership(insertedPgId, companyId, workspace.companyRoleKey);
+    } else {
+      const typedCompany = cleanString(req.body?.companyName || req.body?.company);
+      const roleKey = normalizeCompanyRole(req.body?.companyRoleKey || req.body?.roleKey, 'customer');
+      if (typedCompany) {
+        const matched = await matchExistingCompany(pool, insertedPgId, typedCompany, roleKey);
+        if (!matched.matched) companyNotice = matched.message;
+      }
     }
 
     /**
@@ -7729,9 +7755,12 @@ app.post('/create-user', requireAuth, requireAdminPanelOrTenantUserManagement, a
     res.status(201).json({
       success: true,
       user,
-      message: assignedAtCreate
-        ? 'User created. They can sign in immediately with the assigned roles/permissions.'
-        : 'User created. They can sign in now, but no work access is assigned yet.'
+      ...(companyNotice ? { companyMatched: false, companyMessage: companyNotice } : {}),
+      message: companyNotice
+        ? `User created. ${companyNotice}`
+        : assignedAtCreate
+          ? 'User created. They can sign in immediately with the assigned roles/permissions.'
+          : 'User created. They can sign in now, but no work access is assigned yet.'
     });
   } catch (error) {
     if (insertedPgId) {
@@ -8359,6 +8388,27 @@ app.put('/users/:id/account', requireAuth, requireAdminPanelOrTenantUserManageme
         req.tenantScope?.mode === 'tenant' ? req.tenantScope.companyId : await resolveActorCompanyId(req.user?.id);
       await ensureUserCompanyMembership(id, companyId, aligned.companyRoleKey);
     }
+    const hasCompanyEdit =
+      Object.prototype.hasOwnProperty.call(req.body || {}, 'companyId') ||
+      Object.prototype.hasOwnProperty.call(req.body || {}, 'companyName');
+    if (hasCompanyEdit && req.tenantScope?.mode !== 'tenant') {
+      const typedCompany = cleanString(req.body?.companyName);
+      const companyId = cleanString(req.body?.companyId);
+      const roleKey = normalizeCompanyRole(req.body?.companyRoleKey || req.body?.roleKey, nextType);
+      if (companyId) {
+        await assignMatchedCompany(pool, id, companyId, roleKey);
+      } else if (typedCompany) {
+        const found = await matchExistingCompany(pool, id, typedCompany, roleKey);
+        if (!found.matched) {
+          return res.status(400).json({
+            success: false,
+            error: found.message || 'No company matches that name. The company was not created.'
+          });
+        }
+      } else {
+        await pool.query('DELETE FROM user_company_membership WHERE user_id = $1', [String(id)]);
+      }
+    }
     await tryWasabiStateWrite('account-edit', async (data) => {
       const users = ensureSnapshotTable(data, 'users');
       const idx = users.findIndex((row) => String(row.id || '') === id);
@@ -8389,10 +8439,30 @@ app.put('/users/:id/account', requireAuth, requireAdminPanelOrTenantUserManageme
   }
 });
 
-app.post('/users/:id/password', requireAuth, requireAdminPanelOrTenantUserManagement, async (req, res) => {
+function allowAdminPasswordChange(req, res) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+    Promise.resolve(requireAdminPanelOrTenantUserManagement(req, res, () => finish(true))).then(
+      () => finish(false),
+      () => finish(false)
+    );
+  });
+}
+
+app.post('/users/:id/password', requireAuth, async (req, res) => {
   const id = cleanString(req.params.id);
   if (!id) return res.status(400).json({ success: false, error: 'User id is required' });
-  if (!(await assertAccountActor(req, res, id))) return;
+  const isSelf = String(req.user?.id || '') === id;
+  if (!isSelf) {
+    const allowed = await allowAdminPasswordChange(req, res);
+    if (!allowed) return;
+    if (!(await assertAccountActor(req, res, id))) return;
+  }
   const password = cleanString(req.body?.password || '');
   if (password.length < 4) return res.status(400).json({ success: false, error: 'Type a new password.' });
   try {
@@ -10534,6 +10604,42 @@ app.post(
   }
 });
 
+app.post(
+  '/autosync/psr-ingest',
+  requireAuth,
+  upload.fields([
+    { name: 'file', maxCount: 1 },
+    { name: 'metaFile', maxCount: 1 }
+  ]),
+  async (req, res) => {
+    try {
+      const primaryFile = Array.isArray(req.files?.file) ? req.files.file[0] : req.file;
+      const metaUpload = Array.isArray(req.files?.metaFile) ? req.files.metaFile[0] : null;
+      if (!primaryFile?.buffer?.length) {
+        return res.status(400).json({ success: false, error: 'Upload a DB3 file.' });
+      }
+      const name = String(primaryFile.originalname || '');
+      if (!/\.db3$/i.test(name) && !/\.sqlite$/i.test(name) && !/\.db$/i.test(name)) {
+        return res.status(400).json({ success: false, error: 'Expected a DB3 project file.' });
+      }
+      const savedBy = cleanString(req.user?.displayName || req.user?.username || '') || 'AutoSync';
+      const result = await ingestAutosyncDb3ToPsr({
+        objectKey: name,
+        buffer: primaryFile.buffer,
+        metaBuffer: metaUpload?.buffer || null,
+        savedBy
+      });
+      if (result?.ok === false) {
+        return res.status(400).json({ success: false, ...result });
+      }
+      res.json({ success: true, ...result });
+    } catch (error) {
+      console.error('[autosync-psr] local ingest failed:', error?.message || error);
+      res.status(500).json({ success: false, error: error?.message || 'PSR ingest failed' });
+    }
+  }
+);
+
 app.post('/imports/wincan/commit', requireAuth, requireMike, async (req, res) => {
   try {
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
@@ -12354,9 +12460,44 @@ async function listKnownPlannerCities() {
   }
 }
 
+async function listKnownPlannerClients() {
+  try {
+    const snapshot = await loadWasabiLatestStateSnapshot(true);
+    if (snapshot?.data) {
+      const names = [
+        ...new Set(snapshotRows(snapshot, 'planner_records').map((r) => cleanString(r?.client)).filter(Boolean))
+      ];
+      if (names.length) return names;
+    }
+  } catch (error) {
+    console.warn('[autosync-psr] client list snapshot failed:', error?.message || error);
+  }
+  if (PLANNER_STORE_WASABI_ONLY) return [];
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT client FROM planner_records WHERE client IS NOT NULL AND TRIM(client) <> ''`
+    );
+    return result.rows.map((r) => cleanString(r.client)).filter(Boolean);
+  } catch (error) {
+    console.warn('[autosync-psr] client list query failed:', error?.message || error);
+    return [];
+  }
+}
+
+function latestSegmentVersionIndex(versions) {
+  const list = Array.isArray(versions) ? versions : [];
+  if (!list.length) return -1;
+  let idx = 0;
+  for (let i = 1; i < list.length; i += 1) {
+    if (String(list[i]?.createdAt || '') >= String(list[idx]?.createdAt || '')) idx = i;
+  }
+  return idx;
+}
+
 /**
- * After AutoSync uploads a primary .db3: parse sections, place under Customer/City/Job, upsert PSR rows.
- * Status = complete unless MSA or missing ending access (ACB/AMH/ADP/AEP/EOP) → needs-reviewed.
+ * After AutoSync uploads a primary .db3, or the desktop posts the same local file:
+ * parse sections and place them on the existing client / job / storm|sanitary layout.
+ * No pipes in the DB3 leaves the planner empty for that file.
  */
 async function ingestAutosyncDb3ToPsr({
   objectKey = '',
@@ -12375,156 +12516,203 @@ async function ingestAutosyncDb3ToPsr({
     return { ok: true, added: 0, updated: 0, reason: 'no-sections' };
   }
 
-  const projectName = cleanString(rows[0]?.project || '') || path.basename(String(objectKey || ''), '.db3') || 'NOT SET';
-  let customer = '';
-  for (const row of rows) {
-    customer = extractCustomerFromDb3(row?.db3Imported, projectName);
-    if (customer) break;
+  const placeable = rows.filter((row) => cleanString(row?.reference));
+  if (!placeable.length) {
+    return { ok: true, added: 0, updated: 0, reason: 'no-sections' };
   }
-  if (!customer) {
+
+  const projectName = cleanString(rows[0]?.project || '') || path.basename(String(objectKey || ''), '.db3') || 'NOT SET';
+  let projectCustomer = '';
+  for (const row of placeable) {
+    projectCustomer = extractCustomerFromDb3(row?.db3Imported, projectName);
+    if (projectCustomer) break;
+  }
+  if (!projectCustomer) {
     console.warn('[autosync-psr] no customer field; skipping placement', { projectName, objectKey });
     return { ok: false, error: 'missing-customer', projectName };
   }
 
   const knownCities = await listKnownPlannerCities();
-  const cityInfo = resolveCityForAutosyncPsr(projectName, rows[0]?.city || '', knownCities);
-  const targetCity = cityInfo.city || 'NOT SET';
+  const knownClients = await listKnownPlannerClients();
   const targetJobsite = normalizeJobsiteName(projectName);
-  const targetSystem = 'storm';
   const actor = cleanString(savedBy) || 'AutoSync';
+  const actorUser = { user: { displayName: actor, username: 'autosync' } };
 
-  let record;
-  const existingMatches = await findPlannerRecordsByScope(customer, targetCity, targetJobsite, {
-    latestOnly: true
-  });
-  if (existingMatches.length) {
-    record = existingMatches[0];
-  } else {
-    record = await createPlannerRecord(
-      {
-        record_date: new Date().toISOString().slice(0, 10),
-        client: customer,
-        city: targetCity,
-        street: cleanString(rows[0]?.street || ''),
-        jobsite: targetJobsite,
-        status: '',
-        saved_by: actor,
-        systems: { storm: [], sanitary: [] }
-      },
-      { user: { displayName: actor, username: 'autosync' } }
-    );
+  /** @type {Map<string, { client: string, city: string, citySource: string, rows: Array<{ row: any, system: 'storm'|'sanitary' }> }>} */
+  const groups = new Map();
+  for (const row of placeable) {
+    const lineCustomer = extractCustomerFromDb3(row?.db3Imported, '') || projectCustomer;
+    const matched = matchExistingClient(lineCustomer, knownClients);
+    const client = matched.client || lineCustomer;
+    const cityInfo = resolveCityForAutosyncPsr(projectName, row?.city || '', knownCities);
+    const city = cityInfo.city || 'NOT SET';
+    const pipe = systemFromPipeUse(row?.db3Imported);
+    const system = pipe.system === 'sanitary' ? 'sanitary' : 'storm';
+    const key = `${client.toLowerCase()}\t${city.toLowerCase()}\t${targetJobsite.toLowerCase()}`;
+    if (!groups.has(key)) {
+      groups.set(key, { client, city, citySource: cityInfo.source, rows: [] });
+    }
+    groups.get(key).rows.push({ row, system });
   }
-  ensureImportTargetSystemBranch(record, targetSystem);
-  const branch = Array.isArray(record.systems[targetSystem]) ? record.systems[targetSystem] : [];
-  record.systems[targetSystem] = branch;
 
   let added = 0;
   let updated = 0;
-  for (const row of rows) {
-    if (!row?.reference) continue;
-    const refLower = String(row.reference).trim().toLowerCase();
-    const reviewStatus = normalizeStatus(row.suggestedStatus || 'complete');
-    const reviewNote =
-      Array.isArray(row.reviewReasons) && row.reviewReasons.length
-        ? ` Auto-review: ${row.reviewReasons.join('; ')}.`
-        : '';
-    const identity = buildDb3DeterministicIdentity(row);
-    const existingIdx = branch.findIndex(
-      (seg) => String(seg?.reference || '').trim().toLowerCase() === refLower
-    );
-    if (existingIdx >= 0) {
-      const prev = branch[existingIdx];
-      const versions = Array.isArray(prev.versions) ? [...prev.versions] : [];
-      const latest = versions[0] && typeof versions[0] === 'object' ? { ...versions[0] } : null;
-      if (latest) {
-        latest.status = reviewStatus;
-        latest.notes = cleanString(`${latest.notes || ''}${reviewNote}`.trim()) || latest.notes;
-        versions[0] = latest;
-      } else {
-        versions.unshift(
-          defaultVersion(actor, {
-            status: reviewStatus,
-            recordedDate: record.record_date,
-            notes: `Updated from AutoSync DB3.${reviewNote}`
-          })
-        );
-      }
-      branch[existingIdx] = normalizeSegment(
+  /** @type {string[]} */
+  const recordIds = [];
+  for (const group of groups.values()) {
+    let record;
+    const existingMatches = await findPlannerRecordsByScope(group.client, group.city, targetJobsite, {
+      latestOnly: true
+    });
+    if (existingMatches.length) {
+      record = existingMatches[0];
+    } else {
+      record = await createPlannerRecord(
         {
-          ...prev,
-          reference: row.reference,
-          upstream: row.upstream,
-          downstream: row.downstream,
-          dia: row.dia,
-          material: row.material,
-          shape: row.shape,
-          length: row.length,
-          footage: row.length,
-          street: row.street || prev.street,
-          system: targetSystem,
-          db3Imported: row.db3Imported || prev.db3Imported,
-          db3DedupeKey: row.db3DedupeKey || identity.dedupeKey || prev.db3DedupeKey,
-          db3RowHash: row.db3RowHash || identity.dedupeHash || prev.db3RowHash,
-          versions
+          record_date: new Date().toISOString().slice(0, 10),
+          client: group.client,
+          city: group.city,
+          street: cleanString(group.rows[0]?.row?.street || ''),
+          jobsite: targetJobsite,
+          status: '',
+          saved_by: actor,
+          systems: { storm: [], sanitary: [] }
         },
-        actor
+        actorUser
       );
-      updated += 1;
-      continue;
+    }
+    if (!record.systems || typeof record.systems !== 'object') record.systems = { storm: [], sanitary: [] };
+    if (!Array.isArray(record.systems.storm)) record.systems.storm = [];
+    if (!Array.isArray(record.systems.sanitary)) record.systems.sanitary = [];
+
+    for (const item of group.rows) {
+      const row = item.row;
+      const targetSystem = item.system;
+      ensureImportTargetSystemBranch(record, targetSystem);
+      const branch = record.systems[targetSystem];
+      const refLower = String(row.reference).trim().toLowerCase();
+      const reviewStatus = normalizeStatus(row.suggestedStatus || 'complete');
+      const reviewNote =
+        Array.isArray(row.reviewReasons) && row.reviewReasons.length
+          ? ` Auto-review: ${row.reviewReasons.join('; ')}.`
+          : '';
+      const identity = buildDb3DeterministicIdentity(row);
+      let existingIdx = branch.findIndex(
+        (seg) => String(seg?.reference || '').trim().toLowerCase() === refLower
+      );
+      if (existingIdx < 0) {
+        const other = targetSystem === 'storm' ? 'sanitary' : 'storm';
+        const otherBranch = Array.isArray(record.systems[other]) ? record.systems[other] : [];
+        const otherIdx = otherBranch.findIndex(
+          (seg) => String(seg?.reference || '').trim().toLowerCase() === refLower
+        );
+        if (otherIdx >= 0) {
+          const moved = otherBranch.splice(otherIdx, 1)[0];
+          branch.push(moved);
+          existingIdx = branch.length - 1;
+        }
+      }
+      if (existingIdx >= 0) {
+        const prev = branch[existingIdx];
+        const versions = Array.isArray(prev.versions) ? [...prev.versions] : [];
+        const latestIdx = latestSegmentVersionIndex(versions);
+        const currentStatus = normalizeStatus(latestIdx >= 0 ? versions[latestIdx]?.status : '');
+        const keepOffice = OFFICE_REVIEW_STATUSES.has(currentStatus);
+        if (!keepOffice) {
+          if (latestIdx >= 0) {
+            const latest = { ...versions[latestIdx] };
+            latest.status = reviewStatus;
+            latest.notes = cleanString(`${latest.notes || ''}${reviewNote}`.trim()) || latest.notes;
+            versions[latestIdx] = latest;
+          } else {
+            versions.push(
+              defaultVersion(actor, {
+                status: reviewStatus,
+                recordedDate: record.record_date,
+                notes: `Updated from AutoSync DB3.${reviewNote}`
+              })
+            );
+          }
+        }
+        branch[existingIdx] = normalizeSegment(
+          {
+            ...prev,
+            reference: row.reference,
+            upstream: row.upstream,
+            downstream: row.downstream,
+            dia: row.dia,
+            material: row.material,
+            shape: row.shape,
+            length: row.length,
+            footage: row.length,
+            street: row.street || prev.street,
+            system: targetSystem,
+            db3Imported: row.db3Imported || prev.db3Imported,
+            db3DedupeKey: row.db3DedupeKey || identity.dedupeKey || prev.db3DedupeKey,
+            db3RowHash: row.db3RowHash || identity.dedupeHash || prev.db3RowHash,
+            versions
+          },
+          actor
+        );
+        updated += 1;
+        continue;
+      }
+
+      branch.push(
+        normalizeSegment(
+          {
+            id: crypto.randomUUID(),
+            reference: row.reference,
+            upstream: row.upstream,
+            downstream: row.downstream,
+            dia: row.dia,
+            material: row.material,
+            shape: row.shape,
+            length: row.length,
+            footage: row.length,
+            street: row.street,
+            system: targetSystem,
+            db3Imported: row.db3Imported,
+            db3DedupeKey: identity.dedupeKey,
+            db3RowHash: identity.dedupeHash,
+            versions: [
+              defaultVersion(actor, {
+                status: reviewStatus,
+                recordedDate: record.record_date,
+                notes: `Imported from AutoSync DB3.${reviewNote}`
+              })
+            ]
+          },
+          actor
+        )
+      );
+      added += 1;
     }
 
-    branch.push(
-      normalizeSegment(
-        {
-          id: crypto.randomUUID(),
-          reference: row.reference,
-          upstream: row.upstream,
-          downstream: row.downstream,
-          dia: row.dia,
-          material: row.material,
-          shape: row.shape,
-          length: row.length,
-          footage: row.length,
-          street: row.street,
-          system: targetSystem,
-          db3Imported: row.db3Imported,
-          db3DedupeKey: identity.dedupeKey,
-          db3RowHash: identity.dedupeHash,
-          versions: [
-            defaultVersion(actor, {
-              status: reviewStatus,
-              recordedDate: record.record_date,
-              notes: `Imported from AutoSync DB3.${reviewNote}`
-            })
-          ]
-        },
-        actor
-      )
-    );
-    added += 1;
+    record.saved_by = actor;
+    await persistRecord(record);
+    if (record.id) recordIds.push(String(record.id));
+    console.warn('[autosync-psr] ingest complete', {
+      objectKey,
+      customer: group.client,
+      city: group.city,
+      citySource: group.citySource,
+      jobsite: targetJobsite,
+      added,
+      updated,
+      sections: group.rows.length
+    });
   }
 
-  record.saved_by = actor;
-  await persistRecord(record);
-  console.warn('[autosync-psr] ingest complete', {
-    objectKey,
-    customer,
-    city: targetCity,
-    citySource: cityInfo.source,
-    jobsite: targetJobsite,
-    added,
-    updated,
-    sections: rows.length
-  });
   return {
     ok: true,
-    recordId: record.id,
-    customer,
-    city: targetCity,
+    recordId: recordIds[0] || '',
+    recordIds,
+    customer: groups.values().next().value?.client || projectCustomer,
     jobsite: targetJobsite,
     added,
     updated,
-    sections: rows.length
+    sections: placeable.length
   };
 }
 
@@ -12655,6 +12843,11 @@ registerUserGrantsRoutes(app, {
   requireAdminPanelOrTenantUserManagement,
   assertUserIdInTenantScope
 });
+registerCustomerAccessRoutes(app, {
+  pool,
+  requireAuth,
+  requireAdminPanelOrTenantUserManagement
+});
 registerSignupRoutes(app, {
   pool,
   query: querySignupDataWithWasabiFallback,
@@ -12700,6 +12893,7 @@ registerCustomerSupportRoutes(app, {
   currentToken
 });
 registerJobScheduleRoutes(app, { pool, requireAuth });
+require('./living-index.routes').registerLivingIndexRoutes(app, { requireAuth });
 registerSmsRoutes(app, { pool });
 if (isOvhOpsEnabled() && isClusterBackgroundLeader()) {
   startMetricsCollector();

@@ -1,0 +1,39 @@
+---
+description: OVH hybrid deploy — BASE on pipeshare.live, Push to SaaS, PM2, platform releases
+alwaysApply: true
+---
+
+# OVH hybrid operations (Mike runs deploy — agent executes)
+
+## Workflow
+
+1. **Build on BASE** (`pipeshare.live`) — edit in `C:\GITHUBS\horizon-backend` + `horizon-frontend`, commit, push.
+2. **Deploy** — `ssh horizon-ovh` → `sudo bash /opt/horizon/horizon-backend/deploy/ovh/github-deploy.sh` or `deploy-from-local.ps1`.
+3. **Publish** — cPanel Releases on pipeshare.live after `publish-platform-release.sh` artifacts exist in Wasabi.
+4. **Push to SaaS** — same cPanel on BASE; fans out to `https://pipeshare.net/internal/platform/releases/apply`. Do not require switching to pipeshare.net.
+
+## Hybrid same-box (critical)
+
+- One OVH server serves **pipeshare.live** (BASE) and **pipeshare.net** (SaaS) from `/opt/horizon`.
+- `.env` must include `HP_PLATFORM_APPLY_MANIFEST_ONLY=1` — Push marks SaaS version **without** Wasabi tarball swap (git deploy is source of truth).
+- Artifacts may live in `WASABI_BUCKET=horizon-client-portal`; catalog in `SAAS_WASABI_BUCKET=saaspipeshare`. Code probes both buckets.
+
+## PM2 — never duplicate daemons
+
+- **Only** `ubuntu` PM2: `sudo -u ubuntu pm2 …` from `/opt/horizon/horizon-backend`.
+- **Never** `sudo pm2` or bare `pm2 start` as root — creates `/root/.pm2`, steals `:3000`, serves stale code, ubuntu PM2 crash-loops with `EADDRINUSE`.
+- Before restart or if Push/Apply acts stale: `sudo bash /opt/horizon/horizon-backend/deploy/ovh/deduplicate-pm2.sh`
+- After **route** changes use `pm2 restart`, not `pm2 reload`.
+- `github-deploy.sh` runs dedupe + restart automatically.
+
+## Server paths
+
+- Backend: `/opt/horizon/horizon-backend` · Frontend: `/opt/horizon/horizon-frontend`
+- SSH alias: `horizon-ovh` · PM2 app: `horizon-backend` (4 cluster workers)
+- Releases cPanel: `https://pipeshare.live/horizonpipe-cpanel/releases.html`
+
+## When agent deploys or debugs
+
+- Run commands yourself; do not only tell Mike to run them.
+- After backend deploy, verify one PM2 god (`/home/ubuntu/.pm2` only) and test push if release work is in scope.
+- Do not run full `apply-platform-release.sh` tarball swap on hybrid unless explicitly requested — it replaces git checkout.

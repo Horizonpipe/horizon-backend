@@ -10,6 +10,7 @@ const { getSaasOwnerSessionContext } = require('./lib/saas-tenant-owner');
 const { loadTenantScopeByHost } = require('./lib/saas-tenant-scope');
 const { upsertTenantAuthUserFromRow } = require('./lib/saas-tenant-auth-store');
 const { looksLikeMike } = require('./capabilities');
+const { findCompanyByName, matchExistingCompany, normalizeCompanyRole } = require('./lib/customer-access');
 
 const SIGNUP_PIN_TTL_MIN = Number(process.env.SIGNUP_PIN_TTL_MIN || 30);
 const RESEND_COOLDOWN_SEC = Math.max(30, Number(process.env.SIGNUP_RESEND_COOLDOWN_SEC || 60));
@@ -254,7 +255,10 @@ function registerSignupRoutes(app, deps) {
     const firstName = cleanString(req.body?.firstName);
     const lastName = cleanString(req.body?.lastName);
     const company = cleanString(req.body?.company);
-    const title = cleanString(req.body?.title);
+    const requestedRole = cleanString(req.body?.companyRole || req.body?.roleKey);
+    const title = requestedRole
+      ? normalizeCompanyRole(requestedRole, 'customer')
+      : cleanString(req.body?.title);
     const phone = cleanString(req.body?.phone);
     const email = normalizeEmail(req.body?.email);
     const password = cleanString(req.body?.password);
@@ -348,13 +352,25 @@ function registerSignupRoutes(app, deps) {
         return res.status(503).json({ success: false, ...pub });
       }
 
+      let companyMatched = true;
+      let companyMessage = '';
+      if (!saasSignup) {
+        const existingCompany = await findCompanyByName(pool, company);
+        companyMatched = !!existingCompany;
+        if (!companyMatched) {
+          companyMessage = 'No company matches that name. An admin will assign your company.';
+        }
+      }
+      const sent = sendResult.ok
+        ? 'Check your email for a verification code.'
+        : saasSignup
+          ? 'Check your email for a verification code.'
+          : 'Verification code generated (dev only — configure SMTP for production).';
       res.json({
         success: true,
-        message: sendResult.ok
-          ? 'Check your email for a verification code.'
-          : saasSignup
-            ? 'Check your email for a verification code.'
-            : 'Verification code generated (dev only — configure SMTP for production).',
+        companyMatched,
+        ...(companyMessage ? { companyMessage } : {}),
+        message: companyMessage ? `${sent} ${companyMessage}` : sent,
         ...(devPin ? { devPin } : {})
       });
     } catch (error) {
@@ -414,6 +430,21 @@ function registerSignupRoutes(app, deps) {
           });
           if (wasabiResult && typeof wasabiResult === 'object') {
             await pool.query(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
+            const madeId = wasabiResult.body?.user?.id;
+            if (!saasSignup && madeId) {
+              try {
+                const matched = await matchExistingCompany(pool, madeId, row.company, row.title);
+                if (wasabiResult.body && matched.message) {
+                  wasabiResult.body.companyMatched = false;
+                  wasabiResult.body.companyMessage = matched.message;
+                  wasabiResult.body.message = [wasabiResult.body.message, matched.message].filter(Boolean).join(' ');
+                } else if (wasabiResult.body && matched.matched) {
+                  wasabiResult.body.companyMatched = true;
+                }
+              } catch (matchError) {
+                console.error('[signup] company match failed:', matchError);
+              }
+            }
             return res.status(Number(wasabiResult.status || 200)).json(wasabiResult.body || {});
           }
           if (signupPrimaryStrict) {
@@ -533,6 +564,8 @@ function registerSignupRoutes(app, deps) {
 
       await pool.query(`DELETE FROM signup_verifications WHERE email_normalized = $1`, [email]);
 
+      let companyMatched = false;
+      let companyMessage = '';
       const requestHost = String(req.get('x-forwarded-host') || req.get('host') || '').trim();
       const hostScope = await loadTenantScopeByHost(pool, requestHost);
       if (hostScope.mode === 'tenant') {
@@ -544,15 +577,6 @@ function registerSignupRoutes(app, deps) {
            WHERE CAST(id AS text) = $1`,
           [String(userRow.id), hostScope.portalClientId, hostScope.portalJobId || '1']
         );
-        await pool.query(
-          `INSERT INTO user_company_membership (user_id, company_id, role_key, override_folder_grants)
-           VALUES ($1, $2, 'customer', '[]'::jsonb)
-           ON CONFLICT (user_id) DO UPDATE
-           SET company_id = EXCLUDED.company_id,
-               role_key = 'customer',
-               updated_at = NOW()`,
-          [String(userRow.id), hostScope.companyId]
-        );
         const boundUser = await pool.query(
           `SELECT * FROM users WHERE CAST(id AS text) = $1 LIMIT 1`,
           [String(userRow.id)]
@@ -562,12 +586,22 @@ function registerSignupRoutes(app, deps) {
         }
       }
 
+      try {
+        const matched = await matchExistingCompany(pool, userRow.id, row.company, row.title);
+        companyMatched = matched.matched;
+        companyMessage = matched.message || '';
+      } catch (matchError) {
+        console.error('[signup] company match failed:', matchError);
+      }
       const user = normalizeUser(userRow);
+      const baseMessage = 'Account created. An administrator must grant access before you can sign in.';
       res.json({
         success: true,
         user,
         requiresApproval: true,
-        message: 'Account created. An administrator must grant access before you can sign in.'
+        companyMatched,
+        ...(companyMessage ? { companyMessage } : {}),
+        message: companyMessage ? `${baseMessage} ${companyMessage}` : baseMessage
       });
     } catch (error) {
       console.error('SIGNUP VERIFY ERROR:', error);

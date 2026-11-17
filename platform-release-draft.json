@@ -1,10 +1,10 @@
 {
-  "title": "Daily reports and the production log are separate",
-  "description": "Daily Reports and the older production log were sharing one tab, so the footage log sat on top of the new job reports.\n\nDaily Reports now shows only the assigned job for that day: time logs, images, problems, who was notified, and the plan PDF. The older footage log, including manager notes tied to a calendar day, moved to its own Production log tab next to Daily Reports. Admins still see that log. Crew members and customers do not.\n\nWho is affected: the private server and SaaS after this version is pushed. Schedule, Planner, Crew Hub, Contacts, and My job are unchanged. The desktop app gets the same split in its own installer.",
+  "title": "Account edits, WinCan problems, and daily-log flags",
+  "description": "An Owner, a Superintendent, or a manager who was given clearance can edit an account, set a new password without the old one, or delete an account. The signed-in account cannot be deleted.\n\nWhen a project folder is uploaded, Misc/Docu/Problems/problems.json is indexed onto that job’s daily report.\n\nA daily-log remark keeps its flag instead of being dropped.\n\nWho is affected: pipeshare.live and pipeshare.net on the shared server. The desktop feed stays on 0.3.35.",
   "changeLog": [
-    "Daily Reports shows only the assigned-job report for the day you pick.",
-    "The older footage production log moved to its own Production log tab.",
-    "Admins still see the production log. It no longer covers Daily Reports.",
-    "Schedule, Planner, Crew Hub, Contacts, and My job stay where they were."
+    "Owner, Superintendent, or a manager with clearance can edit an account, set a new password, or delete an account.",
+    "The signed-in account cannot be deleted.",
+    "An uploaded WinCan problems.json is attached to that job’s daily report.",
+    "Daily-log remarks keep their flag."
   ]
 }
