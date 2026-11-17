@@ -10192,58 +10192,34 @@ app.delete('/daily-reports/:id', requireAuth, requireAdmin, async (req, res) => 
 // Any authenticated user can read/write their own vac events. Admins can see all.
 
 /**
- * Jobsites that appear on the Daily Logs tab — i.e. any planner record scoped
- * to this user with at least one segment whose latest status is `complete`
- * (or `rerun-videoed`). Returned as {client, city, jobsite} triples so the
- * Android operator picker renders the same set the desktop Daily Logs shows,
- * without pulling the full /records payload to the phone.
+ * Jobsites for the Android vac operator picker.
+ *
+ * Matches the desktop "Daily Logs" tab (job-schedule module → Daily Reports
+ * view): the list of jobs that are actually **assigned / created** in the
+ * scheduler and visible to the current user (crew members see their assigned
+ * jobs, managers/admins see everything). This is NOT the production footage
+ * log — it's the operational job list.
+ *
+ * Returned as {client, city, jobsite, job_id} triples so the phone can show
+ * the same set the operator sees on the PC's Daily Logs tab.
  */
 app.get('/vac-events/jobsites', requireAuth, async (req, res) => {
   try {
-    const includeRevideoed = String(req.query.includeRevideoed ?? '1').trim() !== '0';
+    const { loadBundle: loadScheduleBundle, tenantKey: scheduleTenantKey } =
+      require('./lib/job-schedule-store');
+    // No mail/sms needed for a read-only jobsite query.
+    const bundle = await loadScheduleBundle(pool, req.user, scheduleTenantKey(req.user, req), null, null);
 
-    // Reuse the same read path as GET /records so scoping and merge rules match.
-    let records = [];
-    if (PLANNER_STORE_WASABI_ONLY) {
-      try { records = await readRecordsFromWasabiSnapshotForUser(req.user, req); } catch (e) { records = []; }
-    } else {
-      const pgRecords = await readPlannerRecordsFromPostgresForUser(req.user);
-      if (WASABI_RECORDS_PRIMARY_ENABLED) {
-        let snapshotRecords = [];
-        try { snapshotRecords = await readRecordsFromWasabiSnapshotForUser(req.user, req); } catch (e) { snapshotRecords = []; }
-        records = mergePlannerRecordsById(snapshotRecords, pgRecords);
-      } else {
-        records = pgRecords;
-      }
-    }
-
-    const pickLatestVersionStatus = (segment) => {
-      const versions = Array.isArray(segment?.versions) ? segment.versions.slice() : [];
-      if (!versions.length) return 'neutral';
-      versions.sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
-      return normalizeStatus(versions[versions.length - 1]?.status || 'neutral');
-    };
-
+    const clientNameById = new Map((bundle.clients || []).map((c) => [c.id, c.name || '']));
     const map = new Map();
-    for (const record of records) {
-      if (!record || record.client === PSR_IMPORT_QUEUE_CLIENT) continue;
-      const systems = record.systems || {};
-      const segments = [...(systems.storm || []), ...(systems.sanitary || [])];
-      let qualifying = 0;
-      for (const seg of segments) {
-        const s = pickLatestVersionStatus(seg);
-        if (s === 'complete' || (includeRevideoed && s === 'rerun-videoed')) qualifying += 1;
-      }
-      if (!qualifying) continue;
-      const client = String(record.client || '').toUpperCase();
-      const city = String(record.city || '').toUpperCase();
-      const jobsite = normalizeJobsiteName(record.jobsite, record.street);
-      if (!jobsite || jobsite === 'NOT SET') continue;
+    for (const job of bundle.jobs || []) {
+      const client = String(clientNameById.get(job.clientId) || '').trim().toUpperCase();
+      const city = String(job.city || '').trim().toUpperCase();
+      const jobsite = String(job.projectName || '').trim();
+      if (!jobsite) continue;
       const key = `${client}|${city}|${jobsite}`;
-      const entry = map.get(key) || { client, city, jobsite, completedSegments: 0, recordCount: 0 };
-      entry.completedSegments += qualifying;
-      entry.recordCount += 1;
-      map.set(key, entry);
+      if (map.has(key)) continue; // dedupe but keep first job_id
+      map.set(key, { job_id: String(job.id || ''), client, city, jobsite, record_count: 1, completed_segments: 0 });
     }
 
     const jobsites = [...map.values()].sort((a, b) => {
@@ -10253,7 +10229,7 @@ app.get('/vac-events/jobsites', requireAuth, async (req, res) => {
       if (byCity) return byCity;
       return a.jobsite.localeCompare(b.jobsite);
     });
-    res.json({ success: true, jobsites });
+    res.json({ success: true, jobsites, role: bundle.role || 'unknown' });
   } catch (error) {
     console.error('GET VAC JOBSITES ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
