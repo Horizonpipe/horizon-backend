@@ -3965,6 +3965,128 @@ async function deleteDailyReportById(id) {
   return result.rows.length > 0;
 }
 
+// ----- Vac operator events (Android app timeline) ---------------------------
+const VAC_EVENT_ACTIVITIES = new Set(['getting_water', 'jetting_line', 'dumping']);
+const VAC_EVENT_STATUSES = new Set(['active', 'completed', 'cancelled']);
+
+function sanitizeVacEventInput(raw, defaults = {}) {
+  const activity = cleanString(raw?.activity).toLowerCase();
+  if (!VAC_EVENT_ACTIVITIES.has(activity)) {
+    throw new Error(`Invalid activity '${activity}'. Expected one of: getting_water, jetting_line, dumping.`);
+  }
+  const status = VAC_EVENT_STATUSES.has(cleanString(raw?.status).toLowerCase())
+    ? cleanString(raw.status).toLowerCase()
+    : 'active';
+  const startAt = raw?.start_at ? new Date(raw.start_at) : null;
+  if (!startAt || Number.isNaN(startAt.getTime())) {
+    throw new Error('start_at is required (ISO-8601).');
+  }
+  const endAtRaw = raw?.end_at ? new Date(raw.end_at) : null;
+  const endAt = endAtRaw && !Number.isNaN(endAtRaw.getTime()) ? endAtRaw : null;
+  let duration = raw?.duration_seconds;
+  if (duration == null && endAt) {
+    duration = Math.max(0, Math.round((endAt.getTime() - startAt.getTime()) / 1000));
+  }
+  const clientEventId = cleanString(raw?.client_event_id);
+  if (!clientEventId) {
+    throw new Error('client_event_id is required (device-side UUID for idempotent sync).');
+  }
+  return {
+    client_event_id: clientEventId,
+    operator_id: cleanString(raw?.operator_id || defaults.operator_id || ''),
+    operator_name: cleanString(raw?.operator_name || defaults.operator_name || ''),
+    client: cleanString(raw?.client).toUpperCase(),
+    city: cleanString(raw?.city).toUpperCase(),
+    jobsite: cleanString(raw?.jobsite),
+    activity,
+    start_at: startAt.toISOString(),
+    end_at: endAt ? endAt.toISOString() : null,
+    duration_seconds: duration == null ? null : Math.max(0, Math.round(Number(duration) || 0)),
+    status,
+    notes: cleanString(raw?.notes),
+    device_id: cleanString(raw?.device_id),
+    app_version: cleanString(raw?.app_version)
+  };
+}
+
+async function upsertVacOperatorEvent(input) {
+  const row = sanitizeVacEventInput(input);
+  // ON CONFLICT by client_event_id so the Android app can safely retry sync.
+  const q = `
+    INSERT INTO vac_operator_events (
+      client_event_id, operator_id, operator_name, client, city, jobsite,
+      activity, start_at, end_at, duration_seconds, status, notes, device_id, app_version
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    ON CONFLICT (client_event_id) DO UPDATE SET
+      operator_id = EXCLUDED.operator_id,
+      operator_name = EXCLUDED.operator_name,
+      client = EXCLUDED.client,
+      city = EXCLUDED.city,
+      jobsite = EXCLUDED.jobsite,
+      activity = EXCLUDED.activity,
+      start_at = EXCLUDED.start_at,
+      end_at = EXCLUDED.end_at,
+      duration_seconds = EXCLUDED.duration_seconds,
+      status = EXCLUDED.status,
+      notes = EXCLUDED.notes,
+      device_id = EXCLUDED.device_id,
+      app_version = EXCLUDED.app_version,
+      updated_at = NOW()
+    RETURNING *`;
+  const params = [
+    row.client_event_id,
+    row.operator_id,
+    row.operator_name,
+    row.client,
+    row.city,
+    row.jobsite,
+    row.activity,
+    row.start_at,
+    row.end_at,
+    row.duration_seconds,
+    row.status,
+    row.notes,
+    row.device_id,
+    row.app_version
+  ];
+  const result = await pool.query(q, params);
+  return result.rows[0];
+}
+
+async function listVacOperatorEvents({ from, to, operatorId, jobsite, limit } = {}) {
+  const where = [];
+  const params = [];
+  if (from) {
+    params.push(from);
+    where.push(`start_at >= $${params.length}`);
+  }
+  if (to) {
+    params.push(to);
+    where.push(`start_at <= $${params.length}`);
+  }
+  if (operatorId) {
+    params.push(String(operatorId));
+    where.push(`operator_id = $${params.length}`);
+  }
+  if (jobsite) {
+    params.push(String(jobsite));
+    where.push(`jobsite = $${params.length}`);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const lim = Math.min(Math.max(Number(limit) || 2000, 1), 10000);
+  params.push(lim);
+  const q = `SELECT * FROM vac_operator_events ${whereSql} ORDER BY start_at DESC LIMIT $${params.length}`;
+  const result = await pool.query(q, params);
+  return result.rows;
+}
+
+function vacOperatorIdentityFromReq(req) {
+  const u = req?.user || {};
+  const id = String(u.id || u.username || '').trim();
+  const name = String(u.displayName || u.username || '').trim();
+  return { operator_id: id, operator_name: name };
+}
+
 async function createJobsiteAsset(assetInput) {
   let created = null;
   const wrote = await tryWasabiStateWrite('create-jobsite-asset', async (data) => {
@@ -5820,6 +5942,37 @@ async function ensureSchema() {
     `ALTER TABLE jobsite_assets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`
   ];
   for (const query of assetAlters) await pool.query(query);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS vac_operator_events (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      client_event_id TEXT NOT NULL UNIQUE,
+      operator_id TEXT NOT NULL DEFAULT '',
+      operator_name TEXT NOT NULL DEFAULT '',
+      client TEXT NOT NULL DEFAULT '',
+      city TEXT NOT NULL DEFAULT '',
+      jobsite TEXT NOT NULL DEFAULT '',
+      activity TEXT NOT NULL CHECK (activity IN ('getting_water','jetting_line','dumping')),
+      start_at TIMESTAMPTZ NOT NULL,
+      end_at TIMESTAMPTZ,
+      duration_seconds INTEGER,
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','completed','cancelled')),
+      notes TEXT NOT NULL DEFAULT '',
+      device_id TEXT NOT NULL DEFAULT '',
+      app_version TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_vac_events_start_at ON vac_operator_events (start_at DESC)`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_vac_events_operator ON vac_operator_events (operator_id, start_at DESC)`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_vac_events_jobsite ON vac_operator_events (jobsite, start_at DESC)`
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS portal_path_grants (
@@ -10032,6 +10185,158 @@ app.delete('/daily-reports/:id', requireAuth, requireAdmin, async (req, res) => 
   } catch (error) {
     console.error('DELETE DAILY REPORT ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ----- Vac operator event routes (Android app timeline) ---------------------
+// Any authenticated user can read/write their own vac events. Admins can see all.
+
+/**
+ * Jobsites that appear on the Daily Logs tab — i.e. any planner record scoped
+ * to this user with at least one segment whose latest status is `complete`
+ * (or `rerun-videoed`). Returned as {client, city, jobsite} triples so the
+ * Android operator picker renders the same set the desktop Daily Logs shows,
+ * without pulling the full /records payload to the phone.
+ */
+app.get('/vac-events/jobsites', requireAuth, async (req, res) => {
+  try {
+    const includeRevideoed = String(req.query.includeRevideoed ?? '1').trim() !== '0';
+
+    // Reuse the same read path as GET /records so scoping and merge rules match.
+    let records = [];
+    if (PLANNER_STORE_WASABI_ONLY) {
+      try { records = await readRecordsFromWasabiSnapshotForUser(req.user, req); } catch (e) { records = []; }
+    } else {
+      const pgRecords = await readPlannerRecordsFromPostgresForUser(req.user);
+      if (WASABI_RECORDS_PRIMARY_ENABLED) {
+        let snapshotRecords = [];
+        try { snapshotRecords = await readRecordsFromWasabiSnapshotForUser(req.user, req); } catch (e) { snapshotRecords = []; }
+        records = mergePlannerRecordsById(snapshotRecords, pgRecords);
+      } else {
+        records = pgRecords;
+      }
+    }
+
+    const pickLatestVersionStatus = (segment) => {
+      const versions = Array.isArray(segment?.versions) ? segment.versions.slice() : [];
+      if (!versions.length) return 'neutral';
+      versions.sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+      return normalizeStatus(versions[versions.length - 1]?.status || 'neutral');
+    };
+
+    const map = new Map();
+    for (const record of records) {
+      if (!record || record.client === PSR_IMPORT_QUEUE_CLIENT) continue;
+      const systems = record.systems || {};
+      const segments = [...(systems.storm || []), ...(systems.sanitary || [])];
+      let qualifying = 0;
+      for (const seg of segments) {
+        const s = pickLatestVersionStatus(seg);
+        if (s === 'complete' || (includeRevideoed && s === 'rerun-videoed')) qualifying += 1;
+      }
+      if (!qualifying) continue;
+      const client = String(record.client || '').toUpperCase();
+      const city = String(record.city || '').toUpperCase();
+      const jobsite = normalizeJobsiteName(record.jobsite, record.street);
+      if (!jobsite || jobsite === 'NOT SET') continue;
+      const key = `${client}|${city}|${jobsite}`;
+      const entry = map.get(key) || { client, city, jobsite, completedSegments: 0, recordCount: 0 };
+      entry.completedSegments += qualifying;
+      entry.recordCount += 1;
+      map.set(key, entry);
+    }
+
+    const jobsites = [...map.values()].sort((a, b) => {
+      const byClient = a.client.localeCompare(b.client);
+      if (byClient) return byClient;
+      const byCity = a.city.localeCompare(b.city);
+      if (byCity) return byCity;
+      return a.jobsite.localeCompare(b.jobsite);
+    });
+    res.json({ success: true, jobsites });
+  } catch (error) {
+    console.error('GET VAC JOBSITES ERROR:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/vac-events', requireAuth, async (req, res) => {
+  try {
+    const from = cleanString(req.query.from);
+    const to = cleanString(req.query.to);
+    const jobsite = cleanString(req.query.jobsite);
+    const mine = String(req.query.mine || '').trim() === '1';
+    const limit = Number(req.query.limit) || 2000;
+    const operatorId = mine ? vacOperatorIdentityFromReq(req).operator_id : cleanString(req.query.operator_id);
+    const events = await listVacOperatorEvents({
+      from: from || null,
+      to: to || null,
+      operatorId: operatorId || null,
+      jobsite: jobsite || null,
+      limit
+    });
+    res.json({ success: true, events });
+  } catch (error) {
+    console.error('GET VAC EVENTS ERROR:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/vac-events', requireAuth, express.json({ limit: '2mb' }), async (req, res) => {
+  try {
+    const identity = vacOperatorIdentityFromReq(req);
+    const saved = await upsertVacOperatorEvent({ ...(req.body || {}), ...identity });
+    res.status(201).json({ success: true, event: saved });
+  } catch (error) {
+    console.error('CREATE VAC EVENT ERROR:', error);
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
+// Batch upsert for the Android offline queue. Body: { events: [...] }
+// Each entry must carry client_event_id. Partial failures are reported per row.
+app.post('/vac-events/sync', requireAuth, express.json({ limit: '10mb' }), async (req, res) => {
+  const list = Array.isArray(req.body?.events) ? req.body.events : [];
+  if (!list.length) {
+    return res.status(400).json({ success: false, error: 'events[] is required' });
+  }
+  const identity = vacOperatorIdentityFromReq(req);
+  const accepted = [];
+  const rejected = [];
+  for (const raw of list) {
+    try {
+      const saved = await upsertVacOperatorEvent({ ...(raw || {}), ...identity });
+      accepted.push({ client_event_id: saved.client_event_id, id: saved.id, status: saved.status });
+    } catch (error) {
+      rejected.push({
+        client_event_id: cleanString(raw?.client_event_id) || null,
+        error: error.message || String(error)
+      });
+    }
+  }
+  res.json({ success: true, accepted, rejected, counts: { accepted: accepted.length, rejected: rejected.length } });
+});
+
+app.patch('/vac-events/:clientEventId', requireAuth, express.json({ limit: '1mb' }), async (req, res) => {
+  try {
+    const clientEventId = cleanString(req.params.clientEventId);
+    if (!clientEventId) {
+      return res.status(400).json({ success: false, error: 'Missing client_event_id' });
+    }
+    const existing = await pool.query(
+      'SELECT * FROM vac_operator_events WHERE client_event_id = $1 LIMIT 1',
+      [clientEventId]
+    );
+    if (!existing.rows.length) {
+      return res.status(404).json({ success: false, error: 'Event not found' });
+    }
+    const identity = vacOperatorIdentityFromReq(req);
+    const merged = { ...existing.rows[0], ...(req.body || {}), client_event_id: clientEventId, ...identity };
+    const saved = await upsertVacOperatorEvent(merged);
+    res.json({ success: true, event: saved });
+  } catch (error) {
+    console.error('PATCH VAC EVENT ERROR:', error);
+    res.status(400).json({ success: false, error: error.message });
   }
 });
 
