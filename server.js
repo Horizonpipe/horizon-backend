@@ -10195,30 +10195,64 @@ app.delete('/daily-reports/:id', requireAuth, requireAdmin, async (req, res) => 
  * Jobsites for the Android vac operator picker.
  *
  * Matches the desktop "Daily Logs" tab (job-schedule module → Daily Reports
- * view): the list of jobs that are actually **assigned / created** in the
- * scheduler and visible to the current user (crew members see their assigned
- * jobs, managers/admins see everything). This is NOT the production footage
- * log — it's the operational job list.
+ * view) for a **single day** — the phone auto-picks today (the PC lets the
+ * user page through dates, the phone does not). Only jobs with a crew
+ * assignment covering the selected date are returned, and the set is
+ * visibility-sliced per user (crew members see their assigned jobs,
+ * managers/admins see everything).
  *
- * Returned as {client, city, jobsite, job_id} triples so the phone can show
- * the same set the operator sees on the PC's Daily Logs tab.
+ * Query params (all optional):
+ *   date=YYYY-MM-DD   — override the date (defaults to today)
+ *   tzOffsetMinutes=N — operator's local offset from UTC in minutes, as
+ *                       produced by JS `new Date().getTimezoneOffset()` (so
+ *                       EST sends 300). Used to derive "today in the
+ *                       operator's wall clock" when the app doesn't pass an
+ *                       explicit date. Ignored if `date` is passed.
+ *   all=1             — return every visible job regardless of date
+ *                       (fallback for crews that forgot to schedule).
+ *
+ * Response: {success, date, scope, role, jobsites: [{job_id, client, city, jobsite}]}
  */
 app.get('/vac-events/jobsites', requireAuth, async (req, res) => {
   try {
     const { loadBundle: loadScheduleBundle, tenantKey: scheduleTenantKey } =
       require('./lib/job-schedule-store');
+
+    // Figure out which calendar date to filter to.
+    const isoDateRe = /^\d{4}-\d{2}-\d{2}$/;
+    const todayFromOffset = (offsetMinStr) => {
+      const n = Number(offsetMinStr);
+      const offsetMs = Number.isFinite(n) ? n * 60 * 1000 : 0;
+      // JS getTimezoneOffset is UTC-local in minutes, so subtract to get local.
+      const d = new Date(Date.now() - offsetMs);
+      const z = (x) => String(x).padStart(2, '0');
+      return `${d.getUTCFullYear()}-${z(d.getUTCMonth() + 1)}-${z(d.getUTCDate())}`;
+    };
+    const wantAll = String(req.query.all ?? '').trim() === '1';
+    const rawDate = String(req.query.date ?? '').trim();
+    const date = isoDateRe.test(rawDate) ? rawDate : todayFromOffset(req.query.tzOffsetMinutes);
+
     // No mail/sms needed for a read-only jobsite query.
     const bundle = await loadScheduleBundle(pool, req.user, scheduleTenantKey(req.user, req), null, null);
+
+    // Set of jobIds that have an assignment covering `date`.
+    const jobIdsForDate = new Set();
+    for (const a of bundle.assignments || []) {
+      const start = a.startDate || '';
+      const end = a.endDate || start;
+      if (start && date >= start && date <= end) jobIdsForDate.add(a.jobId);
+    }
 
     const clientNameById = new Map((bundle.clients || []).map((c) => [c.id, c.name || '']));
     const map = new Map();
     for (const job of bundle.jobs || []) {
+      if (!wantAll && !jobIdsForDate.has(job.id)) continue;
       const client = String(clientNameById.get(job.clientId) || '').trim().toUpperCase();
       const city = String(job.city || '').trim().toUpperCase();
       const jobsite = String(job.projectName || '').trim();
       if (!jobsite) continue;
       const key = `${client}|${city}|${jobsite}`;
-      if (map.has(key)) continue; // dedupe but keep first job_id
+      if (map.has(key)) continue;
       map.set(key, { job_id: String(job.id || ''), client, city, jobsite, record_count: 1, completed_segments: 0 });
     }
 
@@ -10229,7 +10263,13 @@ app.get('/vac-events/jobsites', requireAuth, async (req, res) => {
       if (byCity) return byCity;
       return a.jobsite.localeCompare(b.jobsite);
     });
-    res.json({ success: true, jobsites, role: bundle.role || 'unknown' });
+    res.json({
+      success: true,
+      jobsites,
+      date,
+      scope: wantAll ? 'all' : 'day',
+      role: bundle.role || 'unknown'
+    });
   } catch (error) {
     console.error('GET VAC JOBSITES ERROR:', error);
     res.status(500).json({ success: false, error: error.message });
